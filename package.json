@@ -1,0 +1,33 @@
+{
+  "name": "min-local-ai-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "smoke:app-server": "node scripts/app_server_smoke.cjs",
+    "release:check": "node scripts/release_check.cjs",
+    "release:test": "npm.cmd run build && set \"CARGO_TARGET_DIR=%LOCALAPPDATA%\\min\\cargo-target\"&& cargo test --manifest-path src-tauri/Cargo.toml --no-default-features && node scripts/app_server_smoke.cjs",
+    "release:build": "npm.cmd run release:check && npm.cmd run tauri:build:local",
+    "release:verify": "node scripts/release_verify.cjs",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:dev:local": "set \"CARGO_TARGET_DIR=%LOCALAPPDATA%\\min\\cargo-target\"&& tauri dev",
+    "tauri:build:local": "set \"CARGO_TARGET_DIR=%LOCALAPPDATA%\\min\\cargo-target\"&& tauri build"
+  },
+  "dependencies": {
+    "@openai/codex": "^0.144.1",
+    "@tauri-apps/api": "^2.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0"
+  }
+}

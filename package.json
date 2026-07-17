@@ -12,7 +12,7 @@
     "release:build": "npm.cmd run release:check && npm.cmd run tauri:build:local",
     "release:verify": "node scripts/release_verify.cjs",
     "preview": "vite preview",
-    "tauri": "tauri",
+    "tauri": "set \"CARGO_TARGET_DIR=%LOCALAPPDATA%\\min\\cargo-target\"&& tauri",
     "tauri:dev:local": "set \"CARGO_TARGET_DIR=%LOCALAPPDATA%\\min\\cargo-target\"&& tauri dev",
     "tauri:build:local": "set \"CARGO_TARGET_DIR=%LOCALAPPDATA%\\min\\cargo-target\"&& tauri build"
   },

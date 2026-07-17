@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
-pub const STORE_SCHEMA_VERSION: i64 = 5;
+pub const STORE_SCHEMA_VERSION: i64 = 8;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS store_meta (
@@ -41,7 +41,9 @@ CREATE TABLE IF NOT EXISTS conversations (
     codex_thread_id TEXT,
     archived_at TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    plan_history_json TEXT NOT NULL DEFAULT '{}',
+    commentary_json TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -56,6 +58,7 @@ CREATE TABLE IF NOT EXISTS messages (
     live INTEGER NOT NULL DEFAULT 0,
     final INTEGER NOT NULL DEFAULT 0,
     origin_device_id TEXT REFERENCES devices(id),
+    attachments_json TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL
 );
 
@@ -87,6 +90,9 @@ CREATE TABLE IF NOT EXISTS work_items (
     event_type TEXT NOT NULL,
     body TEXT,
     code TEXT,
+    plan_step_id TEXT,
+    before_code TEXT,
+    after_code TEXT,
     language TEXT,
     sequence INTEGER NOT NULL,
     hlc TEXT,
@@ -210,6 +216,10 @@ pub struct LocalConversation {
     pub work_items: Vec<LocalWorkItem>,
     pub thread_id: Option<String>,
     pub updated_at: String,
+    #[serde(default)]
+    pub plan_history: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub commentary: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,6 +252,16 @@ pub struct LocalMessage {
     pub hlc: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<LocalImageAttachment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalImageAttachment {
+    pub path: String,
+    pub name: String,
+    pub mime_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,6 +270,8 @@ pub struct LocalWorkItem {
     pub id: i64,
     pub item_id: Option<String>,
     pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_step_id: Option<String>,
     pub kind: String,
     pub status: String,
     pub label: String,
@@ -258,6 +280,10 @@ pub struct LocalWorkItem {
     pub time: String,
     pub body: Option<String>,
     pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_code: Option<String>,
     pub language: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hlc: Option<String>,
@@ -417,9 +443,9 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
             format!("A lokális SQLite v4 migráció commitja sikertelen: {error}")
         })?;
     } else if version == 4 {
-        let transaction = connection
-            .transaction()
-            .map_err(|error| format!("A lokÃ¡lis SQLite v5 migrÃ¡ciÃ³ nem indÃ­thatÃ³ el: {error}"))?;
+        let transaction = connection.transaction().map_err(|error| {
+            format!("A lokÃ¡lis SQLite v5 migrÃ¡ciÃ³ nem indÃ­thatÃ³ el: {error}")
+        })?;
         transaction
             .execute_batch(
                 "ALTER TABLE work_items ADD COLUMN hlc TEXT;
@@ -429,6 +455,54 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
             .map_err(|error| format!("A lokÃ¡lis SQLite v5 migrÃ¡ciÃ³ sikertelen: {error}"))?;
         transaction.commit().map_err(|error| {
             format!("A lokÃ¡lis SQLite v5 migrÃ¡ciÃ³ commitja sikertelen: {error}")
+        })?;
+    }
+    let migrated_version = read_schema_version(connection)?;
+    if migrated_version == 5 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("A lokális SQLite v6 migráció nem indítható el: {error}"))?;
+        transaction
+            .execute_batch(
+                "ALTER TABLE work_items ADD COLUMN plan_step_id TEXT;
+                 ALTER TABLE work_items ADD COLUMN before_code TEXT;
+                 ALTER TABLE work_items ADD COLUMN after_code TEXT;
+                 PRAGMA user_version = 6;",
+            )
+            .map_err(|error| format!("A lokális SQLite v6 migráció sikertelen: {error}"))?;
+        transaction.commit().map_err(|error| {
+            format!("A lokális SQLite v6 migráció commitja sikertelen: {error}")
+        })?;
+    }
+    let migrated_version = read_schema_version(connection)?;
+    if migrated_version == 6 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("A lokális SQLite v7 migráció nem indítható el: {error}"))?;
+        transaction
+            .execute_batch(
+                "ALTER TABLE messages ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]';
+                 PRAGMA user_version = 7;",
+            )
+            .map_err(|error| format!("A lokális SQLite v7 migráció sikertelen: {error}"))?;
+        transaction.commit().map_err(|error| {
+            format!("A lokális SQLite v7 migráció commitja sikertelen: {error}")
+        })?;
+    }
+    let migrated_version = read_schema_version(connection)?;
+    if migrated_version == 7 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("A lokális SQLite v8 migráció nem indítható el: {error}"))?;
+        transaction
+            .execute_batch(
+                "ALTER TABLE conversations ADD COLUMN plan_history_json TEXT NOT NULL DEFAULT '{}';
+                 ALTER TABLE conversations ADD COLUMN commentary_json TEXT NOT NULL DEFAULT '[]';
+                 PRAGMA user_version = 8;",
+            )
+            .map_err(|error| format!("A lokális SQLite v8 migráció sikertelen: {error}"))?;
+        transaction.commit().map_err(|error| {
+            format!("A lokális SQLite v8 migráció commitja sikertelen: {error}")
         })?;
     }
     Ok(())
@@ -565,28 +639,57 @@ fn normalized_project_id(project: &LocalProject) -> String {
     local_id
 }
 
-fn normalized_path(value: &str) -> String {
+fn canonical_sync_project_id(project: &LocalProject) -> String {
+    let identity = project
+        .relative_path
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            if project.path_hint.trim().is_empty() {
+                &project.id
+            } else {
+                &project.path_hint
+            }
+        });
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("min:v2:project:{}", identity.to_lowercase()).as_bytes(),
+    )
+    .to_string()
+}
+
+fn project_path_key(value: &str) -> String {
     value
-        .replace('/', "\\")
-        .trim_end_matches('\\')
+        .trim_start_matches(r"\\?\")
+        .replace('\\', "/")
+        .trim_end_matches('/')
         .to_lowercase()
 }
 
 fn project_matches_tombstone(project: &LocalProject, tombstone: &LocalTombstone) -> bool {
-    tombstone.entity_type == "project"
-        && (tombstone.entity_id == project.id
-            || tombstone
-                .relative_path
-                .as_deref()
-                .zip(project.relative_path.as_deref())
-                .map(|(left, right)| normalized_path(left) == normalized_path(right))
-                .unwrap_or(false)
-            || tombstone
-                .path_hint
-                .as_deref()
-                .map(normalized_path)
-                .map(|path| path == normalized_path(&project.path_hint))
-                .unwrap_or(false))
+    if tombstone.entity_type != "project" {
+        return false;
+    }
+    if tombstone.entity_id == project.id
+        || tombstone.entity_id == normalized_project_id(project)
+        || tombstone.entity_id == canonical_sync_project_id(project)
+    {
+        return true;
+    }
+    if let (Some(left), Some(right)) = (
+        tombstone.relative_path.as_deref(),
+        project.relative_path.as_deref(),
+    ) {
+        if project_path_key(left) == project_path_key(right) {
+            return true;
+        }
+    }
+    tombstone
+        .path_hint
+        .as_deref()
+        .map(project_path_key)
+        .map(|path| path == project_path_key(&project.path_hint))
+        .unwrap_or(false)
 }
 
 fn unique_sequence(candidate: i64, index: usize, used: &mut HashSet<i64>) -> i64 {
@@ -600,7 +703,9 @@ fn unique_sequence(candidate: i64, index: usize, used: &mut HashSet<i64>) -> i64
     fallback
 }
 
-fn load_snapshot_from_connection(connection: &Connection) -> Result<LocalStoreSnapshot, String> {
+pub(crate) fn load_snapshot_from_connection(
+    connection: &Connection,
+) -> Result<LocalStoreSnapshot, String> {
     let project_rows = {
         let mut statement = connection
             .prepare(
@@ -644,7 +749,8 @@ fn load_snapshot_from_connection(connection: &Connection) -> Result<LocalStoreSn
     let conversation_rows = {
         let mut statement = connection
             .prepare(
-                "SELECT id, project_id, title, codex_thread_id, updated_at
+                "SELECT id, project_id, title, codex_thread_id, updated_at,
+                        plan_history_json, commentary_json
                  FROM conversations
                  WHERE archived_at IS NULL
                    AND project_id IN (
@@ -662,6 +768,8 @@ fn load_snapshot_from_connection(connection: &Connection) -> Result<LocalStoreSn
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             })
             .map_err(|error| format!("A lokális beszélgetéslista bejárása sikertelen: {error}"))?
@@ -671,12 +779,25 @@ fn load_snapshot_from_connection(connection: &Connection) -> Result<LocalStoreSn
     };
 
     let mut conversations = BTreeMap::new();
-    for (conversation_id, project_id, title, thread_id, updated_at) in conversation_rows {
+    for (
+        conversation_id,
+        project_id,
+        title,
+        thread_id,
+        updated_at,
+        plan_history_json,
+        commentary_json,
+    ) in conversation_rows
+    {
+        let plan_history: BTreeMap<String, serde_json::Value> =
+            serde_json::from_str(&plan_history_json).unwrap_or_default();
+        let commentary: Vec<serde_json::Value> =
+            serde_json::from_str(&commentary_json).unwrap_or_default();
         let messages = {
             let mut statement = connection
                 .prepare(
                     "SELECT id, role, body, created_at, code, live, \"final\", item_id, sequence,
-                            hlc, origin_device_id
+                            hlc, origin_device_id, attachments_json
                      FROM messages
                      WHERE conversation_id = ?1
                      ORDER BY COALESCE(hlc, printf('%020d', sequence)),
@@ -697,6 +818,8 @@ fn load_snapshot_from_connection(connection: &Connection) -> Result<LocalStoreSn
                         sequence: Some(row.get(8)?),
                         hlc: row.get(9)?,
                         origin_device_id: row.get(10)?,
+                        images: serde_json::from_str(&row.get::<_, String>(11)?)
+                            .unwrap_or_default(),
                     })
                 })
                 .map_err(|error| format!("A lokális üzenetlista bejárása sikertelen: {error}"))?
@@ -708,9 +831,9 @@ fn load_snapshot_from_connection(connection: &Connection) -> Result<LocalStoreSn
         let work_items = {
             let mut statement = connection
                 .prepare(
-                    "SELECT w.sequence, w.item_id, t.codex_turn_id, w.kind, w.status,
+                    "SELECT w.sequence, w.item_id, t.codex_turn_id, w.plan_step_id, w.kind, w.status,
                             w.label, w.detail, w.event_type, w.created_at, w.body,
-                            w.code, w.language, w.hlc, w.origin_device_id
+                            w.code, w.before_code, w.after_code, w.language, w.hlc, w.origin_device_id
                      FROM work_items w
                      LEFT JOIN turns t ON t.id = w.turn_id
                      WHERE w.conversation_id = ?1
@@ -726,17 +849,20 @@ fn load_snapshot_from_connection(connection: &Connection) -> Result<LocalStoreSn
                         id: row.get(0)?,
                         item_id: row.get(1)?,
                         turn_id: row.get(2)?,
-                        kind: row.get(3)?,
-                        status: row.get(4)?,
-                        label: row.get(5)?,
-                        detail: row.get(6)?,
-                        event_type: row.get(7)?,
-                        time: row.get(8)?,
-                        body: row.get(9)?,
-                        code: row.get(10)?,
-                        language: row.get(11)?,
-                        hlc: row.get(12)?,
-                        origin_device_id: row.get(13)?,
+                        plan_step_id: row.get(3)?,
+                        kind: row.get(4)?,
+                        status: row.get(5)?,
+                        label: row.get(6)?,
+                        detail: row.get(7)?,
+                        event_type: row.get(8)?,
+                        time: row.get(9)?,
+                        body: row.get(10)?,
+                        code: row.get(11)?,
+                        before_code: row.get(12)?,
+                        after_code: row.get(13)?,
+                        language: row.get(14)?,
+                        hlc: row.get(15)?,
+                        origin_device_id: row.get(16)?,
                     })
                 })
                 .map_err(|error| format!("A lokális work item lista bejárása sikertelen: {error}"))?
@@ -756,6 +882,8 @@ fn load_snapshot_from_connection(connection: &Connection) -> Result<LocalStoreSn
                 work_items,
                 thread_id,
                 updated_at,
+                plan_history,
+                commentary,
             },
         );
         if let Some(project_index) = project_indexes.get(&project_id) {
@@ -809,9 +937,7 @@ fn load_snapshot_from_connection(connection: &Connection) -> Result<LocalStoreSn
         .iter()
         .map(|project| project.id.clone())
         .collect::<HashSet<_>>();
-    conversations.retain(|_, conversation| {
-        active_project_ids.contains(&conversation.project_id)
-    });
+    conversations.retain(|_, conversation| active_project_ids.contains(&conversation.project_id));
     for project in &mut projects {
         project.threads.clear();
     }
@@ -915,6 +1041,34 @@ fn save_snapshot_in_connection(
             )
             .map_err(|error| format!("A lokális tombstone mentése sikertelen: {error}"))?;
     }
+    let incoming_tombstones = snapshot
+        .tombstones
+        .iter()
+        .map(|tombstone| (tombstone.entity_type.clone(), tombstone.entity_id.clone()))
+        .collect::<HashSet<_>>();
+    let stale_tombstones = {
+        let mut statement = transaction
+            .prepare("SELECT entity_type, entity_id FROM sync_tombstones")
+            .map_err(|error| format!("A régi tombstone-ok lekérdezése sikertelen: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| format!("A régi tombstone-lista bejárása sikertelen: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("A régi tombstone-azonosító hibás: {error}"))?;
+        rows.into_iter()
+            .filter(|key| !incoming_tombstones.contains(key))
+            .collect::<Vec<_>>()
+    };
+    for (entity_type, entity_id) in stale_tombstones {
+        transaction
+            .execute(
+                "DELETE FROM sync_tombstones WHERE entity_type = ?1 AND entity_id = ?2",
+                params![entity_type, entity_id],
+            )
+            .map_err(|error| format!("A feloldott tombstone törlése sikertelen: {error}"))?;
+    }
     let active_projects = snapshot
         .projects
         .iter()
@@ -988,6 +1142,8 @@ fn save_snapshot_in_connection(
                     work_items: Vec::new(),
                     thread_id: None,
                     updated_at: now.clone(),
+                    plan_history: BTreeMap::new(),
+                    commentary: Vec::new(),
                 });
             let slot = (local_project_id.clone(), title.clone());
             if seen_slots.insert(slot) {
@@ -1017,7 +1173,7 @@ fn save_snapshot_in_connection(
         if conversation.title.trim().is_empty() {
             return Err("A lokális beszélgetés neve nem lehet üres.".to_string());
         }
-        let conversation_id = conversation
+        let requested_conversation_id = conversation
             .id
             .as_deref()
             .filter(|value| Uuid::parse_str(value).is_ok())
@@ -1028,50 +1184,72 @@ fn save_snapshot_in_connection(
                     &format!("{local_project_id}:{}", conversation.title),
                 )
             });
+        // A stale frontend cache can accidentally carry one UUID for two
+        // different title slots. Never let the second slot overwrite the
+        // first SQLite row; use the deterministic slot identity instead.
+        let conversation_id = if seen_conversation_ids.contains(&requested_conversation_id) {
+            let base = stable_id(
+                "conversation",
+                &format!("{local_project_id}:{}", conversation.title),
+            );
+            let mut replacement = base.clone();
+            let mut suffix = 2_usize;
+            while seen_conversation_ids.contains(&replacement) {
+                replacement = stable_id(
+                    "conversation",
+                    &format!("{local_project_id}:{}:{suffix}", conversation.title),
+                );
+                suffix += 1;
+            }
+            replacement
+        } else {
+            requested_conversation_id
+        };
         let updated_at = if conversation.updated_at.trim().is_empty() {
             now.clone()
         } else {
             conversation.updated_at.clone()
         };
+        let plan_history_json = serde_json::to_string(&conversation.plan_history)
+            .map_err(|error| format!("A tervelőzmény nem szerializálható: {error}"))?;
+        let commentary_json = serde_json::to_string(&conversation.commentary)
+            .map_err(|error| format!("A commentary nem szerializálható: {error}"))?;
         transaction
             .execute(
-                "INSERT INTO conversations (id, project_id, title, codex_thread_id, archived_at, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?5)
+                "INSERT INTO conversations (id, project_id, title, codex_thread_id, archived_at, created_at, updated_at, plan_history_json, commentary_json)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?5, ?6, ?7)
                  ON CONFLICT(id) DO UPDATE SET
                      project_id = excluded.project_id,
                      title = excluded.title,
                      codex_thread_id = excluded.codex_thread_id,
                      archived_at = NULL,
-                     updated_at = excluded.updated_at",
+                     updated_at = excluded.updated_at,
+                     plan_history_json = CASE
+                         WHEN excluded.plan_history_json <> '{}' THEN excluded.plan_history_json
+                         ELSE conversations.plan_history_json
+                     END,
+                     commentary_json = CASE
+                         WHEN excluded.commentary_json <> '[]' THEN excluded.commentary_json
+                         ELSE conversations.commentary_json
+                     END",
                 params![
                     conversation_id,
                     local_project_id,
                     conversation.title,
                     conversation.thread_id,
                     updated_at,
+                    plan_history_json,
+                    commentary_json,
                 ],
             )
             .map_err(|error| format!("A lokális beszélgetés mentése sikertelen: {error}"))?;
         seen_conversation_ids.insert(conversation_id.clone());
 
-        transaction
-            .execute(
-                "DELETE FROM messages WHERE conversation_id = ?1",
-                params![conversation_id],
-            )
-            .map_err(|error| format!("A lokális régi üzenetek nem törölhetők: {error}"))?;
-        transaction
-            .execute(
-                "DELETE FROM work_items WHERE conversation_id = ?1",
-                params![conversation_id],
-            )
-            .map_err(|error| format!("A lokális régi work itemek nem törölhetők: {error}"))?;
-        transaction
-            .execute(
-                "DELETE FROM turns WHERE conversation_id = ?1",
-                params![conversation_id],
-            )
-            .map_err(|error| format!("A lokális régi turnök nem törölhetők: {error}"))?;
+        // Conversation content is append-only at this layer. A frontend
+        // snapshot may be temporarily incomplete while hydration or a sync
+        // pull races a new request; absence must never mean deletion.
+        // Restart recovery rows therefore survive the next partial save too.
+        // Conversation/project tombstones remain the explicit removal path.
 
         let mut message_sequences = HashSet::new();
         let mut message_ids = HashSet::new();
@@ -1097,10 +1275,33 @@ fn save_snapshot_in_connection(
             } else {
                 message.time.clone()
             };
+            let attachments_json = serde_json::to_string(&message.images)
+                .map_err(|error| format!("A képcsatolmányok nem szerializálhatók: {error}"))?;
             transaction
                 .execute(
-                    "INSERT INTO messages (id, conversation_id, role, body, sequence, hlc, item_id, code, live, \"final\", origin_device_id, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    "INSERT INTO messages (id, conversation_id, role, body, sequence, hlc, item_id, code, live, \"final\", origin_device_id, attachments_json, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                     ON CONFLICT DO UPDATE SET
+                         conversation_id = excluded.conversation_id,
+                         role = excluded.role,
+                         body = CASE
+                             WHEN length(excluded.body) >= length(messages.body) THEN excluded.body
+                             ELSE messages.body
+                         END,
+                         sequence = excluded.sequence,
+                         hlc = COALESCE(excluded.hlc, messages.hlc),
+                         item_id = COALESCE(excluded.item_id, messages.item_id),
+                         code = MAX(messages.code, excluded.code),
+                         live = CASE
+                             WHEN messages.\"final\" = 1 OR excluded.\"final\" = 1 THEN 0
+                             ELSE MAX(messages.live, excluded.live)
+                         END,
+                         \"final\" = MAX(messages.\"final\", excluded.\"final\"),
+                         origin_device_id = COALESCE(excluded.origin_device_id, messages.origin_device_id),
+                         attachments_json = CASE
+                             WHEN excluded.attachments_json <> '[]' THEN excluded.attachments_json
+                             ELSE messages.attachments_json
+                         END",
                     params![
                         message_id,
                         conversation_id,
@@ -1113,6 +1314,7 @@ fn save_snapshot_in_connection(
                         if message.live.unwrap_or(false) { 1 } else { 0 },
                         if message.final_message.unwrap_or(false) { 1 } else { 0 },
                         message.origin_device_id,
+                        attachments_json,
                         message_time,
                     ],
                 )
@@ -1151,13 +1353,40 @@ fn save_snapshot_in_connection(
             };
             transaction
                 .execute(
-                    "INSERT INTO work_items (id, conversation_id, turn_id, item_id, kind, status, label, detail, event_type, body, code, language, sequence, hlc, origin_device_id, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                    "INSERT INTO work_items (id, conversation_id, turn_id, item_id, plan_step_id, kind, status, label, detail, event_type, body, code, before_code, after_code, language, sequence, hlc, origin_device_id, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                     ON CONFLICT DO UPDATE SET
+                         conversation_id = excluded.conversation_id,
+                         turn_id = COALESCE(excluded.turn_id, work_items.turn_id),
+                         item_id = COALESCE(excluded.item_id, work_items.item_id),
+                         plan_step_id = COALESCE(excluded.plan_step_id, work_items.plan_step_id),
+                         kind = excluded.kind,
+                         status = CASE
+                             WHEN work_items.status IN ('done', 'error') AND excluded.status = 'running'
+                                 THEN work_items.status
+                             ELSE excluded.status
+                         END,
+                         label = excluded.label,
+                         detail = excluded.detail,
+                         event_type = excluded.event_type,
+                         body = CASE
+                             WHEN length(COALESCE(excluded.body, '')) >= length(COALESCE(work_items.body, ''))
+                                 THEN COALESCE(excluded.body, work_items.body)
+                             ELSE work_items.body
+                         END,
+                         code = COALESCE(excluded.code, work_items.code),
+                         before_code = COALESCE(excluded.before_code, work_items.before_code),
+                         after_code = COALESCE(excluded.after_code, work_items.after_code),
+                         language = COALESCE(excluded.language, work_items.language),
+                         sequence = excluded.sequence,
+                         hlc = COALESCE(excluded.hlc, work_items.hlc),
+                         origin_device_id = COALESCE(excluded.origin_device_id, work_items.origin_device_id)",
                     params![
                         work_item_id,
                         conversation_id,
                         local_turn_id,
                         work_item.item_id,
+                        work_item.plan_step_id,
                         work_item.kind,
                         work_item.status,
                         work_item.label,
@@ -1165,6 +1394,8 @@ fn save_snapshot_in_connection(
                         work_item.event_type,
                         work_item.body,
                         work_item.code,
+                        work_item.before_code,
+                        work_item.after_code,
                         work_item.language,
                         sequence,
                         work_item.hlc,
@@ -1273,12 +1504,24 @@ mod tests {
                      sequence INTEGER NOT NULL,
                      created_at TEXT NOT NULL
                  );
+                 CREATE TABLE messages (
+                     id TEXT PRIMARY KEY NOT NULL
+                 );
+                 CREATE TABLE conversations (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     project_id TEXT NOT NULL,
+                     title TEXT NOT NULL,
+                     codex_thread_id TEXT,
+                     archived_at TEXT,
+                     created_at TEXT NOT NULL,
+                     updated_at TEXT NOT NULL
+                 );
                  PRAGMA user_version = 4;",
             )
             .expect("create v4 fixture");
 
         initialize_connection(&mut connection).expect("migrate v4 schema");
-        assert_eq!(read_schema_version(&connection).expect("schema version"), 5);
+        assert_eq!(read_schema_version(&connection).expect("schema version"), 8);
         let mut statement = connection
             .prepare("PRAGMA table_info(work_items)")
             .expect("work item columns");
@@ -1289,6 +1532,20 @@ mod tests {
             .expect("collect work item columns");
         assert!(columns.iter().any(|column| column == "hlc"));
         assert!(columns.iter().any(|column| column == "origin_device_id"));
+        assert!(columns.iter().any(|column| column == "plan_step_id"));
+        assert!(columns.iter().any(|column| column == "before_code"));
+        assert!(columns.iter().any(|column| column == "after_code"));
+        let mut statement = connection
+            .prepare("PRAGMA table_info(messages)")
+            .expect("message columns");
+        let message_columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("read message columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect message columns");
+        assert!(message_columns
+            .iter()
+            .any(|column| column == "attachments_json"));
     }
 
     fn test_snapshot() -> LocalStoreSnapshot {
@@ -1310,11 +1567,17 @@ mod tests {
                 sequence: Some(10),
                 hlc: Some("00000000000000000010-00000000".to_string()),
                 origin_device_id: None,
+                images: vec![LocalImageAttachment {
+                    path: "Screenshots/8.png".to_string(),
+                    name: "clipboard.png".to_string(),
+                    mime_type: "image/png".to_string(),
+                }],
             }],
             work_items: vec![LocalWorkItem {
                 id: 11,
                 item_id: Some("item-1".to_string()),
                 turn_id: Some("turn-1".to_string()),
+                plan_step_id: Some("step-1".to_string()),
                 kind: "command".to_string(),
                 status: "done".to_string(),
                 label: "Command".to_string(),
@@ -1323,12 +1586,23 @@ mod tests {
                 time: "2".to_string(),
                 body: Some("ok".to_string()),
                 code: None,
+                before_code: Some("before".to_string()),
+                after_code: Some("after".to_string()),
                 language: None,
                 hlc: Some("00000000000000000011-00000000".to_string()),
                 origin_device_id: None,
             }],
             thread_id: Some("thread-1".to_string()),
             updated_at: "3".to_string(),
+            plan_history: BTreeMap::from([(
+                "turn-1".to_string(),
+                serde_json::json!({"steps": [{"id": "step-1", "step": "Step 1"}]}),
+            )]),
+            commentary: vec![serde_json::json!({
+                "id": "commentary-1",
+                "body": "Thinking",
+                "status": "done"
+            })],
         };
         LocalStoreSnapshot {
             schema_version: STORE_SCHEMA_VERSION,
@@ -1367,11 +1641,26 @@ mod tests {
         let conversation = loaded.conversations.values().next().expect("conversation");
         assert_eq!(conversation.messages[0].text, "Hello");
         assert_eq!(conversation.messages[0].final_message, Some(true));
+        assert_eq!(conversation.messages[0].images[0].path, "Screenshots/8.png");
         assert_eq!(
             conversation.messages[0].hlc.as_deref(),
             Some("00000000000000000010-00000000")
         );
         assert_eq!(conversation.work_items[0].detail, "echo");
+        assert_eq!(
+            conversation.work_items[0].plan_step_id.as_deref(),
+            Some("step-1")
+        );
+        assert_eq!(
+            conversation.work_items[0].before_code.as_deref(),
+            Some("before")
+        );
+        assert_eq!(
+            conversation.work_items[0].after_code.as_deref(),
+            Some("after")
+        );
+        assert_eq!(conversation.plan_history.len(), 1);
+        assert_eq!(conversation.commentary.len(), 1);
         assert_eq!(
             conversation.work_items[0].hlc.as_deref(),
             Some("00000000000000000011-00000000")
@@ -1431,6 +1720,72 @@ mod tests {
     }
 
     #[test]
+    fn partial_conversation_snapshot_preserves_existing_history() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        let snapshot = test_snapshot();
+        save_snapshot_in_connection(&mut connection, snapshot.clone())
+            .expect("save complete conversation");
+
+        let mut partial = snapshot;
+        let conversation = partial
+            .conversations
+            .values_mut()
+            .next()
+            .expect("partial conversation");
+        conversation.messages.clear();
+        conversation.work_items.clear();
+        save_snapshot_in_connection(&mut connection, partial).expect("save partial conversation");
+
+        let loaded =
+            load_snapshot_from_connection(&connection).expect("load preserved conversation");
+        let conversation = loaded
+            .conversations
+            .values()
+            .next()
+            .expect("preserved conversation");
+        assert_eq!(conversation.messages.len(), 1);
+        assert_eq!(conversation.messages[0].text, "Hello");
+        assert_eq!(conversation.work_items.len(), 1);
+        assert_eq!(conversation.work_items[0].detail, "echo");
+    }
+
+    #[test]
+    fn duplicate_conversation_uuid_is_reassigned_per_title_slot() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        let mut snapshot = test_snapshot();
+        let project_id = snapshot.projects[0].id.clone();
+        let first = snapshot
+            .conversations
+            .values()
+            .next()
+            .cloned()
+            .expect("first conversation");
+        let mut second = first.clone();
+        second.title = "Other".to_string();
+        snapshot.projects[0].threads.push(second.title.clone());
+        snapshot
+            .conversations
+            .insert(format!("{project_id}::Other"), second);
+
+        save_snapshot_in_connection(&mut connection, snapshot).expect("save duplicate fixture");
+        let active: Vec<String> = connection
+            .prepare("SELECT id FROM conversations WHERE archived_at IS NULL ORDER BY title")
+            .expect("prepare conversation ids")
+            .query_map([], |row| row.get(0))
+            .expect("read conversation ids")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect conversation ids");
+        assert_eq!(active.len(), 2);
+        assert_ne!(active[0], active[1]);
+    }
+
+    #[test]
     fn stale_canonical_project_id_does_not_create_a_second_local_row() {
         let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
         configure_connection(&connection).expect("configure SQLite");
@@ -1484,7 +1839,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_project_row_is_hidden_and_archived_by_project_tombstone() {
+    fn matching_project_tombstone_hides_and_archives_project() {
         let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
         configure_connection(&connection).expect("configure SQLite");
         initialize_connection(&mut connection).expect("initialize schema");
@@ -1514,7 +1869,7 @@ mod tests {
                 conversations: BTreeMap::new(),
                 tombstones: vec![LocalTombstone {
                     entity_type: "project".to_string(),
-                    entity_id: "canonical-project-id".to_string(),
+                    entity_id: "legacy-project".to_string(),
                     archived_at: "2".to_string(),
                     project_id: None,
                     title: Some("Test".to_string()),
@@ -1536,5 +1891,209 @@ mod tests {
             )
             .expect("count active projects");
         assert_eq!(active_rows, 0);
+    }
+
+    #[test]
+    fn project_stays_hidden_by_path_until_the_tombstone_is_restored() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        let project = LocalProject {
+            id: "recreated-project".to_string(),
+            name: "MIDI synth player".to_string(),
+            relative_path: Some("my projects/MIDI synth player".to_string()),
+            path_hint: "C:\\Users\\danis\\OneDrive\\my projects\\MIDI synth player".to_string(),
+            threads: vec!["Új beszélgetés 2".to_string()],
+        };
+        save_snapshot_in_connection(
+            &mut connection,
+            LocalStoreSnapshot {
+                schema_version: STORE_SCHEMA_VERSION,
+                projects: vec![project.clone()],
+                conversations: BTreeMap::new(),
+                tombstones: Vec::new(),
+            },
+        )
+        .expect("save recreated project");
+        save_snapshot_in_connection(
+            &mut connection,
+            LocalStoreSnapshot {
+                schema_version: STORE_SCHEMA_VERSION,
+                projects: vec![project.clone()],
+                conversations: BTreeMap::new(),
+                tombstones: vec![LocalTombstone {
+                    entity_type: "project".to_string(),
+                    entity_id: "old-project-id".to_string(),
+                    archived_at: "2".to_string(),
+                    project_id: None,
+                    title: Some("MIDI synth player".to_string()),
+                    relative_path: Some("my projects/MIDI synth player".to_string()),
+                    path_hint: Some(
+                        "C:\\Users\\danis\\OneDrive\\my projects\\MIDI synth player".to_string(),
+                    ),
+                    reason: Some("old deletion marker".to_string()),
+                }],
+            },
+        )
+        .expect("save stale tombstone");
+
+        let loaded = load_snapshot_from_connection(&connection).expect("load tombstoned project");
+        assert!(loaded.projects.is_empty());
+        let active_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE archived_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count hidden projects");
+        assert_eq!(active_rows, 0);
+
+        save_snapshot_in_connection(
+            &mut connection,
+            LocalStoreSnapshot {
+                schema_version: STORE_SCHEMA_VERSION,
+                projects: vec![project],
+                conversations: BTreeMap::new(),
+                tombstones: Vec::new(),
+            },
+        )
+        .expect("restore project by removing its tombstone");
+
+        let loaded = load_snapshot_from_connection(&connection).expect("load restored project");
+        assert_eq!(loaded.projects.len(), 1);
+        assert_eq!(loaded.projects[0].name, "MIDI synth player");
+        let active_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE archived_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count active restored projects");
+        assert_eq!(active_rows, 1);
+        let tombstone_rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_tombstones", [], |row| row.get(0))
+            .expect("count restored tombstones");
+        assert_eq!(tombstone_rows, 0);
+    }
+
+    #[test]
+    fn project_tree_lifecycle_matrix_preserves_other_projects_and_the_filesystem() {
+        let directory = std::env::temp_dir().join(format!("min-tree-lifecycle-{}", Uuid::new_v4()));
+        let legacy_directory = directory.join("MIDI synth player");
+        let new_directory = directory.join("New project");
+        fs::create_dir_all(&legacy_directory).expect("legacy project directory");
+        fs::create_dir_all(&new_directory).expect("new project directory");
+        let legacy_marker = legacy_directory.join("created-by-codex.txt");
+        let new_marker = new_directory.join("new-project.txt");
+        fs::write(&legacy_marker, b"legacy").expect("legacy marker");
+        fs::write(&new_marker, b"new").expect("new marker");
+
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        let legacy_project = LocalProject {
+            // This is the UUID shape produced by the old Codex/v1 importer.
+            id: Uuid::new_v5(&Uuid::NAMESPACE_OID, b"legacy-codex-project").to_string(),
+            name: "MIDI synth player".to_string(),
+            relative_path: Some("my projects/MIDI synth player".to_string()),
+            path_hint: legacy_directory.to_string_lossy().to_string(),
+            threads: vec!["Imported conversation".to_string()],
+        };
+        let new_project = LocalProject {
+            // The React client initially assigns a non-UUID project-* ID.
+            id: "project-new-fixture".to_string(),
+            name: "New project".to_string(),
+            relative_path: Some("my projects/New project".to_string()),
+            path_hint: new_directory.to_string_lossy().to_string(),
+            threads: vec!["Új beszélgetés".to_string()],
+        };
+
+        save_snapshot_in_connection(
+            &mut connection,
+            LocalStoreSnapshot {
+                schema_version: STORE_SCHEMA_VERSION,
+                projects: vec![legacy_project.clone(), new_project.clone()],
+                conversations: BTreeMap::new(),
+                tombstones: Vec::new(),
+            },
+        )
+        .expect("seed mixed project identities");
+        let seeded = load_snapshot_from_connection(&connection).expect("load seeded projects");
+        assert_eq!(seeded.projects.len(), 2);
+
+        let canonical_legacy_id = canonical_sync_project_id(&legacy_project);
+        let legacy_tombstone = LocalTombstone {
+            entity_type: "project".to_string(),
+            entity_id: canonical_legacy_id,
+            archived_at: "2".to_string(),
+            project_id: None,
+            title: Some(legacy_project.name.clone()),
+            // Exercise casing and the extended Windows path prefix seen in the app.
+            relative_path: Some("MY PROJECTS/midi SYNTH PLAYER".to_string()),
+            path_hint: Some(format!(r"\\?\{}", legacy_directory.to_string_lossy())),
+            reason: Some("remove from tree".to_string()),
+        };
+        save_snapshot_in_connection(
+            &mut connection,
+            LocalStoreSnapshot {
+                schema_version: STORE_SCHEMA_VERSION,
+                // A stale UI snapshot may still contain the deleted project.
+                projects: vec![legacy_project.clone(), new_project.clone()],
+                conversations: BTreeMap::new(),
+                tombstones: vec![legacy_tombstone.clone()],
+            },
+        )
+        .expect("delete imported project from tree");
+
+        let after_delete = load_snapshot_from_connection(&connection).expect("load after delete");
+        assert_eq!(after_delete.projects.len(), 1);
+        assert_eq!(after_delete.projects[0].name, new_project.name);
+        assert!(legacy_marker.is_file());
+        assert_eq!(
+            fs::read(&legacy_marker).expect("legacy marker survives"),
+            b"legacy"
+        );
+        assert!(new_marker.is_file());
+
+        // Repeating the same stale save models a sync poll/restart race. It must
+        // not resurrect the imported project while the tombstone exists.
+        save_snapshot_in_connection(
+            &mut connection,
+            LocalStoreSnapshot {
+                schema_version: STORE_SCHEMA_VERSION,
+                projects: vec![legacy_project.clone(), new_project.clone()],
+                conversations: BTreeMap::new(),
+                tombstones: vec![legacy_tombstone],
+            },
+        )
+        .expect("repeat stale snapshot");
+        let after_repeat =
+            load_snapshot_from_connection(&connection).expect("load repeated snapshot");
+        assert_eq!(after_repeat.projects.len(), 1);
+        assert_eq!(after_repeat.projects[0].name, new_project.name);
+
+        // Explicitly opening the folder removes the project tombstone and is
+        // the only operation in this lifecycle that may add it back.
+        save_snapshot_in_connection(
+            &mut connection,
+            LocalStoreSnapshot {
+                schema_version: STORE_SCHEMA_VERSION,
+                projects: vec![legacy_project.clone(), new_project],
+                conversations: BTreeMap::new(),
+                tombstones: Vec::new(),
+            },
+        )
+        .expect("explicitly reopen project");
+        let reopened = load_snapshot_from_connection(&connection).expect("load reopened projects");
+        assert_eq!(reopened.projects.len(), 2);
+        assert!(reopened
+            .projects
+            .iter()
+            .any(|project| project.name == legacy_project.name));
+        assert!(legacy_marker.is_file());
+
+        fs::remove_dir_all(directory).expect("remove test fixture");
     }
 }

@@ -28,6 +28,12 @@
 - A figyelmeztető/input jelzéshez a `public/sounds/notify.wav` hang tartozik.
 - A hangok lejátszása a kliensen történjen, rejtett CMD- vagy PowerShell-ablak megnyitása nélkül.
 
+## GUI-képernyőképek
+
+- Minden új GUI-screenshot a projekt `Screenshots` mappájába kerüljön.
+- A fájlnevek kizárólag növekvő numerikus indexek legyenek: `1.png`, `2.png`, `3.png`, ...
+- A következő index a legnagyobb meglévő numerikus fájlnév + 1 legyen; meglévő screenshotot ne írj felül.
+
 ## Shell- és parancsfuttatás
 
 - Githez, Pythonhoz és általános fejlesztéshez alapértelmezés szerint Bash-t használj; PowerShellt Windows-specifikus feladatokra. Ha Bash nem érhető el, használd a rendelkezésre álló shellt.

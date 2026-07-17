@@ -27,7 +27,9 @@ async fn codex_send(
 }
 
 #[tauri::command(rename_all = "camelCase")]
-async fn codex_rollback_snapshot(snapshot_id: String) -> Result<codex::AgentRollbackResult, String> {
+async fn codex_rollback_snapshot(
+    snapshot_id: String,
+) -> Result<codex::AgentRollbackResult, String> {
     tauri::async_runtime::spawn_blocking(move || codex::rollback_agent_snapshot(&snapshot_id))
         .await
         .map_err(|error| format!("A Codex rollback háttérfeladata leállt: {error}"))?
@@ -76,6 +78,23 @@ async fn read_code_file(cwd: String, path: String) -> Result<Option<String>, Str
     tauri::async_runtime::spawn_blocking(move || codex::read_code_file(&cwd, &path))
         .await
         .map_err(|error| format!("A kódfájl-beolvasás háttérfeladata leállt: {error}"))?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn save_image_attachments(
+    cwd: String,
+    images: Vec<codex::PendingImageUpload>,
+) -> Result<Vec<codex::CodexImageAttachment>, String> {
+    tauri::async_runtime::spawn_blocking(move || codex::save_image_uploads(&cwd, images))
+        .await
+        .map_err(|error| format!("A képcsatolmányok mentése leállt: {error}"))?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn read_project_image(cwd: String, path: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || codex::read_project_image(&cwd, &path))
+        .await
+        .map_err(|error| format!("A projektkép beolvasása leállt: {error}"))?
 }
 
 #[tauri::command]
@@ -196,6 +215,15 @@ async fn sync_v2_pull() -> Result<sync::SyncV2Result, String> {
 }
 
 #[tauri::command]
+async fn sync_v2_rebuild_from_local() -> Result<sync::SyncV2Result, String> {
+    tauri::async_runtime::spawn_blocking(sync::sync_v2_rebuild_from_local)
+        .await
+        .map_err(|error| {
+            format!("A v2 sync journal helyreállítási háttérfeladata leállt: {error}")
+        })?
+}
+
+#[tauri::command]
 async fn sync_v2_publish_snapshot(
     snapshot: store::LocalStoreSnapshot,
 ) -> Result<sync::SyncV2Result, String> {
@@ -274,6 +302,8 @@ pub fn run() {
             codex_respond_approval,
             codex_cancel,
             read_code_file,
+            save_image_attachments,
+            read_project_image,
             codex_models,
             codex_workspace,
             codex_set_projects_root,
@@ -289,6 +319,7 @@ pub fn run() {
             local_store_load,
             local_store_save,
             sync_v2_pull,
+            sync_v2_rebuild_from_local,
             sync_v2_publish_snapshot,
             sync_v2_preview_restore_entity,
             sync_v2_retention_preview,

@@ -12,7 +12,11 @@ Ez egy Windows desktop app első működő váza Tauri 2 + React + TypeScript + 
 - Tauri 2 Windows shell saját ikonnal;
 - hivatalos Codex app-server bekötés Tauri oldalon;
 - ChatGPT/Codex bejelentkezéssel működő streaming válaszok, külön API-kulcs nélkül;
-- beszélgetésenként megőrzött Codex thread ID.
+- beszélgetésenként megőrzött Codex thread ID;
+- képválasztás és vágólapról screenshot-beillesztés a composerben;
+- a Codex valódi munkakönyvtára mindig az aktív projektmappa, annak teljes fájltartalmával.
+
+A csatolt PNG/JPEG/WebP képeket az app az aktív projekt `Screenshots` mappájába menti növekvő numerikus fájlnévvel, majd natív `localImage` inputként adja át a Codex app-servernek. A projektben végzett agent-írásokat továbbra is snapshot guard védi.
 
 ## Fejlesztés
 
@@ -61,4 +65,4 @@ Az app ezt automatikusan bemásolja egy új projektbe, illetve egy meglévő pro
 
 Az AI-réteg Tauri oldali adapterként működik. Ez kezeli a helyi Codex app-servert, a streaming választ és a thread-folytatást; a frontend csak eseményeket és megjelenítést kap.
 
-A következő lépés a valódi fájlesemények és diffek bekötése, majd a projektenkénti munkakönyvtár-választó. A projektek, beszélgetések, üzenetek és változáscsomagok helyi SQLite-tárolóba kerülhetnek.
+A további fejlesztés fókusza a fájlesemények és diffek megjelenítésének finomítása. A projektek, beszélgetések, üzenetek és képcsatolmány-metaadatok helyi SQLite-tárolóban maradnak.

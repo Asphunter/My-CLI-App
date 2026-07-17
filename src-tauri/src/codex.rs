@@ -1,14 +1,16 @@
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use sha2::{Digest, Sha256};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 use uuid::Uuid;
 
@@ -18,10 +20,22 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+const CODEX_APPROVAL_POLICY: &str = "never";
+const CODEX_SANDBOX_POLICY: &str = "workspace-write";
+const CODEX_REASONING_SUMMARY: &str = "detailed";
+const UI_DEVELOPER_INSTRUCTIONS: &str = concat!(
+    "For every user task, create and maintain an execution plan with at least one step. ",
+    "Update it when work moves between steps, including for simple one-step tasks. ",
+    "Then execute the plan in the same turn. Before long tool work, emit concise ",
+    "user-facing progress commentary. Do not reveal private chain-of-thought."
+);
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexRequest {
     pub prompt: String,
+    #[serde(default)]
+    pub images: Vec<CodexImageAttachment>,
     pub thread_id: Option<String>,
     #[serde(default)]
     pub conversation_context: Option<String>,
@@ -31,6 +45,22 @@ pub struct CodexRequest {
     pub cwd: Option<String>,
     #[serde(default)]
     pub request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexImageAttachment {
+    pub path: String,
+    pub name: String,
+    pub mime_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingImageUpload {
+    pub name: String,
+    pub mime_type: String,
+    pub data_url: String,
 }
 
 struct ActiveRequest {
@@ -50,8 +80,6 @@ static PENDING_APPROVALS: OnceLock<Mutex<HashMap<String, Arc<PendingApproval>>>>
 fn pending_approvals() -> &'static Mutex<HashMap<String, Arc<PendingApproval>>> {
     PENDING_APPROVALS.get_or_init(|| Mutex::new(HashMap::new()))
 }
-
-const APPROVAL_WAIT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 fn active_requests() -> &'static Mutex<HashMap<String, ActiveRequest>> {
     ACTIVE_REQUESTS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -298,16 +326,6 @@ struct AgentSnapshot {
     manifest: GuardManifest,
 }
 
-struct GitShadowWorkspace {
-    repository_root: PathBuf,
-    worktree_root: PathBuf,
-}
-
-struct AgentExecutionWorkspace {
-    cwd: PathBuf,
-    git_shadow: Option<GitShadowWorkspace>,
-}
-
 const GUARD_MAX_FILES: usize = 10_000;
 const GUARD_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const GUARD_MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
@@ -318,6 +336,9 @@ struct CodexDelta {
     thread_id: String,
     delta: String,
     item_id: Option<String>,
+    turn_id: Option<String>,
+    phase: Option<String>,
+    sequence: u64,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -326,6 +347,15 @@ pub struct CodexEvent {
     pub thread_id: String,
     pub event_type: String,
     pub payload: Value,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CodexTransportStatus {
+    request_id: Option<String>,
+    stage: String,
+    detail: String,
+    thread_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -411,7 +441,9 @@ fn write_settings(settings: &MinSettings) -> Result<(), String> {
         if let Err(error) = fs::remove_file(&path) {
             let _ = fs::remove_file(&temporary);
             let _ = fs::remove_file(&backup);
-            return Err(format!("A meglévő min beállításai nem cserélhetők: {error}"));
+            return Err(format!(
+                "A meglévő min beállításai nem cserélhetők: {error}"
+            ));
         }
     }
 
@@ -502,7 +534,8 @@ fn discovered_projects_root() -> Option<PathBuf> {
 
     #[cfg(debug_assertions)]
     if candidates.is_empty() {
-        return development_workspace_cwd().map(|workspace| projects_root_from_workspace(&workspace));
+        return development_workspace_cwd()
+            .map(|workspace| projects_root_from_workspace(&workspace));
     }
 
     None
@@ -529,8 +562,9 @@ pub fn workspace_root_for_ui() -> Result<Option<String>, String> {
 }
 
 pub fn set_projects_root(value: &str) -> Result<String, String> {
-    let root = canonical_existing_directory(value)
-        .ok_or_else(|| "A kiválasztott projektek-gyökér nem abszolút, vagy nem létező mappa.".to_string())?;
+    let root = canonical_existing_directory(value).ok_or_else(|| {
+        "A kiválasztott projektek-gyökér nem abszolút, vagy nem létező mappa.".to_string()
+    })?;
     let settings = MinSettings {
         schema_version: SETTINGS_SCHEMA_VERSION,
         projects_root: Some(root.to_string_lossy().to_string()),
@@ -539,51 +573,83 @@ pub fn set_projects_root(value: &str) -> Result<String, String> {
     Ok(root.to_string_lossy().to_string())
 }
 
+fn managed_codex_binary() -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    let path = PathBuf::from(home)
+        .join(".codex")
+        .join("plugins")
+        .join(".plugin-appserver")
+        .join(if cfg!(windows) { "codex.exe" } else { "codex" });
+    path.is_file().then_some(path)
+}
+
+#[cfg(windows)]
+fn has_windows_sandbox_companions(binary: &Path) -> bool {
+    let Some(directory) = binary.parent() else {
+        return false;
+    };
+    [
+        "codex-command-runner.exe",
+        "codex-windows-sandbox-setup.exe",
+    ]
+    .iter()
+    .all(|name| directory.join(name).is_file())
+}
+
+#[cfg(not(windows))]
+fn has_windows_sandbox_companions(_binary: &Path) -> bool {
+    true
+}
+
 fn codex_binary(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     #[cfg(debug_assertions)]
     if let Ok(path) = std::env::var("MIN_CODEX_BIN") {
         return Ok(PathBuf::from(path));
     }
 
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        let bundled = resource_dir.join("codex.exe");
-        if bundled.is_file() {
-            return Ok(bundled);
-        }
-    }
+    let bundled = app
+        .path()
+        .resource_dir()
+        .ok()
+        .map(|directory| directory.join("codex.exe"))
+        .filter(|path| path.is_file());
+    let managed = managed_codex_binary();
 
     #[cfg(debug_assertions)]
-    {
-        let workspace_binary = workspace_cwd()
+    let workspace_binary = Some(
+        workspace_cwd()
             .join("node_modules")
             .join("@openai")
             .join("codex-win32-x64")
             .join("vendor")
             .join("x86_64-pc-windows-msvc")
             .join("bin")
-            .join("codex.exe");
-        if workspace_binary.is_file() {
-            return Ok(workspace_binary);
-        }
-
-        if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
-            let managed_binary = PathBuf::from(home)
-                .join(".codex")
-                .join("plugins")
-                .join(".plugin-appserver")
-                .join(if cfg!(windows) { "codex.exe" } else { "codex" });
-            if managed_binary.is_file() {
-                return Ok(managed_binary);
-            }
-        }
-
-        return Ok(PathBuf::from("codex"));
-    }
+            .join("codex.exe"),
+    )
+    .filter(|path| path.is_file());
 
     #[cfg(not(debug_assertions))]
+    let workspace_binary: Option<PathBuf> = None;
+
+    let candidates = [bundled, managed, workspace_binary]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if let Some(binary) = candidates
+        .iter()
+        .find(|path| has_windows_sandbox_companions(path))
     {
-        Err("A release Codex binárisa hiányzik a bundle resource könyvtárából (codex.exe).".to_string())
+        return Ok(binary.clone());
     }
+    if let Some(binary) = candidates.into_iter().next() {
+        return Ok(binary);
+    }
+
+    #[cfg(debug_assertions)]
+    return Ok(PathBuf::from("codex"));
+
+    #[cfg(not(debug_assertions))]
+    Err("A release Codex binárisa hiányzik a bundle resource könyvtárából (codex.exe).".to_string())
 }
 
 pub fn workspace_cwd() -> PathBuf {
@@ -608,9 +674,7 @@ fn requested_cwd(cwd: Option<&str>) -> Result<PathBuf, String> {
     }
     let canonical = path.canonicalize().unwrap_or(path);
     let projects_root = require_projects_root()?;
-    let projects_root = projects_root
-        .canonicalize()
-        .unwrap_or(projects_root);
+    let projects_root = projects_root.canonicalize().unwrap_or(projects_root);
     if !canonical.starts_with(&projects_root) {
         return Err(format!(
             "Az agent cwd-je a projektek gyökerén kívülre mutat: {}",
@@ -654,10 +718,15 @@ fn guard_relative_path(path: &str) -> Result<PathBuf, String> {
     let relative = PathBuf::from(path);
     if relative.is_absolute()
         || relative.components().any(|component| {
-            matches!(component, Component::Prefix(_) | Component::RootDir | Component::ParentDir)
+            matches!(
+                component,
+                Component::Prefix(_) | Component::RootDir | Component::ParentDir
+            )
         })
     {
-        return Err(format!("A snapshot relatív útvonala nem biztonságos: {path}"));
+        return Err(format!(
+            "A snapshot relatív útvonala nem biztonságos: {path}"
+        ));
     }
     Ok(relative)
 }
@@ -671,7 +740,8 @@ fn collect_guard_files_inner(
     let entries = fs::read_dir(current)
         .map_err(|error| format!("Az agent snapshot könyvtára nem olvasható: {error}"))?;
     for entry in entries {
-        let entry = entry.map_err(|error| format!("Az agent snapshot fájllistája hibás: {error}"))?;
+        let entry =
+            entry.map_err(|error| format!("Az agent snapshot fájllistája hibás: {error}"))?;
         let path = entry.path();
         let file_type = fs::symlink_metadata(&path)
             .map_err(|error| format!("Az agent snapshot metaadata nem olvasható: {error}"))?
@@ -723,9 +793,9 @@ fn collect_guard_files_inner(
         }
         let bytes = fs::read(&path)
             .map_err(|error| format!("Az agent snapshot fájlja nem olvasható: {error}"))?;
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|error| format!("Az agent snapshot relatív útvonala nem képezhető: {error}"))?;
+        let relative = path.strip_prefix(root).map_err(|error| {
+            format!("Az agent snapshot relatív útvonala nem képezhető: {error}")
+        })?;
         let relative_path = relative.to_string_lossy().replace('\\', "/");
         files.push(GuardFile {
             relative_path,
@@ -761,8 +831,9 @@ fn copy_guard_files(root: &Path, files: &[GuardFile], target_root: &Path) -> Res
         }
         let target = target_root.join(&relative);
         if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("Az agent snapshot almappája nem hozható létre: {error}"))?;
+            fs::create_dir_all(parent).map_err(|error| {
+                format!("Az agent snapshot almappája nem hozható létre: {error}")
+            })?;
         }
         fs::copy(&source, &target)
             .map_err(|error| format!("Az agent snapshot fájlja nem másolható: {error}"))?;
@@ -849,103 +920,6 @@ fn create_agent_snapshot(root: &Path) -> Result<AgentSnapshot, String> {
     create_agent_snapshot_at(root, &snapshot_root)
 }
 
-fn run_git(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    let mut command = Command::new("git");
-    #[cfg(windows)]
-    command.creation_flags(CREATE_NO_WINDOW);
-    command
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
-        .map_err(|error| format!("A Git parancs nem indítható: {error}"))
-}
-
-fn git_repository_root(root: &Path) -> Option<PathBuf> {
-    let output = run_git(root, &["rev-parse", "--show-toplevel"]).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let candidate = PathBuf::from(text.trim());
-    let canonical = candidate.canonicalize().ok()?;
-    if canonical == root.canonicalize().ok()? {
-        Some(canonical)
-    } else {
-        None
-    }
-}
-
-fn prepare_git_shadow(root: &Path) -> Option<GitShadowWorkspace> {
-    let repository_root = git_repository_root(root)?;
-    let status = run_git(
-        &repository_root,
-        &["status", "--porcelain", "--untracked-files=all"],
-    )
-    .ok()?;
-    if !status.status.success() || !status.stdout.is_empty() {
-        return None;
-    }
-    for excluded in ["node_modules", "target", ".pnpm-store", ".venv", "venv"] {
-        if root.join(excluded).exists() {
-            return None;
-        }
-    }
-    let preferred_base = std::env::var_os("LOCALAPPDATA")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .map(|path| path.join("min").join("agent-worktrees"));
-    let bases = preferred_base.into_iter().chain(std::iter::once(
-        std::env::temp_dir().join("min").join("agent-worktrees"),
-    ));
-    for base in bases {
-        if fs::create_dir_all(&base).is_err() {
-            continue;
-        }
-        let worktree_root = base.join(Uuid::new_v4().to_string());
-        let worktree_text = worktree_root.to_string_lossy().to_string();
-        let Ok(output) = run_git(
-            &repository_root,
-            &["worktree", "add", "--detach", "--quiet", &worktree_text, "HEAD"],
-        ) else {
-            continue;
-        };
-        if output.status.success() {
-            return Some(GitShadowWorkspace {
-                repository_root,
-                worktree_root,
-            });
-        }
-        let _ = fs::remove_dir_all(&worktree_root);
-    }
-    None
-}
-
-fn prepare_agent_execution(root: &Path) -> AgentExecutionWorkspace {
-    if let Some(git_shadow) = prepare_git_shadow(root) {
-        return AgentExecutionWorkspace {
-            cwd: git_shadow.worktree_root.clone(),
-            git_shadow: Some(git_shadow),
-        };
-    }
-    AgentExecutionWorkspace {
-        cwd: root.to_path_buf(),
-        git_shadow: None,
-    }
-}
-
-fn cleanup_git_shadow(git_shadow: Option<&GitShadowWorkspace>) {
-    let Some(git_shadow) = git_shadow else {
-        return;
-    };
-    let worktree_text = git_shadow.worktree_root.to_string_lossy().to_string();
-    let _ = run_git(
-        &git_shadow.repository_root,
-        &["worktree", "remove", "--force", &worktree_text],
-    );
-    let _ = fs::remove_dir_all(&git_shadow.worktree_root);
-}
-
 fn diff_guard_files(
     base_files: &[GuardFile],
     post_files: &[GuardFile],
@@ -963,7 +937,9 @@ fn diff_guard_files(
     let mut removed = Vec::new();
     for (path, post_file) in &post {
         match base.get(path) {
-            Some(base_file) if base_file.sha256 != post_file.sha256 => changed.push((*path).to_string()),
+            Some(base_file) if base_file.sha256 != post_file.sha256 => {
+                changed.push((*path).to_string())
+            }
             Some(_) => {}
             None => added.push((*path).to_string()),
         }
@@ -1011,7 +987,11 @@ fn finalize_agent_snapshot_from_root(
 ) -> Result<AgentGuardReport, String> {
     let post_files = collect_guard_files(source_root)?;
     let post_hash = guard_manifest_hash(&post_files)?;
-    copy_guard_files(source_root, &post_files, &snapshot.directory.join("post-files"))?;
+    copy_guard_files(
+        source_root,
+        &post_files,
+        &snapshot.directory.join("post-files"),
+    )?;
     let mut manifest = snapshot.manifest.clone();
     manifest.post_hash = Some(post_hash);
     manifest.post_files = Some(post_files.clone());
@@ -1091,10 +1071,19 @@ fn restore_snapshot_base_files(
     manifest: &GuardManifest,
     current_files: &[GuardFile],
 ) -> Result<(usize, usize), String> {
-    restore_guard_file_set(root, directory, "files", &manifest.base_files, current_files)
+    restore_guard_file_set(
+        root,
+        directory,
+        "files",
+        &manifest.base_files,
+        current_files,
+    )
 }
 
-fn read_guard_manifest(snapshot_root: &Path, snapshot_id: &str) -> Result<(PathBuf, GuardManifest), String> {
+fn read_guard_manifest(
+    snapshot_root: &Path,
+    snapshot_id: &str,
+) -> Result<(PathBuf, GuardManifest), String> {
     Uuid::parse_str(snapshot_id)
         .map_err(|_| "Az agent snapshot azonosítója nem UUID.".to_string())?;
     let directory = snapshot_root.join(snapshot_id);
@@ -1106,7 +1095,10 @@ fn read_guard_manifest(snapshot_root: &Path, snapshot_id: &str) -> Result<(PathB
     Ok((directory, manifest))
 }
 
-fn validate_guard_root(manifest: &GuardManifest, allowed_root: Option<&Path>) -> Result<PathBuf, String> {
+fn validate_guard_root(
+    manifest: &GuardManifest,
+    allowed_root: Option<&Path>,
+) -> Result<PathBuf, String> {
     let root = PathBuf::from(&manifest.root)
         .canonicalize()
         .map_err(|error| format!("Az agent snapshot gyökere nem érhető el: {error}"))?;
@@ -1115,7 +1107,9 @@ fn validate_guard_root(manifest: &GuardManifest, allowed_root: Option<&Path>) ->
             .canonicalize()
             .map_err(|error| format!("A projektek gyökere nem canonicalizálható: {error}"))?;
         if !root.starts_with(&allowed_root) {
-            return Err("Az agent snapshot gyökere a projektek gyökerén kívülre mutat.".to_string());
+            return Err(
+                "Az agent snapshot gyökere a projektek gyökerén kívülre mutat.".to_string(),
+            );
         }
     }
     Ok(root)
@@ -1291,16 +1285,18 @@ fn agent_diff_preview_at(
         }
         let relative = guard_relative_path(&path)?;
         let before_bytes = if before.is_some() {
-            Some(fs::read(directory.join("files").join(&relative)).map_err(|error| {
-                format!("A diff base-fájlja nem olvasható: {error}")
-            })?)
+            Some(
+                fs::read(directory.join("files").join(&relative))
+                    .map_err(|error| format!("A diff base-fájlja nem olvasható: {error}"))?,
+            )
         } else {
             None
         };
         let after_bytes = if after.is_some() {
-            Some(fs::read(directory.join("post-files").join(&relative)).map_err(|error| {
-                format!("A diff post-fájlja nem olvasható: {error}")
-            })?)
+            Some(
+                fs::read(directory.join("post-files").join(&relative))
+                    .map_err(|error| format!("A diff post-fájlja nem olvasható: {error}"))?,
+            )
         } else {
             None
         };
@@ -1352,9 +1348,7 @@ fn single_line_edit(base: &[String], variant: &[String]) -> Option<LineEdit> {
     }
     let mut base_end = base.len();
     let mut variant_end = variant.len();
-    while base_end > start
-        && variant_end > start
-        && base[base_end - 1] == variant[variant_end - 1]
+    while base_end > start && variant_end > start && base[base_end - 1] == variant[variant_end - 1]
     {
         base_end -= 1;
         variant_end -= 1;
@@ -1483,7 +1477,10 @@ fn rebase_agent_snapshot_at(
 ) -> Result<AgentRebaseResult, String> {
     let (directory, mut manifest) = read_guard_manifest(snapshot_root, snapshot_id)?;
     let root = validate_guard_root(&manifest, allowed_root)?;
-    if matches!(manifest.last_action.as_deref(), Some("discarded") | Some("rolled_back")) {
+    if matches!(
+        manifest.last_action.as_deref(),
+        Some("discarded") | Some("rolled_back")
+    ) {
         return Err("Ehhez a snapshothoz nincs pending 3-way merge.".to_string());
     }
     let post_files = manifest
@@ -1497,7 +1494,10 @@ fn rebase_agent_snapshot_at(
         .as_deref()
         .unwrap_or(&manifest.base_hash);
     if current_hash == expected_apply_hash {
-        return Err("A workspace már a staging base-állapotban van; nincs szükség 3-way merge-re.".to_string());
+        return Err(
+            "A workspace már a staging base-állapotban van; nincs szükség 3-way merge-re."
+                .to_string(),
+        );
     }
     if current_hash == manifest.post_hash.clone().unwrap_or_default() {
         return Err("A post-state már alkalmazva van; 3-way merge nem szükséges.".to_string());
@@ -1524,7 +1524,10 @@ fn rebase_agent_snapshot_at(
                 .map_err(|error| format!("Az aktuális merge-fájl nem olvasható: {error}"))?,
         );
     }
-    let mut paths = base_map.keys().cloned().collect::<std::collections::BTreeSet<_>>();
+    let mut paths = base_map
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
     paths.extend(post_map.keys().cloned());
     let mut conflicts = Vec::new();
     for path in paths {
@@ -1532,33 +1535,48 @@ fn rebase_agent_snapshot_at(
         let agent = post_map.get(&path);
         let current = current_map.get(&path);
         let base_bytes = if base.is_some() {
-            Some(fs::read(directory.join("files").join(guard_relative_path(&path)?)).map_err(
-                |error| format!("A merge base-fájlja nem olvasható: {error}"),
-            )?)
+            Some(
+                fs::read(directory.join("files").join(guard_relative_path(&path)?))
+                    .map_err(|error| format!("A merge base-fájlja nem olvasható: {error}"))?,
+            )
         } else {
             None
         };
         let agent_bytes = if agent.is_some() {
-            Some(fs::read(directory.join("post-files").join(guard_relative_path(&path)?)).map_err(
-                |error| format!("A merge agent-fájlja nem olvasható: {error}"),
-            )?)
+            Some(
+                fs::read(
+                    directory
+                        .join("post-files")
+                        .join(guard_relative_path(&path)?),
+                )
+                .map_err(|error| format!("A merge agent-fájlja nem olvasható: {error}"))?,
+            )
         } else {
             None
         };
-        let current_bytes = current
-            .map(|_| merged_bytes.get(&path).cloned().unwrap_or_default());
-        let merged = match (base_bytes.as_deref(), agent_bytes.as_deref(), current_bytes.as_deref()) {
+        let current_bytes = current.map(|_| merged_bytes.get(&path).cloned().unwrap_or_default());
+        let merged = match (
+            base_bytes.as_deref(),
+            agent_bytes.as_deref(),
+            current_bytes.as_deref(),
+        ) {
             (Some(base), Some(agent), Some(current)) => {
                 merge_three_way_text(base, agent, current).map(Some)
             }
             (Some(base), Some(agent), None) if base == agent => Ok(None),
-            (Some(_), Some(_), None) => Err("az aktuális fájl törölve, miközben az agent írta".to_string()),
+            (Some(_), Some(_), None) => {
+                Err("az aktuális fájl törölve, miközben az agent írta".to_string())
+            }
             (Some(base), None, Some(current)) if base == current => Ok(None),
-            (Some(_), None, Some(_)) => Err("az agent törölte, miközben az aktuális fájl is módosult".to_string()),
+            (Some(_), None, Some(_)) => {
+                Err("az agent törölte, miközben az aktuális fájl is módosult".to_string())
+            }
             (Some(_), None, None) => Ok(None),
             (None, Some(agent), None) => Ok(Some(agent.to_vec())),
             (None, Some(agent), Some(current)) if agent == current => Ok(Some(current.to_vec())),
-            (None, Some(_), Some(_)) => Err("az agent új fájlja ütközik egy aktuális fájllal".to_string()),
+            (None, Some(_), Some(_)) => {
+                Err("az agent új fájlja ütközik egy aktuális fájllal".to_string())
+            }
             (None, None, _) => Ok(None),
         };
         match merged {
@@ -1627,7 +1645,10 @@ fn restore_snapshot_base_preserving_manifest(
     let resulting_files = collect_guard_files(&root)?;
     let resulting_hash = guard_manifest_hash(&resulting_files)?;
     if resulting_hash != manifest.base_hash {
-        return Err("Az agent-változás staging utáni base-hash nem egyezik; további írás blokkolva.".to_string());
+        return Err(
+            "Az agent-változás staging utáni base-hash nem egyezik; további írás blokkolva."
+                .to_string(),
+        );
     }
     Ok(true)
 }
@@ -1639,7 +1660,10 @@ fn apply_agent_snapshot_at(
 ) -> Result<AgentApplyResult, String> {
     let (directory, mut manifest) = read_guard_manifest(snapshot_root, snapshot_id)?;
     let root = validate_guard_root(&manifest, allowed_root)?;
-    if matches!(manifest.last_action.as_deref(), Some("discarded") | Some("rolled_back")) {
+    if matches!(
+        manifest.last_action.as_deref(),
+        Some("discarded") | Some("rolled_back")
+    ) {
         return Err("Ehhez a snapshothoz nincs pending apply.".to_string());
     }
     let post_files = manifest
@@ -1658,7 +1682,9 @@ fn apply_agent_snapshot_at(
     let current_files = collect_guard_files(&root)?;
     let current_hash = guard_manifest_hash(&current_files)?;
     if current_hash != expected_apply_hash {
-        return Err("A workspace nem a staging base-állapotban van; az apply blokkolva.".to_string());
+        return Err(
+            "A workspace nem a staging base-állapotban van; az apply blokkolva.".to_string(),
+        );
     }
     let post_paths = post_files
         .iter()
@@ -1745,7 +1771,10 @@ fn discard_agent_snapshot_at(
 ) -> Result<AgentDiscardResult, String> {
     let (directory, manifest) = read_guard_manifest(snapshot_root, snapshot_id)?;
     let root = validate_guard_root(&manifest, allowed_root)?;
-    if matches!(manifest.last_action.as_deref(), Some("discarded") | Some("rolled_back")) {
+    if matches!(
+        manifest.last_action.as_deref(),
+        Some("discarded") | Some("rolled_back")
+    ) {
         return Err("A staged snapshot már lezárt állapotban van.".to_string());
     }
     let expected_apply_hash = manifest
@@ -1755,7 +1784,9 @@ fn discard_agent_snapshot_at(
     let current_files = collect_guard_files(&root)?;
     let resulting_hash = guard_manifest_hash(&current_files)?;
     if resulting_hash != expected_apply_hash {
-        return Err("A workspace közben megváltozott; a staged snapshot elvetése blokkolva.".to_string());
+        return Err(
+            "A workspace közben megváltozott; a staged snapshot elvetése blokkolva.".to_string(),
+        );
     }
     let mut manifest = manifest;
     set_manifest_action(&mut manifest, "discarded");
@@ -1792,7 +1823,9 @@ fn rollback_agent_snapshot_at(
             .canonicalize()
             .map_err(|error| format!("A projektek gyökere nem canonicalizálható: {error}"))?;
         if !root.starts_with(&allowed_root) {
-            return Err("Az agent rollback gyökere a projektek gyökerén kívülre mutat.".to_string());
+            return Err(
+                "Az agent rollback gyökere a projektek gyökerén kívülre mutat.".to_string(),
+            );
         }
     }
     if manifest.post_files.is_none() {
@@ -1819,7 +1852,10 @@ fn rollback_agent_snapshot_at(
         let target = root.join(&relative);
         if let Ok(file_type) = fs::symlink_metadata(&target).map(|metadata| metadata.file_type()) {
             if file_type.is_symlink() {
-                return Err(format!("A rollback célja symlink, ezért blokkolva: {}", target.display()));
+                return Err(format!(
+                    "A rollback célja symlink, ezért blokkolva: {}",
+                    target.display()
+                ));
             }
         }
         if let Some(parent) = target.parent() {
@@ -1922,57 +1958,45 @@ fn approval_request(value: &Value) -> Option<CodexApprovalRequest> {
     let item_id = params
         .get("itemId")
         .and_then(Value::as_str)
-        .or_else(|| params.get("item").and_then(|item| item.get("id")).and_then(Value::as_str))
+        .or_else(|| {
+            params
+                .get("item")
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str)
+        })
         .map(str::to_string);
     Some(CodexApprovalRequest {
         approval_id: Uuid::new_v4().to_string(),
         request_id: value.get("id").cloned().unwrap_or(Value::Null),
         kind: kind.to_string(),
-        thread_id: params.get("threadId").and_then(Value::as_str).map(str::to_string),
-        turn_id: params.get("turnId").and_then(Value::as_str).map(str::to_string),
+        thread_id: params
+            .get("threadId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        turn_id: params
+            .get("turnId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         item_id,
-        reason: params.get("reason").and_then(Value::as_str).map(str::to_string),
+        reason: params
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         command: params.get("command").and_then(|command| match command {
             Value::String(value) => Some(value.clone()),
             Value::Null => None,
             value => Some(value.to_string()),
         }),
-        cwd: params.get("cwd").and_then(Value::as_str).map(str::to_string),
+        cwd: params
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         params,
     })
 }
 
-fn wait_for_approval(
-    pending: &Arc<PendingApproval>,
-    cancellation: &AtomicBool,
-) -> Result<String, String> {
-    let deadline = Instant::now() + APPROVAL_WAIT_TIMEOUT;
-    let mut decision = pending
-        .decision
-        .lock()
-        .map_err(|_| "Az approval-kérés állapota zárolva maradt.".to_string())?;
-    loop {
-        if let Some(value) = decision.clone() {
-            return Ok(value);
-        }
-        if cancellation.load(Ordering::Relaxed) {
-            return Ok("cancel".to_string());
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return Ok("decline".to_string());
-        }
-        let wait_for = (deadline - now).min(Duration::from_millis(250));
-        let (next, _) = pending
-            .resolved
-            .wait_timeout(decision, wait_for)
-            .map_err(|_| "Az approval-kérés állapota zárolva maradt.".to_string())?;
-        decision = next;
-    }
-}
-
 fn handle_server_request(
-    app: &tauri::AppHandle,
+    _app: &tauri::AppHandle,
     stdin: &mut ChildStdin,
     value: &Value,
     cancellation: &Arc<AtomicBool>,
@@ -1982,31 +2006,16 @@ fn handle_server_request(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let request = approval_request(value).ok_or_else(|| {
-        format!(
-            "A Codex app-server nem támogatott szerver-kérést küldött: {method}."
-        )
+        format!("A Codex app-server nem támogatott szerver-kérést küldött: {method}.")
     })?;
-    let approval_id = request.approval_id.clone();
-    let pending = Arc::new(PendingApproval {
-        decision: Mutex::new(None),
-        resolved: Condvar::new(),
-    });
-    pending_approvals()
-        .lock()
-        .map_err(|_| "Az approval-kérések állapota zárolva maradt.".to_string())?
-        .insert(approval_id.clone(), pending.clone());
-
-    let emitted = emit_main_window(app, "codex-approval-request", &request);
-    let decision = if emitted.is_ok() {
-        wait_for_approval(&pending, cancellation)
+    let decision = if cancellation.load(Ordering::Relaxed) {
+        "cancel"
     } else {
-        Err(emitted.err().unwrap_or_else(|| "Az approval-kérés nem jeleníthető meg.".to_string()))
+        // The app-server is started with approvalPolicy = "never". This is a
+        // defensive fallback for a server request that still arrives: keep the
+        // run non-interactive without opening a modal dialog.
+        "acceptForSession"
     };
-    pending_approvals()
-        .lock()
-        .map_err(|_| "Az approval-kérések állapota zárolva maradt.".to_string())?
-        .remove(&approval_id);
-    let decision = decision?;
     send_json(
         stdin,
         json!({
@@ -2014,6 +2023,97 @@ fn handle_server_request(
             "result": { "decision": decision }
         }),
     )
+}
+
+struct CancellableLineReader {
+    lines: mpsc::Receiver<Result<Option<String>, String>>,
+}
+
+impl CancellableLineReader {
+    fn new(stdout: ChildStdout) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        let _ = sender.send(Ok(None));
+                        break;
+                    }
+                    Ok(_) => {
+                        if sender.send(Ok(Some(line))).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error.to_string()));
+                        break;
+                    }
+                }
+            }
+        });
+        Self { lines: receiver }
+    }
+
+    fn next(&self, cancellation: &AtomicBool) -> Result<Option<String>, String> {
+        loop {
+            if cancellation.load(Ordering::Relaxed) {
+                return Err("A Codex-kérés megszakítva.".to_string());
+            }
+            match self.lines.recv_timeout(Duration::from_millis(100)) {
+                Ok(line) => return line,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("A Codex app-server lezárta a kapcsolatot.".to_string());
+                }
+            }
+        }
+    }
+}
+
+fn read_cancellable_response(
+    reader: &CancellableLineReader,
+    id: u64,
+    cancellation: &AtomicBool,
+) -> Result<Value, String> {
+    loop {
+        let line = reader
+            .next(cancellation)?
+            .ok_or_else(|| "A Codex app-server lezárta a kapcsolatot.".to_string())?;
+        let value: Value = serde_json::from_str(line.trim())
+            .map_err(|error| format!("Érvénytelen Codex JSON: {error}"))?;
+        if value.get("id").and_then(Value::as_u64) == Some(id) {
+            if let Some(error) = value.get("error") {
+                return Err(format!("Codex app-server hiba: {error}"));
+            }
+            return Ok(value);
+        }
+    }
+}
+
+fn read_cancellable_response_with_notifications(
+    reader: &CancellableLineReader,
+    id: u64,
+    cancellation: &AtomicBool,
+) -> Result<(Value, Vec<Value>), String> {
+    let mut notifications = Vec::new();
+    loop {
+        let line = reader
+            .next(cancellation)?
+            .ok_or_else(|| "A Codex app-server lezárta a kapcsolatot.".to_string())?;
+        let value: Value = serde_json::from_str(line.trim())
+            .map_err(|error| format!("Érvénytelen Codex JSON: {error}"))?;
+        if value.get("id").and_then(Value::as_u64) == Some(id) {
+            if let Some(error) = value.get("error") {
+                return Err(format!("Codex app-server hiba: {error}"));
+            }
+            return Ok((value, notifications));
+        }
+        if value.get("method").and_then(Value::as_str).is_some() {
+            notifications.push(value);
+        }
+    }
 }
 
 fn read_response(reader: &mut BufReader<ChildStdout>, id: u64) -> Result<Value, String> {
@@ -2072,6 +2172,17 @@ fn prompt_for_rehydrated_thread(context: Option<&str>, prompt: &str) -> String {
         ),
         None => prompt.to_string(),
     }
+}
+
+fn turn_input(prompt: &str, image_paths: &[PathBuf]) -> Vec<Value> {
+    let mut input = vec![json!({ "type": "text", "text": prompt })];
+    input.extend(image_paths.iter().map(|path| {
+        json!({
+            "type": "localImage",
+            "path": path.to_string_lossy().to_string()
+        })
+    }));
+    input
 }
 
 fn terminate(mut child: Child) {
@@ -2136,11 +2247,7 @@ fn stage_agent_snapshot(
         .parent()
         .ok_or_else(|| "Az agent snapshot gyökere nem határozható meg.".to_string())?;
     let allowed_root = require_projects_root()?;
-    restore_snapshot_base_preserving_manifest(
-        snapshot_root,
-        &snapshot.id,
-        Some(&allowed_root),
-    )?;
+    restore_snapshot_base_preserving_manifest(snapshot_root, &snapshot.id, Some(&allowed_root))?;
     report.rollback_available = false;
     report.apply_available = !report.changed_files.is_empty()
         || !report.added_files.is_empty()
@@ -2157,15 +2264,15 @@ pub fn send(
         return Err("A Codex-kérés megszakítva.".to_string());
     }
     let cwd = requested_cwd(request.cwd.as_deref())?;
+    let image_paths = resolve_codex_image_paths(&cwd, &request.images)?;
     let guard_snapshot = create_agent_snapshot(&cwd)?;
-    let execution = prepare_agent_execution(&cwd);
-    let execution_cwd_string = execution.cwd.to_string_lossy().to_string();
+    // The app-server deliberately runs in the real selected project folder.
+    // This keeps ignored, generated and otherwise untracked project files
+    // visible as well; the snapshot guard still stages/reverts agent writes.
+    let execution_cwd_string = cwd.to_string_lossy().to_string();
     let binary = match codex_binary(&app) {
         Ok(binary) => binary,
-        Err(error) => {
-            cleanup_git_shadow(execution.git_shadow.as_ref());
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
     let mut command = Command::new(&binary);
     #[cfg(windows)]
@@ -2173,7 +2280,7 @@ pub fn send(
 
     let mut child = match command
         .args(["app-server", "--stdio"])
-        .current_dir(&execution.cwd)
+        .current_dir(&cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -2181,13 +2288,23 @@ pub fn send(
     {
         Ok(child) => child,
         Err(error) => {
-            cleanup_git_shadow(execution.git_shadow.as_ref());
             return Err(format!(
                 "Nem indítható a Codex app-server ({:?}): {error}",
                 binary
-            ));
+            ))
         }
     };
+
+    emit_main_window(
+        &app,
+        "codex-transport",
+        &CodexTransportStatus {
+            request_id: request.request_id.clone(),
+            stage: "server-starting".to_string(),
+            detail: "A Codex app-server folyamat elindult.".to_string(),
+            thread_id: request.thread_id.clone(),
+        },
+    )?;
 
     if let Some(request_id) = request.request_id.as_deref() {
         attach_child_pid(request_id, child.id());
@@ -2205,7 +2322,7 @@ pub fn send(
             .stdout
             .take()
             .ok_or_else(|| "A Codex stdout nem érhető el.".to_string())?;
-        let mut reader = BufReader::new(stdout);
+        let reader = CancellableLineReader::new(stdout);
 
         send_json(
             &mut stdin,
@@ -2218,30 +2335,41 @@ pub fn send(
                 }
             }),
         )?;
-        read_response(&mut reader, 1)?;
+        read_cancellable_response(&reader, 1, &cancellation)?;
         send_json(&mut stdin, json!({ "method": "initialized", "params": {} }))?;
+        emit_main_window(
+            &app,
+            "codex-transport",
+            &CodexTransportStatus {
+                request_id: request.request_id.clone(),
+                stage: "initialized".to_string(),
+                detail: "A Codex app-server inicializálva.".to_string(),
+                thread_id: request.thread_id.clone(),
+            },
+        )?;
 
         let start_params = json!({
             "cwd": execution_cwd_string,
-            "approvalPolicy": "on-request",
-            "approvalsReviewer": "user",
-            "sandbox": "workspace-write",
-            "serviceName": "min"
+            "approvalPolicy": CODEX_APPROVAL_POLICY,
+            "sandbox": CODEX_SANDBOX_POLICY,
+            "serviceName": "min",
+            "developerInstructions": UI_DEVELOPER_INSTRUCTIONS
         });
         let mut thread_rehydrated = false;
-        let (thread_response, turn_request_id) = if let Some(thread_id) = request.thread_id.clone() {
+        let (thread_response, turn_request_id) = if let Some(thread_id) = request.thread_id.clone()
+        {
             let resume_params = json!({
                 "threadId": thread_id,
                 "cwd": execution_cwd_string,
-                "approvalPolicy": "on-request",
-                "approvalsReviewer": "user",
-                "sandbox": "workspace-write"
+                "approvalPolicy": CODEX_APPROVAL_POLICY,
+                "sandbox": CODEX_SANDBOX_POLICY,
+                "developerInstructions": UI_DEVELOPER_INSTRUCTIONS
             });
             send_json(
                 &mut stdin,
                 json!({ "id": 2, "method": "thread/resume", "params": resume_params }),
             )?;
-            match read_response(&mut reader, 2) {
+            match read_cancellable_response(&reader, 2, &cancellation) {
                 Ok(response) => (response, 3),
                 Err(error) if is_missing_rollout_error(&error) => {
                     thread_rehydrated = true;
@@ -2249,7 +2377,7 @@ pub fn send(
                         &mut stdin,
                         json!({ "id": 3, "method": "thread/start", "params": start_params }),
                     )?;
-                    (read_response(&mut reader, 3)?, 4)
+                    (read_cancellable_response(&reader, 3, &cancellation)?, 4)
                 }
                 Err(error) => return Err(error),
             }
@@ -2258,21 +2386,34 @@ pub fn send(
                 &mut stdin,
                 json!({ "id": 2, "method": "thread/start", "params": start_params }),
             )?;
-            (read_response(&mut reader, 2)?, 3)
+            (read_cancellable_response(&reader, 2, &cancellation)?, 3)
         };
         let thread_id = thread_response["result"]["thread"]["id"]
             .as_str()
             .ok_or_else(|| "A Codex nem adott vissza thread azonosítót.".to_string())?
             .to_string();
 
+        emit_main_window(
+            &app,
+            "codex-transport",
+            &CodexTransportStatus {
+                request_id: request.request_id.clone(),
+                stage: "thread-ready".to_string(),
+                detail: "A Codex thread készen áll a turn indítására.".to_string(),
+                thread_id: Some(thread_id.clone()),
+            },
+        )?;
+
         let prompt = if thread_rehydrated {
             prompt_for_rehydrated_thread(request.conversation_context.as_deref(), &request.prompt)
         } else {
             request.prompt.clone()
         };
+        let turn_input = turn_input(&prompt, &image_paths);
         let mut turn_params = json!({
             "threadId": thread_id,
-            "input": [{ "type": "text", "text": prompt }]
+            "input": turn_input,
+            "summary": CODEX_REASONING_SUMMARY
         });
         if let Some(model) = request.model.as_deref() {
             turn_params["model"] = Value::String(model.to_string());
@@ -2289,32 +2430,56 @@ pub fn send(
                 "params": turn_params
             }),
         )?;
+        emit_main_window(
+            &app,
+            "codex-transport",
+            &CodexTransportStatus {
+                request_id: request.request_id.clone(),
+                stage: "turn-starting".to_string(),
+                detail: "A Codex turn elindítása folyamatban.".to_string(),
+                thread_id: Some(thread_id.clone()),
+            },
+        )?;
         if cancellation.load(Ordering::Relaxed) {
             return Err("A Codex-kérés megszakítva.".to_string());
         }
-        read_response(&mut reader, turn_request_id)?;
+        let (_, buffered_notifications) =
+            read_cancellable_response_with_notifications(&reader, turn_request_id, &cancellation)?;
+        emit_main_window(
+            &app,
+            "codex-transport",
+            &CodexTransportStatus {
+                request_id: request.request_id.clone(),
+                stage: "turn-running".to_string(),
+                detail: "A Codex turn fut; live események érkezhetnek.".to_string(),
+                thread_id: Some(thread_id.clone()),
+            },
+        )?;
 
         let mut final_text = String::new();
         let mut events = Vec::new();
-        let mut line = String::new();
+        let mut event_sequence = 0_u64;
+        let mut agent_message_phases: HashMap<String, String> = HashMap::new();
+        let mut unknown_agent_messages: HashMap<String, String> = HashMap::new();
+        let mut unknown_agent_message_order: Vec<String> = Vec::new();
+        let mut pending_notifications: VecDeque<Value> =
+            buffered_notifications.into_iter().collect();
         loop {
-            if cancellation.load(Ordering::Relaxed) {
-                return Err("A Codex-kérés megszakítva.".to_string());
-            }
-            line.clear();
-            let read = reader
-                .read_line(&mut line)
-                .map_err(|error| error.to_string())?;
-            if read == 0 {
-                break;
-            }
-            let value: Value = serde_json::from_str(line.trim())
-                .map_err(|error| format!("Érvénytelen Codex esemény: {error}"))?;
+            let value = if let Some(buffered) = pending_notifications.pop_front() {
+                buffered
+            } else {
+                let Some(line) = reader.next(&cancellation)? else {
+                    break;
+                };
+                serde_json::from_str(line.trim())
+                    .map_err(|error| format!("Érvénytelen Codex esemény: {error}"))?
+            };
             let method = value
                 .get("method")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             if !method.is_empty() {
+                event_sequence = event_sequence.saturating_add(1);
                 let event = CodexEvent {
                     thread_id: thread_id.clone(),
                     event_type: method.to_string(),
@@ -2327,13 +2492,45 @@ pub fn send(
                 handle_server_request(&app, &mut stdin, &value, &cancellation)?;
                 continue;
             }
+            if method == "item/started"
+                && value["params"]["item"]["type"].as_str() == Some("agentMessage")
+            {
+                if let (Some(item_id), Some(phase)) = (
+                    value["params"]["item"]["id"].as_str(),
+                    value["params"]["item"]["phase"].as_str(),
+                ) {
+                    agent_message_phases.insert(item_id.to_string(), phase.to_string());
+                }
+            }
             if method == "item/agentMessage/delta" {
                 if let Some(delta) = value["params"]["delta"].as_str() {
-                    final_text.push_str(delta);
                     let item_id = value["params"]["itemId"]
                         .as_str()
                         .or_else(|| value["params"]["item"]["id"].as_str())
                         .map(str::to_string);
+                    let phase = item_id
+                        .as_ref()
+                        .and_then(|id| agent_message_phases.get(id))
+                        .cloned()
+                        .or_else(|| {
+                            value["params"]["item"]["phase"]
+                                .as_str()
+                                .map(str::to_string)
+                        });
+                    if phase.as_deref() == Some("final_answer") {
+                        final_text.push_str(delta);
+                    } else if phase.is_none() {
+                        let message_key = item_id
+                            .clone()
+                            .unwrap_or_else(|| format!("unknown-{}", event_sequence));
+                        if !unknown_agent_messages.contains_key(&message_key) {
+                            unknown_agent_message_order.push(message_key.clone());
+                        }
+                        unknown_agent_messages
+                            .entry(message_key)
+                            .or_default()
+                            .push_str(delta);
+                    }
                     emit_main_window(
                         &app,
                         "codex-delta",
@@ -2341,16 +2538,58 @@ pub fn send(
                             thread_id: thread_id.clone(),
                             delta: delta.to_string(),
                             item_id,
+                            turn_id: value["params"]["turnId"].as_str().map(str::to_string),
+                            phase,
+                            sequence: event_sequence,
                         },
                     )?;
                 }
             } else if method == "item/completed"
                 && value["params"]["item"]["type"].as_str() == Some("agentMessage")
             {
-                if let Some(text) = value["params"]["item"]["text"].as_str() {
-                    final_text = text.to_string();
+                let item_id = value["params"]["item"]["id"].as_str();
+                let phase = item_id
+                    .and_then(|id| agent_message_phases.get(id))
+                    .cloned()
+                    .or_else(|| {
+                        value["params"]["item"]["phase"]
+                            .as_str()
+                            .map(str::to_string)
+                    });
+                if phase.as_deref() == Some("final_answer") {
+                    if let Some(text) = value["params"]["item"]["text"].as_str() {
+                        final_text = text.to_string();
+                    }
+                } else if phase.is_none() {
+                    if let Some(text) = value["params"]["item"]["text"].as_str() {
+                        let message_key = item_id
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("unknown-{}", event_sequence));
+                        if !unknown_agent_messages.contains_key(&message_key) {
+                            unknown_agent_message_order.push(message_key.clone());
+                        }
+                        unknown_agent_messages.insert(message_key, text.to_string());
+                    }
                 }
             } else if method == "turn/completed" {
+                if final_text.trim().is_empty() {
+                    final_text = unknown_agent_message_order
+                        .iter()
+                        .rev()
+                        .find_map(|key| unknown_agent_messages.get(key))
+                        .cloned()
+                        .unwrap_or_default();
+                }
+                emit_main_window(
+                    &app,
+                    "codex-transport",
+                    &CodexTransportStatus {
+                        request_id: request.request_id.clone(),
+                        stage: "turn-completed".to_string(),
+                        detail: "A Codex turn lezárult.".to_string(),
+                        thread_id: Some(thread_id.clone()),
+                    },
+                )?;
                 break;
             }
         }
@@ -2365,12 +2604,7 @@ pub fn send(
     })();
 
     terminate(child);
-    let guard_result = if execution.git_shadow.is_some() {
-        finalize_agent_snapshot_from_root(&guard_snapshot, &execution.cwd)
-    } else {
-        finalize_agent_snapshot(&guard_snapshot)
-    };
-    cleanup_git_shadow(execution.git_shadow.as_ref());
+    let guard_result = finalize_agent_snapshot(&guard_snapshot);
     match (result, guard_result) {
         (Ok(mut response), Ok(report)) if !cancellation.load(Ordering::Relaxed) => {
             let mut report = stage_agent_snapshot(&guard_snapshot, report).map_err(|error| {
@@ -2379,11 +2613,7 @@ pub fn send(
                     guard_snapshot.id
                 )
             })?;
-            report.isolation_mode = if execution.git_shadow.is_some() {
-                "gitWorktree".to_string()
-            } else {
-                "nonGitSnapshot".to_string()
-            };
+            report.isolation_mode = "nonGitSnapshot".to_string();
             response.guard = report;
             Ok(response)
         }
@@ -2423,6 +2653,234 @@ pub fn send(
             guard_snapshot.id
         )),
     }
+}
+
+const MAX_IMAGE_ATTACHMENTS: usize = 6;
+const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+fn normalized_image_mime(value: &str) -> Option<(&'static str, &'static str)> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "image/png" => Some(("image/png", "png")),
+        "image/jpeg" | "image/jpg" => Some(("image/jpeg", "jpg")),
+        "image/webp" => Some(("image/webp", "webp")),
+        _ => None,
+    }
+}
+
+fn image_bytes_match_mime(bytes: &[u8], mime_type: &str) -> bool {
+    match mime_type {
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP",
+        _ => false,
+    }
+}
+
+fn decode_image_upload(
+    upload: PendingImageUpload,
+) -> Result<(String, String, String, Vec<u8>), String> {
+    let (header, encoded) = upload
+        .data_url
+        .split_once(',')
+        .ok_or_else(|| "A csatolt kép data URL-je hiányos.".to_string())?;
+    let header_mime = header
+        .strip_prefix("data:")
+        .and_then(|value| value.strip_suffix(";base64"))
+        .ok_or_else(|| "A csatolt kép nem base64 data URL.".to_string())?;
+    let (mime_type, extension) = normalized_image_mime(header_mime)
+        .ok_or_else(|| "Csak PNG, JPEG és WebP kép csatolható.".to_string())?;
+    let (claimed_mime, _) = normalized_image_mime(&upload.mime_type)
+        .ok_or_else(|| "A csatolt kép MIME-típusa nem támogatott.".to_string())?;
+    if mime_type != claimed_mime {
+        return Err("A csatolt kép MIME-típusa nem egyezik a tartalmával.".to_string());
+    }
+    let bytes = BASE64_STANDARD
+        .decode(encoded)
+        .map_err(|_| "A csatolt kép base64 tartalma sérült.".to_string())?;
+    if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "A csatolt kép üres vagy nagyobb {} MB-nál.",
+            MAX_IMAGE_BYTES / 1024 / 1024
+        ));
+    }
+    if !image_bytes_match_mime(&bytes, mime_type) {
+        return Err("A csatolt kép fájlszignatúrája érvénytelen.".to_string());
+    }
+    let name = upload.name.trim();
+    Ok((
+        if name.is_empty() {
+            format!("kép.{extension}")
+        } else {
+            name.to_string()
+        },
+        mime_type.to_string(),
+        extension.to_string(),
+        bytes,
+    ))
+}
+
+fn next_screenshot_index(directory: &Path) -> Result<u64, String> {
+    if !directory.exists() {
+        return Ok(1);
+    }
+    let mut largest = 0_u64;
+    for entry in fs::read_dir(directory)
+        .map_err(|error| format!("A Screenshots mappa nem olvasható: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("Hibás Screenshots bejegyzés: {error}"))?;
+        let entry_path = entry.path();
+        let Some(stem) = entry_path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if let Ok(index) = stem.parse::<u64>() {
+            largest = largest.max(index);
+        }
+    }
+    largest
+        .checked_add(1)
+        .ok_or_else(|| "A következő screenshot-index túl nagy.".to_string())
+}
+
+fn save_image_uploads_at(
+    root: &Path,
+    uploads: Vec<PendingImageUpload>,
+) -> Result<Vec<CodexImageAttachment>, String> {
+    if uploads.is_empty() {
+        return Ok(Vec::new());
+    }
+    if uploads.len() > MAX_IMAGE_ATTACHMENTS {
+        return Err(format!(
+            "Legfelj {MAX_IMAGE_ATTACHMENTS} kép csatolható egyszerre."
+        ));
+    }
+    let decoded = uploads
+        .into_iter()
+        .map(decode_image_upload)
+        .collect::<Result<Vec<_>, _>>()?;
+    let directory = root.join("Screenshots");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("A Screenshots mappa nem hozható létre: {error}"))?;
+    let mut index = next_screenshot_index(&directory)?;
+    let mut created = Vec::<PathBuf>::new();
+    let mut attachments = Vec::new();
+    for (name, mime_type, extension, bytes) in decoded {
+        let (path, file_name) = loop {
+            let file_name = format!("{index}.{extension}");
+            let path = directory.join(&file_name);
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    if let Err(error) = file.write_all(&bytes) {
+                        let _ = fs::remove_file(&path);
+                        for created_path in &created {
+                            let _ = fs::remove_file(created_path);
+                        }
+                        return Err(format!("A csatolt kép nem menthető: {error}"));
+                    }
+                    break (path, file_name);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    index = index
+                        .checked_add(1)
+                        .ok_or_else(|| "A következő screenshot-index túl nagy.".to_string())?;
+                }
+                Err(error) => {
+                    for created_path in &created {
+                        let _ = fs::remove_file(created_path);
+                    }
+                    return Err(format!("A csatolt kép nem hozható létre: {error}"));
+                }
+            }
+        };
+        created.push(path);
+        attachments.push(CodexImageAttachment {
+            path: format!("Screenshots/{file_name}"),
+            name,
+            mime_type,
+        });
+        index = index
+            .checked_add(1)
+            .ok_or_else(|| "A következő screenshot-index túl nagy.".to_string())?;
+    }
+    Ok(attachments)
+}
+
+pub fn save_image_uploads(
+    cwd: &str,
+    uploads: Vec<PendingImageUpload>,
+) -> Result<Vec<CodexImageAttachment>, String> {
+    let root = requested_cwd(Some(cwd))?;
+    save_image_uploads_at(&root, uploads)
+}
+
+fn resolve_codex_image_paths(
+    root: &Path,
+    images: &[CodexImageAttachment],
+) -> Result<Vec<PathBuf>, String> {
+    if images.len() > MAX_IMAGE_ATTACHMENTS {
+        return Err(format!(
+            "Legfelj {MAX_IMAGE_ATTACHMENTS} kép csatolható egyszerre."
+        ));
+    }
+    images
+        .iter()
+        .map(|image| {
+            let relative = PathBuf::from(&image.path);
+            if relative.is_absolute()
+                || relative.components().any(|component| {
+                    matches!(
+                        component,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
+                })
+            {
+                return Err(
+                    "A képcsatolmány útvonala nem projekten belüli relatív útvonal.".to_string(),
+                );
+            }
+            let candidate = root.join(relative);
+            let canonical = candidate
+                .canonicalize()
+                .map_err(|error| format!("A képcsatolmány nem olvasható: {error}"))?;
+            if !canonical.starts_with(root) || !canonical.is_file() {
+                return Err("A képcsatolmány a projektmappán kívülre mutat.".to_string());
+            }
+            let metadata = fs::metadata(&canonical)
+                .map_err(|error| format!("A képcsatolmány metaadata nem olvasható: {error}"))?;
+            if metadata.len() == 0 || metadata.len() > MAX_IMAGE_BYTES as u64 {
+                return Err("A képcsatolmány üres vagy túl nagy.".to_string());
+            }
+            Ok(canonical)
+        })
+        .collect()
+}
+
+pub fn read_project_image(cwd: &str, path: &str) -> Result<Option<String>, String> {
+    let root = requested_cwd(Some(cwd))?;
+    let attachment = CodexImageAttachment {
+        path: path.to_string(),
+        name: String::new(),
+        mime_type: String::new(),
+    };
+    let Some(image_path) = resolve_codex_image_paths(&root, &[attachment])?
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    let bytes =
+        fs::read(&image_path).map_err(|error| format!("A projektkép nem olvasható: {error}"))?;
+    let mime_type = ["image/png", "image/jpeg", "image/webp"]
+        .into_iter()
+        .find(|mime| image_bytes_match_mime(&bytes, mime))
+        .ok_or_else(|| "A projektkép formátuma nem támogatott.".to_string())?;
+    Ok(Some(format!(
+        "data:{mime_type};base64,{}",
+        BASE64_STANDARD.encode(bytes)
+    )))
 }
 
 pub fn read_code_file(cwd: &str, path: &str) -> Result<Option<String>, String> {
@@ -2744,7 +3202,9 @@ mod sync_tests {
         assert!(is_missing_rollout_error(
             "Codex app-server hiba: {\"code\":-32600,\"message\":\"no rollout found for thread id abc\"}"
         ));
-        assert!(!is_missing_rollout_error("A Codex app-server lezárta a kapcsolatot."));
+        assert!(!is_missing_rollout_error(
+            "A Codex app-server lezárta a kapcsolatot."
+        ));
     }
 
     #[test]
@@ -2822,12 +3282,14 @@ mod sync_tests {
     #[test]
     fn agent_snapshot_reports_changes_and_rolls_back_unchanged_post_state() {
         let root = std::env::temp_dir().join(format!("min-agent-root-{}", uuid::Uuid::new_v4()));
-        let snapshot_root = std::env::temp_dir().join(format!("min-agent-snapshots-{}", uuid::Uuid::new_v4()));
+        let snapshot_root =
+            std::env::temp_dir().join(format!("min-agent-snapshots-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("nested")).expect("agent root fixture");
         std::fs::write(root.join("main.txt"), "before").expect("base file");
         std::fs::write(root.join("nested").join("keep.txt"), "keep").expect("nested base file");
 
-        let snapshot = create_agent_snapshot_at(&root, &snapshot_root).expect("create agent snapshot");
+        let snapshot =
+            create_agent_snapshot_at(&root, &snapshot_root).expect("create agent snapshot");
         std::fs::write(root.join("main.txt"), "after").expect("changed file");
         std::fs::remove_file(root.join("nested").join("keep.txt")).expect("removed file");
         std::fs::write(root.join("new.txt"), "new").expect("added file");
@@ -2841,7 +3303,10 @@ mod sync_tests {
             .expect("rollback agent snapshot");
         assert_eq!(rollback.restored_files, 2);
         assert_eq!(rollback.removed_files, 1);
-        assert_eq!(std::fs::read_to_string(root.join("main.txt")).expect("restored main"), "before");
+        assert_eq!(
+            std::fs::read_to_string(root.join("main.txt")).expect("restored main"),
+            "before"
+        );
         assert_eq!(
             std::fs::read_to_string(root.join("nested").join("keep.txt")).expect("restored nested"),
             "keep"
@@ -2858,12 +3323,17 @@ mod sync_tests {
 
     #[test]
     fn staged_snapshot_restores_base_and_applies_only_explicitly() {
-        let root = std::env::temp_dir().join(format!("min-agent-stage-root-{}", uuid::Uuid::new_v4()));
-        let snapshot_root = std::env::temp_dir().join(format!("min-agent-stage-snapshots-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("min-agent-stage-root-{}", uuid::Uuid::new_v4()));
+        let snapshot_root = std::env::temp_dir().join(format!(
+            "min-agent-stage-snapshots-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&root).expect("stage root fixture");
         std::fs::write(root.join("main.txt"), "before").expect("stage base file");
 
-        let snapshot = create_agent_snapshot_at(&root, &snapshot_root).expect("create staged snapshot");
+        let snapshot =
+            create_agent_snapshot_at(&root, &snapshot_root).expect("create staged snapshot");
         std::fs::write(root.join("main.txt"), "after").expect("stage changed file");
         std::fs::write(root.join("new.txt"), "new").expect("stage added file");
         let report = finalize_agent_snapshot(&snapshot).expect("finalize staged snapshot");
@@ -2872,7 +3342,10 @@ mod sync_tests {
 
         restore_snapshot_base_preserving_manifest(&snapshot_root, &snapshot.id, None)
             .expect("restore staging base");
-        assert_eq!(std::fs::read_to_string(root.join("main.txt")).expect("base after stage"), "before");
+        assert_eq!(
+            std::fs::read_to_string(root.join("main.txt")).expect("base after stage"),
+            "before"
+        );
         assert!(!root.join("new.txt").exists());
 
         std::fs::write(root.join("external.txt"), "external").expect("external workspace change");
@@ -2886,15 +3359,22 @@ mod sync_tests {
         let applied = apply_agent_snapshot_at(&snapshot_root, &snapshot.id, None)
             .expect("apply staged snapshot");
         assert_eq!(applied.applied_files, 2);
-        assert_eq!(std::fs::read_to_string(root.join("main.txt")).expect("applied main"), "after");
-        assert_eq!(std::fs::read_to_string(root.join("new.txt")).expect("applied new"), "new");
+        assert_eq!(
+            std::fs::read_to_string(root.join("main.txt")).expect("applied main"),
+            "after"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("new.txt")).expect("applied new"),
+            "new"
+        );
 
         let rollback = rollback_agent_snapshot_at(&snapshot_root, &snapshot.id, None)
             .expect("rollback applied snapshot");
         assert_eq!(rollback.resulting_hash, snapshot.manifest.base_hash);
         assert!(!root.join("new.txt").exists());
 
-        let discard_snapshot = create_agent_snapshot_at(&root, &snapshot_root).expect("create discard snapshot");
+        let discard_snapshot =
+            create_agent_snapshot_at(&root, &snapshot_root).expect("create discard snapshot");
         std::fs::write(root.join("main.txt"), "discarded").expect("discard changed file");
         finalize_agent_snapshot(&discard_snapshot).expect("finalize discard snapshot");
         restore_snapshot_base_preserving_manifest(&snapshot_root, &discard_snapshot.id, None)
@@ -2914,8 +3394,12 @@ mod sync_tests {
     fn bounded_line_diff_exposes_added_and_removed_lines() {
         let (lines, truncated) = bounded_line_diff(Some(b"same\nold"), Some(b"same\nnew"));
         assert!(!truncated);
-        assert!(lines.iter().any(|line| line.kind == "removed" && line.text == "old"));
-        assert!(lines.iter().any(|line| line.kind == "added" && line.text == "new"));
+        assert!(lines
+            .iter()
+            .any(|line| line.kind == "removed" && line.text == "old"));
+        assert!(lines
+            .iter()
+            .any(|line| line.kind == "added" && line.text == "new"));
     }
 
     #[test]
@@ -2928,20 +3412,25 @@ mod sync_tests {
 
     #[test]
     fn rebased_snapshot_preserves_external_change_and_disables_full_rollback() {
-        let root = std::env::temp_dir().join(format!("min-agent-rebase-root-{}", uuid::Uuid::new_v4()));
-        let snapshot_root = std::env::temp_dir().join(format!("min-agent-rebase-snapshots-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("min-agent-rebase-root-{}", uuid::Uuid::new_v4()));
+        let snapshot_root = std::env::temp_dir().join(format!(
+            "min-agent-rebase-snapshots-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&root).expect("rebase root fixture");
         std::fs::write(root.join("main.txt"), "a\nb\nc\n").expect("rebase base file");
 
-        let snapshot = create_agent_snapshot_at(&root, &snapshot_root).expect("create rebase snapshot");
+        let snapshot =
+            create_agent_snapshot_at(&root, &snapshot_root).expect("create rebase snapshot");
         std::fs::write(root.join("main.txt"), "a\nB\nc\n").expect("agent change");
         finalize_agent_snapshot(&snapshot).expect("finalize rebase snapshot");
         restore_snapshot_base_preserving_manifest(&snapshot_root, &snapshot.id, None)
             .expect("restore rebase base");
         std::fs::write(root.join("main.txt"), "A\nb\nc\n").expect("external change");
 
-        let rebased = rebase_agent_snapshot_at(&snapshot_root, &snapshot.id, None)
-            .expect("rebase snapshot");
+        let rebased =
+            rebase_agent_snapshot_at(&snapshot_root, &snapshot.id, None).expect("rebase snapshot");
         assert!(rebased.rebased);
         let applied = apply_agent_snapshot_at(&snapshot_root, &snapshot.id, None)
             .expect("apply rebased snapshot");
@@ -2957,47 +3446,45 @@ mod sync_tests {
     }
 
     #[test]
-    fn clean_git_repository_uses_shadow_and_dirty_repository_falls_back() {
-        let root = std::env::temp_dir().join(format!("min-agent-git-root-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).expect("git root fixture");
-        std::fs::write(root.join("tracked.txt"), "before").expect("git tracked file");
-        let initialized = run_git(&root, &["init", "--quiet"]);
-        let Ok(initialized) = initialized else {
-            let _ = std::fs::remove_dir_all(root);
-            return;
+    fn image_upload_uses_next_numeric_screenshot_name_and_stays_in_project() {
+        let root = std::env::temp_dir().join(format!("min-image-root-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("Screenshots")).expect("image root fixture");
+        std::fs::write(root.join("Screenshots").join("7.png"), b"existing")
+            .expect("existing screenshot");
+        let upload = PendingImageUpload {
+            name: "clipboard.png".to_string(),
+            mime_type: "image/png".to_string(),
+            data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string(),
         };
-        if !initialized.status.success()
-            || !run_git(&root, &["config", "user.email", "min@example.invalid"])
-                .map(|output| output.status.success())
-                .unwrap_or(false)
-            || !run_git(&root, &["config", "user.name", "min-test"])
-                .map(|output| output.status.success())
-                .unwrap_or(false)
-            || !run_git(&root, &["add", "tracked.txt"])
-                .map(|output| output.status.success())
-                .unwrap_or(false)
-            || !run_git(&root, &["commit", "--quiet", "--no-gpg-sign", "-m", "fixture"])
-                .map(|output| output.status.success())
-                .unwrap_or(false)
-        {
-            let _ = std::fs::remove_dir_all(root);
-            return;
-        }
-        let clean_execution = prepare_agent_execution(&root);
-        assert!(clean_execution.git_shadow.is_some());
-        assert_eq!(
-            std::fs::read_to_string(clean_execution.cwd.join("tracked.txt"))
-                .expect("shadow tracked file"),
-            "before"
-        );
-        cleanup_git_shadow(clean_execution.git_shadow.as_ref());
 
-        std::fs::write(root.join("tracked.txt"), "dirty").expect("dirty git file");
-        let dirty_execution = prepare_agent_execution(&root);
-        assert!(dirty_execution.git_shadow.is_none());
-        assert_eq!(dirty_execution.cwd, root);
+        let saved = save_image_uploads_at(&root, vec![upload]).expect("save image upload");
+        assert_eq!(saved[0].path, "Screenshots/8.png");
+        assert!(root.join("Screenshots").join("8.png").is_file());
+
+        let canonical_root = root.canonicalize().expect("canonical image root");
+        let resolved =
+            resolve_codex_image_paths(&canonical_root, &saved).expect("resolve project image");
+        assert!(resolved[0].starts_with(&canonical_root));
+        let escaped = CodexImageAttachment {
+            path: "../outside.png".to_string(),
+            name: "outside.png".to_string(),
+            mime_type: "image/png".to_string(),
+        };
+        assert!(resolve_codex_image_paths(&canonical_root, &[escaped]).is_err());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn turn_input_uses_native_local_image_protocol_items() {
+        let image = PathBuf::from(r"C:\project\Screenshots\8.png");
+        let input = turn_input("Nézd meg ezt.", &[image.clone()]);
+        assert_eq!(input[0], json!({ "type": "text", "text": "Nézd meg ezt." }));
+        assert_eq!(input[1]["type"], "localImage");
+        assert_eq!(
+            input[1]["path"],
+            Value::String(image.to_string_lossy().to_string())
+        );
     }
 
     #[test]
@@ -3022,11 +3509,7 @@ mod sync_tests {
             .insert(approval_id.clone(), pending.clone());
 
         respond_approval(&approval_id, "accept").expect("approval response");
-        let decision = pending
-            .decision
-            .lock()
-            .expect("approval decision")
-            .clone();
+        let decision = pending.decision.lock().expect("approval decision").clone();
         assert_eq!(decision.as_deref(), Some("accept"));
         assert!(respond_approval(&approval_id, "acceptAlways").is_err());
         pending_approvals()

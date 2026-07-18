@@ -9227,17 +9227,18 @@ function App() {
             )}
             <button
               className="footer-action"
-              onClick={() => setSettingsOpen((open) => !open)}
+              onClick={() => {
+                if (settingsOpen) {
+                  setReadingSettingsOpen(false);
+                }
+                setSettingsOpen((open) => !open);
+              }}
               aria-expanded={settingsOpen}
             >
               <span>⚙</span> Beállítások
             </button>
             {settingsOpen && (
               <div className="settings-popover sidebar-settings-popover">
-                <div className="popover-heading">
-                  <span>Beállítások</span>
-                  <span className="popover-hint">azonnal él</span>
-                </div>
                 <button
                   type="button"
                   className="settings-option"
@@ -9245,8 +9246,7 @@ function App() {
                   onClick={() => setReadingSettingsOpen((open) => !open)}
                 >
                   <span>
-                    <strong>Megjelenés</strong>
-                    <small>Betűméret és sorköz</small>
+                    <strong>Megjelenítés</strong>
                   </span>
                   <span aria-hidden="true">
                     {readingSettingsOpen ? "⌃" : "⌄"}
@@ -9254,9 +9254,6 @@ function App() {
                 </button>
                 {readingSettingsOpen && (
                   <div className="settings-subpanel">
-                    <div className="settings-subpanel-heading">
-                      Olvasási beállítások
-                    </div>
                     <label className="range-row">
                       <span>Betűméret</span>
                       <output>{fontSize}</output>
@@ -9298,28 +9295,21 @@ function App() {
                     </button>
                   </div>
                 )}
-                {isTauri && (
-                  <div className="settings-root-section">
-                    <div className="settings-section-heading">
-                      Projektek gyökere
-                    </div>
-                    <p className="settings-section-hint">
-                      Az új projektek és a Tree alapértelmezett OneDrive-helye.
-                    </p>
-                    <div className="settings-root-path" title={workspaceRoot}>
-                      {workspaceRoot || "Nincs beállítva OneDrive-gyökér"}
-                    </div>
-                    <button
-                      type="button"
-                      className="settings-root-button"
-                      onClick={() => {
-                        void changeProjectsRoot();
-                      }}
-                    >
-                      Hely módosítása
-                    </button>
-                  </div>
-                )}
+                <button
+                  type="button"
+                  className="settings-option"
+                  disabled={!isTauri}
+                  onClick={() => {
+                    if (isTauri) {
+                      void changeProjectsRoot();
+                    }
+                  }}
+                >
+                  <span>
+                    <strong>Mappa</strong>
+                  </span>
+                  <span aria-hidden="true">›</span>
+                </button>
               </div>
             )}
           </div>

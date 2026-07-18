@@ -4236,6 +4236,7 @@ mod tests {
                 live: Some(false),
                 final_message: Some(true),
                 item_id: None,
+                turn_id: Some("request:stable-turn".to_string()),
                 sequence: Some(1),
                 hlc: None,
                 origin_device_id: None,
@@ -4272,6 +4273,16 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(first.iter().any(|event| event.event_type == MESSAGE_UPSERT));
+        let message_event = first
+            .iter()
+            .find(|event| event.event_type == MESSAGE_UPSERT)
+            .expect("message event");
+        let message_payload: MessageEventPayload =
+            serde_json::from_value(message_event.payload.clone()).expect("message payload");
+        assert_eq!(
+            message_payload.message.turn_id.as_deref(),
+            Some("request:stable-turn")
+        );
         let conversation_event = first
             .iter()
             .find(|event| event.event_type == CONVERSATION_UPSERT)
@@ -4575,6 +4586,7 @@ mod tests {
                     live: Some(false),
                     final_message: Some(true),
                     item_id: None,
+                    turn_id: None,
                     sequence: Some(1),
                     hlc: None,
                     origin_device_id: None,

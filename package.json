@@ -6,9 +6,10 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "test:timeline": "node --test tests/chatTimeline.test.ts",
     "smoke:app-server": "node scripts/app_server_smoke.cjs",
     "release:check": "node scripts/release_check.cjs",
-    "release:test": "npm.cmd run build && set \"CARGO_TARGET_DIR=%LOCALAPPDATA%\\min\\cargo-target\"&& cargo test --manifest-path src-tauri/Cargo.toml --no-default-features && node scripts/app_server_smoke.cjs",
+    "release:test": "npm.cmd run test:timeline && npm.cmd run build && set \"CARGO_TARGET_DIR=%LOCALAPPDATA%\\min\\cargo-target\"&& cargo test --manifest-path src-tauri/Cargo.toml --no-default-features && node scripts/app_server_smoke.cjs",
     "release:build": "npm.cmd run release:check && npm.cmd run tauri:build:local",
     "release:verify": "node scripts/release_verify.cjs",
     "preview": "vite preview",

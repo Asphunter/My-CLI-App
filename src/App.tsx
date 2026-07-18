@@ -13,6 +13,15 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import {
+  buildWorkLogGroups,
+  findActiveWorkGroup,
+  mergePlanHistoryRecords,
+  messageBelongsToWorkGroup as timelineMessageBelongsToWorkGroup,
+  settleHistoricalPlan,
+  workGroupTurnKeys,
+  type WorkLogGroup as TimelineWorkLogGroup,
+} from "./chatTimeline";
 
 type Message = {
   id?: string;
@@ -147,17 +156,7 @@ type TimelineOrder = {
   sequence?: number;
   tieBreaker?: string;
 };
-type WorkLogGroup = {
-  key: string;
-  /** Raw turn ids folded into this one visual session. */
-  turnKeys?: string[];
-  /** Stable user-message bucket used to keep a session in place. */
-  userMessageKey?: string;
-  activities: CodeActivity[];
-  sequence: number;
-  hlc?: string;
-  originDeviceId?: string;
-};
+type WorkLogGroup = TimelineWorkLogGroup<CodeActivity>;
 type TimelineEntry =
   | {
       kind: "message";
@@ -395,7 +394,7 @@ const COMMENTARY_STORAGE_KEY = "min-commentary-history";
 const DEVICE_ID_STORAGE_KEY = "min-device-id";
 const LOCAL_THREAD_IDS_STORAGE_KEY = "min-local-thread-ids";
 const SYNC_SCHEMA_VERSION = 1;
-const LOCAL_STORE_SNAPSHOT_VERSION = 8;
+const LOCAL_STORE_SNAPSHOT_VERSION = 9;
 const MAX_IMAGE_ATTACHMENTS = 6;
 const MAX_IMAGE_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const SYNC_POLL_INTERVAL_MS = 15_000;
@@ -1165,7 +1164,7 @@ const mergeMessages = (
       final,
       itemId: existing.itemId ?? message.itemId,
       sequence: existing.sequence ?? message.sequence,
-      turnId: existing.turnId ?? message.turnId,
+      turnId: message.turnId ?? existing.turnId,
       hlc: existing.hlc ?? message.hlc,
       originDeviceId: existing.originDeviceId ?? message.originDeviceId,
       images:
@@ -1381,7 +1380,7 @@ const mergeWorkItems = (
 const mergePlanHistory = (
   primary: Record<string, PlanSnapshot> = {},
   secondary: Record<string, PlanSnapshot> = {},
-) => ({ ...primary, ...secondary });
+) => mergePlanHistoryRecords(primary, secondary);
 
 const mergeCommentary = (
   primary: CommentaryEntry[] = [],
@@ -2002,7 +2001,7 @@ const appendCodexDelta = (
         ? {
             ...message,
             itemId: itemId ?? message.itemId,
-            turnId: delta.turnId ?? message.turnId,
+            turnId: message.turnId ?? delta.turnId ?? undefined,
             text: `${target.text}${delta.delta}`,
             final: false,
           }
@@ -4089,7 +4088,7 @@ function TurnProgressCard({
                   </>
                 ) : (
                   <span className="trace-thinking-empty-text">
-                    Ehhez a lÃ©pÃ©shez nem Ã©rkezett kÃ¼lÃ¶n gondolkodÃ¡si naplÃ³.
+                    Ehhez a lépéshez nem érkezett külön gondolkodási napló.
                   </span>
                 )}
               </div>
@@ -5166,6 +5165,10 @@ function App() {
 
   const restoreTombstone = async (tombstone: SyncTombstone) => {
     if (!isTauri || syncActionBusyRef.current) return;
+    if (isStreamingRef.current) {
+      setToast("Aktív válasz közben a Recovery restore szünetel.");
+      return;
+    }
     const busyKey = `${tombstone.entityType}:${tombstone.entityId}`;
     const sameProjectScope = (candidate: SyncTombstone) =>
       candidate.entityType === "project" &&
@@ -5275,6 +5278,10 @@ function App() {
     restoreConversations = false,
   ) => {
     if (!isTauri) return;
+    if (isStreamingRef.current) {
+      setToast("Aktív válasz közben a Recovery restore szünetel.");
+      return;
+    }
     const shouldRestore = (tombstone: SyncTombstone) =>
       (tombstone.entityType === "project" || restoreConversations) &&
       tombstoneMatchesProjectScope(tombstone, project);
@@ -5540,147 +5547,15 @@ function App() {
     modelFamilies.find((family) => family.key === activeFamilyKey) ??
     selectedFamily ??
     modelFamilies[0];
-  const codeSnippets = useMemo<CodeSnippet[]>(() => {
-    const lastUserIndex = messages
-      .map((message) => message.role)
-      .lastIndexOf("user");
-    const currentTurn = messages.slice(
-      lastUserIndex >= 0 ? lastUserIndex + 1 : 0,
-    );
-    return currentTurn.flatMap((message, messageIndex) =>
-      extractCodeBlocks(message.text).map((block, blockIndex) => ({
-        ...block,
-        id: `${lastUserIndex + 1 + messageIndex}-${blockIndex}`,
-        messageIndex: lastUserIndex + 1 + messageIndex,
-      })),
-    );
-  }, [messages]);
-
   const workLogGroups = useMemo<WorkLogGroup[]>(() => {
-    const grouped = new Map<string, CodeActivity[]>();
-    for (const activity of codeActivity) {
-      const key = activity.turnId ?? "legacy";
-      const items = grouped.get(key) ?? [];
-      items.push(activity);
-      grouped.set(key, items);
-    }
-    const userMessages = messages
-      .filter((message) => message.role === "user")
-      .map((message, index) => ({
-        key: message.id ?? `user:${message.sequence ?? index}`,
-        sequence: message.sequence ?? index,
-        hlc: message.hlc,
-      }))
-      .sort((left, right) => left.sequence - right.sequence);
-    const precedingUserBucket = (sequence: number) => {
-      let bucket: (typeof userMessages)[number] | undefined;
-      for (const message of userMessages) {
-        if (message.sequence <= sequence) bucket = message;
-        else break;
-      }
-      return bucket?.key ?? "before-first-user";
-    };
-    type MutableGroup = WorkLogGroup & {
-      bucket: string;
-      turnKeySet: Set<string>;
-    };
-    const canonical = new Map<string, MutableGroup>();
-    for (const [rawKey, activities] of grouped.entries()) {
-      const orderedActivities = [...activities].sort(compareWorkItems);
-      const firstActivity = orderedActivities[0];
-      const lastActivity = orderedActivities[orderedActivities.length - 1];
-      const bucket = precedingUserBucket(
-        lastActivity?.id ?? firstActivity?.id ?? 0,
-      );
-      const userMessageKey =
-        bucket === "before-first-user" ? undefined : bucket;
-      const existing = canonical.get(bucket);
-      if (!existing) {
-        canonical.set(bucket, {
-          key: `session:${bucket}`,
-          bucket,
-          turnKeySet: new Set([rawKey]),
-          turnKeys: [rawKey],
-          userMessageKey,
-          activities: orderedActivities,
-          sequence: firstActivity?.id ?? lastActivity?.id ?? 0,
-          hlc: firstActivity?.hlc,
-          originDeviceId: firstActivity?.originDeviceId,
-        });
-        continue;
-      }
-      existing.turnKeySet.add(rawKey);
-      existing.turnKeys = [...existing.turnKeySet];
-      existing.activities = [...existing.activities, ...orderedActivities].sort(
-        compareWorkItems,
-      );
-      if (firstActivity && firstActivity.id < existing.sequence) {
-        existing.sequence = firstActivity.id;
-        existing.hlc = firstActivity.hlc;
-        existing.originDeviceId = firstActivity.originDeviceId;
-      }
-    }
-    const groups = [...canonical.values()].map(({ bucket, turnKeySet, ...group }) =>
-      group,
-    );
-    const pendingAssistant = [...messages]
-      .reverse()
-      .find(
-        (message) =>
-          message.role === "assistant" && message.live && !message.final,
-      );
-    const activeTurnKey = activeTurnIdRef.current;
-    const hasActiveTurnGroup = Boolean(
-      activeTurnKey &&
-        groups.some(
-          (group) =>
-            group.key === activeTurnKey ||
-            Boolean(group.turnKeys?.includes(activeTurnKey)),
-        ),
-    );
-    const pendingTurnKey = pendingAssistant?.id
-      ? `pending:${pendingAssistant.id}`
-      : undefined;
-    const hasPendingTurnGroup = Boolean(
-      pendingTurnKey &&
-        groups.some(
-          (group) =>
-            group.key === pendingTurnKey ||
-            Boolean(group.turnKeys?.includes(pendingTurnKey)),
-        ),
-    );
-    if (
-      (isStreaming &&
-        Boolean(pendingAssistant) &&
-        !activeTurnKey &&
-        !hasPendingTurnGroup) ||
-      (isStreaming && Boolean(activeTurnKey) && !hasActiveTurnGroup) ||
-      ((codeSnippets.length > 0 || activePlan.steps.length > 0) &&
-        groups.length === 0)
-    ) {
-      const lastMessage = pendingAssistant ?? messages[messages.length - 1];
-      const lastMessageSequence = lastMessage?.sequence ?? messages.length;
-      const placeholderBucket = precedingUserBucket(lastMessageSequence);
-      const placeholderKey =
-        placeholderBucket === "before-first-user"
-          ? pendingTurnKey ?? activeTurnKey ?? "current"
-          : `session:${placeholderBucket}`;
-      groups.push({
-        key: placeholderKey,
-        turnKeys: [pendingTurnKey, activeTurnKey].filter(
-          (key): key is string => Boolean(key),
-        ),
-        userMessageKey:
-          placeholderBucket === "before-first-user"
-            ? undefined
-            : placeholderBucket,
-        activities: [],
-        sequence: lastMessageSequence + 1,
-        hlc: lastMessage?.hlc,
-        originDeviceId: lastMessage?.originDeviceId,
-      });
-    }
-    return groups.sort((left, right) =>
+    return buildWorkLogGroups({
+      messages,
+      activities: codeActivity,
+      planHistory,
+      commentary: commentaryEntries,
+      activeTurnKey: activeTurnIdRef.current,
+      compareActivities: compareWorkItems,
+    }).sort((left, right) =>
       compareTimelineOrder(
         {
           hlc: left.hlc,
@@ -5697,11 +5572,10 @@ function App() {
       ),
     );
   }, [
-    activePlan.steps.length,
     codeActivity,
-    codeSnippets.length,
-    isStreaming,
+    commentaryEntries,
     messages,
+    planHistory,
   ]);
 
   const timelineEntries = useMemo<TimelineEntry[]>(() => {
@@ -5736,10 +5610,6 @@ function App() {
   latestWorkLogKeyRef.current =
     workLogGroups[workLogGroups.length - 1]?.key ?? null;
 
-  const workGroupTurnKeys = (group: WorkLogGroup) => [
-    group.key,
-    ...(group.turnKeys ?? []),
-  ].filter((key, index, values): key is string => Boolean(key) && values.indexOf(key) === index);
   const workGroupExpansionKeys = (group: WorkLogGroup) => [
     ...workGroupTurnKeys(group),
     group.userMessageKey ? `session:${group.userMessageKey}` : undefined,
@@ -6541,6 +6411,9 @@ function App() {
               // A request may start while a restart-time pull is in flight.
               // Merge its newest in-memory rows into the pulled snapshot so
               // neither the previous history nor the live row can disappear.
+              // Plans and commentary belong to the same turn and must be
+              // protected by the same merge; replacing only those two with
+              // the pulled snapshot made LÉPÉSEK vanish until the next event.
               messages: mergeMessages(
                 selectedConversation.messages,
                 messagesRef.current,
@@ -6549,6 +6422,14 @@ function App() {
               workItems: mergeWorkItems(
                 selectedConversation.workItems ?? [],
                 codeActivityRef.current,
+              ),
+              planHistory: mergePlanHistory(
+                selectedConversation.planHistory ?? {},
+                planHistoryRef.current,
+              ),
+              commentary: mergeCommentary(
+                selectedConversation.commentary ?? [],
+                commentaryEntriesRef.current,
               ),
             };
           }
@@ -7166,17 +7047,22 @@ function App() {
     if (!isTauri) return;
     let cleanup: (() => void) | undefined;
     let disposed = false;
-    let activeTurnId: string | undefined;
     void listen<CodexEvent>("codex-event", (event) => {
+      // Events are meaningful only for the request currently owned by this
+      // view. Late notifications from a completed/cancelled request must not
+      // leak into a conversation selected afterwards.
+      if (!activeRequestIdRef.current) return;
       const codexEvent = normalizeCodexEvent(event.payload);
       if (!codexEvent) return;
       const params = asRecord(codexEvent.payload);
       const item = asRecord(params.item);
       const explicitTurnId = eventTurnId(codexEvent, params, item);
+      if (activeRequestIdRef.current && !activeTurnIdRef.current)
+        activeTurnIdRef.current = explicitTurnId;
+      // The UI identity is created before the request leaves the client and
+      // remains stable even if app-server emits multiple/fallback turn ids.
+      const uiTurnId = activeTurnIdRef.current ?? explicitTurnId;
       let planStepIdOverride: string | undefined;
-      if (codexEvent.eventType === "turn/started")
-        activeTurnId = explicitTurnId;
-      if (activeTurnId) activeTurnIdRef.current = activeTurnId;
 
       if (
         codexEvent.eventType === "item/started" &&
@@ -7203,7 +7089,7 @@ function App() {
                   threadId: codexEvent.threadId,
                   delta: deltaText,
                   itemId,
-                  turnId: explicitTurnId,
+                  turnId: uiTurnId,
                   phase,
                 },
                 activeLiveMessageIdRef.current ?? undefined,
@@ -7226,7 +7112,7 @@ function App() {
                   {
                     id: itemId ?? `commentary-${sequence}`,
                     itemId,
-                    turnId: explicitTurnId,
+                    turnId: uiTurnId,
                     stepId,
                     sequence: sequence!,
                     body: deltaText,
@@ -7267,14 +7153,14 @@ function App() {
       if (codexEvent.eventType === "turn/plan/updated") {
         const snapshot = normalizePlanSnapshot(
           codexEvent.payload,
-          explicitTurnId,
+          uiTurnId,
         );
         if (snapshot) {
           const current = activePlanRef.current;
           const next = planWithTiming(
             {
               ...current,
-              turnId: snapshot.turnId ?? current.turnId,
+              turnId: current.turnId ?? uiTurnId,
               explanation: snapshot.explanation || current.explanation,
             },
             snapshot.steps,
@@ -7297,7 +7183,7 @@ function App() {
       ) {
         const delta = firstString(params.delta, params.text, item.text);
         const bufferKey =
-          eventItemId(codexEvent, params, item) ?? explicitTurnId;
+          eventItemId(codexEvent, params, item) ?? uiTurnId;
         if (delta && bufferKey) {
           const nextText = `${planTextBufferRef.current[bufferKey] ?? ""}${delta}`;
           planTextBufferRef.current[bufferKey] = nextText;
@@ -7307,7 +7193,7 @@ function App() {
               planWithTiming(
                 {
                   ...activePlanRef.current,
-                  turnId: activePlanRef.current.turnId ?? explicitTurnId,
+                  turnId: activePlanRef.current.turnId ?? uiTurnId,
                 },
                 steps,
                 activeTurnTimingRef.current.startedAt ?? Date.now(),
@@ -7319,7 +7205,7 @@ function App() {
       const activity = summarizeCodexWorkEvent(
         codexEvent,
         activityId,
-        activeTurnId,
+        uiTurnId,
       );
       if (activity) {
         const planStepId =
@@ -7372,7 +7258,11 @@ function App() {
               ];
         updatePlanState(
           planWithTiming(
-            { ...current, turnId: explicitTurnId, explanation: current.explanation },
+            {
+              ...current,
+              turnId: current.turnId ?? uiTurnId,
+              explanation: current.explanation,
+            },
             steps,
             current.startedAt ?? activeTurnTimingRef.current.startedAt ?? Date.now(),
           ),
@@ -7420,6 +7310,15 @@ function App() {
   const notify = (message: string, sound?: AppSound) => {
     setToast(message);
     if (sound) playAppSound(sound);
+  };
+
+  const blockConversationMutationDuringStream = () => {
+    if (!isStreamingRef.current) return false;
+    notify(
+      "Aktív válasz közben a projekt- és beszélgetésváltás zárolva van. Előbb állítsd le a választ.",
+      "notify",
+    );
+    return true;
   };
 
   const addImageFiles = async (files: File[]) => {
@@ -7578,6 +7477,7 @@ function App() {
   };
 
   const renameProject = (project: Project) => {
+    if (blockConversationMutationDuringStream()) return;
     setAppDialog({
       kind: "input",
       title: "Projekt átnevezése",
@@ -7585,6 +7485,7 @@ function App() {
       value: project.name,
       confirmLabel: "Mentés",
       onConfirm: (value) => {
+        if (blockConversationMutationDuringStream()) return false;
         const nextName = value.trim();
         if (!nextName) return false;
         if (nextName === project.name) return true;
@@ -7614,6 +7515,7 @@ function App() {
   };
 
   const performDeleteProject = (project: Project) => {
+    if (blockConversationMutationDuringStream()) return;
     markProjectMutation();
     if (isTauri) {
       setTombstones((current) => [
@@ -7708,6 +7610,7 @@ function App() {
   };
 
   const deleteProject = (project: Project) => {
+    if (blockConversationMutationDuringStream()) return;
     setAppDialog({
       kind: "confirm",
       title: "Projekt eltávolítása a Tree-ből",
@@ -7719,6 +7622,7 @@ function App() {
   };
 
   const renameThread = (project: Project, thread: string) => {
+    if (blockConversationMutationDuringStream()) return;
     setAppDialog({
       kind: "input",
       title: "Beszélgetés átnevezése",
@@ -7726,6 +7630,7 @@ function App() {
       value: thread,
       confirmLabel: "Mentés",
       onConfirm: (value) => {
+        if (blockConversationMutationDuringStream()) return false;
         const nextName = value.trim();
         if (!nextName) return false;
         if (nextName === thread) return true;
@@ -7787,6 +7692,7 @@ function App() {
   };
 
   const performDeleteThread = (project: Project, thread: string) => {
+    if (blockConversationMutationDuringStream()) return;
     const oldKey = `${project.path}/${thread}`;
     if (isTauri) {
       const conversation = localConversationCacheRef.current[oldKey];
@@ -7873,6 +7779,7 @@ function App() {
   };
 
   const deleteThread = (project: Project, thread: string) => {
+    if (blockConversationMutationDuringStream()) return;
     setAppDialog({
       kind: "confirm",
       title: "Beszélgetés törlése",
@@ -7884,6 +7791,7 @@ function App() {
   };
 
   const changeProjectsRoot = async () => {
+    if (blockConversationMutationDuringStream()) return;
     if (!isTauri) return;
     try {
       const selected = await invoke<string | null>("pick_projects_root");
@@ -7902,6 +7810,7 @@ function App() {
   };
 
   const createProject = async (requestedName: string) => {
+    if (blockConversationMutationDuringStream()) return;
     if (!isTauri) {
       notify("Az új projekt a natív Tauri appban hozható létre");
       return;
@@ -7931,6 +7840,7 @@ function App() {
   };
 
   const addProject = () => {
+    if (blockConversationMutationDuringStream()) return;
     if (!isTauri) {
       notify("Az új projekt a natív Tauri appban hozható létre");
       return;
@@ -7951,6 +7861,7 @@ function App() {
   };
 
   const addExistingProject = async () => {
+    if (blockConversationMutationDuringStream()) return;
     if (!isTauri) {
       notify("A meglévő projekt kiválasztása a natív Tauri appban érhető el");
       return;
@@ -8006,6 +7917,7 @@ function App() {
   };
 
   const selectThread = (project: Project, thread: string) => {
+    if (blockConversationMutationDuringStream()) return;
     setActiveProject(project.name);
     setActiveThread(thread);
     commitMessages(messagesForThread(`${project.path}/${thread}`));
@@ -8068,7 +7980,7 @@ function App() {
             : message,
         ),
       );
-      settleActivePlan("completed");
+      settleActivePlan("error");
       setIsStreaming(false);
       setIsCancelling(false);
       setCodeStatus("kész");
@@ -8183,6 +8095,7 @@ function App() {
     shouldStickToBottom.current = true;
     setIsAtBottom(true);
     const requestId = createRequestId();
+    const clientTurnId = `request:${requestId}`;
     const liveMessageId = createEntityId();
     const userSequence = nextTimelineSequence();
     const liveSequence = nextTimelineSequence();
@@ -8194,6 +8107,7 @@ function App() {
       live: true,
       final: false,
       sequence: liveSequence,
+      turnId: clientTurnId,
     };
     const previousMessages = mergeMessages(
       localConversationCacheRef.current[threadKey]?.messages ?? [],
@@ -8307,7 +8221,7 @@ function App() {
         requestThreadKey = nextThreadKey;
       }
     }
-    activeTurnIdRef.current = undefined;
+    activeTurnIdRef.current = clientTurnId;
     const requestStartedAt = Date.now();
     activeTurnTimingRef.current = { startedAt: requestStartedAt };
     planTextBufferRef.current = {};
@@ -8318,7 +8232,7 @@ function App() {
       threadId: null,
     });
     const initialPlan: PlanSnapshot = {
-      turnId: null,
+      turnId: clientTurnId,
       explanation: "",
       steps: [
         {
@@ -8332,8 +8246,7 @@ function App() {
         "client-pre-plan": { startedAt: requestStartedAt },
       },
     };
-    activePlanRef.current = initialPlan;
-    setActivePlan(initialPlan);
+    updatePlanState(initialPlan);
     commitMessages(nextMessages);
     setInput("");
     setPendingImages([]);
@@ -8539,6 +8452,7 @@ function App() {
   };
 
   const newConversationForProject = (project: Project) => {
+    if (blockConversationMutationDuringStream()) return;
     const baseTitle = "Új beszélgetés";
     const archivedTitles = tombstones
       .filter(
@@ -8589,6 +8503,7 @@ function App() {
   };
 
   const newConversation = () => {
+    if (blockConversationMutationDuringStream()) return;
     const project =
       projects.find((candidate) => candidate.name === activeProject) ??
       projects[0];
@@ -8600,6 +8515,7 @@ function App() {
   };
 
   const selectProject = (project: Project) => {
+    if (blockConversationMutationDuringStream()) return;
     const thread =
       project.name === activeProject && project.threads.includes(activeThread)
         ? activeThread
@@ -8640,38 +8556,34 @@ function App() {
   const latestWorkGroup = [...workLogGroups]
     .reverse()
     .find(workGroupHasVisibleTrace);
-  const userMessageKeyAtIndex = (index: number) => {
-    for (let cursor = index; cursor >= 0; cursor -= 1) {
-      const message = messages[cursor];
-      if (message?.role === "user")
-        return message.id ?? `user:${message.sequence ?? cursor}`;
-    }
-    return undefined;
-  };
-  const userMessageKeyForGroup = (group: WorkLogGroup) => {
-    if (group.userMessageKey) return group.userMessageKey;
-    let candidate: string | undefined;
-    for (let index = 0; index < messages.length; index += 1) {
-      const message = messages[index];
-      if (message.role !== "user") continue;
-      const sequence = message.sequence ?? index;
-      if (sequence <= group.sequence)
-        candidate = message.id ?? `user:${sequence}`;
-      else break;
-    }
-    return candidate;
-  };
+  const activeWorkGroup = isStreaming
+    ? findActiveWorkGroup(
+        workLogGroups,
+        messages,
+        activeTurnIdRef.current,
+      )
+    : undefined;
+  const currentWorkGroup =
+    activeWorkGroup ??
+    (activeTurnIdRef.current
+      ? workLogGroups.find((group) =>
+          workGroupTurnKeys(group).includes(activeTurnIdRef.current!),
+        )
+      : undefined);
   const messageBelongsToWorkGroup = (
     message: Message,
     messageIndex: number,
     group: WorkLogGroup,
   ) => {
-    const turnKeys = new Set(workGroupTurnKeys(group));
-    if (message.turnId && turnKeys.has(message.turnId)) return true;
-    const groupUserKey = userMessageKeyForGroup(group);
-    if (groupUserKey && userMessageKeyAtIndex(messageIndex) === groupUserKey)
+    if (timelineMessageBelongsToWorkGroup(messages, messageIndex, group))
       return true;
-    if (message.role !== "assistant" || message.live) return false;
+    if (
+      message.turnId ||
+      group.userMessageKey ||
+      message.role !== "assistant" ||
+      message.live
+    )
+      return false;
     // Older persisted messages did not carry a turn id and some old work
     // items used a different sequence clock. In that case the visual trace
     // is paired with the nearest completed assistant row immediately before
@@ -8700,7 +8612,7 @@ function App() {
   };
   const isInterruptedAssistantText = (text: string) => {
     if (text.toLowerCase().includes("megszak")) return true;
-    /(?:^|\n\n)A vÃ¡lasz megszakÃ­tva\.?\s*$/i.test(text.trim());
+    return /(?:^|\n\n)A válasz megszakítva\.?\s*$/i.test(text.trim());
   };
   const answerForWorkGroup = (group: WorkLogGroup) => {
     const candidates = messages
@@ -8721,6 +8633,10 @@ function App() {
       );
     if (nonInterrupted) return nonInterrupted.message;
     if (candidates.length > 0) return candidates[candidates.length - 1].message;
+    // A normal user-scoped group already had an exact chronological/identity
+    // chance above. Do not steal the nearest answer from another turn merely
+    // to fill an otherwise empty card.
+    if (group.userMessageKey) return undefined;
     const completedAssistants = messages
       .map((message, index) => ({ message, index }))
       .filter(
@@ -8782,14 +8698,15 @@ function App() {
         />
       );
     }
-    if (isStreaming && entry.group.key === latestWorkGroup?.key) return null;
+    if (isStreaming && entry.group.key === activeWorkGroup?.key) return null;
     const storedPlan = planForWorkGroup(entry.group);
     if (!workGroupHasVisibleTrace(entry.group)) return null;
     const isLatestGroup = entry.group.key === latestWorkGroup?.key;
+    const isCurrentGroup = entry.group.key === currentWorkGroup?.key;
     const expanded = expandedForWorkGroup(entry.group, isLatestGroup);
     const basePlan =
       storedPlan ??
-      (isLatestGroup
+      (isCurrentGroup
         ? activePlan
         : {
             turnId: entry.group.key,
@@ -8802,7 +8719,7 @@ function App() {
               },
             ],
           });
-    const plan: PlanSnapshot = isLatestGroup
+    const plan: PlanSnapshot = settleHistoricalPlan(isCurrentGroup
       ? {
           ...basePlan,
           startedAt: basePlan.startedAt ?? activePlan.startedAt,
@@ -8815,14 +8732,14 @@ function App() {
                 }
               : undefined,
         }
-      : basePlan;
+      : basePlan);
     return (
       <TurnProgressCard
         key={entry.key}
         plan={plan}
         activities={entry.group.activities}
         commentary={commentaryForWorkGroup(entry.group)}
-        status={isLatestGroup ? codeStatus : "kész"}
+        status={isCurrentGroup ? codeStatus : "kész"}
         streaming={false}
         expanded={expanded}
         transport={null}
@@ -8834,7 +8751,7 @@ function App() {
       />
     );
   });
-  const liveWorkGroup = isStreaming ? latestWorkGroup : undefined;
+  const liveWorkGroup = activeWorkGroup;
   const liveTurnKey = liveWorkGroup?.key ?? activePlan.turnId ?? "current";
   const liveTurnId = activePlan.turnId ?? activeTurnIdRef.current;
   const liveExpanded = liveWorkGroup

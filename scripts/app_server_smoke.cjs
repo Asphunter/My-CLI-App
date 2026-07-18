@@ -1,6 +1,7 @@
 "use strict";
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { execFileSync, spawn } = require("child_process");
 
@@ -31,8 +32,11 @@ function resolveCodexBinary() {
 }
 
 function createFixtures() {
-  const gitRoot = fs.mkdtempSync(path.join(projectsRoot, ".min-app-server-smoke-git-"));
-  const plainRoot = fs.mkdtempSync(path.join(projectsRoot, ".min-app-server-smoke-plain-"));
+  // A directory below projectsRoot inherits its parent worktree, so it can
+  // never exercise the non-Git app-server path. Keep both disposable fixtures
+  // as direct children of the OS temp directory instead.
+  const gitRoot = fs.mkdtempSync(path.join(os.tmpdir(), "min-app-server-smoke-git-"));
+  const plainRoot = fs.mkdtempSync(path.join(os.tmpdir(), "min-app-server-smoke-plain-"));
   execFileSync("git", ["init", "--quiet"], { cwd: gitRoot, stdio: "ignore" });
   execFileSync("git", ["rev-parse", "--is-inside-work-tree"], { cwd: gitRoot, stdio: "ignore" });
   try {
@@ -161,11 +165,12 @@ function runSmoke(fixture) {
 
 function cleanup(fixtures) {
   if (keepFixtures) return;
+  const tempRoot = path.resolve(os.tmpdir());
   for (const fixture of fixtures) {
     const resolved = path.resolve(fixture.root);
     if (
-      resolved.startsWith(`${projectsRoot}${path.sep}`) &&
-      path.basename(resolved).startsWith(".min-app-server-smoke-")
+      path.dirname(resolved) === tempRoot &&
+      path.basename(resolved).startsWith("min-app-server-smoke-")
     ) {
       fs.rmSync(resolved, { recursive: true, force: true });
     }

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
-pub const STORE_SCHEMA_VERSION: i64 = 8;
+pub const STORE_SCHEMA_VERSION: i64 = 9;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS store_meta (
@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS messages (
     sequence INTEGER NOT NULL,
     hlc TEXT,
     item_id TEXT,
+    turn_id TEXT,
     code INTEGER NOT NULL DEFAULT 0,
     live INTEGER NOT NULL DEFAULT 0,
     final INTEGER NOT NULL DEFAULT 0,
@@ -247,6 +248,8 @@ pub struct LocalMessage {
     #[serde(rename = "final")]
     pub final_message: Option<bool>,
     pub item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
     pub sequence: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hlc: Option<String>,
@@ -503,6 +506,21 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
             .map_err(|error| format!("A lokális SQLite v8 migráció sikertelen: {error}"))?;
         transaction.commit().map_err(|error| {
             format!("A lokális SQLite v8 migráció commitja sikertelen: {error}")
+        })?;
+    }
+    let migrated_version = read_schema_version(connection)?;
+    if migrated_version == 8 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("A lokális SQLite v9 migráció nem indítható el: {error}"))?;
+        transaction
+            .execute_batch(
+                "ALTER TABLE messages ADD COLUMN turn_id TEXT;
+                 PRAGMA user_version = 9;",
+            )
+            .map_err(|error| format!("A lokális SQLite v9 migráció sikertelen: {error}"))?;
+        transaction.commit().map_err(|error| {
+            format!("A lokális SQLite v9 migráció commitja sikertelen: {error}")
         })?;
     }
     Ok(())
@@ -796,8 +814,8 @@ pub(crate) fn load_snapshot_from_connection(
         let messages = {
             let mut statement = connection
                 .prepare(
-                    "SELECT id, role, body, created_at, code, live, \"final\", item_id, sequence,
-                            hlc, origin_device_id, attachments_json
+                    "SELECT id, role, body, created_at, code, live, \"final\", item_id, turn_id,
+                            sequence, hlc, origin_device_id, attachments_json
                      FROM messages
                      WHERE conversation_id = ?1
                      ORDER BY COALESCE(hlc, printf('%020d', sequence)),
@@ -815,10 +833,11 @@ pub(crate) fn load_snapshot_from_connection(
                         live: Some(row.get::<_, i64>(5)? != 0),
                         final_message: Some(row.get::<_, i64>(6)? != 0),
                         item_id: row.get(7)?,
-                        sequence: Some(row.get(8)?),
-                        hlc: row.get(9)?,
-                        origin_device_id: row.get(10)?,
-                        images: serde_json::from_str(&row.get::<_, String>(11)?)
+                        turn_id: row.get(8)?,
+                        sequence: Some(row.get(9)?),
+                        hlc: row.get(10)?,
+                        origin_device_id: row.get(11)?,
+                        images: serde_json::from_str(&row.get::<_, String>(12)?)
                             .unwrap_or_default(),
                     })
                 })
@@ -1279,8 +1298,8 @@ fn save_snapshot_in_connection(
                 .map_err(|error| format!("A képcsatolmányok nem szerializálhatók: {error}"))?;
             transaction
                 .execute(
-                    "INSERT INTO messages (id, conversation_id, role, body, sequence, hlc, item_id, code, live, \"final\", origin_device_id, attachments_json, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                    "INSERT INTO messages (id, conversation_id, role, body, sequence, hlc, item_id, turn_id, code, live, \"final\", origin_device_id, attachments_json, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                      ON CONFLICT DO UPDATE SET
                          conversation_id = excluded.conversation_id,
                          role = excluded.role,
@@ -1291,6 +1310,7 @@ fn save_snapshot_in_connection(
                          sequence = excluded.sequence,
                          hlc = COALESCE(excluded.hlc, messages.hlc),
                          item_id = COALESCE(excluded.item_id, messages.item_id),
+                         turn_id = COALESCE(excluded.turn_id, messages.turn_id),
                          code = MAX(messages.code, excluded.code),
                          live = CASE
                              WHEN messages.\"final\" = 1 OR excluded.\"final\" = 1 THEN 0
@@ -1310,6 +1330,7 @@ fn save_snapshot_in_connection(
                         sequence,
                         message.hlc,
                         message.item_id,
+                        message.turn_id,
                         if message.code.unwrap_or(false) { 1 } else { 0 },
                         if message.live.unwrap_or(false) { 1 } else { 0 },
                         if message.final_message.unwrap_or(false) { 1 } else { 0 },
@@ -1521,7 +1542,10 @@ mod tests {
             .expect("create v4 fixture");
 
         initialize_connection(&mut connection).expect("migrate v4 schema");
-        assert_eq!(read_schema_version(&connection).expect("schema version"), 8);
+        assert_eq!(
+            read_schema_version(&connection).expect("schema version"),
+            STORE_SCHEMA_VERSION
+        );
         let mut statement = connection
             .prepare("PRAGMA table_info(work_items)")
             .expect("work item columns");
@@ -1546,6 +1570,7 @@ mod tests {
         assert!(message_columns
             .iter()
             .any(|column| column == "attachments_json"));
+        assert!(message_columns.iter().any(|column| column == "turn_id"));
     }
 
     fn test_snapshot() -> LocalStoreSnapshot {
@@ -1564,6 +1589,7 @@ mod tests {
                 live: Some(false),
                 final_message: Some(true),
                 item_id: None,
+                turn_id: Some("turn-1".to_string()),
                 sequence: Some(10),
                 hlc: Some("00000000000000000010-00000000".to_string()),
                 origin_device_id: None,
@@ -1641,6 +1667,7 @@ mod tests {
         let conversation = loaded.conversations.values().next().expect("conversation");
         assert_eq!(conversation.messages[0].text, "Hello");
         assert_eq!(conversation.messages[0].final_message, Some(true));
+        assert_eq!(conversation.messages[0].turn_id.as_deref(), Some("turn-1"));
         assert_eq!(conversation.messages[0].images[0].path, "Screenshots/8.png");
         assert_eq!(
             conversation.messages[0].hlc.as_deref(),

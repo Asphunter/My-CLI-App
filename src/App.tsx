@@ -4665,6 +4665,7 @@ function App() {
   const [threadIds, setThreadIds] =
     useState<Record<string, string>>(loadLocalThreadIds);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [readingSettingsOpen, setReadingSettingsOpen] = useState(false);
   const [commandsOpen, setCommandsOpen] = useState(false);
   const [openMenu, setOpenMenu] = useState<OpenMenu>(null);
   const [newProjectMenuOpen, setNewProjectMenuOpen] = useState(false);
@@ -8826,72 +8827,7 @@ function App() {
             D
           </button>
         </div>
-        {settingsOpen && (
-          <div className="settings-popover">
-            <div className="popover-heading">
-              <span>Beállítások</span>
-              <span className="popover-hint">azonnal él</span>
-            </div>
-            <label className="range-row">
-              <span>Betűméret</span>
-              <output>{fontSize}</output>
-              <input
-                type="range"
-                min="8"
-                max="17"
-                value={parseInt(fontSize, 10)}
-                onChange={(event) => setFontSize(`${event.target.value}px`)}
-              />
-            </label>
-            <label className="range-row">
-              <span>Sorköz</span>
-              <output>{lineHeight}</output>
-              <input
-                type="range"
-                min="100"
-                max="180"
-                value={Math.round(parseFloat(lineHeight) * 100)}
-                onChange={(event) =>
-                  setLineHeight((Number(event.target.value) / 100).toFixed(2))
-                }
-              />
-            </label>
-            <button
-              className="reset-button"
-              onClick={() => {
-                setFontSize("8px");
-                setLineHeight("1.00");
-                notify("Olvasási beállítások visszaállítva");
-              }}
-            >
-              Alapértékek visszaállítása
-            </button>
-            {isTauri && (
-              <div className="settings-root-section">
-                <div className="settings-section-heading">
-                  Projektek gyökere
-                </div>
-                <div className="settings-root-path" title={workspaceRoot}>
-                  {workspaceRoot || "Nincs beállítva OneDrive-gyökér"}
-                </div>
-                <button
-                  type="button"
-                  className="settings-root-button"
-                  onClick={() => {
-                    void changeProjectsRoot();
-                  }}
-                >
-                  Gyökér módosítása
-                </button>
-              </div>
-            )}
-          </div>
-        )}
       </header>
-
-      <div className="local-store-health" role="status" aria-live="polite">
-        SQLite · {localStoreStatus}
-      </div>
 
       {isTauri &&
         syncHealth?.warnings.some((warning) =>
@@ -9289,9 +9225,6 @@ function App() {
                 )}
               </div>
             )}
-            <button className="footer-action">
-              <span>⌕</span> Keresés
-            </button>
             <button
               className="footer-action"
               onClick={() => setSettingsOpen((open) => !open)}
@@ -9302,56 +9235,90 @@ function App() {
             {settingsOpen && (
               <div className="settings-popover sidebar-settings-popover">
                 <div className="popover-heading">
-                  <span>Olvasási beállítások</span>
+                  <span>Beállítások</span>
                   <span className="popover-hint">azonnal él</span>
                 </div>
-                <label className="range-row">
-                  <span>Betűméret</span>
-                  <output>{fontSize}</output>
-                  <input
-                    type="range"
-                    min="8"
-                    max="17"
-                    value={parseInt(fontSize, 10)}
-                    onChange={(event) => setFontSize(`${event.target.value}px`)}
-                  />
-                </label>
-                <label className="range-row">
-                  <span>Sorköz</span>
-                  <output>{lineHeight}</output>
-                  <input
-                    type="range"
-                    min="100"
-                    max="180"
-                    value={Math.round(parseFloat(lineHeight) * 100)}
-                    onChange={(event) =>
-                      setLineHeight(
-                        (Number(event.target.value) / 100).toFixed(2),
-                      )
-                    }
-                  />
-                </label>
                 <button
-                  className="reset-button"
-                  onClick={() => {
-                    setFontSize("8px");
-                    setLineHeight("1.00");
-                    notify("Olvasási beállítások visszaállítva");
-                  }}
+                  type="button"
+                  className="settings-option"
+                  aria-expanded={readingSettingsOpen}
+                  onClick={() => setReadingSettingsOpen((open) => !open)}
                 >
-                  Alapértékek visszaállítása
+                  <span>
+                    <strong>Megjelenés</strong>
+                    <small>Betűméret és sorköz</small>
+                  </span>
+                  <span aria-hidden="true">
+                    {readingSettingsOpen ? "⌃" : "⌄"}
+                  </span>
                 </button>
+                {readingSettingsOpen && (
+                  <div className="settings-subpanel">
+                    <div className="settings-subpanel-heading">
+                      Olvasási beállítások
+                    </div>
+                    <label className="range-row">
+                      <span>Betűméret</span>
+                      <output>{fontSize}</output>
+                      <input
+                        type="range"
+                        min="8"
+                        max="17"
+                        value={parseInt(fontSize, 10)}
+                        onChange={(event) =>
+                          setFontSize(`${event.target.value}px`)
+                        }
+                      />
+                    </label>
+                    <label className="range-row">
+                      <span>Sorköz</span>
+                      <output>{lineHeight}</output>
+                      <input
+                        type="range"
+                        min="100"
+                        max="180"
+                        value={Math.round(parseFloat(lineHeight) * 100)}
+                        onChange={(event) =>
+                          setLineHeight(
+                            (Number(event.target.value) / 100).toFixed(2),
+                          )
+                        }
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      className="reset-button"
+                      onClick={() => {
+                        setFontSize("8px");
+                        setLineHeight("1.00");
+                        notify("Olvasási beállítások visszaállítva");
+                      }}
+                    >
+                      Alapértékek visszaállítása
+                    </button>
+                  </div>
+                )}
                 {isTauri && (
-                  <RetentionSettingsSection
-                    preview={retentionPreview}
-                    selection={retentionSelection}
-                    onRefresh={refreshRetention}
-                    onAction={runRetentionAction}
-                    onSelectAll={selectAllEligibleRetention}
-                    onClearSelection={() => setRetentionSelection([])}
-                    onPurgeSelected={purgeSelectedRetention}
-                    onToggleSelection={toggleRetentionSelection}
-                  />
+                  <div className="settings-root-section">
+                    <div className="settings-section-heading">
+                      Projektek gyökere
+                    </div>
+                    <p className="settings-section-hint">
+                      Az új projektek és a Tree alapértelmezett OneDrive-helye.
+                    </p>
+                    <div className="settings-root-path" title={workspaceRoot}>
+                      {workspaceRoot || "Nincs beállítva OneDrive-gyökér"}
+                    </div>
+                    <button
+                      type="button"
+                      className="settings-root-button"
+                      onClick={() => {
+                        void changeProjectsRoot();
+                      }}
+                    >
+                      Hely módosítása
+                    </button>
+                  </div>
                 )}
               </div>
             )}
@@ -9361,29 +9328,10 @@ function App() {
         <section className="chat panel-edge">
           <div className="chat-header">
             <div>
-              <div className="eyebrow">{activeProjectData.name}</div>
-              <h1>{activeThread || "Nincs beszélgetés"}</h1>
-            </div>
-            <div className="chat-header-actions">
-              <button className="header-icon" title="Keresés a beszélgetésben">
-                ⌕
-              </button>
-              <button
-                className="header-icon"
-                title="Beszélgetés műveletei"
-                onClick={() => {
-                  setOpenProjects((current) => ({
-                    ...current,
-                    [activeProjectData.path]: true,
-                  }));
-                  setOpenMenu({
-                    kind: "thread",
-                    key: `${activeProjectData.id}::${activeThread}`,
-                  });
-                }}
-              >
-                •••
-              </button>
+              <div className="chat-header-project">{activeProjectData.name}</div>
+              <div className="chat-header-thread">
+                {activeThread || "Nincs beszélgetés"}
+              </div>
             </div>
           </div>
           <div

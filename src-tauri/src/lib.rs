@@ -81,6 +81,20 @@ async fn read_code_file(cwd: String, path: String) -> Result<Option<String>, Str
 }
 
 #[tauri::command(rename_all = "camelCase")]
+async fn run_project_file(cwd: String, path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || codex::run_project_file(&cwd, &path))
+        .await
+        .map_err(|error| format!("A fÃ¡jl futtatÃ¡si hÃ¡ttÃ©rfeladata leÃ¡llt: {error}"))?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn open_project_folder(cwd: String, path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || codex::open_project_folder(&cwd, &path))
+        .await
+        .map_err(|error| format!("A mappanyitÃ¡si hÃ¡ttÃ©rfeladata leÃ¡llt: {error}"))?
+}
+
+#[tauri::command(rename_all = "camelCase")]
 async fn save_image_attachments(
     cwd: String,
     images: Vec<codex::PendingImageUpload>,
@@ -193,7 +207,17 @@ async fn local_store_import_v1() -> Result<Vec<migration::ImportReport>, String>
 
 #[tauri::command]
 async fn local_store_load() -> Result<store::LocalStoreSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(store::load_snapshot)
+    tauri::async_runtime::spawn_blocking(|| {
+        let snapshot = store::load_snapshot()?;
+        let (snapshot, recovered) = codex::recover_local_store_snapshot(snapshot)?;
+        if recovered {
+            // SQLite is the local startup source of truth. Persisting the
+            // recovered text also prevents a later partial sync row from
+            // hiding the answer again.
+            let _ = store::save_snapshot(snapshot.clone());
+        }
+        Ok(snapshot)
+    })
         .await
         .map_err(|error| format!("A lokÃ¡lis snapshot betÃ¶ltÃ©se leÃ¡llt: {error}"))?
 }
@@ -302,6 +326,8 @@ pub fn run() {
             codex_respond_approval,
             codex_cancel,
             read_code_file,
+            run_project_file,
+            open_project_folder,
             save_image_attachments,
             read_project_image,
             codex_models,

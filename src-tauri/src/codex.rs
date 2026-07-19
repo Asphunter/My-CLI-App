@@ -1,8 +1,9 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use crate::store;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
@@ -16,6 +17,9 @@ use uuid::Uuid;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -175,6 +179,280 @@ pub struct CodexResponse {
     pub thread_rehydrated: bool,
 }
 
+/// A completed answer recovered from Codex's durable rollout log.
+///
+/// The local UI store can contain a provisional empty/interrupted/error row
+/// when the WebView is closed while a request is still settling.  Rollouts
+/// are the authoritative record of the request and let us repair that row on
+/// the next startup without replaying the request.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RolloutRecoveryTurn {
+    pub prompt: String,
+    pub text: String,
+}
+
+const MAX_ROLLOUT_FILE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_ROLLOUT_SCAN_DEPTH: usize = 8;
+
+fn codex_sessions_root() -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    Some(PathBuf::from(home).join(".codex").join("sessions"))
+}
+
+fn collect_rollout_files(
+    directory: &Path,
+    thread_ids: &HashSet<String>,
+    depth: usize,
+    output: &mut Vec<(String, PathBuf)>,
+) {
+    if depth > MAX_ROLLOUT_SCAN_DEPTH {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_rollout_files(&path, thread_ids, depth + 1, output);
+            continue;
+        }
+        if !file_type.is_file()
+            || path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
+        {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.len() > MAX_ROLLOUT_FILE_BYTES {
+            continue;
+        }
+        let filename = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+        for thread_id in thread_ids {
+            if filename.contains(thread_id) {
+                output.push((thread_id.clone(), path.clone()));
+                break;
+            }
+        }
+    }
+}
+
+fn rollout_content_text(payload: &Value) -> String {
+    let Some(content) = payload.get("content").and_then(Value::as_array) else {
+        return String::new();
+    };
+    content
+        .iter()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn finish_rollout_turn(
+    turns: &mut Vec<RolloutRecoveryTurn>,
+    current: &mut Option<RolloutRecoveryTurn>,
+) {
+    if let Some(turn) = current.take() {
+        if !turn.prompt.trim().is_empty() && !turn.text.trim().is_empty() {
+            turns.push(turn);
+        }
+    }
+}
+
+fn parse_rollout_file(path: &Path) -> Vec<RolloutRecoveryTurn> {
+    let Ok(file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut turns = Vec::new();
+    let mut current: Option<RolloutRecoveryTurn> = None;
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let record_type = record.get("type").and_then(Value::as_str).unwrap_or_default();
+        let Some(payload) = record.get("payload") else {
+            continue;
+        };
+
+        if record_type == "event_msg"
+            && payload.get("type").and_then(Value::as_str) == Some("user_message")
+        {
+            finish_rollout_turn(&mut turns, &mut current);
+            let prompt = payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            current = Some(RolloutRecoveryTurn {
+                prompt,
+                text: String::new(),
+            });
+            continue;
+        }
+
+        let is_assistant_message = record_type == "response_item"
+            && payload.get("type").and_then(Value::as_str) == Some("message")
+            && payload.get("role").and_then(Value::as_str) == Some("assistant");
+        if is_assistant_message {
+            let text = rollout_content_text(payload);
+            if !text.trim().is_empty() {
+                if let Some(turn) = current.as_mut() {
+                    turn.text = text;
+                }
+            }
+            continue;
+        }
+
+        // Older rollouts also expose the final answer as an event_msg.  Keep
+        // this fallback, but ignore commentary so it cannot replace a later
+        // response_item containing the actual final answer.
+        if record_type == "event_msg"
+            && payload.get("type").and_then(Value::as_str) == Some("agent_message")
+            && payload.get("phase").and_then(Value::as_str) == Some("final_answer")
+        {
+            if let Some(text) = payload.get("message").and_then(Value::as_str) {
+                if let Some(turn) = current.as_mut() {
+                    if !text.trim().is_empty() {
+                        turn.text = text.to_string();
+                    }
+                }
+            }
+        }
+    }
+    finish_rollout_turn(&mut turns, &mut current);
+    turns
+}
+
+/// Reads only rollout files whose names contain one of the requested thread
+/// ids. Missing/incomplete files are intentionally treated as no recovery so
+/// startup can never be blocked by a damaged old session log.
+pub fn recover_rollout_messages_for_threads(
+    thread_ids: Vec<String>,
+) -> Result<HashMap<String, Vec<RolloutRecoveryTurn>>, String> {
+    let wanted = thread_ids
+        .into_iter()
+        .filter(|thread_id| Uuid::parse_str(thread_id).is_ok())
+        .collect::<HashSet<_>>();
+    if wanted.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let Some(root) = codex_sessions_root() else {
+        return Ok(HashMap::new());
+    };
+    if !root.is_dir() {
+        return Ok(HashMap::new());
+    }
+
+    let mut files = Vec::new();
+    collect_rollout_files(&root, &wanted, 0, &mut files);
+    files.sort_by(|left, right| left.1.cmp(&right.1));
+    let mut recovered = HashMap::new();
+    for (thread_id, path) in files {
+        let turns = parse_rollout_file(&path);
+        if !turns.is_empty() {
+            recovered.entry(thread_id).or_insert_with(Vec::new).extend(turns);
+        }
+    }
+    Ok(recovered)
+}
+
+fn normalized_recovery_prompt(text: &str) -> String {
+    text.replace("\r\n", "\n").trim().to_string()
+}
+
+fn recovery_prompt_matches(local_prompt: &str, rollout_prompt: &str) -> bool {
+    let local = normalized_recovery_prompt(local_prompt);
+    let rollout = normalized_recovery_prompt(rollout_prompt);
+    if local.is_empty() || rollout == local {
+        return !local.is_empty() && rollout == local;
+    }
+    rollout
+        .strip_prefix(&local)
+        .map(|suffix| suffix.starts_with('\n'))
+        .unwrap_or(false)
+}
+
+fn is_placeholder_assistant_message(message: &store::LocalMessage) -> bool {
+    let text = message.text.trim();
+    if text.is_empty() {
+        return true;
+    }
+    let lower = text.to_lowercase();
+    lower.contains("a v\u{00e1}lasz megszak\u{00ed}tva")
+        || lower.starts_with("nem siker\u{00fc}lt a codex-k\u{00e9}r\u{00e9}s:")
+}
+
+fn restore_messages_from_rollout(
+    messages: &mut [store::LocalMessage],
+    recovery: &[RolloutRecoveryTurn],
+) -> bool {
+    let mut recovery_cursor = 0usize;
+    let mut changed = false;
+    for user_index in 0..messages.len() {
+        if messages[user_index].role != "user" || recovery_cursor >= recovery.len() {
+            continue;
+        }
+        let Some(relative_index) = recovery[recovery_cursor..]
+            .iter()
+            .position(|entry| recovery_prompt_matches(&messages[user_index].text, &entry.prompt))
+        else {
+            continue;
+        };
+        let recovery_index = recovery_cursor + relative_index;
+        let mut assistant_index = None;
+        for index in (user_index + 1)..messages.len() {
+            if messages[index].role == "user" {
+                break;
+            }
+            if messages[index].role == "assistant" {
+                assistant_index = Some(index);
+                break;
+            }
+        }
+        if let Some(index) = assistant_index {
+            let entry = &recovery[recovery_index];
+            if is_placeholder_assistant_message(&messages[index]) && !entry.text.trim().is_empty() {
+                messages[index].text = entry.text.clone();
+                messages[index].live = Some(false);
+                messages[index].final_message = Some(true);
+                changed = true;
+            }
+        }
+        recovery_cursor = recovery_index + 1;
+    }
+    changed
+}
+
+/// Repairs the local snapshot in place from durable Codex rollouts.
+/// Returns the repaired snapshot and whether SQLite should be written back.
+pub fn recover_local_store_snapshot(
+    mut snapshot: store::LocalStoreSnapshot,
+) -> Result<(store::LocalStoreSnapshot, bool), String> {
+    let thread_ids = snapshot
+        .conversations
+        .values()
+        .filter_map(|conversation| conversation.thread_id.clone())
+        .collect::<Vec<_>>();
+    let recovered = recover_rollout_messages_for_threads(thread_ids)?;
+    let mut changed = false;
+    for conversation in snapshot.conversations.values_mut() {
+        let Some(thread_id) = conversation.thread_id.as_ref() else {
+            continue;
+        };
+        let Some(turns) = recovered.get(thread_id) else {
+            continue;
+        };
+        changed |= restore_messages_from_rollout(&mut conversation.messages, turns);
+    }
+    Ok((snapshot, changed))
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentGuardReport {
@@ -300,6 +578,8 @@ struct GuardManifest {
     root: String,
     base_hash: String,
     base_files: Vec<GuardFile>,
+    #[serde(default)]
+    cloud_placeholder_paths: Vec<String>,
     post_hash: Option<String>,
     post_files: Option<Vec<GuardFile>>,
     #[serde(default)]
@@ -400,11 +680,29 @@ fn read_settings() -> Option<MinSettings> {
 }
 
 fn canonical_existing_directory(value: &str) -> Option<PathBuf> {
-    let path = PathBuf::from(value);
+    let path = normalize_platform_path(PathBuf::from(value));
     if !path.is_absolute() || !path.is_dir() {
         return None;
     }
     Some(path.canonicalize().unwrap_or(path))
+}
+
+// Windows file pickers can return an extended-length path (`\\?\\C:\\...`),
+// while paths coming from the React side normally use the regular `C:\\...`
+// spelling. Normalize both forms before comparing roots; otherwise every
+// legitimate file action is rejected by the project-boundary check.
+fn normalize_platform_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path
 }
 
 fn configured_projects_root() -> Option<PathBuf> {
@@ -664,7 +962,7 @@ pub fn workspace_cwd() -> PathBuf {
 fn requested_cwd(cwd: Option<&str>) -> Result<PathBuf, String> {
     let path = cwd
         .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from)
+        .map(|value| normalize_platform_path(PathBuf::from(value)))
         .unwrap_or_else(workspace_cwd);
     if !path.is_dir() {
         return Err(format!(
@@ -707,11 +1005,41 @@ fn agent_snapshot_root() -> Result<PathBuf, String> {
     Ok(PathBuf::from(base).join("min").join("agent-snapshots"))
 }
 
-fn is_guard_excluded_directory(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        ".git" | ".min-sync" | "node_modules" | "target" | "dist" | ".vite"
-    )
+fn is_guard_excluded_directory(path: &Path) -> bool {
+    let excluded_by_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                ".git" | ".min-sync" | "node_modules" | "target" | "dist" | ".vite"
+            )
+        })
+        .unwrap_or(false);
+
+    // CMake always writes this marker into a configured binary directory.
+    // Excluding the directory as a unit keeps generated compiler objects and
+    // FetchContent checkouts out of the rollback snapshot, independently of
+    // the build directory's user-chosen name.
+    excluded_by_name || path.join("CMakeCache.txt").is_file()
+}
+
+#[cfg(windows)]
+fn is_guard_cloud_placeholder(metadata: &fs::Metadata) -> bool {
+    const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
+    const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
+    const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+    let attributes = metadata.file_attributes();
+    attributes
+        & (FILE_ATTRIBUTE_OFFLINE
+            | FILE_ATTRIBUTE_RECALL_ON_OPEN
+            | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+        != 0
+}
+
+#[cfg(not(windows))]
+fn is_guard_cloud_placeholder(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 fn guard_relative_path(path: &str) -> Result<PathBuf, String> {
@@ -736,6 +1064,8 @@ fn collect_guard_files_inner(
     current: &Path,
     files: &mut Vec<GuardFile>,
     total_bytes: &mut u64,
+    forced_cloud_paths: &HashSet<String>,
+    discovered_cloud_paths: &mut BTreeSet<String>,
 ) -> Result<(), String> {
     let entries = fs::read_dir(current)
         .map_err(|error| format!("Az agent snapshot könyvtára nem olvasható: {error}"))?;
@@ -743,17 +1073,9 @@ fn collect_guard_files_inner(
         let entry =
             entry.map_err(|error| format!("Az agent snapshot fájllistája hibás: {error}"))?;
         let path = entry.path();
-        let file_type = fs::symlink_metadata(&path)
-            .map_err(|error| format!("Az agent snapshot metaadata nem olvasható: {error}"))?
-            .file_type();
-        if entry
-            .file_name()
-            .to_str()
-            .map(is_guard_excluded_directory)
-            .unwrap_or(false)
-        {
-            continue;
-        }
+        let entry_metadata = fs::symlink_metadata(&path)
+            .map_err(|error| error.to_string())?;
+        let file_type = entry_metadata.file_type();
         if file_type.is_symlink() {
             return Err(format!(
                 "Az agent snapshot symlinket talált, ezért fail-closed: {}",
@@ -761,10 +1083,32 @@ fn collect_guard_files_inner(
             ));
         }
         if file_type.is_dir() {
-            collect_guard_files_inner(root, &path, files, total_bytes)?;
+            if is_guard_excluded_directory(&path) {
+                continue;
+            }
+            collect_guard_files_inner(
+                root,
+                &path,
+                files,
+                total_bytes,
+                forced_cloud_paths,
+                discovered_cloud_paths,
+            )?;
             continue;
         }
         if !file_type.is_file() {
+            continue;
+        }
+        let cloud_relative = path
+            .strip_prefix(root)
+            .map_err(|error| error.to_string())?;
+        let cloud_relative_path = cloud_relative.to_string_lossy().replace('\\', "/");
+        if forced_cloud_paths.contains(&cloud_relative_path)
+            || is_guard_cloud_placeholder(&entry_metadata)
+        {
+            if !forced_cloud_paths.contains(&cloud_relative_path) {
+                discovered_cloud_paths.insert(cloud_relative_path);
+            }
             continue;
         }
         if files.len() >= GUARD_MAX_FILES {
@@ -773,8 +1117,7 @@ fn collect_guard_files_inner(
                 GUARD_MAX_FILES
             ));
         }
-        let metadata = fs::metadata(&path)
-            .map_err(|error| format!("Az agent snapshot fájlmérete nem olvasható: {error}"))?;
+        let metadata = &entry_metadata;
         if metadata.len() > GUARD_MAX_FILE_BYTES {
             return Err(format!(
                 "Az agent snapshot fájlja túl nagy (limit: {} bájt): {}.",
@@ -806,10 +1149,51 @@ fn collect_guard_files_inner(
     Ok(())
 }
 
-fn collect_guard_files(root: &Path) -> Result<Vec<GuardFile>, String> {
+fn collect_guard_snapshot(root: &Path) -> Result<(Vec<GuardFile>, Vec<String>), String> {
     let mut files = Vec::new();
     let mut total_bytes = 0_u64;
-    collect_guard_files_inner(root, root, &mut files, &mut total_bytes)?;
+    let forced_cloud_paths = HashSet::new();
+    let mut discovered_cloud_paths = BTreeSet::new();
+    collect_guard_files_inner(
+        root,
+        root,
+        &mut files,
+        &mut total_bytes,
+        &forced_cloud_paths,
+        &mut discovered_cloud_paths,
+    )?;
+    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok((files, discovered_cloud_paths.into_iter().collect()))
+}
+
+fn collect_guard_files_for_manifest(
+    root: &Path,
+    manifest: &GuardManifest,
+) -> Result<Vec<GuardFile>, String> {
+    let forced_cloud_paths = manifest
+        .cloud_placeholder_paths
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut files = Vec::new();
+    let mut total_bytes = 0_u64;
+    let mut discovered_cloud_paths = BTreeSet::new();
+    collect_guard_files_inner(
+        root,
+        root,
+        &mut files,
+        &mut total_bytes,
+        &forced_cloud_paths,
+        &mut discovered_cloud_paths,
+    )?;
+    for relative_path in &forced_cloud_paths {
+        let path = root.join(guard_relative_path(relative_path)?);
+        if fs::symlink_metadata(&path).is_err() {
+            return Err(format!(
+                "Az agent snapshot OneDrive-placeholder fájlja eltűnt a turn közben: {relative_path}"
+            ));
+        }
+    }
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(files)
 }
@@ -866,7 +1250,7 @@ fn create_agent_snapshot_at(root: &Path, snapshot_root: &Path) -> Result<AgentSn
     let root = root
         .canonicalize()
         .map_err(|error| format!("Az agent snapshot gyökere nem canonicalizálható: {error}"))?;
-    let files = collect_guard_files(&root)?;
+    let (files, cloud_placeholder_paths) = collect_guard_snapshot(&root)?;
     let base_hash = guard_manifest_hash(&files)?;
     let id = Uuid::new_v4().to_string();
     let directory = snapshot_root.join(&id);
@@ -896,6 +1280,7 @@ fn create_agent_snapshot_at(root: &Path, snapshot_root: &Path) -> Result<AgentSn
         root: root.to_string_lossy().to_string(),
         base_hash: base_hash.clone(),
         base_files: files.clone(),
+        cloud_placeholder_paths,
         post_hash: None,
         post_files: None,
         applied: false,
@@ -985,7 +1370,7 @@ fn finalize_agent_snapshot_from_root(
     snapshot: &AgentSnapshot,
     source_root: &Path,
 ) -> Result<AgentGuardReport, String> {
-    let post_files = collect_guard_files(source_root)?;
+    let post_files = collect_guard_files_for_manifest(source_root, &snapshot.manifest)?;
     let post_hash = guard_manifest_hash(&post_files)?;
     copy_guard_files(
         source_root,
@@ -1252,7 +1637,7 @@ fn agent_diff_preview_at(
         .as_deref()
         .ok_or_else(|| "Az agent snapshothoz nincs post-hash.".to_string())?
         .to_string();
-    let current_files = collect_guard_files(&root)?;
+    let current_files = collect_guard_files_for_manifest(&root, &manifest)?;
     let current_hash = guard_manifest_hash(&current_files)?;
     let current_state = if current_hash == manifest.base_hash {
         "base"
@@ -1487,7 +1872,7 @@ fn rebase_agent_snapshot_at(
         .post_files
         .as_deref()
         .ok_or_else(|| "Az agent snapshothoz nincs lezárt post-manifest.".to_string())?;
-    let current_files = collect_guard_files(&root)?;
+    let current_files = collect_guard_files_for_manifest(&root, &manifest)?;
     let current_hash = guard_manifest_hash(&current_files)?;
     let expected_apply_hash = manifest
         .apply_base_hash
@@ -1629,7 +2014,7 @@ fn restore_snapshot_base_preserving_manifest(
 ) -> Result<bool, String> {
     let (directory, manifest) = read_guard_manifest(snapshot_root, snapshot_id)?;
     let root = validate_guard_root(&manifest, allowed_root)?;
-    let current_files = collect_guard_files(&root)?;
+    let current_files = collect_guard_files_for_manifest(&root, &manifest)?;
     let current_hash = guard_manifest_hash(&current_files)?;
     if current_hash == manifest.base_hash {
         return Ok(false);
@@ -1642,7 +2027,7 @@ fn restore_snapshot_base_preserving_manifest(
         return Err("A projekt a snapshot lezárása óta megváltozott; az automatikus visszaállítás blokkolva.".to_string());
     }
     restore_snapshot_base_files(&root, &directory, &manifest, &current_files)?;
-    let resulting_files = collect_guard_files(&root)?;
+    let resulting_files = collect_guard_files_for_manifest(&root, &manifest)?;
     let resulting_hash = guard_manifest_hash(&resulting_files)?;
     if resulting_hash != manifest.base_hash {
         return Err(
@@ -1679,7 +2064,7 @@ fn apply_agent_snapshot_at(
         .apply_base_hash
         .as_deref()
         .unwrap_or(&manifest.base_hash);
-    let current_files = collect_guard_files(&root)?;
+    let current_files = collect_guard_files_for_manifest(&root, &manifest)?;
     let current_hash = guard_manifest_hash(&current_files)?;
     if current_hash != expected_apply_hash {
         return Err(
@@ -1715,7 +2100,7 @@ fn apply_agent_snapshot_at(
                 .map_err(|error| format!("Az apply törölt fájlja nem távolítható el: {error}"))?;
             removed_files += 1;
         }
-        let resulting_files = collect_guard_files(&root)?;
+        let resulting_files = collect_guard_files_for_manifest(&root, &manifest)?;
         let resulting_hash = guard_manifest_hash(&resulting_files)?;
         if resulting_hash != expected_post_hash {
             return Err("Az apply utáni post-hash nem egyezik; az apply blokkolva.".to_string());
@@ -1725,7 +2110,7 @@ fn apply_agent_snapshot_at(
     let (applied_files, removed_files, resulting_hash) = match apply_result {
         Ok(value) => value,
         Err(error) => {
-            let rollback_attempt = collect_guard_files(&root).and_then(|files| {
+            let rollback_attempt = collect_guard_files_for_manifest(&root, &manifest).and_then(|files| {
                 if manifest.rebased {
                     let apply_base_files = manifest
                         .apply_base_files
@@ -1781,7 +2166,7 @@ fn discard_agent_snapshot_at(
         .apply_base_hash
         .as_deref()
         .unwrap_or(&manifest.base_hash);
-    let current_files = collect_guard_files(&root)?;
+    let current_files = collect_guard_files_for_manifest(&root, &manifest)?;
     let resulting_hash = guard_manifest_hash(&current_files)?;
     if resulting_hash != expected_apply_hash {
         return Err(
@@ -1835,7 +2220,7 @@ fn rollback_agent_snapshot_at(
         .post_hash
         .as_deref()
         .ok_or_else(|| "Az agent snapshothoz nincs post-hash.".to_string())?;
-    let current_files = collect_guard_files(&root)?;
+    let current_files = collect_guard_files_for_manifest(&root, &manifest)?;
     let current_hash = guard_manifest_hash(&current_files)?;
     if current_hash != expected_post_hash {
         return Err("A projekt a snapshot lezárása óta megváltozott; rollback blokkolva, hogy ne írjon felül új munkát.".to_string());
@@ -1877,7 +2262,7 @@ fn rollback_agent_snapshot_at(
             .map_err(|error| format!("A rollback új fájlja nem távolítható el: {error}"))?;
         removed_files += 1;
     }
-    let resulting_files = collect_guard_files(&root)?;
+    let resulting_files = collect_guard_files_for_manifest(&root, &manifest)?;
     let resulting_hash = guard_manifest_hash(&resulting_files)?;
     if resulting_hash != manifest.base_hash {
         return Err("A rollback után a base-hash nem egyezik; további írás blokkolva.".to_string());
@@ -2268,7 +2653,8 @@ pub fn send(
     let guard_snapshot = create_agent_snapshot(&cwd)?;
     // The app-server deliberately runs in the real selected project folder.
     // This keeps ignored, generated and otherwise untracked project files
-    // visible as well; the snapshot guard still stages/reverts agent writes.
+    // visible; local files are staged/reverted while OneDrive placeholders
+    // remain metadata-only so the guard never hydrates them.
     let execution_cwd_string = cwd.to_string_lossy().to_string();
     let binary = match codex_binary(&app) {
         Ok(binary) => binary,
@@ -2310,6 +2696,12 @@ pub fn send(
         attach_child_pid(request_id, child.id());
     }
 
+    // `turn/completed` is the protocol boundary for the model response.  The
+    // guard/snapshot work below can take considerably longer (especially on a
+    // synced workspace), and a late stop click must not turn that already
+    // completed response into an "interrupted" error.
+    let turn_completed = Arc::new(AtomicBool::new(false));
+    let turn_completed_for_result = Arc::clone(&turn_completed);
     let result = (|| {
         if cancellation.load(Ordering::Relaxed) {
             return Err("A Codex-kérés megszakítva.".to_string());
@@ -2572,6 +2964,7 @@ pub fn send(
                     }
                 }
             } else if method == "turn/completed" {
+                turn_completed_for_result.store(true, Ordering::Release);
                 if final_text.trim().is_empty() {
                     final_text = unknown_agent_message_order
                         .iter()
@@ -2605,8 +2998,10 @@ pub fn send(
 
     terminate(child);
     let guard_result = finalize_agent_snapshot(&guard_snapshot);
+    let cancelled_before_turn_completion = cancellation.load(Ordering::Acquire)
+        && !turn_completed.load(Ordering::Acquire);
     match (result, guard_result) {
-        (Ok(mut response), Ok(report)) if !cancellation.load(Ordering::Relaxed) => {
+        (Ok(mut response), Ok(report)) if !cancelled_before_turn_completion => {
             let mut report = stage_agent_snapshot(&guard_snapshot, report).map_err(|error| {
                 format!(
                     "A Codex-válasz stagingje sikertelen: {error}. A snapshot azonosítója: {}.",
@@ -2885,7 +3280,7 @@ pub fn read_project_image(cwd: &str, path: &str) -> Result<Option<String>, Strin
 
 pub fn read_code_file(cwd: &str, path: &str) -> Result<Option<String>, String> {
     let root = requested_cwd(Some(cwd))?;
-    let requested = PathBuf::from(path);
+    let requested = normalize_platform_path(PathBuf::from(path));
     let candidate = if requested.is_absolute() {
         requested
     } else {
@@ -2908,6 +3303,158 @@ pub fn read_code_file(cwd: &str, path: &str) -> Result<Option<String>, String> {
     let bytes =
         std::fs::read(&canonical).map_err(|error| format!("Nem olvasható a kódfájl: {error}"))?;
     Ok(String::from_utf8(bytes).ok())
+}
+
+fn resolve_project_action_path(cwd: &str, path: &str) -> Result<(PathBuf, PathBuf), String> {
+    let root = requested_cwd(Some(cwd))?;
+    let mut cleaned = path
+        .trim()
+        .trim_matches(|character| matches!(character, '`' | '"' | '\''));
+    if cleaned.starts_with("file:///") {
+        cleaned = cleaned.trim_start_matches("file:///");
+    }
+    #[cfg(windows)]
+    if cleaned.len() >= 3
+        && cleaned.as_bytes()[0] == b'/'
+        && cleaned.as_bytes()[1].is_ascii_alphabetic()
+        && cleaned.as_bytes()[2] == b':'
+    {
+        cleaned = &cleaned[1..];
+    }
+    if cleaned.is_empty() {
+        return Err("A fájlútvonal üres.".to_string());
+    }
+    let requested = normalize_platform_path(PathBuf::from(cleaned));
+    let candidate = if requested.is_absolute() {
+        requested
+    } else {
+        root.join(requested)
+    };
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|error| format!("A fájl vagy mappa nem található: {error}"))?;
+    if !canonical.starts_with(&root) {
+        return Err("A művelet csak a projektmappán belüli fájlokon engedélyezett.".to_string());
+    }
+    Ok((root, normalize_platform_path(canonical)))
+}
+
+pub fn open_project_folder(cwd: &str, path: &str) -> Result<(), String> {
+    let (_root, target) = resolve_project_action_path(cwd, path)?;
+    let folder = if target.is_dir() {
+        target.clone()
+    } else {
+        target
+            .parent()
+            .ok_or_else(|| "A fájl szülőmappája nem határozható meg.".to_string())?
+            .to_path_buf()
+    };
+
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("explorer.exe");
+        // The action is explicitly "Mappa megnyitása". Pass the containing
+        // folder itself instead of Explorer's fragile `/select,` syntax;
+        // the latter can silently fall back to Documents when a canonical
+        // path contains spaces or an extended Windows prefix.
+        command.arg(&folder);
+        command
+            .spawn()
+            .map_err(|error| format!("A mappa megnyitása nem sikerült: {error}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let opener = "xdg-open";
+    #[cfg(not(any(windows, unix)))]
+    return Err("Ezen a platformon nem támogatott a mappa megnyitása.".to_string());
+
+    #[cfg(any(unix, target_os = "macos"))]
+    {
+        Command::new(opener)
+            .arg(folder)
+            .spawn()
+            .map_err(|error| format!("A mappa megnyitása nem sikerült: {error}"))?;
+        Ok(())
+    }
+}
+
+pub fn run_project_file(cwd: &str, path: &str) -> Result<(), String> {
+    let (_root, target) = resolve_project_action_path(cwd, path)?;
+    if !target.is_file() {
+        return Err("A futtatáshoz fájlt kell kiválasztani, nem mappát.".to_string());
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| "A fájl munkamappája nem határozható meg.".to_string())?;
+    let extension = target
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    #[cfg(windows)]
+    {
+        let target_string = target.to_string_lossy().to_string();
+        let mut command = match extension.as_str() {
+            "bat" | "cmd" => {
+                let mut command = Command::new("cmd.exe");
+                // Pass `call` and the script path as separate Windows command
+                // arguments.  Supplying `call \"path\"` as one Rust argument
+                // makes CommandLineToArgvW quote the whole /C payload again;
+                // cmd.exe then receives a malformed command and exits without
+                // running the script (while spawn() still reports success).
+                command.args(["/D", "/C", "call", target_string.as_str()]);
+                command
+            }
+            "ps1" => {
+                let mut command = Command::new("powershell.exe");
+                command.args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    target_string.as_str(),
+                ]);
+                command
+            }
+            "py" => {
+                let mut command = Command::new("py");
+                command.arg(&target);
+                command
+            }
+            "exe" => Command::new(&target),
+            _ => {
+                let mut command = Command::new("explorer.exe");
+                command.arg(&target);
+                command
+            }
+        };
+        command.current_dir(parent);
+        // A CMD/BAT action is an explicit user request to run a script, so let
+        // Windows create its normal console window.  Keep helper interpreters
+        // hidden; their output is not useful to the user and can otherwise
+        // flash a console over the app.
+        if matches!(extension.as_str(), "ps1" | "py") {
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        command
+            .spawn()
+            .map_err(|error| format!("A fájl futtatása nem sikerült: {error}"))?;
+        return Ok(());
+    }
+
+    #[cfg(not(windows))]
+    {
+        Command::new(&target)
+            .current_dir(parent)
+            .spawn()
+            .map_err(|error| format!("A fájl futtatása nem sikerült: {error}"))?;
+        Ok(())
+    }
 }
 
 fn pick_directory(description: &str) -> Result<Option<String>, String> {
@@ -3197,6 +3744,19 @@ mod sync_tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn extended_windows_paths_are_normalized_before_root_checks() {
+        assert_eq!(
+            normalize_platform_path(PathBuf::from(r"\\?\C:\Users\danis\OneDrive\my projects")),
+            PathBuf::from(r"C:\Users\danis\OneDrive\my projects")
+        );
+        assert_eq!(
+            normalize_platform_path(PathBuf::from(r"\\?\UNC\server\share\project")),
+            PathBuf::from(r"\\server\share\project")
+        );
+    }
+
     #[test]
     fn missing_rollout_error_is_detected_for_cross_device_resume() {
         assert!(is_missing_rollout_error(
@@ -3277,6 +3837,69 @@ mod sync_tests {
             .expect_err("outside cwd must be rejected")
             .contains("projektek gyökerén kívül"));
         let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn agent_snapshot_excludes_configured_cmake_build_tree() {
+        let root =
+            std::env::temp_dir().join(format!("min-agent-cmake-root-{}", uuid::Uuid::new_v4()));
+        let build = root.join("build-gui-juce");
+        let source_directory = root.join("source").join("build_helpers");
+        std::fs::create_dir_all(build.join("CMakeFiles")).expect("CMake build fixture");
+        std::fs::create_dir_all(&source_directory).expect("source fixture");
+        std::fs::write(build.join("CMakeCache.txt"), "configured").expect("CMake marker");
+        let generated_object = std::fs::File::create(build.join("CMakeFiles").join("large.obj"))
+            .expect("generated object");
+        generated_object
+            .set_len(GUARD_MAX_FILE_BYTES + 1)
+            .expect("oversized generated object");
+        std::fs::write(source_directory.join("keep.cpp"), "// source").expect("source file");
+
+        let files = collect_guard_snapshot(&root)
+            .expect("collect snapshot files")
+            .0;
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].relative_path, "source/build_helpers/keep.cpp");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_snapshot_keeps_forced_cloud_paths_out_of_followup_hashes() {
+        let root =
+            std::env::temp_dir().join(format!("min-agent-cloud-root-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("cloud fixture");
+        std::fs::write(root.join("cloud.txt"), "cloud").expect("cloud file");
+        std::fs::write(root.join("local.txt"), "local").expect("local file");
+        let manifest = GuardManifest {
+            root: root.to_string_lossy().to_string(),
+            base_hash: String::new(),
+            base_files: Vec::new(),
+            cloud_placeholder_paths: vec!["cloud.txt".to_string()],
+            post_hash: None,
+            post_files: None,
+            applied: false,
+            created_at: None,
+            last_action: None,
+            last_action_at: None,
+            apply_base_hash: None,
+            apply_base_files: None,
+            rebased: false,
+        };
+
+        let initial = collect_guard_files_for_manifest(&root, &manifest)
+            .expect("collect forced cloud snapshot");
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].relative_path, "local.txt");
+
+        std::fs::write(root.join("cloud.txt"), "agent changed cloud").expect("changed cloud");
+        let followup = collect_guard_files_for_manifest(&root, &manifest)
+            .expect("collect follow-up snapshot");
+        assert_eq!(followup, initial);
+
+        std::fs::remove_file(root.join("cloud.txt")).expect("remove cloud fixture");
+        assert!(collect_guard_files_for_manifest(&root, &manifest).is_err());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3516,6 +4139,115 @@ mod sync_tests {
             .lock()
             .expect("approval registry cleanup")
             .remove(&approval_id);
+    }
+
+    fn local_message(role: &str, text: &str) -> store::LocalMessage {
+        store::LocalMessage {
+            id: None,
+            role: role.to_string(),
+            text: text.to_string(),
+            time: "2026-01-01T00:00:00Z".to_string(),
+            code: None,
+            live: None,
+            final_message: None,
+            item_id: None,
+            turn_id: None,
+            sequence: None,
+            hlc: None,
+            origin_device_id: None,
+            images: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn rollout_recovery_replaces_only_placeholder_answers() {
+        let mut messages = vec![
+            local_message("user", "első kérdés"),
+            local_message("assistant", "A válasz megszakítva."),
+            local_message("user", "második kérdés"),
+            local_message("assistant", "Már meglévő válasz"),
+        ];
+        let recovery = vec![
+            RolloutRecoveryTurn {
+                prompt: "első kérdés\n\nThe local client already read context".to_string(),
+                text: "Helyreállított válasz".to_string(),
+            },
+            RolloutRecoveryTurn {
+                prompt: "második kérdés".to_string(),
+                text: "Ne írd felül ezt".to_string(),
+            },
+        ];
+
+        assert!(restore_messages_from_rollout(&mut messages, &recovery));
+        assert_eq!(messages[1].text, "Helyreállított válasz");
+        assert_eq!(messages[1].live, Some(false));
+        assert_eq!(messages[1].final_message, Some(true));
+        assert_eq!(messages[3].text, "Már meglévő válasz");
+    }
+
+    #[test]
+    fn rollout_recovery_ignores_unmatched_or_empty_entries() {
+        let mut messages = vec![
+            local_message("user", "ismeretlen kérdés"),
+            local_message("assistant", "A válasz megszakítva."),
+        ];
+        let recovery = vec![RolloutRecoveryTurn {
+            prompt: "másik kérdés".to_string(),
+            text: "Válasz".to_string(),
+        }];
+
+        assert!(!restore_messages_from_rollout(&mut messages, &recovery));
+        assert_eq!(messages[1].text, "A válasz megszakítva.");
+    }
+
+    #[test]
+    fn rollout_parser_reads_user_events_and_final_assistant_messages() {
+        let path = std::env::temp_dir().join(format!(
+            "min-rollout-recovery-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"Kérdés"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Válasz"}]}}"#,
+                "\n",
+            ),
+        )
+        .expect("rollout fixture");
+
+        let turns = parse_rollout_file(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            turns,
+            vec![RolloutRecoveryTurn {
+                prompt: "Kérdés".to_string(),
+                text: "Válasz".to_string(),
+            }]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn project_action_resolves_markdown_drive_path() {
+        let cwd = workspace_cwd();
+        let target = cwd.join("package.json");
+        if !target.is_file() {
+            return;
+        }
+        let markdown_path = format!("/{}", target.to_string_lossy().replace('\\', "/"));
+        let (_, resolved) = resolve_project_action_path(
+            &cwd.to_string_lossy(),
+            &markdown_path,
+        )
+        .expect("Markdown /C:/ path must resolve");
+        assert_eq!(
+            resolved,
+            normalize_platform_path(
+                target.canonicalize().expect("target should canonicalize"),
+            )
+        );
     }
 }
 

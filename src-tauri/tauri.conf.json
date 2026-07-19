@@ -5,7 +5,6 @@
   "identifier": "hu.danis.min",
   "build": {
     "beforeDevCommand": "npm.cmd run dev",
-    "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm.cmd run build",
     "frontendDist": "../dist"
   },

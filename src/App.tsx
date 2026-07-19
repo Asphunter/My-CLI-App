@@ -1,5 +1,7 @@
 import {
+  createContext,
   Fragment,
+  useContext,
   useEffect,
   useMemo,
   useRef,
@@ -31,6 +33,8 @@ type Message = {
   code?: boolean;
   live?: boolean;
   final?: boolean;
+  /** True only when the user explicitly stopped this turn. */
+  interrupted?: boolean;
   itemId?: string;
   sequence?: number;
   /** Codex turn that produced this assistant response. */
@@ -45,6 +49,22 @@ type MessageImageAttachment = {
   name: string;
   mimeType: string;
 };
+
+type FileActionMenuState = {
+  path: string;
+  x: number;
+  y: number;
+};
+
+type SelectionQuote = {
+  text: string;
+  x: number;
+  y: number;
+};
+
+type FileClickHandler = (path: string, x: number, y: number) => void;
+
+const FileActionContext = createContext<FileClickHandler | null>(null);
 
 type PendingImageAttachment = {
   id: string;
@@ -210,7 +230,7 @@ const DEFAULT_MODEL = "gpt-5.6-luna";
 const DEFAULT_EFFORT = "low";
 const MODEL_PREFERENCE_VERSION = "4";
 const EFFORT_PREFERENCE_VERSION = "1";
-const READING_SETTINGS_VERSION = "2";
+const READING_SETTINGS_VERSION = "3";
 const FALLBACK_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 const EFFORT_LABELS: Record<string, string> = {
   low: "Low",
@@ -801,6 +821,35 @@ const createEntityId = () =>
     ? crypto.randomUUID()
     : `entity-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
+const parseMessageTimestamp = (value: string | undefined) => {
+  if (!value || value.trim().length === 0) return undefined;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) return numeric;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+};
+
+const messagePromptTimestamp = (message: Pick<Message, "time" | "sequence">) => {
+  const storedTimestamp = parseMessageTimestamp(message.time);
+  if (storedTimestamp !== undefined) return storedTimestamp;
+  // Older rows kept `time: "most"`, but their timeline sequence is a
+  // millisecond timestamp. Use it only when it is clearly epoch-ms data;
+  // imported legacy sequence numbers must not turn into 00:00.
+  return typeof message.sequence === "number" && message.sequence > 1e12
+    ? message.sequence
+    : undefined;
+};
+
+const formatPromptTime = (timestamp: number | undefined) => {
+  if (timestamp === undefined) return "";
+  return new Intl.DateTimeFormat("hu-HU", {
+    timeZone: "Europe/Budapest",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).format(new Date(timestamp));
+};
+
 const formatSyncHealthTime = (value: string | null | undefined) => {
   if (!value) return "még nincs";
   const timestamp = Number(value);
@@ -917,6 +966,7 @@ const compactMessages = (messages: Message[]) => {
         // a stale streamed copy is merged back from the local cache.
         live: final ? false : Boolean(previous.live || message.live),
         final,
+        interrupted: message.interrupted ?? previous.interrupted,
         turnId: previous.turnId ?? message.turnId,
       };
     } else {
@@ -927,20 +977,58 @@ const compactMessages = (messages: Message[]) => {
 };
 
 // A Codex request cannot remain live across an app reload. Every persisted
-// assistant row is therefore a settled response (or an interrupted empty
-// placeholder), never an active stream. Normalizing all of them here also
-// repairs rows whose live flag was cleared by sync sanitization.
+// assistant row is therefore settled and never remains an active stream.
+const interruptedMarkerPattern = /(?:\n\s*){0,2}A válasz megszakítva\.?\s*$/i;
+
+// A persisted assistant row may still be a provisional failure marker when
+// the WebView was closed during the finalization race. A durable rollout can
+// replace it in Rust; anything that cannot be recovered must stay hidden
+// instead of rendering an empty/error answer panel on every startup.
+const persistedUnavailableAssistantPattern =
+  /^(?:A v\u00e1lasz megszak\u00edtva\.?|Nem siker\u00fclt a Codex-k\u00e9r\u00e9s:)/i;
+
+const isUnavailablePersistedAssistant = (message: Message) => {
+  if (message.role !== "assistant") return false;
+  const text = message.text.trim();
+  // A known failure marker is never useful content, even if an older client
+  // accidentally left its live bit set. Empty rows are hidden only after
+  // they have settled so an active stream can still render its spinner.
+  return (
+    persistedUnavailableAssistantPattern.test(text) ||
+    (!message.live && !text)
+  );
+};
+
+const dropUnrecoverablePersistedAnswers = (messages: Message[]) =>
+  messages.filter(
+    (message) =>
+      !isUnavailablePersistedAssistant(message) ||
+      Boolean(message.images?.length),
+  );
+
+const stripStaleInterruptionMarker = (message: Message): Message => {
+  if (message.role !== "assistant" || message.interrupted) return message;
+  const cleaned = message.text.replace(interruptedMarkerPattern, "").trimEnd();
+  return cleaned === message.text ? message : { ...message, text: cleaned };
+};
+
+// Settling a persisted row must never invent an interruption message for an
+// empty placeholder. Explicit user cancellations carry `interrupted: true`;
+// old rows without that flag are repaired by removing the stale marker.
 const settleInterruptedMessages = (messages: Message[]) =>
-  messages.map((message) =>
-    message.role === "assistant"
+  messages.map((message) => {
+    const normalized = stripStaleInterruptionMarker(message);
+    return normalized.role === "assistant"
       ? {
-          ...message,
-          text: message.text.trim() || "A válasz megszakítva.",
+          ...normalized,
+          text:
+            normalized.text.trim() ||
+            (normalized.interrupted ? "A válasz megszakítva." : ""),
           live: false,
           final: true,
         }
-      : message,
-  );
+      : normalized;
+  });
 
 const normalizedThreadStorageKey = (key: string) =>
   key
@@ -1132,11 +1220,11 @@ const messageMergeKey = (message: Message, index: number) =>
 const mergeMessages = (
   primary: Message[],
   secondary: Message[] = [],
-  settleInterrupted = true,
+  settleInterrupted = false,
 ) => {
   const merged: Message[] = [];
   const indexes = new Map<string, number>();
-  for (const message of [...primary, ...secondary]) {
+  for (const message of [...primary, ...secondary].map(stripStaleInterruptionMarker)) {
     const key = messageMergeKey(message, merged.length);
     const existingIndex = indexes.get(key);
     if (existingIndex === undefined) {
@@ -1150,18 +1238,31 @@ const mergeMessages = (
     // letting the sanitized remote copy hide the local live/final state.
     const existing = merged[existingIndex];
     const final = Boolean(existing.final || message.final);
+    const existingUnavailable = isUnavailablePersistedAssistant(existing);
+    const messageUnavailable = isUnavailablePersistedAssistant(message);
+    const mergedText =
+      existingUnavailable && !messageUnavailable
+        ? message.text
+        : !existingUnavailable && messageUnavailable
+          ? existing.text
+          : message.text.trim().length > existing.text.trim().length
+            ? message.text
+            : existing.text;
     merged[existingIndex] = {
       ...existing,
-      text:
-        message.text.trim().length > existing.text.trim().length
-          ? message.text
-          : existing.text,
+      time:
+        parseMessageTimestamp(existing.time) !== undefined ||
+        parseMessageTimestamp(message.time) === undefined
+          ? existing.time
+          : message.time,
+      text: mergedText,
       code: existing.code ?? message.code,
       // Prefer the settled lifecycle once either source knows that the
       // answer is final. Otherwise a stale SQLite/browser row can hide the
       // answer by keeping the merged row in the live state forever.
       live: final ? false : Boolean(existing.live || message.live),
       final,
+      interrupted: message.interrupted ?? existing.interrupted,
       itemId: existing.itemId ?? message.itemId,
       sequence: existing.sequence ?? message.sequence,
       turnId: message.turnId ?? existing.turnId,
@@ -1173,7 +1274,7 @@ const mergeMessages = (
           : message.images,
     };
   }
-  const compacted = compactMessages(merged);
+  const compacted = compactMessages(merged).map(stripStaleInterruptionMarker);
   return (settleInterrupted
     ? settleInterruptedMessages(compacted)
     : compacted
@@ -1191,16 +1292,18 @@ const loadThreadMessages = (key: string): Message[] => {
       (value) => Array.isArray(value) && value.length > 0,
     ) as Message[] | undefined;
     return Array.isArray(messages)
-      ? settleInterruptedMessages(
-          compactMessages(
-            messages.filter(
-              (message) =>
-                message &&
-                (message.role === "user" || message.role === "assistant") &&
-                typeof message.text === "string",
+      ? dropUnrecoverablePersistedAnswers(
+          settleInterruptedMessages(
+            compactMessages(
+              messages.filter(
+                (message) =>
+                  message &&
+                  (message.role === "user" || message.role === "assistant") &&
+                  typeof message.text === "string",
+              ),
             ),
-          ),
-        ).sort(compareMessages)
+          ).sort(compareMessages),
+        )
       : [];
   } catch {
     return [];
@@ -1578,16 +1681,49 @@ const planWithTiming = (
   const stepTimes: Record<string, PlanStepTiming> = {
     ...(previous.stepTimes ?? {}),
   };
-  for (const step of steps) {
+  for (const [index, step] of steps.entries()) {
     const previousTiming = stepTimes[step.id] ?? {};
+    const finished = step.status === "completed" || step.status === "error";
+    // A plan snapshot describes the state at `now`; it must not use the
+    // request's original start time as the timestamp for every new step.
+    // When a server sends a completed step without an earlier in-progress
+    // snapshot, use the previous step's completion (or the turn start) as a
+    // best available start instead of manufacturing a zero-length interval.
+    const precedingCompletion = steps
+      .slice(0, index)
+      .reverse()
+      .map((candidate) => stepTimes[candidate.id]?.completedAt)
+      .find((value): value is number => Number.isFinite(value));
     const startedAt =
       previousTiming.startedAt ??
-      (step.status !== "pending" ? now : undefined);
-    const finished = step.status === "completed" || step.status === "error";
+      (step.status === "inProgress"
+        ? now
+        : step.status === "completed" || step.status === "error"
+          ? precedingCompletion ?? previous.startedAt ?? now
+          : undefined);
     stepTimes[step.id] = {
       startedAt,
       completedAt:
         previousTiming.completedAt ?? (finished ? now : undefined),
+    };
+  }
+  const firstRealStep = steps.find(
+    (step) =>
+      step.id !== "client-pre-plan" && !step.id.startsWith("client-fallback"),
+  );
+  const preparationTiming = stepTimes["client-pre-plan"];
+  const firstRealStart = firstRealStep
+    ? stepTimes[firstRealStep.id]?.startedAt
+    : undefined;
+  if (
+    preparationTiming?.startedAt !== undefined &&
+    preparationTiming.completedAt === undefined &&
+    firstRealStart !== undefined &&
+    firstRealStart >= preparationTiming.startedAt
+  ) {
+    stepTimes["client-pre-plan"] = {
+      ...preparationTiming,
+      completedAt: firstRealStart,
     };
   }
   return {
@@ -2088,7 +2224,7 @@ const extractFilePath = (value: unknown, keyHint = ""): string | undefined => {
 const extractMentionedFilePaths = (text: string) => {
   const matches =
     text.match(
-      /(?:[A-Za-z]:[\\/])?(?:[\w.-]+[\\/])*[\w.-]+\.(?:py|js|jsx|ts|tsx|rs|go|java|cpp|c|h|json|yaml|yml|html|css|md|txt|toml|ini|sh|bat|ps1)\b/gi,
+      /(?:[A-Za-z]:[\\/][^<>\n`]*?\.(?:py|js|jsx|ts|tsx|rs|go|java|cpp|c|h|json|yaml|yml|html|css|md|txt|toml|ini|sh|bat|ps1|exe)\b|(?:[A-Za-z]:[\\/])?(?:[\w.-]+[\\/])*[\w.-]+\.(?:py|js|jsx|ts|tsx|rs|go|java|cpp|c|h|json|yaml|yml|html|css|md|txt|toml|ini|sh|bat|ps1|exe)\b)/gi,
     ) ?? [];
   return [...new Set(matches)];
 };
@@ -2503,44 +2639,181 @@ const textWithoutCodeBlocks = (text: string) =>
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 
-const inlineMarkdownPattern =
-  /(`[^`\n]+`|\*\*[^*\n]+\*\*|\[[^\]]+\]\([^\)]+\))/g;
+const localFileExtensions = new Set([
+  "7z",
+  "avi",
+  "bmp",
+  "bat",
+  "c",
+  "cmd",
+  "cpp",
+  "css",
+  "csv",
+  "doc",
+  "docx",
+  "dll",
+  "exe",
+  "gif",
+  "go",
+  "h",
+  "html",
+  "ico",
+  "ini",
+  "java",
+  "jpeg",
+  "jpg",
+  "js",
+  "json",
+  "jsx",
+  "lnk",
+  "log",
+  "md",
+  "mid",
+  "midi",
+  "mkv",
+  "mp3",
+  "mp4",
+  "pdf",
+  "ps1",
+  "ppt",
+  "pptx",
+  "py",
+  "rar",
+  "rs",
+  "sh",
+  "svg",
+  "toml",
+  "ts",
+  "tsx",
+  "txt",
+  "wav",
+  "webp",
+  "yaml",
+  "yml",
+  "xls",
+  "xlsx",
+  "xml",
+  "zip",
+]);
 
-const renderInlineMarkdown = (text: string): ReactNode[] => {
+const inlineMarkdownPattern =
+  /(`[^`\n]+`|\*\*[^*\n]+\*\*|\[[^\]]+\]\([^\)]+\)|(?:[A-Za-z]:[\\/]|\.{1,2}[\\/])[^<>\n`]*?\.[A-Za-z0-9]{1,12}\b|(?:[A-Za-z]:[\\/]|\.{1,2}[\\/]|\\\\)?[\w.-]+(?:[\\/][\w.-]+)*\.[A-Za-z0-9]{1,12}\b)/g;
+
+const normalizeFileReference = (value: string) => {
+  let candidate = value
+    .trim()
+    .replace(/^<|>$/g, "")
+    .replace(/^[([{\"']+|[\]},.;:!?\"']+$/g, "");
+  candidate = candidate
+    .replace(/^file:\/\/\//i, "")
+    .replace(/^file:\/\//i, "");
+  // </C:/...> is valid Markdown syntax, but the leading slash is not
+  // part of a Windows drive path.
+  candidate = candidate.replace(/^\/(?=[A-Za-z]:[\\/])/, "");
+  try {
+    candidate = decodeURIComponent(candidate);
+  } catch {
+    // Keep a literal percent sign when the response is not URI-encoded.
+  }
+  return candidate;
+};
+
+const isWindowsPathLike = (value: string) =>
+  /^[A-Za-z]:[\\/]/.test(value) ||
+  /^\\\\/.test(value) ||
+  /^\.{1,2}[\\/]/.test(value);
+
+const isLocalFileReference = (value: string) => {
+  const candidate = normalizeFileReference(value);
+  if (!candidate || /^(?:https?|mailto|data|file):\/\//i.test(candidate))
+    return false;
+  const extension = candidate.match(/\.([A-Za-z0-9]{1,12})$/)?.[1]?.toLowerCase();
+  if (!extension || !localFileExtensions.has(extension)) return false;
+  return (
+    candidate.length <= 400 &&
+    (candidate.includes("\\") ||
+      candidate.includes("/") ||
+      /^[A-Za-z]:/.test(candidate) ||
+      /^[\w.-]+\.[A-Za-z0-9]{1,12}$/.test(candidate))
+  );
+};
+
+const renderInlineMarkdown = (
+  text: string,
+  onFileClick?: FileClickHandler,
+): ReactNode[] => {
   const parts: ReactNode[] = [];
   let cursor = 0;
+  const fileButton = (value: string, label: string, key: string) => {
+    const path = normalizeFileReference(value);
+    if (!onFileClick || !isLocalFileReference(path)) return null;
+    return (
+      <button
+        type="button"
+        className="inline-file-link"
+        key={key}
+        title={`${path} – fájlműveletek`}
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          onFileClick(path, event.clientX, event.clientY);
+        }}
+      >
+        {label}
+      </button>
+    );
+  };
   for (const match of text.matchAll(inlineMarkdownPattern)) {
     const value = match[0];
     const index = match.index ?? 0;
     if (index > cursor) parts.push(text.slice(cursor, index));
     if (value.startsWith("`") && value.endsWith("`")) {
+      const code = value.slice(1, -1);
       parts.push(
-        <code className="inline-code" key={`inline-${index}`}>
-          {value.slice(1, -1)}
-        </code>,
+        fileButton(code, code, `file-inline-${index}`) ?? (
+          <code className="inline-code" key={`inline-${index}`}>
+            {code}
+          </code>
+        ),
       );
     } else if (value.startsWith("**")) {
       parts.push(<strong key={`bold-${index}`}>{value.slice(2, -2)}</strong>);
     } else {
       const link = value.match(/^\[([^\]]+)\]\(([^\)]+)\)$/);
-      if (link)
+      if (link) {
         parts.push(
-          <a
-            href={link[2]}
-            target="_blank"
-            rel="noreferrer"
-            key={`link-${index}`}
-          >
-            {link[1]}
-          </a>,
+          fileButton(link[2], link[1], `file-link-${index}`) ?? (
+            <a
+              href={link[2]}
+              target="_blank"
+              rel="noreferrer"
+              key={`link-${index}`}
+            >
+              {link[1]}
+            </a>
+          ),
         );
-      else parts.push(value);
+      } else {
+        const previousCharacter = text[index - 1] ?? "";
+        const renderedFile =
+          previousCharacter !== "/" && previousCharacter !== ":"
+            ? fileButton(value, value, `file-plain-${index}`)
+            : null;
+        parts.push(
+          renderedFile ?? value,
+        );
+      }
     }
     cursor = index + value.length;
   }
   if (cursor < text.length) parts.push(text.slice(cursor));
   return parts;
 };
+
+function InlineMarkdown({ text }: { text: string }) {
+  const onFileClick = useContext(FileActionContext);
+  return <>{renderInlineMarkdown(text, onFileClick ?? undefined)}</>;
+}
 
 const codeKeywords = new Set([
   "and",
@@ -3049,18 +3322,34 @@ function MessageRow({
   const final = isFinal ?? message.final;
   const isPending =
     message.role === "assistant" && !message.text.trim() && !final;
+  const promptTimestamp =
+    message.role === "user" ? messagePromptTimestamp(message) : undefined;
 
   return (
     <article
       className={`message ${message.role === "user" ? "user-message" : "assistant-message"}${final ? " is-final" : ""}${!showAvatar ? " no-avatar" : ""}`}
     >
-      <span
-        className={`avatar ${message.role === "user" ? "user-avatar" : "assistant-avatar"}`}
-      >
-        {showAvatar ? (message.role === "user" ? "D" : "m") : ""}
-      </span>
+      <div className="message-avatar-column">
+        <span
+          className={`avatar ${message.role === "user" ? "user-avatar" : "assistant-avatar"}`}
+        >
+          {showAvatar ? (message.role === "user" ? "D" : "m") : ""}
+        </span>
+        {showAvatar && promptTimestamp !== undefined && (
+          <time
+            className="message-prompt-time"
+            dateTime={new Date(promptTimestamp).toISOString()}
+            title="A prompt elküldésének ideje"
+          >
+            {formatPromptTime(promptTimestamp)}
+          </time>
+        )}
+      </div>
       <div className="message-content">
-        <div className={`message-body${isPending ? " is-pending" : ""}`}>
+        <div
+          className={`message-body${isPending ? " is-pending" : ""}`}
+          data-quote-selectable="true"
+        >
           {message.images && message.images.length > 0 && (
             <div className="message-images">
               {message.images.map((image) => (
@@ -3072,7 +3361,7 @@ function MessageRow({
               ))}
             </div>
           )}
-          {visibleText && <p>{renderInlineMarkdown(visibleText)}</p>}
+          {visibleText && <p><InlineMarkdown text={visibleText} /></p>}
           {isPending && (
             <div className="assistant-pending" aria-label="A min válaszol">
               <span />
@@ -3146,6 +3435,7 @@ function WorkLogCard({
       {expanded && (
         <div
           className="code-work-body"
+          data-quote-selectable="true"
           role="log"
           aria-live={streaming ? "polite" : undefined}
         >
@@ -3271,6 +3561,7 @@ function WorkFlowCard({
       {expanded && (
         <div
           className="work-flow-panel"
+          data-quote-selectable="true"
           role="region"
           aria-label="Munkafolyamat részletei"
           aria-live={streaming ? "polite" : undefined}
@@ -3451,7 +3742,12 @@ function PlanProgressCard({
         <span className="code-work-chevron">{expanded ? "⌃" : "⌄"}</span>
       </button>
       {hasSteps ? (
-        <div className="plan-step-list" role="list" aria-live="polite">
+        <div
+          className="plan-step-list"
+          data-quote-selectable="true"
+          role="list"
+          aria-live="polite"
+        >
           {plan.steps.map((step, index) => (
             <div
               className={`plan-step plan-step-${step.status}`}
@@ -3485,7 +3781,7 @@ function PlanProgressCard({
         </div>
       )}
       {expanded && (
-        <div className="plan-detail-panel">
+        <div className="plan-detail-panel" data-quote-selectable="true">
           {plan.explanation && (
             <p className="plan-explanation">
               <strong>Miért ez a felbontás?</strong>
@@ -3536,16 +3832,29 @@ function TurnProgressCard({
   onToggle,
   answer,
 }: TurnProgressCardProps) {
+  const hasPlanStepEvidence = (stepId: string) =>
+    activities.some((activity) => activity.planStepId === stepId) ||
+    commentary.some((entry) => entry.stepId === stepId);
   const plannedSteps = plan.steps
     .filter(
       (step) =>
         step.id !== "client-pre-plan" && !step.id.startsWith("client-fallback"),
     )
-    .map((step) =>
-      !streaming && step.status !== "error"
-        ? { ...step, status: "completed" as const }
-        : step,
-    );
+    .map((step) => {
+      const timing = plan.stepTimes?.[step.id];
+      const hasZeroStoredTiming =
+        timing?.startedAt !== undefined &&
+        timing?.completedAt !== undefined &&
+        timing.completedAt <= timing.startedAt;
+      // Old clients marked every planned row as completed at the same
+      // request-start timestamp. Rows with no trace evidence are recovered as
+      // pending so historical cards do not claim work that never ran.
+      return step.status === "completed" &&
+        hasZeroStoredTiming &&
+        !hasPlanStepEvidence(step.id)
+        ? { ...step, status: "pending" as const }
+        : step;
+    });
   const fallbackStep: PlanStep = {
     id: "client-pre-plan",
     step: "0. Terv előkészítése és feladatértelmezése",
@@ -3648,6 +3957,24 @@ function TurnProgressCard({
   const orderedActivities = [...activities].sort(
     (left, right) => left.id - right.id,
   );
+  const evidenceTimesForStep = (stepId: string) => {
+    const activityTimes = orderedActivities
+      .filter((activity) =>
+        stepId === fallbackStep.id
+          ? isPrePlanStepId(activity.planStepId)
+          : activity.planStepId === stepId,
+      )
+      .map((activity) => activity.id)
+      .filter((value) => Number.isFinite(value) && value > 1e12);
+    const commentaryTimes = commentary
+      .filter((entry) => commentaryBelongsToStep(entry, stepId))
+      .map((entry) => entry.sequence)
+      .filter(
+        (value): value is number =>
+          typeof value === "number" && Number.isFinite(value) && value > 1e12,
+      );
+    return [...activityTimes, ...commentaryTimes].sort((left, right) => left - right);
+  };
   const stepActivities = orderedActivities.filter((activity) =>
     selectedStep.id === fallbackStep.id
       ? isPrePlanStepId(activity.planStepId)
@@ -3817,16 +4144,11 @@ function TurnProgressCard({
   const recordedStepEnds = Object.values(plan.stepTimes ?? {})
     .map((timing) => timing.completedAt)
     .filter((value): value is number => Number.isFinite(value));
-  const activityTimes = activities
-    .map((activity) => activity.id)
-    .filter((value) => Number.isFinite(value));
   const inferredPlanStartedAt = Math.min(
     ...recordedStepStarts,
-    ...(activityTimes.length > 0 ? [Math.min(...activityTimes)] : []),
   );
   const inferredPlanCompletedAt = Math.max(
     ...recordedStepEnds,
-    ...(activityTimes.length > 0 ? [Math.max(...activityTimes)] : []),
   );
   const startedAtForDisplay =
     plan.startedAt ??
@@ -3837,17 +4159,12 @@ function TurnProgressCard({
     (!streaming && Number.isFinite(inferredPlanCompletedAt)
       ? inferredPlanCompletedAt
       : undefined);
-  const overallElapsed = startedAtForDisplay
-    ? formatElapsed(
-        (completedAtForDisplay ?? (streaming ? clockNow : startedAtForDisplay)) -
-          startedAtForDisplay,
-      )
-    : !streaming && plan.steps.length > 0
-      ? "0:00"
+  const elapsedEnd = streaming ? clockNow : completedAtForDisplay;
+  const overallElapsed =
+    startedAtForDisplay !== undefined && elapsedEnd !== undefined
+      ? formatElapsed(Math.max(0, elapsedEnd - startedAtForDisplay))
       : "";
   const hasAnswer = Boolean(answer?.text.trim());
-  const showAnswer = streaming || hasAnswer;
-  const answerPending = streaming;
   const selectStep = (stepId: string) => {
     followActiveStepRef.current = false;
     setSelectedStepId(stepId);
@@ -3867,7 +4184,7 @@ function TurnProgressCard({
   const stepIndicator = (step: PlanStep) => {
     const currentStatus = displayStatus(step);
     if (currentStatus === "inProgress")
-      return <span className="trace-step-spinner" aria-label="Fut" />;
+      return <span className="trace-step-active-marker" aria-label="Fut">›</span>;
     if (currentStatus === "error")
       return <span className="trace-step-error-indicator">!</span>;
     if (currentStatus !== "completed") return null;
@@ -3891,10 +4208,8 @@ function TurnProgressCard({
   const stepElapsedFor = (step: PlanStep) => {
     const timing = plan.stepTimes?.[step.id];
     const currentStatus = displayStatus(step);
-    let startedAt =
-      timing?.startedAt ??
-      (currentStatus === "inProgress" ? startedAtForDisplay : undefined);
-    let fallbackEnd: number | undefined;
+    let startedAt = timing?.startedAt;
+    let end = timing?.completedAt;
     if (
       startedAt === undefined &&
       step.id === fallbackStep.id &&
@@ -3903,21 +4218,51 @@ function TurnProgressCard({
       // The synthetic preparation row is not part of the model-provided
       // plan. Its end is the moment the first real plan step starts.
       startedAt = startedAtForDisplay;
-      fallbackEnd =
+      end =
         plan.stepTimes?.[plannedSteps[0]?.id ?? ""]?.startedAt ??
-        (currentStatus === "inProgress" ? clockNow : plan.completedAt);
+        (plannedSteps[0]
+          ? evidenceTimesForStep(plannedSteps[0].id)[0]
+          : undefined) ??
+        (currentStatus === "inProgress" ? clockNow : completedAtForDisplay);
     }
-    if (startedAt === undefined)
-      return !streaming && plan.steps.length > 0 ? "0:00" : "";
-    const end =
-      timing?.completedAt ??
-      fallbackEnd ??
-      (currentStatus === "inProgress"
-        ? clockNow
-        : !streaming
-          ? completedAtForDisplay
-          : undefined);
-    return end === undefined ? "" : formatElapsed(end - startedAt);
+    if (startedAt === undefined && currentStatus === "inProgress")
+      startedAt = startedAtForDisplay;
+    if (startedAt === undefined) return "";
+    if (end === undefined && currentStatus === "inProgress") end = clockNow;
+    const stepIndex = steps.findIndex((candidate) => candidate.id === step.id);
+    const nextStep = stepIndex >= 0 ? steps[stepIndex + 1] : undefined;
+    const nextStepEvidenceStart = nextStep
+      ? evidenceTimesForStep(nextStep.id)[0]
+      : undefined;
+    const evidenceTimes = evidenceTimesForStep(step.id);
+    const hasInvalidStoredTiming =
+      end !== undefined && end <= startedAt;
+    if (hasInvalidStoredTiming && evidenceTimes.length > 0) {
+      // Older snapshots recorded the request start for both sides of every
+      // step. Recover a useful interval from the durable activity timeline.
+      startedAt = evidenceTimes[0];
+      end =
+        currentStatus === "inProgress"
+          ? clockNow
+          : nextStepEvidenceStart ??
+            plan.stepTimes?.[nextStep?.id ?? ""]?.startedAt ??
+            completedAtForDisplay ??
+            evidenceTimes.at(-1);
+    }
+    if (
+      hasInvalidStoredTiming &&
+      evidenceTimes.length === 0 &&
+      currentStatus !== "inProgress"
+    )
+      return "";
+    if (end === undefined && currentStatus === "completed") {
+      end = nextStep
+        ? plan.stepTimes?.[nextStep.id]?.startedAt
+        : completedAtForDisplay;
+    }
+    return end === undefined
+      ? ""
+      : formatElapsed(Math.max(0, end - startedAt));
   };
   const openInlineDiff = (activity: CodeActivity) =>
     setInlineDiff(inlineCodeDiffForActivity(activity));
@@ -3927,59 +4272,52 @@ function TurnProgressCard({
       className={`turn-progress-card trace-card${streaming ? " is-live" : ""}`}
       aria-label="Lépések és gondolkodás"
     >
-      {showAnswer && (
-        <section className="turn-progress-answer" aria-label="Válasz">
-          <div className="turn-progress-answer-heading">
-            VÁLASZ
-            {answerPending && <span className="trace-answer-spinner" aria-label="Válasz készül" />}
-          </div>
-          <div className="turn-progress-answer-body">
-            {hasAnswer ? (
+      {(hasAnswer || streaming) && (
+        <section
+        className="turn-progress-answer"
+        data-quote-selectable="true"
+        aria-label="Válasz"
+      >
+        <div className="turn-progress-answer-body">
+          <div className="trace-answer-line">
+            {hasAnswer && (
               <p>
-                {renderInlineMarkdown(textWithoutCodeBlocks(answer?.text ?? ""))}
+                <InlineMarkdown text={textWithoutCodeBlocks(answer?.text ?? "")} />
               </p>
-            ) : (
-              <div className="trace-answer-pending">
-                <span className="trace-answer-spinner" aria-hidden="true" />
-              </div>
+            )}
+            {streaming && (
+              <span className="trace-answer-spinner" aria-label="Válasz készül" />
             )}
           </div>
+          <button
+            type="button"
+            className="trace-collapse"
+            onClick={onToggle}
+            aria-expanded={expanded}
+            aria-label={expanded ? "Trace összecsukása" : "Trace kinyitása"}
+          >
+            {expanded ? "⌃" : "⌄"}
+          </button>
+        </div>
         </section>
       )}
 
-      <div className="trace-step-bar">
-        <button
-          type="button"
-          className="trace-collapse"
-          onClick={onToggle}
-          aria-expanded={expanded}
-          aria-label={
-            expanded
-              ? "Lépések és gondolkodás összecsukása"
-              : "Lépések és gondolkodás kinyitása"
-          }
-        >
-          {expanded ? "⌃" : "⌄"}
-        </button>
-        <strong className="trace-step-label">
-          LÉPÉSEK
-          {overallElapsed && (
-            <span className="trace-elapsed" aria-label="Teljes eltelt idő">
-              {overallElapsed}
-            </span>
-          )}
-        </strong>
-      </div>
-
-      {expanded && (
-        <div className="trace-content">
+      <div
+        className={`trace-content${expanded ? " is-expanded" : ""}`}
+        aria-hidden={!expanded}
+      >
           <section className="trace-steps-panel" aria-label="Lépések listája">
-            <div className="trace-step-list" role="list">
+            <div
+              className="trace-step-list"
+              data-quote-selectable="true"
+              role="list"
+            >
               {steps.map((step) => {
                 const disabled =
                   streaming &&
                   step.status === "pending" &&
                   step.id !== activeStep.id;
+                const elapsed = stepElapsedFor(step);
                 return (
                   <button
                     type="button"
@@ -3994,21 +4332,23 @@ function TurnProgressCard({
                       {stepIndicator(step)}
                     </span>
                     <span className="trace-step-name">{step.step}</span>
-                    {stepElapsedFor(step) && (
-                      <span className="trace-step-elapsed">
-                        {stepElapsedFor(step)}
-                      </span>
-                    )}
+                    {elapsed && <span className="trace-step-elapsed">{elapsed}</span>}
                   </button>
                 );
               })}
             </div>
+            {overallElapsed && (
+              <div className="trace-total-elapsed" aria-label="Teljes gondolkodási idő">
+                <span>Összesen</span>
+                <time>{overallElapsed}</time>
+              </div>
+            )}
           </section>
           <section
             className="trace-thinking-panel"
+            data-quote-selectable="true"
             aria-label="Gondolkodás menete"
           >
-            <div className="trace-thinking-heading">GONDOLKODÁS MENETE</div>
             {thinkingEntries.length > 0 ? (
               <ul className="trace-thinking-list" ref={thinkingListRef}>
                 {thinkingEntries.map((entry) => (
@@ -4031,7 +4371,7 @@ function TurnProgressCard({
                         >
                           <span className="trace-thinking-bullet">•</span>
                           <span className="trace-internal-preview">
-                            {renderInlineMarkdown(entry.body)}
+                            <InlineMarkdown text={entry.body} />
                           </span>
                           <span className="trace-internal-caret" aria-hidden="true">
                             {expandedInternalEntryId === entry.id ? "▾" : "▸"}
@@ -4051,7 +4391,10 @@ function TurnProgressCard({
                         {expandedInternalEntryId === entry.id &&
                           entry.internalHistory &&
                           entry.internalHistory.length > 0 && (
-                            <div className="trace-internal-history-body">
+                            <div
+                              className="trace-internal-history-body"
+                              data-quote-selectable="true"
+                            >
                               {entry.internalHistory.map((line, index) => (
                                 <div key={`${entry.id}-history-${index}`}>{line}</div>
                               ))}
@@ -4061,7 +4404,7 @@ function TurnProgressCard({
                     ) : (
                       <>
                         <span className="trace-thinking-bullet">•</span>
-                        <p>{renderInlineMarkdown(entry.body)}</p>
+                        <p><InlineMarkdown text={entry.body} /></p>
                         {entry.codeActivity && (
                           <button
                             type="button"
@@ -4080,13 +4423,7 @@ function TurnProgressCard({
               </ul>
             ) : (
               <div className="trace-thinking-empty">
-                {streaming ? (
-                  <>
-                    <span className="typing-dot" />
-                    <span className="typing-dot" />
-                    <span className="typing-dot" />
-                  </>
-                ) : (
+                {!streaming && (
                   <span className="trace-thinking-empty-text">
                     Ehhez a lépéshez nem érkezett külön gondolkodási napló.
                   </span>
@@ -4095,7 +4432,7 @@ function TurnProgressCard({
             )}
           </section>
         </div>
-      )}
+
 
       {inlineDiff && (
         <div
@@ -4168,8 +4505,8 @@ function LiveResponseCard({ message }: { message?: Message }) {
         <strong>Részeredmény</strong>
         <span>nem végleges</span>
       </div>
-      <div className="live-response-body">
-        {visibleText && <p>{renderInlineMarkdown(visibleText)}</p>}
+      <div className="live-response-body" data-quote-selectable="true">
+        {visibleText && <p><InlineMarkdown text={visibleText} /></p>}
         {hasCode && (
           <div className="live-response-code-hint">
             Kódrészlet érkezik · megnyitható a munkafolyamatban
@@ -4485,6 +4822,7 @@ function CompactWorkFlowCard({
       {expanded && (
         <div
           className="work-flow-panel"
+          data-quote-selectable="true"
           role="region"
           aria-label="Munkafolyamat részletei"
           aria-live={streaming ? "polite" : undefined}
@@ -4639,7 +4977,7 @@ function App() {
   const [messages, setMessages] = useState<Message[]>(
     isTauri ? [] : loadInitialMessages,
   );
-  const [input, setInput] = useState("");
+  const [composerQuote, setComposerQuote] = useState<string | null>(null);
   const [pendingImages, setPendingImages] = useState<PendingImageAttachment[]>(
     [],
   );
@@ -4653,10 +4991,10 @@ function App() {
         "min-reading-settings-version",
         READING_SETTINGS_VERSION,
       );
-      return { fontSize: "8px", lineHeight: "1.00" };
+      return { fontSize: "10px", lineHeight: "1.00" };
     }
     return {
-      fontSize: localStorage.getItem("min-font-size") ?? "8px",
+      fontSize: localStorage.getItem("min-font-size") ?? "10px",
       lineHeight: localStorage.getItem("min-line-height") ?? "1.00",
     };
   });
@@ -4719,8 +5057,20 @@ function App() {
   const [agentApplyBusy, setAgentApplyBusy] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
+  // The model turn can be complete while the native command is still
+  // finalizing the workspace snapshot. Keep the request locked during that
+  // short phase, but remove the stop affordance so a late click cannot cancel
+  // an answer that has already arrived.
+  const [turnCompletedRequestId, setTurnCompletedRequestId] = useState<
+    string | null
+  >(null);
   const [isAtBottom, setIsAtBottom] = useState(true);
   const [toast, setToast] = useState("");
+  const [fileActionMenu, setFileActionMenu] =
+    useState<FileActionMenuState | null>(null);
+  const [selectionQuote, setSelectionQuote] = useState<SelectionQuote | null>(
+    null,
+  );
   const [appDialog, setAppDialog] = useState<AppDialog | null>(null);
   const [syncReady, setSyncReady] = useState(!isTauri);
   const [syncWriteEnabled, setSyncWriteEnabled] = useState(!isTauri);
@@ -4771,6 +5121,47 @@ function App() {
   );
   const activeProjectPath = activeProjectData?.path ?? workspaceRoot;
   const threadKey = `${activeProjectPath}/${activeThread}`;
+
+  useEffect(() => {
+    const updateSelectionQuote = () => {
+      const selection = window.getSelection();
+      if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+        setSelectionQuote(null);
+        return;
+      }
+      const text = selection.toString().replace(/\u00a0/g, " ").trim();
+      if (!text || text.length > 12_000) {
+        setSelectionQuote(null);
+        return;
+      }
+      const range = selection.getRangeAt(0);
+      const container =
+        range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
+          ? (range.commonAncestorContainer as Element)
+          : range.commonAncestorContainer.parentElement;
+      if (!container?.closest("[data-quote-selectable=\"true\"]")) {
+        setSelectionQuote(null);
+        return;
+      }
+      const rect = range.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) return;
+      setSelectionQuote((current) =>
+        current?.text === text &&
+        Math.abs(current.x - rect.right) < 1 &&
+        Math.abs(current.y - Math.max(8, rect.top - 8)) < 1
+          ? current
+          : {
+              text,
+              x: Math.min(window.innerWidth - 42, Math.max(8, rect.right + 8)),
+              y: Math.min(window.innerHeight - 42, Math.max(8, rect.top - 8)),
+            },
+      );
+    };
+    document.addEventListener("selectionchange", updateSelectionQuote);
+    return () =>
+      document.removeEventListener("selectionchange", updateSelectionQuote);
+  }, []);
+
   const messageKeyRef = useRef(threadKey);
   const workLogKeyRef = useRef<string | null>(null);
   const projectsRef = useRef(projects);
@@ -4801,29 +5192,45 @@ function App() {
   const planTextBufferRef = useRef<Record<string, string>>({});
   const messageStreamRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const quoteInputRef = useRef<HTMLTextAreaElement>(null);
+  const inputDraftRef = useRef("");
+  const quoteInstructionRef = useRef("");
   const imageInputRef = useRef<HTMLInputElement>(null);
   const submitBusyRef = useRef(false);
   const composerScopeRef = useRef(threadKey);
   useEffect(() => {
     if (composerScopeRef.current === threadKey) return;
     composerScopeRef.current = threadKey;
+    inputDraftRef.current = "";
+    quoteInstructionRef.current = "";
+    if (inputRef.current) inputRef.current.value = "";
+    if (quoteInputRef.current) quoteInputRef.current.value = "";
     setPendingImages([]);
+    setComposerQuote(null);
   }, [threadKey]);
-  useEffect(() => {
-    const textarea = inputRef.current;
+  const resizeComposerTextarea = (textarea: HTMLTextAreaElement | null) => {
     if (!textarea) return;
-    const maxHeight = Math.min(260, Math.max(150, Math.round(window.innerHeight * 0.32)));
+    const maxHeight = Math.min(
+      260,
+      Math.max(150, Math.round(window.innerHeight * 0.32)),
+    );
     textarea.style.height = "auto";
     const nextHeight = Math.min(textarea.scrollHeight, maxHeight);
     textarea.style.height = `${Math.max(43, nextHeight)}px`;
-    textarea.style.overflowY = textarea.scrollHeight > maxHeight ? "auto" : "hidden";
-  }, [input]);
+    textarea.style.overflowY =
+      textarea.scrollHeight > maxHeight ? "auto" : "hidden";
+  };
+  useEffect(() => {
+    resizeComposerTextarea(inputRef.current);
+    resizeComposerTextarea(quoteInputRef.current);
+  }, [composerQuote, pendingImages, threadKey]);
   const shouldStickToBottom = useRef(true);
   const autoScrollFrameRef = useRef<number | null>(null);
   const activeRequestIdRef = useRef<string | null>(null);
   const completionSoundRequestsRef = useRef<Set<string>>(new Set());
   const activeLiveMessageIdRef = useRef<string | null>(null);
   const preparingRequestIdRef = useRef<string | null>(null);
+  const turnCompletedRequestIdRef = useRef<string | null>(null);
   const syncActionBusyRef = useRef(false);
   const cancelledRequestIdsRef = useRef<Set<string>>(new Set());
   const activeProjectPathRef = useRef(activeProjectPath);
@@ -4846,6 +5253,12 @@ function App() {
       return resolved;
     });
   };
+
+  useEffect(() => {
+    const sanitized = messages.map(stripStaleInterruptionMarker);
+    if (sanitized.some((message, index) => message.text !== messages[index]?.text))
+      commitMessages(sanitized);
+  }, [messages]);
 
   const maxKnownTimelineSequence = [
     Date.now(),
@@ -4915,14 +5328,51 @@ function App() {
     if (!stepId) return;
     const current = activePlanRef.current;
     const existing = current.stepTimes?.[stepId];
-    if (existing?.startedAt !== undefined) return;
+    const activeStep = current.steps.find(
+      (step) => step.status === "inProgress" && step.id !== stepId,
+    );
+    const stepTimes = { ...(current.stepTimes ?? {}) };
+    if (activeStep) {
+      const activeTiming = stepTimes[activeStep.id];
+      if (activeTiming?.startedAt !== undefined) {
+        stepTimes[activeStep.id] = {
+          ...activeTiming,
+          completedAt: activeTiming.completedAt ?? now,
+        };
+      }
+    }
+    if (
+      stepId !== "client-pre-plan" &&
+      stepTimes["client-pre-plan"]?.startedAt !== undefined
+    ) {
+      const preparationTiming = stepTimes["client-pre-plan"];
+      stepTimes["client-pre-plan"] = {
+        ...preparationTiming,
+        completedAt: preparationTiming.completedAt ?? now,
+      };
+    }
+    const nextSteps = current.steps.map((step) => {
+      if (activeStep && step.id === activeStep.id)
+        return { ...step, status: "completed" as const };
+      if (step.id === stepId && step.status === "pending")
+        return { ...step, status: "inProgress" as const };
+      return step;
+    });
+    if (existing?.startedAt !== undefined && !activeStep) {
+      // The activity is another event from the same step. Do not rewrite its
+      // original start time or create a new React plan snapshot.
+      return;
+    }
+    stepTimes[stepId] = {
+      ...existing,
+      startedAt: existing?.startedAt ?? now,
+      completedAt: existing?.completedAt,
+    };
     updatePlanState({
       ...current,
+      steps: nextSteps,
       startedAt: current.startedAt ?? now,
-      stepTimes: {
-        ...(current.stepTimes ?? {}),
-        [stepId]: { ...existing, startedAt: now },
-      },
+      stepTimes,
     });
   };
 
@@ -5404,7 +5854,9 @@ function App() {
         id: remote?.id ?? cached?.id,
         projectId: project.id,
         title,
-        messages: mergeMessages(remote?.messages ?? [], localMessages, false),
+        messages: dropUnrecoverablePersistedAnswers(
+          mergeMessages(remote?.messages ?? [], localMessages, false),
+        ),
         workItems: mergeWorkItems(remote?.workItems ?? [], localWorkItems),
         planHistory: mergePlanHistory(
           remote?.planHistory ?? {},
@@ -5899,9 +6351,11 @@ function App() {
               id: databaseConversation?.id,
               projectId: project.id,
               title,
-              messages: mergeMessages(
-                databaseConversation?.messages ?? [],
-                localMessages,
+              messages: dropUnrecoverablePersistedAnswers(
+                mergeMessages(
+                  databaseConversation?.messages ?? [],
+                  localMessages,
+                ),
               ),
               workItems: mergeWorkItems(
                 databaseConversation?.workItems ?? [],
@@ -5970,9 +6424,11 @@ function App() {
               id: databaseConversation?.id,
               projectId: local.id,
               title,
-              messages: mergeMessages(
-                databaseConversation?.messages ?? [],
-                messages,
+              messages: dropUnrecoverablePersistedAnswers(
+                mergeMessages(
+                  databaseConversation?.messages ?? [],
+                  messages,
+                ),
               ),
               workItems: mergeWorkItems(
                 databaseConversation?.workItems ?? [],
@@ -6415,10 +6871,12 @@ function App() {
               // Plans and commentary belong to the same turn and must be
               // protected by the same merge; replacing only those two with
               // the pulled snapshot made LÉPÉSEK vanish until the next event.
-              messages: mergeMessages(
-                selectedConversation.messages,
-                messagesRef.current,
-                false,
+              messages: dropUnrecoverablePersistedAnswers(
+                mergeMessages(
+                  selectedConversation.messages,
+                  messagesRef.current,
+                  false,
+                ),
               ),
               workItems: mergeWorkItems(
                 selectedConversation.workItems ?? [],
@@ -6987,6 +7445,8 @@ function App() {
         setModelMenuOpen(false);
         setAppDialog(null);
         setExpandedWorkLogs({});
+        setFileActionMenu(null);
+        setSelectionQuote(null);
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -7004,6 +7464,19 @@ function App() {
     document.addEventListener("pointerdown", closeOverflowMenu);
     return () => document.removeEventListener("pointerdown", closeOverflowMenu);
   }, []);
+
+  useEffect(() => {
+    if (!fileActionMenu) return;
+    const closeFileMenu = (event: PointerEvent) => {
+      if (
+        !(event.target instanceof Element) ||
+        !event.target.closest(".file-action-menu")
+      )
+        setFileActionMenu(null);
+    };
+    document.addEventListener("pointerdown", closeFileMenu);
+    return () => document.removeEventListener("pointerdown", closeFileMenu);
+  }, [fileActionMenu]);
 
   useEffect(() => {
     if (!isTauri) return;
@@ -7143,12 +7616,37 @@ function App() {
         const phase =
           (itemId ? agentMessagePhasesRef.current[itemId] : undefined) ??
           firstString(item.phase, params.phase);
-        if (itemId && phase !== "final_answer")
+        if (phase === "final_answer") {
+          // Some app-server versions send the complete final item without
+          // deltas. Commit it as soon as `item/completed` arrives so a slow
+          // snapshot finalization (or an app restart during it) cannot turn a
+          // valid answer into an empty interrupted placeholder.
+          const completedText = firstString(item.text, params.text);
+          if (completedText) {
+            const liveMessageId = activeLiveMessageIdRef.current;
+            commitMessages((current) =>
+              current.map((message) =>
+                message.id === liveMessageId && message.role === "assistant"
+                  ? {
+                      ...message,
+                      itemId: itemId ?? message.itemId,
+                      turnId: message.turnId ?? uiTurnId,
+                      text:
+                        message.text.trim().length >= completedText.trim().length
+                          ? message.text
+                          : completedText,
+                    }
+                  : message,
+              ),
+            );
+          }
+        } else if (itemId) {
           setCommentaryEntries((current) =>
             current.map((entry) =>
               entry.itemId === itemId ? { ...entry, status: "done" } : entry,
             ),
           );
+        }
       }
 
       if (codexEvent.eventType === "turn/plan/updated") {
@@ -7165,7 +7663,7 @@ function App() {
               explanation: snapshot.explanation || current.explanation,
             },
             snapshot.steps,
-            activeTurnTimingRef.current.startedAt ?? Date.now(),
+            Date.now(),
           );
           const targetStep =
             next.steps.find((step) => step.status === "inProgress") ??
@@ -7197,7 +7695,7 @@ function App() {
                   turnId: activePlanRef.current.turnId ?? uiTurnId,
                 },
                 steps,
-                activeTurnTimingRef.current.startedAt ?? Date.now(),
+                Date.now(),
               ),
             );
         }
@@ -7265,24 +7763,27 @@ function App() {
               explanation: current.explanation,
             },
             steps,
-            current.startedAt ?? activeTurnTimingRef.current.startedAt ?? Date.now(),
+            Date.now(),
           ),
         );
         setWatchdogMessage("");
         setCodeStatus("dolgozik");
       } else if (codexEvent.eventType === "turn/completed") {
+        const completedRequestId = activeRequestIdRef.current;
+        if (completedRequestId) {
+          turnCompletedRequestIdRef.current = completedRequestId;
+          setTurnCompletedRequestId(completedRequestId);
+        }
         const completedAt = Date.now();
         const completedSteps = activePlanRef.current.steps.map((step) =>
-          step.status === "error"
-            ? step
-            : { ...step, status: "completed" as const },
+          step.status === "inProgress"
+            ? { ...step, status: "completed" as const }
+            : step,
         );
         const completedPlan = planWithTiming(
           activePlanRef.current,
           completedSteps,
-          activePlanRef.current.startedAt ??
-            activeTurnTimingRef.current.startedAt ??
-            completedAt,
+          completedAt,
           completedAt,
         );
         updatePlanState(completedPlan);
@@ -7311,6 +7812,72 @@ function App() {
   const notify = (message: string, sound?: AppSound) => {
     setToast(message);
     if (sound) playAppSound(sound);
+  };
+
+  const handleFileClick: FileClickHandler = (path, x, y) => {
+    setSelectionQuote(null);
+    setFileActionMenu({
+      path,
+      x: Math.min(Math.max(12, x), Math.max(12, window.innerWidth - 236)),
+      y: Math.min(Math.max(12, y + 8), Math.max(12, window.innerHeight - 132)),
+    });
+  };
+
+  const handleLocalLinkClickCapture = (
+    event: React.MouseEvent<HTMLDivElement>,
+  ) => {
+    const element =
+      event.target instanceof Element
+        ? event.target.closest("a")
+        : null;
+    if (!element) return;
+    const path = normalizeFileReference(element.getAttribute("href") ?? "");
+    if (!path || (!isWindowsPathLike(path) && !isLocalFileReference(path)))
+      return;
+    event.preventDefault();
+    event.stopPropagation();
+    handleFileClick(path, event.clientX, event.clientY);
+  };
+
+  const closeFileActionMenu = () => setFileActionMenu(null);
+
+  const runSelectedFile = async () => {
+    const target = fileActionMenu?.path;
+    if (!target) return;
+    closeFileActionMenu();
+    try {
+      await invoke("run_project_file", {
+        cwd: activeProjectPathRef.current || activeProjectPath,
+        path: target,
+      });
+      notify(`Elindítva: ${target}`);
+    } catch (error) {
+      notify(`Nem sikerült futtatni: ${String(error)}`, "notify");
+    }
+  };
+
+  const openSelectedFileFolder = async () => {
+    const target = fileActionMenu?.path;
+    if (!target) return;
+    closeFileActionMenu();
+    try {
+      await invoke("open_project_folder", {
+        cwd: activeProjectPathRef.current || activeProjectPath,
+        path: target,
+      });
+      notify(`Mappa megnyitva: ${target}`);
+    } catch (error) {
+      notify(`Nem sikerült megnyitni a mappát: ${String(error)}`, "notify");
+    }
+  };
+
+  const insertSelectionQuote = () => {
+    const selected = selectionQuote?.text.trim();
+    if (!selected) return;
+    setComposerQuote(selected);
+    quoteInstructionRef.current = "";
+    setSelectionQuote(null);
+    window.requestAnimationFrame(() => quoteInputRef.current?.focus());
   };
 
   const blockConversationMutationDuringStream = () => {
@@ -7390,12 +7957,13 @@ function App() {
       const textarea = event.currentTarget;
       const start = textarea.selectionStart;
       const end = textarea.selectionEnd;
-      const next = `${input.slice(0, start)}${pastedText}${input.slice(end)}`;
-      setInput(next);
+      textarea.setRangeText(pastedText, start, end, "end");
+      if (textarea === quoteInputRef.current)
+        quoteInstructionRef.current = textarea.value;
+      else inputDraftRef.current = textarea.value;
       requestAnimationFrame(() => {
-        const position = start + pastedText.length;
         textarea.focus();
-        textarea.setSelectionRange(position, position);
+        resizeComposerTextarea(textarea);
       });
     }
     void addImageFiles(imageFiles);
@@ -7951,15 +8519,25 @@ function App() {
         current.steps.map((step) =>
           step.status === "inProgress" ? { ...step, status } : step,
         ),
-        current.startedAt ?? activeTurnTimingRef.current.startedAt ?? now,
+        now,
         now,
       ),
     );
   };
 
+  const activeTurnHasCompleted = Boolean(
+    activeRequestIdRef.current &&
+      turnCompletedRequestId === activeRequestIdRef.current,
+  );
+
   const stopGeneration = async () => {
     const requestId = activeRequestIdRef.current;
-    if (!requestId || isCancelling) return;
+    if (
+      !requestId ||
+      isCancelling ||
+      turnCompletedRequestIdRef.current === requestId
+    )
+      return;
     const liveMessageId = activeLiveMessageIdRef.current;
     const finalizeCancellation = () => {
       cancelledRequestIdsRef.current.add(requestId);
@@ -7971,12 +8549,13 @@ function App() {
           message.id === liveMessageId
             ? {
                 ...message,
-                text: message.text.trim()
-                  ? `${message.text.trimEnd()}\n\nA válasz megszakítva.`
+                text: stripStaleInterruptionMarker(message).text.trim()
+                  ? `${stripStaleInterruptionMarker(message).text.trimEnd()}\n\nA válasz megszakítva.`
                   : "A válasz megszakítva.",
                 turnId: message.turnId ?? activeTurnIdRef.current,
                 live: false,
                 final: true,
+                interrupted: true,
               }
             : message,
         ),
@@ -8011,14 +8590,15 @@ function App() {
   };
 
   useEffect(() => {
-    document.documentElement.classList.toggle("is-streaming", isStreaming);
+    const showingStop = isStreaming && !activeTurnHasCompleted;
+    document.documentElement.classList.toggle("is-streaming", showingStop);
     document.documentElement.classList.toggle("is-cancelling", isCancelling);
     document
       .querySelectorAll<HTMLButtonElement>(".send-button")
       .forEach((button) => {
         button.setAttribute(
           "aria-label",
-          isStreaming ? "Gondolkodás leállítása" : "Üzenet küldése",
+          showingStop ? "Gondolkodás leállítása" : "Üzenet küldése",
         );
       });
     return () => {
@@ -8027,11 +8607,16 @@ function App() {
         "is-cancelling",
       );
     };
-  }, [isStreaming, isCancelling]);
+  }, [isStreaming, isCancelling, activeTurnHasCompleted]);
 
   useEffect(() => {
     const onSendButtonClick = (event: MouseEvent) => {
-      if (!isStreaming || !(event.target instanceof Element)) return;
+      if (
+        !isStreaming ||
+        activeTurnHasCompleted ||
+        !(event.target instanceof Element)
+      )
+        return;
       const button = event.target.closest(".send-button");
       if (!button) return;
       event.preventDefault();
@@ -8040,11 +8625,30 @@ function App() {
     };
     document.addEventListener("click", onSendButtonClick, true);
     return () => document.removeEventListener("click", onSendButtonClick, true);
-  }, [isStreaming, isCancelling]);
+  }, [isStreaming, isCancelling, activeTurnHasCompleted]);
 
   const submitMessage = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const text = input.trim();
+    const generalInstruction = inputDraftRef.current.trim();
+    const quoteInstructionText = quoteInstructionRef.current.trim();
+    const selectedQuote = composerQuote?.trim() ?? "";
+    const quoteBlock = selectedQuote
+      ? `**Idézet:**\n${selectedQuote
+          .split(/\r?\n/)
+          .map((line) => `> ${line}`)
+          .join("\n")}`
+      : "";
+    const text = [
+      quoteBlock,
+      quoteInstructionText
+        ? `**Az idézethez kapcsolódó utasítás:**\n${quoteInstructionText}`
+        : "",
+      generalInstruction
+        ? `**Általános utasítás (nem az idézetre):**\n${generalInstruction}`
+        : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
     const pendingImageSnapshot = [...pendingImages];
     if (
       (!text && pendingImageSnapshot.length === 0) ||
@@ -8100,6 +8704,7 @@ function App() {
     const liveMessageId = createEntityId();
     const userSequence = nextTimelineSequence();
     const liveSequence = nextTimelineSequence();
+    const requestStartedAt = Date.now();
     const liveMessage: Message = {
       id: liveMessageId,
       role: "assistant",
@@ -8118,7 +8723,7 @@ function App() {
     const userMessage: Message = {
       id: createEntityId(),
       role: "user",
-      time: "most",
+      time: new Date(requestStartedAt).toISOString(),
       text,
       images: storedImages,
       sequence: userSequence,
@@ -8136,7 +8741,11 @@ function App() {
       const nextTitle = uniqueConversationTitle(
         activeProjectForNaming,
         conversationTitleFromPrompt(
-          text || storedImages[0]?.name || "Képes kérdés",
+          generalInstruction ||
+            quoteInstructionText ||
+            selectedQuote ||
+            storedImages[0]?.name ||
+            "Képes kérdés",
         ),
         tombstones
           .filter(
@@ -8223,7 +8832,6 @@ function App() {
       }
     }
     activeTurnIdRef.current = clientTurnId;
-    const requestStartedAt = Date.now();
     activeTurnTimingRef.current = { startedAt: requestStartedAt };
     planTextBufferRef.current = {};
     agentMessagePhasesRef.current = {};
@@ -8249,8 +8857,14 @@ function App() {
     };
     updatePlanState(initialPlan);
     commitMessages(nextMessages);
-    setInput("");
+    inputDraftRef.current = "";
+    quoteInstructionRef.current = "";
+    if (inputRef.current) inputRef.current.value = "";
+    if (quoteInputRef.current) quoteInputRef.current.value = "";
+    setComposerQuote(null);
     setPendingImages([]);
+    turnCompletedRequestIdRef.current = null;
+    setTurnCompletedRequestId(null);
     preparingRequestIdRef.current = requestId;
     activeRequestIdRef.current = requestId;
     activeLiveMessageIdRef.current = liveMessageId;
@@ -8311,10 +8925,11 @@ function App() {
           index === targetIndex
             ? {
                 ...message,
-                text: message.text || response.text,
+                text: stripStaleInterruptionMarker(message).text || response.text,
                 turnId: message.turnId ?? activeTurnIdRef.current,
                 live: false,
                 final: true,
+                interrupted: false,
               }
             : message,
         );
@@ -8361,13 +8976,11 @@ function App() {
           planWithTiming(
             currentPlan,
             currentPlan.steps.map((step) =>
-              step.status === "error"
-                ? step
-                : { ...step, status: "completed" as const },
+              step.status === "inProgress"
+                ? { ...step, status: "completed" as const }
+                : step,
             ),
-            currentPlan.startedAt ??
-              activeTurnTimingRef.current.startedAt ??
-              completedAt,
+            completedAt,
             currentPlan.completedAt ?? completedAt,
           ),
         );
@@ -8384,6 +8997,13 @@ function App() {
       );
     } catch (error) {
       const errorText = String(error);
+      // The native command performs snapshot finalization after the model has
+      // emitted its final answer. Preserve that streamed answer if only the
+      // later workspace post-processing failed.
+      const streamedAnswer = messagesRef.current.find(
+        (message) => message.id === liveMessageId,
+      );
+      const hasStreamedAnswer = Boolean(streamedAnswer?.text.trim());
       const wasCancelled =
         cancelledRequestIdsRef.current.delete(requestId) ||
         /megszakítva|leállítva|cancel/i.test(errorText);
@@ -8396,21 +9016,29 @@ function App() {
           index === targetIndex
             ? {
                 ...message,
-                text: wasCancelled
-                  ? "A válasz megszakítva."
-                  : `Nem sikerült a Codex-kérés: ${errorText}`,
+                text:
+                  stripStaleInterruptionMarker(message).text.trim() ||
+                  (wasCancelled
+                    ? "A válasz megszakítva."
+                    : `Nem sikerült a Codex-kérés: ${errorText}`),
                 turnId: message.turnId ?? activeTurnIdRef.current,
                 live: false,
                 final: true,
+                interrupted: wasCancelled || message.interrupted,
               }
             : message,
         );
       });
-      settleActivePlan(wasCancelled ? "completed" : "error");
-      setCodeStatus(wasCancelled ? "kész" : "hiba");
+      const answerArrived = !wasCancelled && hasStreamedAnswer;
+      settleActivePlan(wasCancelled || answerArrived ? "completed" : "error");
+      setCodeStatus(wasCancelled || answerArrived ? "kész" : "hiba");
       notify(
-        wasCancelled ? "Codex-kérés megszakítva" : "Codex-kapcsolati hiba",
-        wasCancelled ? undefined : "notify",
+        answerArrived
+          ? "A válasz megérkezett; a lezárás utóellenőrzése nem sikerült"
+          : wasCancelled
+            ? "Codex-kérés megszakítva"
+            : "Codex-kapcsolati hiba",
+        hasStreamedAnswer || wasCancelled ? undefined : "notify",
       );
     } finally {
       if (activeRequestIdRef.current === requestId) {
@@ -8419,6 +9047,8 @@ function App() {
         activeRequestIdRef.current = null;
         activeLiveMessageIdRef.current = null;
         preparingRequestIdRef.current = null;
+        turnCompletedRequestIdRef.current = null;
+        setTurnCompletedRequestId(null);
       }
       submitBusyRef.current = false;
     }
@@ -8438,11 +9068,14 @@ function App() {
       event.preventDefault();
       const insertion = `\n${numberedLine[1]}${Number(numberedLine[2]) + 1}) `;
       textarea.setRangeText(insertion, cursor, textarea.selectionEnd, "end");
-      setInput(textarea.value);
+      if (textarea === quoteInputRef.current)
+        quoteInstructionRef.current = textarea.value;
+      else inputDraftRef.current = textarea.value;
       requestAnimationFrame(() => {
         const position = cursor + insertion.length;
         textarea.focus();
         textarea.setSelectionRange(position, position);
+        resizeComposerTextarea(textarea);
       });
       return;
     }
@@ -8780,7 +9413,7 @@ function App() {
               )
         }
         status={codeStatus}
-        streaming
+        streaming={isStreaming && !activeTurnHasCompleted}
         expanded={liveExpanded}
         transport={transportStatus}
         watchdogMessage={watchdogMessage}
@@ -8799,7 +9432,8 @@ function App() {
   );
 
   return (
-    <div className="app-shell">
+    <FileActionContext.Provider value={handleFileClick}>
+      <div className="app-shell" onClickCapture={handleLocalLinkClickCapture}>
       <header className="topbar">
         <div className="brand-lockup">
           <div className="brand-mark">m</div>
@@ -9286,7 +9920,7 @@ function App() {
                       type="button"
                       className="reset-button"
                       onClick={() => {
-                        setFontSize("8px");
+                        setFontSize("10px");
                         setLineHeight("1.00");
                         notify("Olvasási beállítások visszaállítva");
                       }}
@@ -9344,6 +9978,28 @@ function App() {
           </div>
           <form className="composer-wrap" onSubmit={submitMessage}>
             <div className="composer">
+              {composerQuote && (
+                <section className="composer-quote" aria-label="Kijelölt idézet">
+                  <div className="composer-quote-header">
+                    <span className="composer-quote-badge">Idézet</span>
+                    <button
+                      type="button"
+                      className="composer-quote-remove"
+                      aria-label="Idézet eltávolítása"
+                      title="Idézet eltávolítása"
+                      onClick={() => {
+                        setComposerQuote(null);
+                        quoteInstructionRef.current = "";
+                        if (quoteInputRef.current) quoteInputRef.current.value = "";
+                        inputRef.current?.focus();
+                      }}
+                    >
+                      ×
+                    </button>
+                  </div>
+                  <blockquote>{composerQuote}</blockquote>
+                </section>
+              )}
               {pendingImages.length > 0 && (
                 <div className="composer-attachments" aria-label="Csatolt képek">
                   {pendingImages.map((image) => (
@@ -9365,14 +10021,43 @@ function App() {
                   ))}
                 </div>
               )}
+              {composerQuote && (
+                <label className="composer-field composer-quote-field">
+                  <span>Az idézethez kapcsolódó utasítás</span>
+                  <textarea
+                    ref={quoteInputRef}
+                    rows={1}
+                    defaultValue=""
+                    onInput={(event) => {
+                      quoteInstructionRef.current = event.currentTarget.value;
+                      resizeComposerTextarea(event.currentTarget);
+                    }}
+                    onKeyDown={handleInputKeyDown}
+                    onPaste={handleInputPaste}
+                    placeholder="Mit szeretnél tudni vagy módosítani az idézettel kapcsolatban?"
+                  />
+                </label>
+              )}
+              {composerQuote && (
+                <div className="composer-general-label">
+                  Általános utasítás <span>(nem az idézetre vonatkozik)</span>
+                </div>
+              )}
               <textarea
                 ref={inputRef}
                 rows={1}
-                value={input}
-                onChange={(event) => setInput(event.target.value)}
+                defaultValue=""
+                onInput={(event) => {
+                  inputDraftRef.current = event.currentTarget.value;
+                  resizeComposerTextarea(event.currentTarget);
+                }}
                 onKeyDown={handleInputKeyDown}
                 onPaste={handleInputPaste}
-                placeholder="Írj egy üzenetet, vagy illessz be egy screenshotot…"
+                placeholder={
+                  composerQuote
+                    ? "Írd ide az idézettől független utasításodat…"
+                    : "Írj egy üzenetet, vagy illessz be egy screenshotot…"
+                }
               />
               <input
                 ref={imageInputRef}
@@ -9424,6 +10109,43 @@ function App() {
           </form>
         </section>
       </main>
+
+      {selectionQuote && (
+        <button
+          type="button"
+          className="quote-selection-button"
+          style={{ left: selectionQuote.x, top: selectionQuote.y }}
+          aria-label="Kijelölés idézetként a chatbe"
+          title="Idézet hozzáadása a chathez"
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={insertSelectionQuote}
+        >
+          💬
+        </button>
+      )}
+
+      {fileActionMenu && (
+        <div
+          className="file-action-menu"
+          role="menu"
+          style={{ left: fileActionMenu.x, top: fileActionMenu.y }}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          <div className="file-action-path" title={fileActionMenu.path}>
+            {fileActionMenu.path}
+          </div>
+          <button type="button" role="menuitem" onClick={() => void runSelectedFile()}>
+            ▶ Futtatás
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => void openSelectedFileFolder()}
+          >
+            ▣ Mappa megnyitása
+          </button>
+        </div>
+      )}
 
       {appDialog && (
         <div
@@ -9546,7 +10268,8 @@ function App() {
           </div>
         </div>
       )}
-    </div>
+      </div>
+    </FileActionContext.Provider>
   );
 }
 

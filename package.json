@@ -15,6 +15,7 @@
     "preview": "vite preview",
     "tauri": "set \"CARGO_TARGET_DIR=%LOCALAPPDATA%\\min\\cargo-target\"&& tauri",
     "tauri:dev:local": "set \"CARGO_TARGET_DIR=%LOCALAPPDATA%\\min\\cargo-target\"&& tauri dev",
+    "tauri:debug:standalone": "npm.cmd run build && set \"CARGO_TARGET_DIR=%LOCALAPPDATA%\\min\\cargo-target\"&& cargo build --manifest-path src-tauri/Cargo.toml --features custom-protocol",
     "tauri:build:local": "set \"CARGO_TARGET_DIR=%LOCALAPPDATA%\\min\\cargo-target\"&& tauri build"
   },
   "dependencies": {

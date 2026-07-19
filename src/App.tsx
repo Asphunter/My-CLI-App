@@ -46,6 +46,8 @@ type Message = {
   quoteRefs?: QuoteReference[];
   /** Whether this turn should render the detailed plan/reasoning trace. */
   detailed?: boolean;
+  /** File changes produced by this response, when the native guard exposed them. */
+  changeSummary?: ChangeSummaryFile[];
 };
 
 type MessageImageAttachment = {
@@ -116,6 +118,39 @@ type AgentApplyResult = {
   baseHash: string;
   resultingHash: string;
   rollbackAvailable: boolean;
+};
+type AgentDiffLine = {
+  kind: "context" | "added" | "removed" | "empty" | "meta" | string;
+  oldLine?: number | null;
+  newLine?: number | null;
+  text: string;
+};
+type AgentDiffFile = {
+  path: string;
+  status: string;
+  beforeHash?: string | null;
+  afterHash?: string | null;
+  binaryOrTruncated?: boolean;
+  lines: AgentDiffLine[];
+};
+type AgentDiffPreview = {
+  snapshotId: string;
+  root: string;
+  baseHash: string;
+  postHash: string;
+  currentHash: string;
+  currentState: string;
+  createdAt?: string | null;
+  lastAction?: string | null;
+  lastActionAt?: string | null;
+  files: AgentDiffFile[];
+};
+type ChangeSummaryFile = {
+  path: string;
+  status: "modified" | "added" | "removed";
+  added: number;
+  removed: number;
+  binaryOrTruncated?: boolean;
 };
 type CodexResponse = {
   threadId: string;
@@ -600,6 +635,47 @@ const selectQuoteText = (root: HTMLElement, text: string) => {
   selection.removeAllRanges();
   selection.addRange(range);
   return true;
+};
+
+const normalizedQuoteSearchText = (value: string) =>
+  value.replace(/\s+/g, " ").trim().toLowerCase();
+
+const findQuoteTarget = (quote: QuoteReference) => {
+  const candidates = Array.from(
+    document.querySelectorAll<HTMLElement>(
+      '[data-quote-selectable="true"][data-quote-anchor]',
+    ),
+  );
+  const exact = candidates.find(
+    (candidate) => candidate.dataset.quoteAnchor === quote.anchorId,
+  );
+  const needles = [quote.text, quote.instruction]
+    .map(normalizedQuoteSearchText)
+    .filter((needle) => needle.length >= 3);
+  const containsNeedle = (candidate: HTMLElement) => {
+    if (needles.length === 0) return true;
+    const body = normalizedQuoteSearchText(candidate.textContent ?? "");
+    return needles.some((needle) => body.includes(needle));
+  };
+  // Prefer the persisted anchor, but only when the referenced text is still
+  // present in that node. Sync/restart can preserve a stale anchor id while
+  // the message id changes; in that case fall back to the visible quote text.
+  if (exact && containsNeedle(exact)) return exact;
+  const scored = candidates
+    .filter(containsNeedle)
+    .map((candidate) => {
+      let score = Math.max(
+        ...needles.map((needle) => needle.length),
+        0,
+      );
+      if (candidate.classList.contains("message-body")) score += 20;
+      if (candidate.closest(".user-message")) score += 10;
+      if (candidate.closest(".trace-thinking-panel")) score += 5;
+      if (candidate.closest(".turn-progress-answer")) score += 4;
+      return { candidate, score };
+    })
+    .sort((left, right) => right.score - left.score);
+  return scored[0]?.candidate ?? exact;
 };
 
 const PROJECTS_STORAGE_KEY = "min-projects";
@@ -1474,6 +1550,10 @@ const mergeMessages = (
           ? existing.quoteRefs
           : message.quoteRefs,
       detailed: existing.detailed ?? message.detailed,
+      changeSummary:
+        existing.changeSummary && existing.changeSummary.length > 0
+          ? existing.changeSummary
+          : message.changeSummary,
     };
   }
   const compacted = compactMessages(merged).map(stripStaleInterruptionMarker);
@@ -1559,7 +1639,8 @@ const messageUsesDetailedTrace = (message: Message) => {
       const saved = JSON.parse(
         localStorage.getItem(DETAIL_MODE_STORAGE_KEY) ?? "{}",
       ) as Record<string, unknown>;
-      if (typeof saved[message.id] === "boolean") return saved[message.id];
+      const savedMode = saved[message.id];
+      if (typeof savedMode === "boolean") return savedMode;
     } catch {
       // Fall back to the historical detailed layout.
     }
@@ -3270,6 +3351,110 @@ const buildInlineDiffRows = (
     : [{ before: emptyInlineDiffLine(), after: emptyInlineDiffLine() }];
 };
 
+const changeStatus = (status: string): ChangeSummaryFile["status"] => {
+  const normalized = status.toLowerCase();
+  if (normalized.includes("add") || normalized.includes("create")) return "added";
+  if (normalized.includes("remove") || normalized.includes("delete")) return "removed";
+  return "modified";
+};
+
+const summaryFromDiffRows = (
+  path: string,
+  status: string,
+  rows: InlineDiffRow[],
+  binaryOrTruncated = false,
+): ChangeSummaryFile => ({
+  path,
+  status: changeStatus(status),
+  added: rows.filter((row) => row.after.kind === "added").length,
+  removed: rows.filter((row) => row.before.kind === "removed").length,
+  binaryOrTruncated,
+});
+
+const changeSummaryFromDiffFiles = (
+  files: AgentDiffFile[],
+): ChangeSummaryFile[] =>
+  files
+    .filter((file) => file.path.trim())
+    .map((file) =>
+      summaryFromDiffRows(
+        file.path.trim(),
+        file.status,
+        file.lines.map((line) => ({
+          before: {
+            kind: line.kind === "removed" ? "removed" : "context",
+            text: line.text,
+            number: line.oldLine ?? null,
+          },
+          after: {
+            kind: line.kind === "added" ? "added" : "context",
+            text: line.text,
+            number: line.newLine ?? null,
+          },
+        })),
+        file.binaryOrTruncated,
+      ),
+    );
+
+const changeSummaryFromGuard = (
+  guard: AgentGuardReport,
+): ChangeSummaryFile[] => {
+  const files = new Map<string, ChangeSummaryFile>();
+  for (const path of guard.changedFiles) {
+    if (path.trim())
+      files.set(path, { path, status: "modified", added: 0, removed: 0 });
+  }
+  for (const path of guard.addedFiles) {
+    if (path.trim())
+      files.set(path, { path, status: "added", added: 0, removed: 0 });
+  }
+  for (const path of guard.removedFiles) {
+    if (path.trim())
+      files.set(path, { path, status: "removed", added: 0, removed: 0 });
+  }
+  return [...files.values()];
+};
+
+const changeSummaryFromActivities = (
+  activities: CodeActivity[],
+): ChangeSummaryFile[] => {
+  const byPath = new Map<string, ChangeSummaryFile>();
+  for (const activity of activities) {
+    const path = activity.detail.trim();
+    const readOnlyActivity =
+      /(?:^|[\\/._-])(read|inspect|view|open)(?:$|[\\/._-])/i.test(
+        activity.eventType,
+      ) || /(?:read|inspect|view|open)$/i.test(activity.eventType);
+    const hasCodeBoundary =
+      !readOnlyActivity &&
+      (activity.beforeCode !== undefined || activity.afterCode !== undefined);
+    const looksLikeChange =
+      activity.kind === "file" &&
+      /(change|create|delete|remove|write|patch|edit)/i.test(activity.eventType);
+    if (!path || (!hasCodeBoundary && !looksLikeChange)) continue;
+    const before = activity.beforeCode ?? "";
+    const after = activity.afterCode ?? activity.code ?? "";
+    const rows = buildInlineDiffRows(before, after);
+    const next = summaryFromDiffRows(
+      path,
+      activity.eventType,
+      rows,
+      !hasCodeBoundary && Boolean(activity.code),
+    );
+    const previous = byPath.get(path);
+    if (!previous) {
+      byPath.set(path, next);
+      continue;
+    }
+    previous.added += next.added;
+    previous.removed += next.removed;
+    if (next.status === "added" || next.status === "removed")
+      previous.status = next.status;
+    previous.binaryOrTruncated ||= next.binaryOrTruncated;
+  }
+  return [...byPath.values()];
+};
+
 const parseUnifiedInlineDiff = (source: string): InlineDiffRow[] => {
   const rows: InlineDiffRow[] = [];
   const lines = source.replace(/\r/g, "").split("\n");
@@ -4097,6 +4282,55 @@ function PlanProgressCard({
   );
 }
 
+function ChangeSummaryPanel({ files }: { files: ChangeSummaryFile[] }) {
+  if (files.length === 0) return null;
+  const added = files.reduce((total, file) => total + file.added, 0);
+  const removed = files.reduce((total, file) => total + file.removed, 0);
+  const statusLabel = (status: ChangeSummaryFile["status"]) =>
+    status === "added" ? "ÚJ" : status === "removed" ? "TÖRÖLT" : "MÓDOSÍTVA";
+  return (
+    <aside className="trace-change-summary" aria-label="Fájlok és változások">
+      <div className="trace-change-heading">
+        <strong>FÁJLOK / VÁLTOZÁSOK</strong>
+        <span>{files.length} fájl</span>
+      </div>
+      <ul className="trace-change-list">
+        {files.map((file) => (
+          <li key={`${file.status}:${file.path}`} title={file.path}>
+            <code>{file.path}</code>
+            <span className="trace-change-status">{statusLabel(file.status)}</span>
+            <span className="trace-change-added">+{file.added}</span>
+            <span className="trace-change-removed">−{file.removed}</span>
+          </li>
+        ))}
+      </ul>
+      <div className="trace-change-footer" aria-label="Változási összesítő">
+        <span><i className="trace-change-dot is-added" />{added} hozzáadva</span>
+        <span><i className="trace-change-dot is-removed" />{removed} kivéve</span>
+      </div>
+    </aside>
+  );
+}
+
+const writeTextToClipboard = async (text: string) => {
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (copied) return;
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  throw new Error("A vágólap nem érhető el.");
+};
+
 type TurnProgressCardProps = {
   plan: PlanSnapshot;
   activities: CodeActivity[];
@@ -4112,6 +4346,8 @@ type TurnProgressCardProps = {
   quoteAnchorPrefix: string;
   onQuoteJump?: QuoteJumpHandler;
   compact?: boolean;
+  onCopyAnswer?: (answer: Message) => Promise<void> | void;
+  onRegenerate?: (answer: Message) => void;
 };
 
 function TurnProgressCard({
@@ -4129,6 +4365,8 @@ function TurnProgressCard({
   quoteAnchorPrefix,
   onQuoteJump,
   compact = false,
+  onCopyAnswer,
+  onRegenerate,
 }: TurnProgressCardProps) {
   const quoteAnchor = (suffix: string) =>
     `${quoteAnchorPrefix}:${suffix}`;
@@ -4202,21 +4440,12 @@ function TurnProgressCard({
     !stepId ||
     stepId === fallbackStep.id ||
     stepId.startsWith("client-fallback");
-  const hasPrePlanTrace =
-    activities.some(
-      (activity) =>
-        isPrePlanStepId(activity.planStepId) &&
-        activity.kind === "reasoning" &&
-        Boolean(activity.body?.trim()),
-    ) ||
-    commentary.some(
-      (entry) =>
-        isPrePlanStepId(entry.stepId) && Boolean(entry.body.trim()),
-    );
-  const steps =
-    plannedSteps.length === 0 || hasPrePlanTrace
-      ? [fallbackStep, ...plannedSteps]
-      : plannedSteps;
+  // The preparation row is a client-side placeholder used only until a real
+  // model plan arrives. Once real plan steps exist, attach unassigned
+  // preparation notes to the first real step instead of rendering a separate
+  // synthetic `0. Terv...` row with a misleading 0:00 duration.
+  const steps = plannedSteps.length === 0 ? [fallbackStep] : plannedSteps;
+  const prePlanDisplayStepId = plannedSteps[0]?.id ?? fallbackStep.id;
   const commentaryStepId = (body: string) => {
     const match = body.match(/\b(\d+)\.\s*lépés\b/i);
     const index = match ? Number(match[1]) - 1 : -1;
@@ -4229,16 +4458,18 @@ function TurnProgressCard({
     if (numberedStepId) return numberedStepId === stepId;
     return entry.stepId
       ? isPrePlanStepId(entry.stepId)
-        ? stepId === fallbackStep.id
+        ? stepId === prePlanDisplayStepId
         : entry.stepId === stepId
-      : stepId === fallbackStep.id;
+      : stepId === prePlanDisplayStepId;
   };
+  const activityBelongsToStep = (activity: CodeActivity, stepId: string) =>
+    isPrePlanStepId(activity.planStepId)
+      ? stepId === prePlanDisplayStepId
+      : activity.planStepId === stepId;
   const hasTraceForStep = (stepId: string) =>
     activities.some(
       (activity) =>
-        (stepId === fallbackStep.id
-          ? isPrePlanStepId(activity.planStepId)
-          : activity.planStepId === stepId) &&
+        activityBelongsToStep(activity, stepId) &&
         activity.kind === "reasoning" &&
         Boolean(activity.body?.trim()),
     ) ||
@@ -4297,11 +4528,7 @@ function TurnProgressCard({
   );
   const evidenceTimesForStep = (stepId: string) => {
     const activityTimes = orderedActivities
-      .filter((activity) =>
-        stepId === fallbackStep.id
-          ? isPrePlanStepId(activity.planStepId)
-          : activity.planStepId === stepId,
-      )
+      .filter((activity) => activityBelongsToStep(activity, stepId))
       .map((activity) => activity.id)
       .filter((value) => Number.isFinite(value) && value > 1e12);
     const commentaryTimes = commentary
@@ -4314,9 +4541,7 @@ function TurnProgressCard({
     return [...activityTimes, ...commentaryTimes].sort((left, right) => left - right);
   };
   const stepActivities = orderedActivities.filter((activity) =>
-    selectedStep.id === fallbackStep.id
-      ? isPrePlanStepId(activity.planStepId)
-      : activity.planStepId === selectedStep.id,
+    activityBelongsToStep(activity, selectedStep.id),
   );
   const stepCommentary = commentary
     .filter((entry) => commentaryBelongsToStep(entry, selectedStep.id))
@@ -4453,6 +4678,10 @@ function TurnProgressCard({
   }, [orderedActivities, stepActivities, stepCommentary]);
   const [expandedInternalEntryId, setExpandedInternalEntryId] =
     useState<string | null>(null);
+  const [essentialTraceOnly, setEssentialTraceOnly] = useState(false);
+  const visibleThinkingEntries = essentialTraceOnly
+    ? thinkingEntries.filter((entry) => entry.kind !== "internal")
+    : thinkingEntries;
   const thinkingListRef = useRef<HTMLUListElement>(null);
   const inferredStartedAtRef = useRef<number | undefined>(plan.startedAt);
   const [clockNow, setClockNow] = useState(() => Date.now());
@@ -4503,6 +4732,60 @@ function TurnProgressCard({
       ? formatElapsed(Math.max(0, elapsedEnd - startedAtForDisplay))
       : "";
   const hasAnswer = Boolean(answer?.text.trim());
+  const changeSummary =
+    answer?.changeSummary && answer.changeSummary.length > 0
+      ? answer.changeSummary
+      : changeSummaryFromActivities(activities);
+  const [copiedAnswer, setCopiedAnswer] = useState(false);
+  const copyAnswer = async () => {
+    if (!answer?.text.trim()) return;
+    try {
+      if (onCopyAnswer) await onCopyAnswer(answer);
+      else await writeTextToClipboard(answer.text);
+      setCopiedAnswer(true);
+      window.setTimeout(() => setCopiedAnswer(false), 1400);
+    } catch {
+      setCopiedAnswer(false);
+    }
+  };
+  const answerActions = hasAnswer && !streaming && (onCopyAnswer || onRegenerate) ? (
+    <div className="trace-answer-actions">
+      {onCopyAnswer && (
+        <button type="button" onClick={() => void copyAnswer()}>
+          <span aria-hidden="true">{copiedAnswer ? "✓" : "⧉"}</span>
+          {copiedAnswer ? "Másolva" : "Másolás"}
+        </button>
+      )}
+      {onRegenerate && (
+        <button type="button" onClick={() => answer && onRegenerate(answer)}>
+          <span aria-hidden="true">↻</span>
+          Újragenerálás
+        </button>
+      )}
+    </div>
+  ) : null;
+  type TraceView = "answer" | "steps";
+  const [traceView, setTraceView] = useState<TraceView>(
+    streaming ? (hasAnswer ? "answer" : "steps") : expanded ? "steps" : "answer",
+  );
+  useEffect(() => {
+    setTraceView(expanded ? "steps" : "answer");
+  }, [expanded]);
+  useEffect(() => {
+    if (!streaming) return;
+    const nextView: TraceView = hasAnswer ? "answer" : "steps";
+    setTraceView(nextView);
+    // Keep the durable expansion choice in sync so the completed card does
+    // not jump back to LÉPÉSEK after the live card is replaced in the timeline.
+    if ((nextView === "steps") !== expanded) onToggle();
+    // This is deliberately phase-driven. A later manual tab choice must not be
+    // immediately overwritten while the answer remains in the same phase.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasAnswer, streaming]);
+  const selectTraceView = (next: TraceView) => {
+    setTraceView(next);
+    if ((next === "steps") !== expanded) onToggle();
+  };
   const selectStep = (stepId: string) => {
     followActiveStepRef.current = false;
     setSelectedStepId(stepId);
@@ -4511,13 +4794,14 @@ function TurnProgressCard({
     streaming && step.id === activeStep.id && step.status === "pending"
       ? "inProgress"
       : step.status;
+  const completedStepCount = steps.filter(
+    (step) => displayStatus(step) === "completed",
+  ).length;
   const reasoningCountFor = (stepId: string) =>
     orderedActivities.filter(
       (activity) =>
         activity.kind === "reasoning" &&
-        (stepId === fallbackStep.id
-          ? isPrePlanStepId(activity.planStepId)
-          : activity.planStepId === stepId),
+        activityBelongsToStep(activity, stepId),
     ).length;
   const stepIndicator = (step: PlanStep) => {
     const currentStatus = displayStatus(step);
@@ -4613,6 +4897,11 @@ function TurnProgressCard({
         data-quote-anchor={answerAnchorId}
         aria-label="Válasz"
       >
+        <div className="compact-answer-header">
+          <strong>VÁLASZ</strong>
+          <span>{streaming ? "készül" : "kész"}</span>
+          {answerActions}
+        </div>
         <div className="compact-answer-body">
           <div className="compact-answer-line">
             {hasAnswer && (
@@ -4643,69 +4932,103 @@ function TurnProgressCard({
               onQuoteJump,
             )}
         </div>
+        {changeSummary.length > 0 && (
+          <div className="compact-answer-changes">
+            <ChangeSummaryPanel files={changeSummary} />
+          </div>
+        )}
       </article>
     );
   }
 
   return (
     <article
-      className={`turn-progress-card trace-card${streaming ? " is-live" : ""}`}
+      className={`turn-progress-card trace-card trace-view-${traceView}${streaming ? " is-live" : ""}`}
       aria-label="Lépések és gondolkodás"
     >
       {(hasAnswer || streaming) && (
         <section
-        className="turn-progress-answer"
-        data-quote-selectable="true"
-        data-quote-anchor={answerAnchorId}
-        aria-label="Válasz"
-      >
-        <div className="turn-progress-answer-body">
-          <div className="trace-answer-line">
-            {hasAnswer && (
-              <p>
-                {answerWithQuoteBacklinks(
-                  textWithoutCodeBlocks(answer?.text ?? ""),
-                  answerQuoteRefs,
-                  onQuoteJump ?? (() => undefined),
-                )}
-              </p>
-            )}
-            {streaming && (
-              <span className="trace-answer-spinner" aria-label="Válasz készül" />
-            )}
+          className="turn-progress-answer"
+          data-quote-selectable="true"
+          data-quote-anchor={answerAnchorId}
+          aria-label={traceView === "answer" ? "Válasz" : "Lépések és gondolkodás"}
+        >
+          <div className="trace-answer-layout">
+            <div className="trace-answer-main">
+              <div className="turn-progress-answer-heading">
+                <div
+                  className="trace-view-switch"
+                  role="tablist"
+                  aria-label="Panel nézete"
+                >
+                  <button
+                    type="button"
+                    role="tab"
+                    className={`trace-view-option${traceView === "answer" ? " is-active" : ""}`}
+                    aria-selected={traceView === "answer"}
+                    onClick={() => selectTraceView("answer")}
+                  >
+                    VÁLASZ
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    className={`trace-view-option${traceView === "steps" ? " is-active" : ""}`}
+                    aria-selected={traceView === "steps"}
+                    onClick={() => selectTraceView("steps")}
+                  >
+                    LÉPÉSEK
+                  </button>
+                </div>
+                <span>{streaming ? "készül" : "kész"}</span>
+                {overallElapsed && <time>{overallElapsed}</time>}
+                {answerActions}
+              </div>
+              {traceView === "answer" && <div className="turn-progress-answer-body">
+                <div className="trace-answer-line">
+                  {hasAnswer && (
+                    <p>
+                      {answerWithQuoteBacklinks(
+                        textWithoutCodeBlocks(answer?.text ?? ""),
+                        answerQuoteRefs,
+                        onQuoteJump ?? (() => undefined),
+                      )}
+                    </p>
+                  )}
+                  {streaming && (
+                    <span className="trace-answer-spinner" aria-label="Válasz készül" />
+                  )}
+                </div>
+                {onQuoteJump && answerQuoteRefs.length > 0 &&
+                  answerQuoteRefs.some(
+                    (quote) =>
+                      !answer?.text.includes(quote.text) &&
+                      !(quote.instruction && answer?.text.includes(quote.instruction)),
+                  ) &&
+                  quoteBacklinkButtons(
+                    answerQuoteRefs.filter(
+                      (quote) =>
+                        !answer?.text.includes(quote.text) &&
+                        !(quote.instruction && answer?.text.includes(quote.instruction)),
+                    ),
+                    onQuoteJump,
+                  )}
+              </div>}
+            </div>
+            <ChangeSummaryPanel files={changeSummary} />
           </div>
-          {onQuoteJump && answerQuoteRefs.length > 0 &&
-            answerQuoteRefs.some(
-              (quote) =>
-                !answer?.text.includes(quote.text) &&
-                !(quote.instruction && answer?.text.includes(quote.instruction)),
-            ) &&
-            quoteBacklinkButtons(
-              answerQuoteRefs.filter(
-                (quote) =>
-                  !answer?.text.includes(quote.text) &&
-                  !(quote.instruction && answer?.text.includes(quote.instruction)),
-              ),
-              onQuoteJump,
-            )}
-          <button
-            type="button"
-            className="trace-collapse"
-            onClick={onToggle}
-            aria-expanded={expanded}
-            aria-label={expanded ? "Trace összecsukása" : "Trace kinyitása"}
-          >
-            {expanded ? "⌃" : "⌄"}
-          </button>
-        </div>
         </section>
       )}
 
-      <div
-        className={`trace-content${expanded ? " is-expanded" : ""}`}
-        aria-hidden={!expanded}
+      {traceView === "steps" && <div
+        className="trace-content is-expanded"
+        aria-hidden={false}
       >
           <section className="trace-steps-panel" aria-label="Lépések listája">
+            <div className="trace-panel-heading">
+              <strong>LÉPÉSEK</strong>
+              <span>{completedStepCount}/{steps.length} kész</span>
+            </div>
             <div
               className="trace-step-list"
               data-quote-selectable="true"
@@ -4754,9 +5077,22 @@ function TurnProgressCard({
             data-quote-anchor={quoteAnchor(`thinking:${selectedStep.id}`)}
             aria-label="Gondolkodás menete"
           >
-            {thinkingEntries.length > 0 ? (
+            <div className="trace-panel-heading trace-panel-heading-thinking">
+              <strong>GONDOLKODÁS MENETE</strong>
+              <div className="trace-panel-actions">
+                <button
+                  type="button"
+                  className="trace-panel-action"
+                  aria-pressed={essentialTraceOnly}
+                  onClick={() => setEssentialTraceOnly((current) => !current)}
+                >
+                  {essentialTraceOnly ? "Minden részlet" : "Csak lényeges"}
+                </button>
+              </div>
+            </div>
+            {visibleThinkingEntries.length > 0 ? (
               <ul className="trace-thinking-list" ref={thinkingListRef}>
-                {thinkingEntries.map((entry) => (
+                {visibleThinkingEntries.map((entry) => (
                   <li
                     className={`trace-thinking-item${entry.kind === "internal" ? " is-internal" : ""}`}
                     key={entry.id}
@@ -4830,13 +5166,15 @@ function TurnProgressCard({
               <div className="trace-thinking-empty">
                 {!streaming && (
                   <span className="trace-thinking-empty-text">
-                    Ehhez a lépéshez nem érkezett külön gondolkodási napló.
+                    {essentialTraceOnly
+                      ? "A részletes belső naplósorok el vannak rejtve."
+                      : "Ehhez a lépéshez nem érkezett külön gondolkodási napló."}
                   </span>
                 )}
               </div>
             )}
           </section>
-        </div>
+        </div>}
 
 
       {inlineDiff && (
@@ -5605,6 +5943,7 @@ function App() {
   const commentaryKeyRef = useRef<string | null>(null);
   const planTextBufferRef = useRef<Record<string, string>>({});
   const messageStreamRef = useRef<HTMLDivElement>(null);
+  const composerFormRef = useRef<HTMLFormElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const quoteInputRefs = useRef<Record<string, HTMLTextAreaElement | null>>({});
   // Keep fast quote typing out of the root render path. The conversation can
@@ -8305,17 +8644,18 @@ function App() {
   };
 
   const jumpToQuote: QuoteJumpHandler = (quote) => {
-    const target = Array.from(
-      document.querySelectorAll<HTMLElement>("[data-quote-anchor]"),
-    ).find((candidate) => candidate.dataset.quoteAnchor === quote.anchorId);
+    const target = findQuoteTarget(quote);
     if (!target) {
-      notify("Az idézet eredeti helye jelenleg nem látható.", "notify");
+      notify("Az idézet eredeti helye jelenleg nem látható.");
       return;
     }
     target.scrollIntoView({ behavior: "smooth", block: "center" });
     target.classList.add("is-quote-target");
     window.setTimeout(() => {
-      selectQuoteText(target, quote.text);
+      const selected =
+        selectQuoteText(target, quote.text) ||
+        (quote.instruction ? selectQuoteText(target, quote.instruction) : false);
+      if (!selected) notify("Az idézet szövege már nem található ezen a helyen.");
       window.setTimeout(() => target.classList.remove("is-quote-target"), 1400);
     }, 220);
   };
@@ -9370,6 +9710,20 @@ function App() {
         response.guard.changedFiles.length > 0 ||
         response.guard.addedFiles.length > 0 ||
         response.guard.removedFiles.length > 0;
+      let responseChangeSummary = hasAgentChanges
+        ? changeSummaryFromGuard(response.guard)
+        : [];
+      if (hasAgentChanges && isTauri) {
+        try {
+          const preview = await invoke<AgentDiffPreview>("codex_preview_snapshot", {
+            snapshotId: response.guard.snapshotId,
+          });
+          const previewSummary = changeSummaryFromDiffFiles(preview.files);
+          if (previewSummary.length > 0) responseChangeSummary = previewSummary;
+        } catch (error) {
+          console.warn("Agent diff preview unavailable", error);
+        }
+      }
       if (hasAgentChanges)
         await applyAgentSnapshotAutomatically(response.guard);
       setThreadIds((current) => ({
@@ -9390,6 +9744,10 @@ function App() {
                 live: false,
                 final: true,
                 interrupted: false,
+                changeSummary:
+                  responseChangeSummary.length > 0
+                    ? responseChangeSummary
+                    : undefined,
               }
             : message,
         );
@@ -9512,6 +9870,42 @@ function App() {
       }
       submitBusyRef.current = false;
     }
+  };
+
+  const copyAnswerToClipboard = async (answer: Message) => {
+    await writeTextToClipboard(answer.text);
+    notify("A válasz a vágólapra került");
+  };
+
+  const regenerateAnswer = (answer: Message) => {
+    if (isStreaming || submitBusyRef.current) {
+      notify("Újragenerálás csak befejezett válasznál indítható");
+      return;
+    }
+    const answerIndex = messagesRef.current.findIndex(
+      (message) => message.id === answer.id,
+    );
+    const source =
+      answerIndex >= 0
+        ? [...messagesRef.current.slice(0, answerIndex)]
+            .reverse()
+            .find((message) => message.role === "user")
+        : undefined;
+    if (!source) {
+      notify("Az eredeti prompt nem található");
+      return;
+    }
+    inputDraftRef.current = source.text;
+    if (inputRef.current) {
+      inputRef.current.value = source.text;
+      resizeComposerTextarea(inputRef.current);
+    }
+    quoteInstructionDraftsRef.current = Object.fromEntries(
+      (source.quoteRefs ?? []).map((quote) => [quote.id, quote.instruction]),
+    );
+    setComposerQuotes(source.quoteRefs ?? []);
+    setShowDetailedTrace(messageUsesDetailedTrace(source));
+    window.setTimeout(() => composerFormRef.current?.requestSubmit(), 0);
   };
 
   const handleInputKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -9873,6 +10267,8 @@ function App() {
         quoteAnchorPrefix={`trace:${entry.group.key}`}
         onQuoteJump={jumpToQuote}
         compact={compact}
+        onCopyAnswer={copyAnswerToClipboard}
+        onRegenerate={regenerateAnswer}
         onToggle={() =>
           setExpandedForWorkGroup(entry.group, !expanded)
         }
@@ -9922,6 +10318,8 @@ function App() {
         quoteAnchorPrefix={`trace:${liveTurnKey}`}
         onQuoteJump={jumpToQuote}
         compact={liveCompact}
+        onCopyAnswer={copyAnswerToClipboard}
+        onRegenerate={regenerateAnswer}
         onToggle={() =>
           setExpandedForKeys(
             [
@@ -10480,7 +10878,7 @@ function App() {
               </button>
             )}
           </div>
-          <form className="composer-wrap" onSubmit={submitMessage}>
+          <form ref={composerFormRef} className="composer-wrap" onSubmit={submitMessage}>
             <label
               className="composer-detail-toggle"
               title="Részletes terv, lépések és gondolkodás megjelenítése"

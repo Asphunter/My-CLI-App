@@ -4156,6 +4156,7 @@ mod sync_tests {
             hlc: None,
             origin_device_id: None,
             images: Vec::new(),
+            quote_refs: Vec::new(),
         }
     }
 

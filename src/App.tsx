@@ -42,6 +42,10 @@ type Message = {
   hlc?: string;
   originDeviceId?: string;
   images?: MessageImageAttachment[];
+  /** Quote references created from text selected in the conversation. */
+  quoteRefs?: QuoteReference[];
+  /** Whether this turn should render the detailed plan/reasoning trace. */
+  detailed?: boolean;
 };
 
 type MessageImageAttachment = {
@@ -60,7 +64,17 @@ type SelectionQuote = {
   text: string;
   x: number;
   y: number;
+  anchorId: string;
 };
+
+type QuoteReference = {
+  id: string;
+  text: string;
+  instruction: string;
+  anchorId: string;
+};
+
+type QuoteJumpHandler = (quote: QuoteReference) => void;
 
 type FileClickHandler = (path: string, x: number, y: number) => void;
 
@@ -406,15 +420,198 @@ const messageImageContext = (message: Message) =>
     ? `\nCsatolt projektképek: ${message.images.map((image) => image.path).join(", ")}`
     : "";
 
+const messageAnchorId = (message: Pick<Message, "id" | "sequence" | "time">) =>
+  `message:${message.id ?? `${message.sequence ?? "unknown"}:${message.time}`}`;
+
+const quoteBacklinkButtons = (
+  quotes: QuoteReference[],
+  onQuoteJump: QuoteJumpHandler,
+) => {
+  if (quotes.length === 0) return null;
+  return (
+    <span className="quote-backlinks" aria-label="Idézetek visszaugrása">
+      {quotes.map((quote, index) => (
+        <button
+          type="button"
+          className="quote-backlink-button"
+          key={quote.id}
+          onClick={() => onQuoteJump(quote)}
+          aria-label={`Idézet ${index + 1} megnyitása`}
+          title={quote.instruction || `Idézet ${index + 1} megnyitása`}
+        >
+          💬{quotes.length > 1 ? <small>{index + 1}</small> : null}
+        </button>
+      ))}
+    </span>
+  );
+};
+
+const answerWithQuoteBacklinks = (
+  text: string,
+  quotes: QuoteReference[],
+  onQuoteJump: QuoteJumpHandler,
+) => {
+  if (quotes.length === 0) return <InlineMarkdown text={text} />;
+  const matches = quotes
+    .map((quote) => {
+      const needles = [quote.text, quote.instruction].filter(Boolean);
+      const found = needles
+        .map((needle) => ({ needle, index: text.indexOf(needle) }))
+        .filter((candidate) => candidate.index >= 0)
+        .sort((a, b) => a.index - b.index)[0];
+      if (!found) return { quote, needle: "", index: -1 };
+      let index = found.index;
+      let needle = found.needle;
+      for (const marker of ["**", "__", "`", "*"]) {
+        if (
+          index >= marker.length &&
+          text.slice(index - marker.length, index) === marker &&
+          text.slice(index + needle.length, index + needle.length + marker.length) ===
+            marker
+        ) {
+          index -= marker.length;
+          needle = text.slice(index, index + needle.length + marker.length * 2);
+          break;
+        }
+      }
+      return { quote, needle, index };
+    })
+    .filter((match) => match.index >= 0)
+    .sort((a, b) => a.index - b.index);
+  if (matches.length === 0)
+    return (
+      <>
+        <InlineMarkdown text={text} />
+        {quoteBacklinkButtons(quotes, onQuoteJump)}
+      </>
+    );
+
+  // Put the backlink after the complete sentence that contains the match.
+  // A selected passage can end in the middle of a word or before the final
+  // punctuation; placing the icon at the raw match boundary makes it look as
+  // if the answer text was cut in half.
+  const sentenceEndFor = (match: (typeof matches)[number]) => {
+    const matchEnd = match.index + match.needle.length;
+    const matchedText = text.slice(match.index, matchEnd);
+    if (/[.!?…](?:["'”»)\]]*|\*{1,2}|`)$/.test(matchedText))
+      return matchEnd;
+    const remainder = text.slice(matchEnd);
+    const newline = remainder.search(/\r?\n/);
+    const boundary = /[.!?…](?:["'”»)\]]*)?(?=\s|$)/.exec(remainder);
+    const boundaryOffset = boundary?.index ?? -1;
+    if (newline >= 0 && (boundaryOffset < 0 || newline < boundaryOffset))
+      return matchEnd + newline;
+    if (boundary && boundaryOffset >= 0)
+      return matchEnd + boundaryOffset + boundary[0].length;
+    return text.length;
+  };
+  const groupedMatches: Array<{
+    start: number;
+    end: number;
+    quotes: QuoteReference[];
+  }> = [];
+  for (const match of matches) {
+    const end = sentenceEndFor(match);
+    const previous = groupedMatches.at(-1);
+    if (previous && match.index < previous.end) {
+      previous.end = Math.max(previous.end, end);
+      previous.quotes.push(match.quote);
+    } else {
+      groupedMatches.push({
+        start: match.index,
+        end,
+        quotes: [match.quote],
+      });
+    }
+  }
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  groupedMatches.forEach((group, index) => {
+    if (group.start < cursor) return;
+    if (group.start > cursor)
+      parts.push(
+        <InlineMarkdown
+          key={`answer-prefix-${group.start}`}
+          text={text.slice(cursor, group.start)}
+        />,
+      );
+    parts.push(
+      <span
+        className="trace-answer-quoted-sentence"
+        key={`answer-quote-${group.start}-${index}`}
+      >
+        <InlineMarkdown text={text.slice(group.start, group.end)} />
+        {quoteBacklinkButtons(group.quotes, onQuoteJump)}
+      </span>,
+    );
+    cursor = group.end;
+  });
+  if (cursor < text.length)
+    parts.push(<InlineMarkdown key="answer-suffix" text={text.slice(cursor)} />);
+  const matchedQuoteIds = new Set(matches.map((match) => match.quote.id));
+  const unmatchedQuotes = quotes.filter((quote) => !matchedQuoteIds.has(quote.id));
+  if (unmatchedQuotes.length > 0)
+    parts.push(
+      <span className="trace-answer-quoted-sentence" key="answer-unmatched-quotes">
+        {quoteBacklinkButtons(unmatchedQuotes, onQuoteJump)}
+      </span>,
+    );
+  return <>{parts}</>;
+};
+
+const selectQuoteText = (root: HTMLElement, text: string) => {
+  const needle = text.trim();
+  if (!needle) return false;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const nodes: Text[] = [];
+  let current: Node | null = walker.nextNode();
+  while (current) {
+    if (current.nodeType === Node.TEXT_NODE) nodes.push(current as Text);
+    current = walker.nextNode();
+  }
+  const fullText = nodes.map((node) => node.nodeValue ?? "").join("");
+  const start = fullText.indexOf(needle);
+  if (start < 0) return false;
+  const end = start + needle.length;
+  let cursor = 0;
+  let startNode: Text | undefined;
+  let endNode: Text | undefined;
+  let startOffset = 0;
+  let endOffset = 0;
+  for (const node of nodes) {
+    const length = (node.nodeValue ?? "").length;
+    if (!startNode && start >= cursor && start <= cursor + length) {
+      startNode = node;
+      startOffset = start - cursor;
+    }
+    if (end >= cursor && end <= cursor + length) {
+      endNode = node;
+      endOffset = end - cursor;
+      break;
+    }
+    cursor += length;
+  }
+  if (!startNode || !endNode) return false;
+  const range = document.createRange();
+  range.setStart(startNode, startOffset);
+  range.setEnd(endNode, endOffset);
+  const selection = window.getSelection();
+  if (!selection) return false;
+  selection.removeAllRanges();
+  selection.addRange(range);
+  return true;
+};
+
 const PROJECTS_STORAGE_KEY = "min-projects";
 const MESSAGE_HISTORY_STORAGE_KEY = "min-message-history";
+const DETAIL_MODE_STORAGE_KEY = "min-detail-mode";
 const WORK_LOG_STORAGE_KEY = "min-work-log";
 const PLAN_STORAGE_KEY = "min-plan-history";
 const COMMENTARY_STORAGE_KEY = "min-commentary-history";
 const DEVICE_ID_STORAGE_KEY = "min-device-id";
 const LOCAL_THREAD_IDS_STORAGE_KEY = "min-local-thread-ids";
 const SYNC_SCHEMA_VERSION = 1;
-const LOCAL_STORE_SNAPSHOT_VERSION = 9;
+const LOCAL_STORE_SNAPSHOT_VERSION = 10;
 const MAX_IMAGE_ATTACHMENTS = 6;
 const MAX_IMAGE_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const SYNC_POLL_INTERVAL_MS = 15_000;
@@ -1272,6 +1469,11 @@ const mergeMessages = (
         existing.images && existing.images.length > 0
           ? existing.images
           : message.images,
+      quoteRefs:
+        existing.quoteRefs && existing.quoteRefs.length > 0
+          ? existing.quoteRefs
+          : message.quoteRefs,
+      detailed: existing.detailed ?? message.detailed,
     };
   }
   const compacted = compactMessages(merged).map(stripStaleInterruptionMarker);
@@ -1333,6 +1535,37 @@ const saveThreadMessages = (key: string, messages: Message[]) => {
   } catch {
     // A storage quota error must not break the conversation.
   }
+};
+
+const rememberDetailMode = (messageId: string | undefined, detailed: boolean) => {
+  if (typeof window === "undefined" || !messageId) return;
+  try {
+    const saved = JSON.parse(
+      localStorage.getItem(DETAIL_MODE_STORAGE_KEY) ?? "{}",
+    ) as Record<string, boolean>;
+    localStorage.setItem(
+      DETAIL_MODE_STORAGE_KEY,
+      JSON.stringify({ ...saved, [messageId]: detailed }),
+    );
+  } catch {
+    // A storage quota error must not affect sending a prompt.
+  }
+};
+
+const messageUsesDetailedTrace = (message: Message) => {
+  if (typeof message.detailed === "boolean") return message.detailed;
+  if (typeof window !== "undefined" && message.id) {
+    try {
+      const saved = JSON.parse(
+        localStorage.getItem(DETAIL_MODE_STORAGE_KEY) ?? "{}",
+      ) as Record<string, unknown>;
+      if (typeof saved[message.id] === "boolean") return saved[message.id];
+    } catch {
+      // Fall back to the historical detailed layout.
+    }
+  }
+  // Messages created before the toggle existed retain their established UI.
+  return true;
 };
 
 const workItemKinds = new Set<WorkItemKind>([
@@ -2639,6 +2872,48 @@ const textWithoutCodeBlocks = (text: string) =>
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 
+const cleanUserMessageText = (text: string) =>
+  text
+    .replace(/^\s*\*{0,2}---?\s*Idézet\s*---?\s*\*{0,2}\s*$/gim, "")
+    .replace(/^\s*\*{0,2}---?\s*Idézet vége\s*---?\s*\*{0,2}\s*$/gim, "")
+    .replace(/^\s*\*{0,2}---?\s*Idézethez tartozó utasítás\s*---?\s*\*{0,2}\s*$/gim, "")
+    .replace(/^\s*\*{0,2}---?\s*Általános utasítás(?: \(nem az idézetre\))?\s*---?\s*\*{0,2}\s*$/gim, "")
+    .replace(/\*{0,2}(?:Idézet|Az idézethez kapcsolódó utasítás|Általános utasítás(?: \(nem az idézetre\))?):\*{0,2}\s*/gi, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+const userMessageDisplayText = (message: Message) => {
+  let text = textWithoutCodeBlocks(message.text);
+  const hasEmbeddedQuote = (message.quoteRefs ?? []).some((quote) => {
+    const quotedBlock = quote.text
+      .split(/\r?\n/)
+      .map((line) => `> ${line}`)
+      .join("\n");
+    return text.includes(quotedBlock) || text.includes(quote.text);
+  });
+  for (const quote of message.quoteRefs ?? []) {
+    const quotedBlock = quote.text
+      .split(/\r?\n/)
+      .map((line) => `> ${line}`)
+      .join("\n");
+    text = text.replace(quotedBlock, "").replace(quote.text, "");
+    // Older snapshots embedded each quote instruction in message.text. New
+    // messages keep only the general instruction there, so remove this only
+    // when the legacy quoted block was actually present.
+    if (hasEmbeddedQuote && quote.instruction)
+      text = text.replace(quote.instruction, "");
+  }
+  const cleanedText = cleanUserMessageText(text);
+  // Quote-only turns keep their per-quote instructions in quoteRefs rather
+  // than in message.text. Show those instructions in the user bubble too;
+  // otherwise the backlink icon would replace the entire visible prompt.
+  const quoteInstructions = (message.quoteRefs ?? [])
+    .map((quote) => quote.instruction.trim())
+    .filter(Boolean)
+    .filter((instruction) => !cleanedText.includes(instruction));
+  return [cleanedText, ...quoteInstructions].filter(Boolean).join("\n");
+};
+
 const localFileExtensions = new Set([
   "7z",
   "avi",
@@ -3312,18 +3587,24 @@ function MessageRow({
   projectPath,
   isFinal,
   showAvatar = true,
+  onQuoteJump,
 }: {
   message: Message;
   projectPath: string;
   isFinal?: boolean;
   showAvatar?: boolean;
+  onQuoteJump?: QuoteJumpHandler;
 }) {
-  const visibleText = textWithoutCodeBlocks(message.text);
+  const visibleText =
+    message.role === "user"
+      ? userMessageDisplayText(message)
+      : textWithoutCodeBlocks(message.text);
   const final = isFinal ?? message.final;
   const isPending =
     message.role === "assistant" && !message.text.trim() && !final;
   const promptTimestamp =
     message.role === "user" ? messagePromptTimestamp(message) : undefined;
+  const anchorId = messageAnchorId(message);
 
   return (
     <article
@@ -3349,6 +3630,7 @@ function MessageRow({
         <div
           className={`message-body${isPending ? " is-pending" : ""}`}
           data-quote-selectable="true"
+          data-quote-anchor={anchorId}
         >
           {message.images && message.images.length > 0 && (
             <div className="message-images">
@@ -3361,7 +3643,15 @@ function MessageRow({
               ))}
             </div>
           )}
-          {visibleText && <p><InlineMarkdown text={visibleText} /></p>}
+          {visibleText && (
+            <p>
+              <InlineMarkdown text={visibleText} />
+              {message.role === "user" && onQuoteJump &&
+                quoteBacklinkButtons(message.quoteRefs ?? [], onQuoteJump)}
+            </p>
+          )}
+          {!visibleText && message.role === "user" && onQuoteJump &&
+            quoteBacklinkButtons(message.quoteRefs ?? [], onQuoteJump)}
           {isPending && (
             <div className="assistant-pending" aria-label="A min válaszol">
               <span />
@@ -3818,6 +4108,10 @@ type TurnProgressCardProps = {
   watchdogMessage: string;
   onToggle: () => void;
   answer?: Message;
+  quoteRefs?: QuoteReference[];
+  quoteAnchorPrefix: string;
+  onQuoteJump?: QuoteJumpHandler;
+  compact?: boolean;
 };
 
 function TurnProgressCard({
@@ -3831,11 +4125,34 @@ function TurnProgressCard({
   watchdogMessage,
   onToggle,
   answer,
+  quoteRefs = [],
+  quoteAnchorPrefix,
+  onQuoteJump,
+  compact = false,
 }: TurnProgressCardProps) {
+  const quoteAnchor = (suffix: string) =>
+    `${quoteAnchorPrefix}:${suffix}`;
+  const quotesForAnchor = (anchorId: string) =>
+    quoteRefs.filter((quote) => quote.anchorId === anchorId);
+  const answerAnchorId = answer ? messageAnchorId(answer) : quoteAnchor("answer");
+  const answerText = answer?.text ?? "";
+  const answerQuoteRefs = Array.from(
+    new Map(
+      [
+        ...quotesForAnchor(answerAnchorId),
+        ...quotesForAnchor(quoteAnchor("answer")),
+        ...quoteRefs.filter(
+          (quote) =>
+            quote.instruction.trim().length >= 3 &&
+            answerText.includes(quote.instruction.trim()),
+        ),
+      ].map((quote) => [quote.id, quote]),
+    ).values(),
+  );
   const hasPlanStepEvidence = (stepId: string) =>
     activities.some((activity) => activity.planStepId === stepId) ||
     commentary.some((entry) => entry.stepId === stepId);
-  const plannedSteps = plan.steps
+  const normalizedPlannedSteps = plan.steps
     .filter(
       (step) =>
         step.id !== "client-pre-plan" && !step.id.startsWith("client-fallback"),
@@ -3855,6 +4172,27 @@ function TurnProgressCard({
         ? { ...step, status: "pending" as const }
         : step;
     });
+  const plannedSteps = streaming
+    ? normalizedPlannedSteps
+    : normalizedPlannedSteps.filter((step) => {
+        const timing = plan.stepTimes?.[step.id];
+        const hasTraceEvidence = hasPlanStepEvidence(step.id);
+        const hasMeaningfulTiming =
+          (timing?.startedAt !== undefined || timing?.completedAt !== undefined) &&
+          !(timing?.startedAt !== undefined &&
+            timing?.completedAt !== undefined &&
+            timing.completedAt <= timing.startedAt);
+        // A model can announce more work than it actually performs. Once the
+        // turn is finished, remove only rows with no trace/timing evidence;
+        // completed steps with a real boundary and error/in-progress rows are
+        // retained even when their displayed duration is 0:00.
+        return (
+          hasTraceEvidence ||
+          hasMeaningfulTiming ||
+          step.status === "error" ||
+          step.status === "inProgress"
+        );
+      });
   const fallbackStep: PlanStep = {
     id: "client-pre-plan",
     step: "0. Terv előkészítése és feladatértelmezése",
@@ -4267,6 +4605,48 @@ function TurnProgressCard({
   const openInlineDiff = (activity: CodeActivity) =>
     setInlineDiff(inlineCodeDiffForActivity(activity));
 
+  if (compact) {
+    return (
+      <article
+        className="compact-answer-card"
+        data-quote-selectable="true"
+        data-quote-anchor={answerAnchorId}
+        aria-label="Válasz"
+      >
+        <div className="compact-answer-body">
+          <div className="compact-answer-line">
+            {hasAnswer && (
+              <p>
+                {answerWithQuoteBacklinks(
+                  textWithoutCodeBlocks(answer?.text ?? ""),
+                  answerQuoteRefs,
+                  onQuoteJump ?? (() => undefined),
+                )}
+              </p>
+            )}
+            {streaming && (
+              <span className="trace-answer-spinner" aria-label="Válasz készül" />
+            )}
+          </div>
+          {onQuoteJump && answerQuoteRefs.length > 0 &&
+            answerQuoteRefs.some(
+              (quote) =>
+                !answer?.text.includes(quote.text) &&
+                !(quote.instruction && answer?.text.includes(quote.instruction)),
+            ) &&
+            quoteBacklinkButtons(
+              answerQuoteRefs.filter(
+                (quote) =>
+                  !answer?.text.includes(quote.text) &&
+                  !(quote.instruction && answer?.text.includes(quote.instruction)),
+              ),
+              onQuoteJump,
+            )}
+        </div>
+      </article>
+    );
+  }
+
   return (
     <article
       className={`turn-progress-card trace-card${streaming ? " is-live" : ""}`}
@@ -4276,19 +4656,38 @@ function TurnProgressCard({
         <section
         className="turn-progress-answer"
         data-quote-selectable="true"
+        data-quote-anchor={answerAnchorId}
         aria-label="Válasz"
       >
         <div className="turn-progress-answer-body">
           <div className="trace-answer-line">
             {hasAnswer && (
               <p>
-                <InlineMarkdown text={textWithoutCodeBlocks(answer?.text ?? "")} />
+                {answerWithQuoteBacklinks(
+                  textWithoutCodeBlocks(answer?.text ?? ""),
+                  answerQuoteRefs,
+                  onQuoteJump ?? (() => undefined),
+                )}
               </p>
             )}
             {streaming && (
               <span className="trace-answer-spinner" aria-label="Válasz készül" />
             )}
           </div>
+          {onQuoteJump && answerQuoteRefs.length > 0 &&
+            answerQuoteRefs.some(
+              (quote) =>
+                !answer?.text.includes(quote.text) &&
+                !(quote.instruction && answer?.text.includes(quote.instruction)),
+            ) &&
+            quoteBacklinkButtons(
+              answerQuoteRefs.filter(
+                (quote) =>
+                  !answer?.text.includes(quote.text) &&
+                  !(quote.instruction && answer?.text.includes(quote.instruction)),
+              ),
+              onQuoteJump,
+            )}
           <button
             type="button"
             className="trace-collapse"
@@ -4319,21 +4718,26 @@ function TurnProgressCard({
                   step.id !== activeStep.id;
                 const elapsed = stepElapsedFor(step);
                 return (
-                  <button
-                    type="button"
-                    role="listitem"
+                  <div
+                    className="trace-step-target"
                     key={step.id}
-                    className={`trace-step-row trace-step-row-${displayStatus(step)}${selectedStep.id === step.id ? " is-selected" : ""}${disabled ? " is-disabled" : ""}`}
-                    onClick={() => selectStep(step.id)}
-                    disabled={disabled}
-                    aria-pressed={selectedStep.id === step.id}
+                    data-quote-anchor={quoteAnchor(`step:${step.id}`)}
                   >
-                    <span className="trace-step-marker" aria-hidden="true">
-                      {stepIndicator(step)}
-                    </span>
-                    <span className="trace-step-name">{step.step}</span>
-                    {elapsed && <span className="trace-step-elapsed">{elapsed}</span>}
-                  </button>
+                    <button
+                      type="button"
+                      role="listitem"
+                      className={`trace-step-row trace-step-row-${displayStatus(step)}${selectedStep.id === step.id ? " is-selected" : ""}${disabled ? " is-disabled" : ""}`}
+                      onClick={() => selectStep(step.id)}
+                      disabled={disabled}
+                      aria-pressed={selectedStep.id === step.id}
+                    >
+                      <span className="trace-step-marker" aria-hidden="true">
+                        {stepIndicator(step)}
+                      </span>
+                      <span className="trace-step-name">{step.step}</span>
+                      {elapsed && <span className="trace-step-elapsed">{elapsed}</span>}
+                    </button>
+                  </div>
                 );
               })}
             </div>
@@ -4347,6 +4751,7 @@ function TurnProgressCard({
           <section
             className="trace-thinking-panel"
             data-quote-selectable="true"
+            data-quote-anchor={quoteAnchor(`thinking:${selectedStep.id}`)}
             aria-label="Gondolkodás menete"
           >
             {thinkingEntries.length > 0 ? (
@@ -4977,7 +5382,8 @@ function App() {
   const [messages, setMessages] = useState<Message[]>(
     isTauri ? [] : loadInitialMessages,
   );
-  const [composerQuote, setComposerQuote] = useState<string | null>(null);
+  const [composerQuotes, setComposerQuotes] = useState<QuoteReference[]>([]);
+  const [showDetailedTrace, setShowDetailedTrace] = useState(false);
   const [pendingImages, setPendingImages] = useState<PendingImageAttachment[]>(
     [],
   );
@@ -5143,15 +5549,23 @@ function App() {
         setSelectionQuote(null);
         return;
       }
+      const quoteAnchor = container.closest<HTMLElement>("[data-quote-anchor]");
+      const anchorId = quoteAnchor?.dataset.quoteAnchor;
+      if (!anchorId) {
+        setSelectionQuote(null);
+        return;
+      }
       const rect = range.getBoundingClientRect();
       if (rect.width === 0 && rect.height === 0) return;
       setSelectionQuote((current) =>
         current?.text === text &&
+        current.anchorId === anchorId &&
         Math.abs(current.x - rect.right) < 1 &&
         Math.abs(current.y - Math.max(8, rect.top - 8)) < 1
           ? current
           : {
               text,
+              anchorId,
               x: Math.min(window.innerWidth - 42, Math.max(8, rect.right + 8)),
               y: Math.min(window.innerHeight - 42, Math.max(8, rect.top - 8)),
             },
@@ -5192,9 +5606,12 @@ function App() {
   const planTextBufferRef = useRef<Record<string, string>>({});
   const messageStreamRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const quoteInputRef = useRef<HTMLTextAreaElement>(null);
+  const quoteInputRefs = useRef<Record<string, HTMLTextAreaElement | null>>({});
+  // Keep fast quote typing out of the root render path. The conversation can
+  // contain thousands of nodes, so updating React state on every keystroke
+  // made the WebView renderer stall and appear gray.
+  const quoteInstructionDraftsRef = useRef<Record<string, string>>({});
   const inputDraftRef = useRef("");
-  const quoteInstructionRef = useRef("");
   const imageInputRef = useRef<HTMLInputElement>(null);
   const submitBusyRef = useRef(false);
   const composerScopeRef = useRef(threadKey);
@@ -5202,11 +5619,11 @@ function App() {
     if (composerScopeRef.current === threadKey) return;
     composerScopeRef.current = threadKey;
     inputDraftRef.current = "";
-    quoteInstructionRef.current = "";
     if (inputRef.current) inputRef.current.value = "";
-    if (quoteInputRef.current) quoteInputRef.current.value = "";
     setPendingImages([]);
-    setComposerQuote(null);
+    quoteInstructionDraftsRef.current = {};
+    setComposerQuotes([]);
+    setShowDetailedTrace(false);
   }, [threadKey]);
   const resizeComposerTextarea = (textarea: HTMLTextAreaElement | null) => {
     if (!textarea) return;
@@ -5222,8 +5639,8 @@ function App() {
   };
   useEffect(() => {
     resizeComposerTextarea(inputRef.current);
-    resizeComposerTextarea(quoteInputRef.current);
-  }, [composerQuote, pendingImages, threadKey]);
+    Object.values(quoteInputRefs.current).forEach(resizeComposerTextarea);
+  }, [composerQuotes, pendingImages, threadKey]);
   const shouldStickToBottom = useRef(true);
   const autoScrollFrameRef = useRef<number | null>(null);
   const activeRequestIdRef = useRef<string | null>(null);
@@ -7873,11 +8290,34 @@ function App() {
 
   const insertSelectionQuote = () => {
     const selected = selectionQuote?.text.trim();
-    if (!selected) return;
-    setComposerQuote(selected);
-    quoteInstructionRef.current = "";
+    const anchorId = selectionQuote?.anchorId;
+    if (!selected || !anchorId) return;
+    const quote: QuoteReference = {
+      id: createEntityId(),
+      text: selected,
+      instruction: "",
+      anchorId,
+    };
+    quoteInstructionDraftsRef.current[quote.id] = "";
+    setComposerQuotes((current) => [...current, quote]);
     setSelectionQuote(null);
-    window.requestAnimationFrame(() => quoteInputRef.current?.focus());
+    window.requestAnimationFrame(() => quoteInputRefs.current[quote.id]?.focus());
+  };
+
+  const jumpToQuote: QuoteJumpHandler = (quote) => {
+    const target = Array.from(
+      document.querySelectorAll<HTMLElement>("[data-quote-anchor]"),
+    ).find((candidate) => candidate.dataset.quoteAnchor === quote.anchorId);
+    if (!target) {
+      notify("Az idézet eredeti helye jelenleg nem látható.", "notify");
+      return;
+    }
+    target.scrollIntoView({ behavior: "smooth", block: "center" });
+    target.classList.add("is-quote-target");
+    window.setTimeout(() => {
+      selectQuoteText(target, quote.text);
+      window.setTimeout(() => target.classList.remove("is-quote-target"), 1400);
+    }, 220);
   };
 
   const blockConversationMutationDuringStream = () => {
@@ -7958,9 +8398,10 @@ function App() {
       const start = textarea.selectionStart;
       const end = textarea.selectionEnd;
       textarea.setRangeText(pastedText, start, end, "end");
-      if (textarea === quoteInputRef.current)
-        quoteInstructionRef.current = textarea.value;
-      else inputDraftRef.current = textarea.value;
+      const quoteId = textarea.dataset.quoteId;
+      if (quoteId) {
+        quoteInstructionDraftsRef.current[quoteId] = textarea.value;
+      } else inputDraftRef.current = textarea.value;
       requestAnimationFrame(() => {
         textarea.focus();
         resizeComposerTextarea(textarea);
@@ -8630,28 +9071,42 @@ function App() {
   const submitMessage = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const generalInstruction = inputDraftRef.current.trim();
-    const quoteInstructionText = quoteInstructionRef.current.trim();
-    const selectedQuote = composerQuote?.trim() ?? "";
-    const quoteBlock = selectedQuote
-      ? `**Idézet:**\n${selectedQuote
-          .split(/\r?\n/)
-          .map((line) => `> ${line}`)
-          .join("\n")}`
-      : "";
-    const text = [
-      quoteBlock,
-      quoteInstructionText
-        ? `**Az idézethez kapcsolódó utasítás:**\n${quoteInstructionText}`
-        : "",
-      generalInstruction
-        ? `**Általános utasítás (nem az idézetre):**\n${generalInstruction}`
-        : "",
+    const quoteSnapshot = composerQuotes
+      .map((quote) => ({
+        ...quote,
+        instruction: (
+          quoteInstructionDraftsRef.current[quote.id] ?? quote.instruction
+        ).trim(),
+      }))
+      .filter((quote) => quote.text.trim());
+    const quoteInstructionText = quoteSnapshot
+      .map((quote) => quote.instruction)
+      .filter(Boolean)
+      .join("\n");
+    const selectedQuote = quoteSnapshot[0]?.text.trim() ?? "";
+    // The visible user bubble contains only the actual instructions. The
+    // quoted source is kept in quoteRefs and shown as a clickable reference
+    // button; the full quoted passages remain in modelPrompt for the model.
+    const text = generalInstruction;
+    const modelPrompt = [
+      ...quoteSnapshot.map((quote, index) =>
+        [
+          `Quoted passage ${index + 1}:`,
+          quote.text
+            .split(/\r?\n/)
+            .map((line) => `> ${line}`)
+            .join("\n"),
+          `Instruction for quoted passage ${index + 1}:`,
+          quote.instruction || "Apply the general instruction to this passage.",
+        ].join("\n"),
+      ),
+      generalInstruction ? `General instruction:\n${generalInstruction}` : "",
     ]
       .filter(Boolean)
       .join("\n\n");
     const pendingImageSnapshot = [...pendingImages];
     if (
-      (!text && pendingImageSnapshot.length === 0) ||
+      (!text && quoteSnapshot.length === 0 && pendingImageSnapshot.length === 0) ||
       isStreaming ||
       submitBusyRef.current
     )
@@ -8720,14 +9175,18 @@ function App() {
       messagesRef.current,
       false,
     );
+    const userMessageId = createEntityId();
     const userMessage: Message = {
-      id: createEntityId(),
+      id: userMessageId,
       role: "user",
       time: new Date(requestStartedAt).toISOString(),
       text,
       images: storedImages,
+      quoteRefs: quoteSnapshot,
+      detailed: showDetailedTrace,
       sequence: userSequence,
     };
+    rememberDetailMode(userMessageId, showDetailedTrace);
     const nextMessages = [...previousMessages, userMessage, liveMessage];
     let requestThreadKey = threadKey;
     const activeProjectForNaming = projects.find(
@@ -8858,10 +9317,10 @@ function App() {
     updatePlanState(initialPlan);
     commitMessages(nextMessages);
     inputDraftRef.current = "";
-    quoteInstructionRef.current = "";
     if (inputRef.current) inputRef.current.value = "";
-    if (quoteInputRef.current) quoteInputRef.current.value = "";
-    setComposerQuote(null);
+    quoteInputRefs.current = {};
+    quoteInstructionDraftsRef.current = {};
+    setComposerQuotes([]);
     setPendingImages([]);
     turnCompletedRequestIdRef.current = null;
     setTurnCompletedRequestId(null);
@@ -8871,7 +9330,8 @@ function App() {
     setIsStreaming(true);
     setIsCancelling(false);
     setCodeStatus("dolgozik");
-    let codexPrompt = promptText;
+    const baseCodexPrompt = modelPrompt || promptText;
+    let codexPrompt = baseCodexPrompt;
     const rehydrationContext =
       conversationContextForRehydration(previousMessages);
     if (isTauri && activeProjectData?.path) {
@@ -8881,7 +9341,7 @@ function App() {
         activeProjectData.path,
       );
       if (localFileContext)
-        codexPrompt = `${promptText}\n\n${localFileContext}`;
+        codexPrompt = `${baseCodexPrompt}\n\n${localFileContext}`;
     }
     if (cancelledRequestIdsRef.current.delete(requestId)) {
       preparingRequestIdRef.current = null;
@@ -9068,9 +9528,10 @@ function App() {
       event.preventDefault();
       const insertion = `\n${numberedLine[1]}${Number(numberedLine[2]) + 1}) `;
       textarea.setRangeText(insertion, cursor, textarea.selectionEnd, "end");
-      if (textarea === quoteInputRef.current)
-        quoteInstructionRef.current = textarea.value;
-      else inputDraftRef.current = textarea.value;
+      const quoteId = textarea.dataset.quoteId;
+      if (quoteId) {
+        quoteInstructionDraftsRef.current[quoteId] = textarea.value;
+      } else inputDraftRef.current = textarea.value;
       requestAnimationFrame(() => {
         const position = cursor + insertion.length;
         textarea.focus();
@@ -9299,8 +9760,30 @@ function App() {
         workGroupHasVisibleTrace(group) &&
         messageBelongsToWorkGroup(message, messageIndex, group),
     );
+  const allQuoteRefs = messages.flatMap((message) => message.quoteRefs ?? []);
+  const userMessageForWorkGroup = (group: WorkLogGroup) =>
+    group.userMessageKey
+      ? messages.find((message, index) => {
+          if (message.role !== "user") return false;
+          const key = message.id ?? `user:${message.sequence ?? index}`;
+          return key === group.userMessageKey;
+        })
+      : undefined;
+  const workGroupUsesDetailedTrace = (group: WorkLogGroup) => {
+    const userMessage = userMessageForWorkGroup(group);
+    return userMessage ? messageUsesDetailedTrace(userMessage) : true;
+  };
   const timelineContent = timelineEntries.map((entry) => {
     if (entry.kind === "message") {
+      // A persisted turn may contain an empty final assistant placeholder.
+      // Rendering it creates nothing but a full-width bordered line between
+      // the user prompt and the next turn. Keep real text/image rows only.
+      if (
+        entry.message.role === "assistant" &&
+        !entry.message.text.trim() &&
+        !(entry.message.images && entry.message.images.length > 0)
+      )
+        return null;
       const nextMessage = messages[entry.messageIndex + 1];
       const isFinal =
         entry.message.final ??
@@ -9329,15 +9812,22 @@ function App() {
           projectPath={activeProjectPath}
           isFinal={isFinal}
           showAvatar={showAvatar}
+          onQuoteJump={jumpToQuote}
         />
       );
     }
     if (isStreaming && entry.group.key === activeWorkGroup?.key) return null;
+    const groupAnswer = answerForWorkGroup(entry.group);
+    // A quote-only/aborted turn can leave plan metadata behind without an
+    // assistant answer. Rendering that orphaned trace produces a stray
+    // horizontal rule between messages, so keep the timeline clean.
+    if (!groupAnswer?.text.trim()) return null;
     const storedPlan = planForWorkGroup(entry.group);
     if (!workGroupHasVisibleTrace(entry.group)) return null;
     const isLatestGroup = entry.group.key === latestWorkGroup?.key;
     const isCurrentGroup = entry.group.key === currentWorkGroup?.key;
     const expanded = expandedForWorkGroup(entry.group, isLatestGroup);
+    const compact = !workGroupUsesDetailedTrace(entry.group);
     const basePlan =
       storedPlan ??
       (isCurrentGroup
@@ -9378,7 +9868,11 @@ function App() {
         expanded={expanded}
         transport={null}
         watchdogMessage=""
-        answer={answerForWorkGroup(entry.group)}
+        answer={groupAnswer}
+        quoteRefs={allQuoteRefs}
+        quoteAnchorPrefix={`trace:${entry.group.key}`}
+        onQuoteJump={jumpToQuote}
+        compact={compact}
         onToggle={() =>
           setExpandedForWorkGroup(entry.group, !expanded)
         }
@@ -9400,6 +9894,12 @@ function App() {
         message.role === "assistant" &&
         message.live,
     );
+  const activeUserMessage = [...messages]
+    .reverse()
+    .find((message) => message.role === "user");
+  const liveCompact = activeUserMessage
+    ? !messageUsesDetailedTrace(activeUserMessage)
+    : !showDetailedTrace;
   const liveTurnContent = isStreaming && (
     <div className="live-turn-anchor">
       <TurnProgressCard
@@ -9418,6 +9918,10 @@ function App() {
         transport={transportStatus}
         watchdogMessage={watchdogMessage}
         answer={liveAnswer}
+        quoteRefs={allQuoteRefs}
+        quoteAnchorPrefix={`trace:${liveTurnKey}`}
+        onQuoteJump={jumpToQuote}
+        compact={liveCompact}
         onToggle={() =>
           setExpandedForKeys(
             [
@@ -9977,28 +10481,64 @@ function App() {
             )}
           </div>
           <form className="composer-wrap" onSubmit={submitMessage}>
+            <label
+              className="composer-detail-toggle"
+              title="Részletes terv, lépések és gondolkodás megjelenítése"
+            >
+              <input
+                type="checkbox"
+                checked={showDetailedTrace}
+                onChange={(event) =>
+                  setShowDetailedTrace(event.currentTarget.checked)
+                }
+                aria-label="Részletes terv, lépések és gondolkodás"
+              />
+              <span>Részletes</span>
+            </label>
             <div className="composer">
-              {composerQuote && (
-                <section className="composer-quote" aria-label="Kijelölt idézet">
-                  <div className="composer-quote-header">
-                    <span className="composer-quote-badge">Idézet</span>
-                    <button
-                      type="button"
-                      className="composer-quote-remove"
-                      aria-label="Idézet eltávolítása"
-                      title="Idézet eltávolítása"
-                      onClick={() => {
-                        setComposerQuote(null);
-                        quoteInstructionRef.current = "";
-                        if (quoteInputRef.current) quoteInputRef.current.value = "";
-                        inputRef.current?.focus();
-                      }}
-                    >
-                      ×
-                    </button>
-                  </div>
-                  <blockquote>{composerQuote}</blockquote>
-                </section>
+              {composerQuotes.length > 0 && (
+                <div className="composer-quotes" aria-label="Kijelölt idézetek">
+                  {composerQuotes.map((quote, index) => (
+                    <section className="composer-quote" key={quote.id}>
+                      <div className="composer-quote-header">
+                        <span className="composer-quote-badge">#{index + 1}</span>
+                        <button
+                          type="button"
+                          className="composer-quote-remove"
+                          aria-label="Idézet eltávolítása"
+                          title="Idézet eltávolítása"
+                          onClick={() => {
+                            setComposerQuotes((current) =>
+                              current.filter((candidate) => candidate.id !== quote.id),
+                            );
+                            delete quoteInputRefs.current[quote.id];
+                            delete quoteInstructionDraftsRef.current[quote.id];
+                            inputRef.current?.focus();
+                          }}
+                        >
+                          ×
+                        </button>
+                      </div>
+                      <blockquote>{quote.text}</blockquote>
+                      <textarea
+                        ref={(element) => {
+                          quoteInputRefs.current[quote.id] = element;
+                        }}
+                        data-quote-id={quote.id}
+                        rows={1}
+                        defaultValue={quote.instruction}
+                        onChange={(event) => {
+                          quoteInstructionDraftsRef.current[quote.id] =
+                            event.currentTarget.value;
+                        }}
+                        onInput={(event) => resizeComposerTextarea(event.currentTarget)}
+                        onKeyDown={handleInputKeyDown}
+                        onPaste={handleInputPaste}
+                        placeholder="Mit szeretnél tudni vagy módosítani ezzel kapcsolatban?"
+                      />
+                    </section>
+                  ))}
+                </div>
               )}
               {pendingImages.length > 0 && (
                 <div className="composer-attachments" aria-label="Csatolt képek">
@@ -10021,29 +10561,8 @@ function App() {
                   ))}
                 </div>
               )}
-              {composerQuote && (
-                <label className="composer-field composer-quote-field">
-                  <span>Az idézethez kapcsolódó utasítás</span>
-                  <textarea
-                    ref={quoteInputRef}
-                    rows={1}
-                    defaultValue=""
-                    onInput={(event) => {
-                      quoteInstructionRef.current = event.currentTarget.value;
-                      resizeComposerTextarea(event.currentTarget);
-                    }}
-                    onKeyDown={handleInputKeyDown}
-                    onPaste={handleInputPaste}
-                    placeholder="Mit szeretnél tudni vagy módosítani az idézettel kapcsolatban?"
-                  />
-                </label>
-              )}
-              {composerQuote && (
-                <div className="composer-general-label">
-                  Általános utasítás <span>(nem az idézetre vonatkozik)</span>
-                </div>
-              )}
-              <textarea
+              <div className="composer-input-row">
+                <textarea
                 ref={inputRef}
                 rows={1}
                 defaultValue=""
@@ -10053,12 +10572,9 @@ function App() {
                 }}
                 onKeyDown={handleInputKeyDown}
                 onPaste={handleInputPaste}
-                placeholder={
-                  composerQuote
-                    ? "Írd ide az idézettől független utasításodat…"
-                    : "Írj egy üzenetet, vagy illessz be egy screenshotot…"
-                }
-              />
+                placeholder="Írj egy üzenetet, vagy illessz be egy screenshotot…"
+                />
+              </div>
               <input
                 ref={imageInputRef}
                 className="hidden-file-input"

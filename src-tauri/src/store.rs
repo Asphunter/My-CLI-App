@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
-pub const STORE_SCHEMA_VERSION: i64 = 9;
+pub const STORE_SCHEMA_VERSION: i64 = 10;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS store_meta (
@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS messages (
     final INTEGER NOT NULL DEFAULT 0,
     origin_device_id TEXT REFERENCES devices(id),
     attachments_json TEXT NOT NULL DEFAULT '[]',
+    quote_refs_json TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL
 );
 
@@ -257,6 +258,17 @@ pub struct LocalMessage {
     pub origin_device_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<LocalImageAttachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quote_refs: Vec<LocalQuoteReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalQuoteReference {
+    pub id: String,
+    pub text: String,
+    pub instruction: String,
+    pub anchor_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -521,6 +533,21 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
             .map_err(|error| format!("A lokális SQLite v9 migráció sikertelen: {error}"))?;
         transaction.commit().map_err(|error| {
             format!("A lokális SQLite v9 migráció commitja sikertelen: {error}")
+        })?;
+    }
+    let migrated_version = read_schema_version(connection)?;
+    if migrated_version == 9 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("A lokális SQLite v10 migráció nem indítható el: {error}"))?;
+        transaction
+            .execute_batch(
+                "ALTER TABLE messages ADD COLUMN quote_refs_json TEXT NOT NULL DEFAULT '[]';
+                 PRAGMA user_version = 10;",
+            )
+            .map_err(|error| format!("A lokális SQLite v10 migráció sikertelen: {error}"))?;
+        transaction.commit().map_err(|error| {
+            format!("A lokális SQLite v10 migráció commitja sikertelen: {error}")
         })?;
     }
     Ok(())
@@ -815,7 +842,7 @@ pub(crate) fn load_snapshot_from_connection(
             let mut statement = connection
                 .prepare(
                     "SELECT id, role, body, created_at, code, live, \"final\", item_id, turn_id,
-                            sequence, hlc, origin_device_id, attachments_json
+                            sequence, hlc, origin_device_id, attachments_json, quote_refs_json
                      FROM messages
                      WHERE conversation_id = ?1
                      ORDER BY COALESCE(hlc, printf('%020d', sequence)),
@@ -838,6 +865,8 @@ pub(crate) fn load_snapshot_from_connection(
                         hlc: row.get(10)?,
                         origin_device_id: row.get(11)?,
                         images: serde_json::from_str(&row.get::<_, String>(12)?)
+                            .unwrap_or_default(),
+                        quote_refs: serde_json::from_str(&row.get::<_, String>(13)?)
                             .unwrap_or_default(),
                     })
                 })
@@ -1296,10 +1325,12 @@ fn save_snapshot_in_connection(
             };
             let attachments_json = serde_json::to_string(&message.images)
                 .map_err(|error| format!("A képcsatolmányok nem szerializálhatók: {error}"))?;
+            let quote_refs_json = serde_json::to_string(&message.quote_refs)
+                .map_err(|error| format!("Az idézet-hivatkozások nem szerializálhatók: {error}"))?;
             transaction
                 .execute(
-                    "INSERT INTO messages (id, conversation_id, role, body, sequence, hlc, item_id, turn_id, code, live, \"final\", origin_device_id, attachments_json, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                    "INSERT INTO messages (id, conversation_id, role, body, sequence, hlc, item_id, turn_id, code, live, \"final\", origin_device_id, attachments_json, quote_refs_json, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                      ON CONFLICT DO UPDATE SET
                          conversation_id = excluded.conversation_id,
                          role = excluded.role,
@@ -1321,6 +1352,10 @@ fn save_snapshot_in_connection(
                          attachments_json = CASE
                              WHEN excluded.attachments_json <> '[]' THEN excluded.attachments_json
                              ELSE messages.attachments_json
+                         END,
+                         quote_refs_json = CASE
+                             WHEN excluded.quote_refs_json <> '[]' THEN excluded.quote_refs_json
+                             ELSE messages.quote_refs_json
                          END",
                     params![
                         message_id,
@@ -1336,6 +1371,7 @@ fn save_snapshot_in_connection(
                         if message.final_message.unwrap_or(false) { 1 } else { 0 },
                         message.origin_device_id,
                         attachments_json,
+                        quote_refs_json,
                         message_time,
                     ],
                 )
@@ -1571,6 +1607,9 @@ mod tests {
             .iter()
             .any(|column| column == "attachments_json"));
         assert!(message_columns.iter().any(|column| column == "turn_id"));
+        assert!(message_columns
+            .iter()
+            .any(|column| column == "quote_refs_json"));
     }
 
     fn test_snapshot() -> LocalStoreSnapshot {
@@ -1598,6 +1637,7 @@ mod tests {
                     name: "clipboard.png".to_string(),
                     mime_type: "image/png".to_string(),
                 }],
+                quote_refs: Vec::new(),
             }],
             work_items: vec![LocalWorkItem {
                 id: 11,

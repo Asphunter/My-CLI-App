@@ -4241,6 +4241,7 @@ mod tests {
                 hlc: None,
                 origin_device_id: None,
                 images: Vec::new(),
+                quote_refs: Vec::new(),
             }],
             work_items: Vec::new(),
             thread_id: Some("foreign-machine-rollout".to_string()),
@@ -4591,6 +4592,7 @@ mod tests {
                     hlc: None,
                     origin_device_id: None,
                     images: Vec::new(),
+                    quote_refs: Vec::new(),
                 },
             })
             .expect("message payload"),

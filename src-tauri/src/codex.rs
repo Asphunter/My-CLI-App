@@ -1,5 +1,5 @@
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use crate::store;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -27,6 +27,9 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const CODEX_APPROVAL_POLICY: &str = "never";
 const CODEX_SANDBOX_POLICY: &str = "workspace-write";
 const CODEX_REASONING_SUMMARY: &str = "detailed";
+// The Min window owns completion audio. Inheriting the user's global Codex
+// `notify` hook would play a second, slightly delayed copy of the same sound.
+const CODEX_APP_SERVER_ARGS: [&str; 4] = ["-c", "notify=[]", "app-server", "--stdio"];
 const UI_DEVELOPER_INSTRUCTIONS: &str = concat!(
     "For every user task, create and maintain an execution plan with at least one step. ",
     "Update it when work moves between steps, including for simple one-step tasks. ",
@@ -232,7 +235,10 @@ fn collect_rollout_files(
         if metadata.len() > MAX_ROLLOUT_FILE_BYTES {
             continue;
         }
-        let filename = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
         for thread_id in thread_ids {
             if filename.contains(thread_id) {
                 output.push((thread_id.clone(), path.clone()));
@@ -275,7 +281,10 @@ fn parse_rollout_file(path: &Path) -> Vec<RolloutRecoveryTurn> {
         let Ok(record) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        let record_type = record.get("type").and_then(Value::as_str).unwrap_or_default();
+        let record_type = record
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let Some(payload) = record.get("payload") else {
             continue;
         };
@@ -356,7 +365,10 @@ pub fn recover_rollout_messages_for_threads(
     for (thread_id, path) in files {
         let turns = parse_rollout_file(&path);
         if !turns.is_empty() {
-            recovered.entry(thread_id).or_insert_with(Vec::new).extend(turns);
+            recovered
+                .entry(thread_id)
+                .or_insert_with(Vec::new)
+                .extend(turns);
         }
     }
     Ok(recovered)
@@ -369,13 +381,25 @@ fn normalized_recovery_prompt(text: &str) -> String {
 fn recovery_prompt_matches(local_prompt: &str, rollout_prompt: &str) -> bool {
     let local = normalized_recovery_prompt(local_prompt);
     let rollout = normalized_recovery_prompt(rollout_prompt);
-    if local.is_empty() || rollout == local {
-        return !local.is_empty() && rollout == local;
+    if local.is_empty() {
+        return false;
     }
-    rollout
-        .strip_prefix(&local)
-        .map(|suffix| suffix.starts_with('\n'))
-        .unwrap_or(false)
+
+    // The app stores the user's instruction without the protocol wrapper,
+    // while the durable Codex rollout records it as:
+    // `General instruction:\n<local prompt>`.  Compare both forms and keep
+    // accepting the local-client context that may follow the prompt.
+    let mut candidates = vec![rollout.as_str()];
+    if let Some(without_wrapper) = rollout.strip_prefix("General instruction:\n") {
+        candidates.push(without_wrapper);
+    }
+    candidates.into_iter().any(|candidate| {
+        candidate == local
+            || candidate
+                .strip_prefix(&local)
+                .map(|suffix| suffix.starts_with('\n'))
+                .unwrap_or(false)
+    })
 }
 
 fn is_placeholder_assistant_message(message: &store::LocalMessage) -> bool {
@@ -624,9 +648,27 @@ struct CodexDelta {
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexEvent {
+    pub request_id: Option<String>,
+    pub sequence: u64,
     pub thread_id: String,
     pub event_type: String,
     pub payload: Value,
+}
+
+fn event_payload_with_final_answer(method: &str, mut payload: Value, final_text: &str) -> Value {
+    if method != "turn/completed" {
+        return payload;
+    }
+    if !payload.is_object() {
+        payload = json!({});
+    }
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "finalText".to_string(),
+            Value::String(final_text.to_string()),
+        );
+    }
+    payload
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1012,7 +1054,14 @@ fn is_guard_excluded_directory(path: &Path) -> bool {
         .map(|name| {
             matches!(
                 name.to_ascii_lowercase().as_str(),
-                ".git" | ".min-sync" | "node_modules" | "target" | "dist" | ".vite"
+        ".git"
+            | ".min-sync"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | ".vite"
+            | "artifacts"
+            | "conversation audits"
             )
         })
         .unwrap_or(false);
@@ -1073,8 +1122,7 @@ fn collect_guard_files_inner(
         let entry =
             entry.map_err(|error| format!("Az agent snapshot fájllistája hibás: {error}"))?;
         let path = entry.path();
-        let entry_metadata = fs::symlink_metadata(&path)
-            .map_err(|error| error.to_string())?;
+        let entry_metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
         let file_type = entry_metadata.file_type();
         if file_type.is_symlink() {
             return Err(format!(
@@ -1099,9 +1147,7 @@ fn collect_guard_files_inner(
         if !file_type.is_file() {
             continue;
         }
-        let cloud_relative = path
-            .strip_prefix(root)
-            .map_err(|error| error.to_string())?;
+        let cloud_relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
         let cloud_relative_path = cloud_relative.to_string_lossy().replace('\\', "/");
         if forced_cloud_paths.contains(&cloud_relative_path)
             || is_guard_cloud_placeholder(&entry_metadata)
@@ -1119,11 +1165,11 @@ fn collect_guard_files_inner(
         }
         let metadata = &entry_metadata;
         if metadata.len() > GUARD_MAX_FILE_BYTES {
-            return Err(format!(
-                "Az agent snapshot fájlja túl nagy (limit: {} bájt): {}.",
-                GUARD_MAX_FILE_BYTES,
-                path.display()
-            ));
+            // Large opaque assets (for example PDFs, installers and database
+            // snapshots) are outside the rollback guard's byte budget. They
+            // must not block an otherwise valid Codex request, and they are
+            // deliberately left untouched rather than partially copied.
+            continue;
         }
         *total_bytes = total_bytes
             .checked_add(metadata.len())
@@ -2110,23 +2156,24 @@ fn apply_agent_snapshot_at(
     let (applied_files, removed_files, resulting_hash) = match apply_result {
         Ok(value) => value,
         Err(error) => {
-            let rollback_attempt = collect_guard_files_for_manifest(&root, &manifest).and_then(|files| {
-                if manifest.rebased {
-                    let apply_base_files = manifest
-                        .apply_base_files
-                        .as_deref()
-                        .ok_or_else(|| "A 3-way apply base-manifestje hiányzik.".to_string())?;
-                    restore_guard_file_set(
-                        &root,
-                        &directory,
-                        "apply-base-files",
-                        apply_base_files,
-                        &files,
-                    )
-                } else {
-                    restore_snapshot_base_files(&root, &directory, &manifest, &files)
-                }
-            });
+            let rollback_attempt =
+                collect_guard_files_for_manifest(&root, &manifest).and_then(|files| {
+                    if manifest.rebased {
+                        let apply_base_files = manifest
+                            .apply_base_files
+                            .as_deref()
+                            .ok_or_else(|| "A 3-way apply base-manifestje hiányzik.".to_string())?;
+                        restore_guard_file_set(
+                            &root,
+                            &directory,
+                            "apply-base-files",
+                            apply_base_files,
+                            &files,
+                        )
+                    } else {
+                        restore_snapshot_base_files(&root, &directory, &manifest, &files)
+                    }
+                });
             return match rollback_attempt {
                 Ok(_) => Err(format!("{error} Az apply részleges írásait visszaállítottam.")),
                 Err(rollback_error) => Err(format!(
@@ -2595,7 +2642,7 @@ fn spawn_app_server(app: &tauri::AppHandle) -> Result<Child, String> {
     command.creation_flags(CREATE_NO_WINDOW);
 
     command
-        .args(["app-server", "--stdio"])
+        .args(CODEX_APP_SERVER_ARGS)
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2665,7 +2712,7 @@ pub fn send(
     command.creation_flags(CREATE_NO_WINDOW);
 
     let mut child = match command
-        .args(["app-server", "--stdio"])
+        .args(CODEX_APP_SERVER_ARGS)
         .current_dir(&cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2870,12 +2917,27 @@ pub fn send(
                 .get("method")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            if method == "turn/completed" && final_text.trim().is_empty() {
+                final_text = unknown_agent_message_order
+                    .iter()
+                    .rev()
+                    .find_map(|key| unknown_agent_messages.get(key))
+                    .cloned()
+                    .unwrap_or_default();
+            }
             if !method.is_empty() {
                 event_sequence = event_sequence.saturating_add(1);
+                let event_payload = event_payload_with_final_answer(
+                    method,
+                    value.get("params").cloned().unwrap_or(Value::Null),
+                    &final_text,
+                );
                 let event = CodexEvent {
+                    request_id: request.request_id.clone(),
+                    sequence: event_sequence,
                     thread_id: thread_id.clone(),
                     event_type: method.to_string(),
-                    payload: value.get("params").cloned().unwrap_or(Value::Null),
+                    payload: event_payload,
                 };
                 emit_main_window(&app, "codex-event", &event)?;
                 events.push(event);
@@ -2965,14 +3027,6 @@ pub fn send(
                 }
             } else if method == "turn/completed" {
                 turn_completed_for_result.store(true, Ordering::Release);
-                if final_text.trim().is_empty() {
-                    final_text = unknown_agent_message_order
-                        .iter()
-                        .rev()
-                        .find_map(|key| unknown_agent_messages.get(key))
-                        .cloned()
-                        .unwrap_or_default();
-                }
                 emit_main_window(
                     &app,
                     "codex-transport",
@@ -2998,8 +3052,8 @@ pub fn send(
 
     terminate(child);
     let guard_result = finalize_agent_snapshot(&guard_snapshot);
-    let cancelled_before_turn_completion = cancellation.load(Ordering::Acquire)
-        && !turn_completed.load(Ordering::Acquire);
+    let cancelled_before_turn_completion =
+        cancellation.load(Ordering::Acquire) && !turn_completed.load(Ordering::Acquire);
     match (result, guard_result) {
         (Ok(mut response), Ok(report)) if !cancelled_before_turn_completion => {
             let mut report = stage_agent_snapshot(&guard_snapshot, report).map_err(|error| {
@@ -3844,8 +3898,12 @@ mod sync_tests {
         let root =
             std::env::temp_dir().join(format!("min-agent-cmake-root-{}", uuid::Uuid::new_v4()));
         let build = root.join("build-gui-juce");
+        let artifacts = root.join("artifacts");
+        let conversation_audits = root.join("Conversation audits").join("20260722-101144");
         let source_directory = root.join("source").join("build_helpers");
         std::fs::create_dir_all(build.join("CMakeFiles")).expect("CMake build fixture");
+        std::fs::create_dir_all(&artifacts).expect("release artifacts fixture");
+        std::fs::create_dir_all(&conversation_audits).expect("conversation audit fixture");
         std::fs::create_dir_all(&source_directory).expect("source fixture");
         std::fs::write(build.join("CMakeCache.txt"), "configured").expect("CMake marker");
         let generated_object = std::fs::File::create(build.join("CMakeFiles").join("large.obj"))
@@ -3853,7 +3911,23 @@ mod sync_tests {
         generated_object
             .set_len(GUARD_MAX_FILE_BYTES + 1)
             .expect("oversized generated object");
+        let installer = std::fs::File::create(artifacts.join("min-cross-device-fix.exe"))
+            .expect("generated installer");
+        installer
+            .set_len(GUARD_MAX_FILE_BYTES + 1)
+            .expect("oversized generated installer");
+        let audit_snapshot =
+            std::fs::File::create(conversation_audits.join("min-audit-snapshot.db"))
+                .expect("generated audit snapshot");
+        audit_snapshot
+            .set_len(GUARD_MAX_FILE_BYTES + 1)
+            .expect("oversized audit snapshot");
         std::fs::write(source_directory.join("keep.cpp"), "// source").expect("source file");
+        let large_document = std::fs::File::create(source_directory.join("large.pdf"))
+            .expect("oversized source asset");
+        large_document
+            .set_len(GUARD_MAX_FILE_BYTES + 1)
+            .expect("oversized source asset");
 
         let files = collect_guard_snapshot(&root)
             .expect("collect snapshot files")
@@ -3893,8 +3967,8 @@ mod sync_tests {
         assert_eq!(initial[0].relative_path, "local.txt");
 
         std::fs::write(root.join("cloud.txt"), "agent changed cloud").expect("changed cloud");
-        let followup = collect_guard_files_for_manifest(&root, &manifest)
-            .expect("collect follow-up snapshot");
+        let followup =
+            collect_guard_files_for_manifest(&root, &manifest).expect("collect follow-up snapshot");
         assert_eq!(followup, initial);
 
         std::fs::remove_file(root.join("cloud.txt")).expect("remove cloud fixture");
@@ -4187,6 +4261,38 @@ mod sync_tests {
     }
 
     #[test]
+    fn rollout_recovery_matches_general_instruction_wrapper() {
+        let local_prompt = "Nézd át a MIDI synth projektet.";
+        let rollout_prompt =
+            "General instruction:\nNézd át a MIDI synth projektet.\n\nThe local client already read context";
+
+        assert!(recovery_prompt_matches(local_prompt, rollout_prompt));
+        assert!(!recovery_prompt_matches(local_prompt, "Másik kérdés"));
+    }
+
+    #[test]
+    fn turn_completed_event_contains_the_durable_final_answer() {
+        let payload = event_payload_with_final_answer(
+            "turn/completed",
+            serde_json::json!({"turnId": "turn-1"}),
+            "Végleges válasz",
+        );
+
+        assert_eq!(
+            payload.get("finalText").and_then(Value::as_str),
+            Some("Végleges válasz")
+        );
+    }
+
+    #[test]
+    fn embedded_app_server_disables_the_global_completion_hook() {
+        assert_eq!(
+            CODEX_APP_SERVER_ARGS,
+            ["-c", "notify=[]", "app-server", "--stdio"]
+        );
+    }
+
+    #[test]
     fn rollout_recovery_ignores_unmatched_or_empty_entries() {
         let mut messages = vec![
             local_message("user", "ismeretlen kérdés"),
@@ -4238,16 +4344,11 @@ mod sync_tests {
             return;
         }
         let markdown_path = format!("/{}", target.to_string_lossy().replace('\\', "/"));
-        let (_, resolved) = resolve_project_action_path(
-            &cwd.to_string_lossy(),
-            &markdown_path,
-        )
-        .expect("Markdown /C:/ path must resolve");
+        let (_, resolved) = resolve_project_action_path(&cwd.to_string_lossy(), &markdown_path)
+            .expect("Markdown /C:/ path must resolve");
         assert_eq!(
             resolved,
-            normalize_platform_path(
-                target.canonicalize().expect("target should canonicalize"),
-            )
+            normalize_platform_path(target.canonicalize().expect("target should canonicalize"),)
         );
     }
 }

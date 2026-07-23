@@ -3,6 +3,8 @@ mod migration;
 mod store;
 mod sync;
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(desktop)]
+use tauri::Manager;
 
 #[tauri::command]
 async fn codex_send(
@@ -218,8 +220,8 @@ async fn local_store_load() -> Result<store::LocalStoreSnapshot, String> {
         }
         Ok(snapshot)
     })
-        .await
-        .map_err(|error| format!("A lokÃ¡lis snapshot betÃ¶ltÃ©se leÃ¡llt: {error}"))?
+    .await
+    .map_err(|error| format!("A lokÃ¡lis snapshot betÃ¶ltÃ©se leÃ¡llt: {error}"))?
 }
 
 #[tauri::command]
@@ -315,7 +317,20 @@ async fn sync_v2_restore_entity(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Register this first: a second native process would own another WebView,
+    // app-server and audio queue, producing offset completion sounds and
+    // competing SQLite/sync writes for the same device identity.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }));
+
+    builder
         .invoke_handler(tauri::generate_handler![
             codex_send,
             codex_rollback_snapshot,

@@ -161,7 +161,14 @@ export const buildWorkLogGroups = <
     const key = `session:${bucket}`;
     const floor = userSequenceByKey.get(bucket);
     const sequence = finiteNumber(floor)
-      ? Math.max(floor, evidence.sequence)
+      // A trace card owns the answer for this user turn, so it must never
+      // sort before the user row. Older plan/activity metadata can have the
+      // exact same (or an earlier) timestamp as the submitted prompt; using
+      // the prompt sequence verbatim then lets HLC/tie-breakers put the whole
+      // answer card above its question after a restart. A fractional local
+      // anchor preserves the immutable integer message positions while
+      // placing such a card strictly after its user.
+      ? Math.max(floor + 0.5, evidence.sequence)
       : evidence.sequence;
     let group = groups.get(bucket);
     if (!group) {

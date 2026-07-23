@@ -7,7 +7,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
-pub const STORE_SCHEMA_VERSION: i64 = 10;
+pub const STORE_SCHEMA_VERSION: i64 = 19;
+// The public snapshot and sync contracts represent GENERAL with
+// projectId = null. SQLite keeps this hidden FK target only because the
+// existing conversations.project_id column is intentionally NOT NULL and
+// changing that live table would put legacy Coding data at unnecessary risk.
+pub const GENERAL_PROJECT_ID: &str = "system-general-scope-v1";
+pub const GENERAL_SCOPE: &str = "general";
+pub const CODING_SCOPE: &str = "coding";
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS store_meta (
@@ -37,6 +44,7 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY NOT NULL,
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+    scope TEXT NOT NULL DEFAULT 'coding',
     title TEXT NOT NULL,
     codex_thread_id TEXT,
     archived_at TEXT,
@@ -65,8 +73,6 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_sequence
-    ON messages(conversation_id, sequence);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_conversation_sequence
     ON messages(conversation_id, sequence);
 
 CREATE TABLE IF NOT EXISTS turns (
@@ -208,10 +214,16 @@ pub struct LocalProject {
     pub threads: Vec<String>,
 }
 
+fn default_coding_scope() -> String {
+    CODING_SCOPE.to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalConversation {
     pub id: Option<String>,
+    #[serde(default = "default_coding_scope")]
+    pub scope: String,
     pub project_id: String,
     pub title: String,
     pub messages: Vec<LocalMessage>,
@@ -260,6 +272,13 @@ pub struct LocalMessage {
     pub images: Vec<LocalImageAttachment>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quote_refs: Vec<LocalQuoteReference>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredMessageEventPayload {
+    conversation_id: String,
+    message: LocalMessage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -363,6 +382,143 @@ fn configure_connection(connection: &Connection) -> Result<(), String> {
         .pragma_update(None, "journal_mode", "WAL")
         .map_err(|error| format!("A lokális SQLite WAL módja nem állítható be: {error}"))?;
     Ok(())
+}
+
+fn restore_first_written_user_payloads(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<usize, String> {
+    // message.upsert is append-only. The first event for one user message is
+    // the submitted payload; later events may enrich metadata but must never
+    // rewrite the question. v14 uses that journal as the repair authority for
+    // databases damaged by the former "longer text wins" merge.
+    let has_sync_events: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'sync_events'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("A v14 sync schema nem ellenőrizhető: {error}"))?;
+    if !has_sync_events {
+        return Ok(0);
+    }
+    let payloads = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT payload_json
+                 FROM sync_events
+                 WHERE event_type = 'message.upsert'
+                 ORDER BY hlc, device_id, device_sequence, event_id",
+            )
+            .map_err(|error| format!("A v14 user-journal nem olvasható: {error}"))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("A v14 user-journal nem járható be: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("A v14 user-journal sora hibás: {error}"))?;
+        rows
+    };
+
+    let mut first_written = BTreeMap::<(String, String), LocalMessage>::new();
+    for payload_json in payloads {
+        let Ok(payload) = serde_json::from_str::<StoredMessageEventPayload>(&payload_json) else {
+            continue;
+        };
+        if payload.message.role != "user" {
+            continue;
+        }
+        let Some(message_id) = payload
+            .message
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        first_written
+            .entry((payload.conversation_id, message_id.to_string()))
+            .or_insert(payload.message);
+    }
+
+    let mut repaired = 0usize;
+    for ((conversation_id, message_id), message) in first_written {
+        let attachments_json = serde_json::to_string(&message.images)
+            .map_err(|error| format!("A v14 user-csatolmány nem írható: {error}"))?;
+        let quote_refs_json = serde_json::to_string(&message.quote_refs)
+            .map_err(|error| format!("A v14 user-idézet nem írható: {error}"))?;
+        repaired += transaction
+            .execute(
+                "UPDATE messages
+                 SET body = ?1,
+                     sequence = COALESCE(?2, sequence),
+                     created_at = CASE WHEN trim(?3) <> '' THEN ?3 ELSE created_at END,
+                     attachments_json = ?4,
+                     quote_refs_json = ?5,
+                     item_id = COALESCE(item_id, ?6),
+                     turn_id = COALESCE(turn_id, ?7)
+                 WHERE id = ?8 AND conversation_id = ?9 AND role = 'user'",
+                params![
+                    message.text,
+                    message.sequence,
+                    message.time,
+                    attachments_json,
+                    quote_refs_json,
+                    message.item_id,
+                    message.turn_id,
+                    message_id,
+                    conversation_id,
+                ],
+            )
+            .map_err(|error| format!("A v14 user-input javítása sikertelen: {error}"))?;
+    }
+    Ok(repaired)
+}
+
+fn same_user_payload(left: &LocalMessage, right: &LocalMessage) -> bool {
+    left.role == "user"
+        && right.role == "user"
+        && left.text == right.text
+        && left.images == right.images
+}
+
+fn collapse_abandoned_regeneration_retries(messages: &[LocalMessage]) -> Vec<LocalMessage> {
+    let mut output = Vec::<LocalMessage>::new();
+    let answered_users = messages
+        .windows(2)
+        .filter(|pair| {
+            pair[0].role == "user" && pair[1].role == "assistant" && !pair[1].text.trim().is_empty()
+        })
+        .map(|pair| &pair[0])
+        .collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < messages.len() {
+        let retry_user = &messages[index];
+        let retry_answer = messages.get(index + 1);
+        let abandoned = matches!(
+            retry_answer,
+            Some(retry_answer)
+                if retry_answer.role == "assistant"
+                    && retry_answer.text.trim().is_empty()
+                    && !retry_answer.live.unwrap_or(false)
+                    && !retry_answer.final_message.unwrap_or(false)
+                    && retry_user.turn_id.is_some()
+                    && retry_user.turn_id == retry_answer.turn_id
+                    && answered_users.iter().any(|answered_user| {
+                        !std::ptr::eq(*answered_user, retry_user)
+                            && same_user_payload(answered_user, retry_user)
+                    })
+        );
+        if abandoned {
+            index += 2;
+            continue;
+        }
+        output.push(messages[index].clone());
+        index += 1;
+    }
+    output
 }
 
 pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> {
@@ -550,6 +706,586 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
             format!("A lokális SQLite v10 migráció commitja sikertelen: {error}")
         })?;
     }
+    let migrated_version = read_schema_version(connection)?;
+    if migrated_version == 10 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("A lokális SQLite v11 migráció nem indítható el: {error}"))?;
+        let message_columns = {
+            let mut statement = transaction
+                .prepare("PRAGMA table_info(messages)")
+                .map_err(|error| format!("A messages schema olvasása sikertelen: {error}"))?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|error| format!("A messages oszlopok bejárása sikertelen: {error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("A messages schema hibás: {error}"))?;
+            columns
+        };
+        if message_columns.iter().any(|column| column == "role")
+            && message_columns.iter().any(|column| column == "body")
+        {
+            let rows = {
+                let mut statement = transaction
+                    .prepare("SELECT id, role, body FROM messages WHERE role = 'assistant'")
+                    .map_err(|error| {
+                        format!("A sérült válaszok felderítése sikertelen: {error}")
+                    })?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })
+                    .map_err(|error| format!("A sérült válaszok bejárása sikertelen: {error}"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("A sérült válaszadat hibás: {error}"))?;
+                rows
+            };
+            for (id, role, body) in rows {
+                let repaired = collapse_repeated_assistant_text(&role, &body);
+                if repaired != body {
+                    transaction
+                        .execute(
+                            "UPDATE messages SET body = ?1 WHERE id = ?2",
+                            params![repaired, id],
+                        )
+                        .map_err(|error| {
+                            format!("A duplikált válasz javítása sikertelen: {error}")
+                        })?;
+                }
+            }
+        }
+        transaction
+            .execute_batch("PRAGMA user_version = 11;")
+            .map_err(|error| format!("A lokális SQLite v11 verzió mentése sikertelen: {error}"))?;
+        transaction.commit().map_err(|error| {
+            format!("A lokális SQLite v11 migráció commitja sikertelen: {error}")
+        })?;
+    }
+    let migrated_version = read_schema_version(connection)?;
+    if migrated_version == 11 {
+        // v11's detector was bounded to 64 exact copies. Re-run the repair
+        // with the unbounded linear detector for already-migrated 100+ copy
+        // rows. Identities and timeline order remain untouched.
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("A lokális SQLite v12 migráció nem indítható el: {error}"))?;
+        let message_columns = {
+            let mut statement = transaction
+                .prepare("PRAGMA table_info(messages)")
+                .map_err(|error| format!("A v12 messages schema olvasása sikertelen: {error}"))?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|error| format!("A v12 messages oszlopok bejárása sikertelen: {error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("A v12 messages schema hibás: {error}"))?;
+            columns
+        };
+        if message_columns.iter().any(|column| column == "role")
+            && message_columns.iter().any(|column| column == "body")
+        {
+            let rows = {
+                let mut statement = transaction
+                    .prepare("SELECT id, role, body FROM messages WHERE role = 'assistant'")
+                    .map_err(|error| {
+                        format!("A v12 sérült válaszainak felderítése sikertelen: {error}")
+                    })?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })
+                    .map_err(|error| {
+                        format!("A v12 sérült válaszainak bejárása sikertelen: {error}")
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("A v12 sérült válaszadata hibás: {error}"))?;
+                rows
+            };
+            for (id, role, body) in rows {
+                let repaired = collapse_repeated_assistant_text(&role, &body);
+                if repaired != body {
+                    transaction
+                        .execute(
+                            "UPDATE messages SET body = ?1 WHERE id = ?2",
+                            params![repaired, id],
+                        )
+                        .map_err(|error| {
+                            format!("A v12 duplikált válasz javítása sikertelen: {error}")
+                        })?;
+                }
+            }
+        }
+        transaction
+            .execute_batch("PRAGMA user_version = 12;")
+            .map_err(|error| format!("A lokális SQLite v12 verzió mentése sikertelen: {error}"))?;
+        transaction.commit().map_err(|error| {
+            format!("A lokális SQLite v12 migráció commitja sikertelen: {error}")
+        })?;
+    }
+    let migrated_version = read_schema_version(connection)?;
+    if migrated_version == 12 {
+        // v12 deliberately required three copies, but the original
+        // two-listener failure persisted many rows as answer+answer. Repair
+        // exact two-copy assistant bodies without touching row identity/order.
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("A lokális SQLite v13 migráció nem indítható el: {error}"))?;
+        let message_columns = {
+            let mut statement = transaction
+                .prepare("PRAGMA table_info(messages)")
+                .map_err(|error| format!("A v13 messages schema olvasása sikertelen: {error}"))?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|error| format!("A v13 messages oszlopok bejárása sikertelen: {error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("A v13 messages schema hibás: {error}"))?;
+            columns
+        };
+        if message_columns.iter().any(|column| column == "role")
+            && message_columns.iter().any(|column| column == "body")
+        {
+            let rows = {
+                let mut statement = transaction
+                    .prepare("SELECT id, role, body FROM messages WHERE role = 'assistant'")
+                    .map_err(|error| {
+                        format!("A v13 sérült válaszainak felderítése sikertelen: {error}")
+                    })?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })
+                    .map_err(|error| {
+                        format!("A v13 sérült válaszainak bejárása sikertelen: {error}")
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("A v13 sérült válaszadata hibás: {error}"))?;
+                rows
+            };
+            for (id, role, body) in rows {
+                let repaired = collapse_repeated_assistant_text(&role, &body);
+                if repaired != body {
+                    transaction
+                        .execute(
+                            "UPDATE messages SET body = ?1 WHERE id = ?2",
+                            params![repaired, id],
+                        )
+                        .map_err(|error| {
+                            format!("A v13 duplikált válasz javítása sikertelen: {error}")
+                        })?;
+                }
+            }
+        }
+        transaction
+            .execute_batch("PRAGMA user_version = 13;")
+            .map_err(|error| format!("A lokális SQLite v13 verzió mentése sikertelen: {error}"))?;
+        transaction.commit().map_err(|error| {
+            format!("A lokális SQLite v13 migráció commitja sikertelen: {error}")
+        })?;
+    }
+    let migrated_version = read_schema_version(connection)?;
+    if migrated_version == 13 {
+        // Sequence is an immutable ordering hint, not a globally unique row
+        // identity: two offline devices can allocate the same millisecond.
+        // Restore already-corrupted user payloads from their first append-only
+        // journal event before applying the narrow legacy retry cleanup.
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("A lokális SQLite v14 migráció nem indítható el: {error}"))?;
+        transaction
+            .execute_batch("DROP INDEX IF EXISTS uq_messages_conversation_sequence;")
+            .map_err(|error| format!("A v14 message-index migráció sikertelen: {error}"))?;
+        restore_first_written_user_payloads(&transaction)?;
+        let message_columns = {
+            let mut statement = transaction
+                .prepare("PRAGMA table_info(messages)")
+                .map_err(|error| format!("A v14 messages schema nem olvasható: {error}"))?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|error| format!("A v14 messages schema nem járható be: {error}"))?
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(|error| format!("A v14 messages schema hibás: {error}"))?;
+            rows
+        };
+        let required_columns = [
+            "id",
+            "conversation_id",
+            "role",
+            "body",
+            "created_at",
+            "code",
+            "live",
+            "final",
+            "item_id",
+            "turn_id",
+            "sequence",
+            "hlc",
+            "origin_device_id",
+            "attachments_json",
+            "quote_refs_json",
+        ];
+        let rows = if required_columns
+            .iter()
+            .all(|column| message_columns.contains(*column))
+        {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id, conversation_id, role, body, created_at, code, live, \"final\",
+                            item_id, turn_id, sequence, hlc, origin_device_id,
+                            attachments_json, quote_refs_json
+                     FROM messages
+                     ORDER BY conversation_id, sequence, id",
+                )
+                .map_err(|error| {
+                    format!("A v14 regenerálási sorok felderítése sikertelen: {error}")
+                })?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(1)?,
+                        LocalMessage {
+                            id: Some(row.get(0)?),
+                            role: row.get(2)?,
+                            text: row.get(3)?,
+                            time: row.get(4)?,
+                            code: Some(row.get::<_, i64>(5)? != 0),
+                            live: Some(row.get::<_, i64>(6)? != 0),
+                            final_message: Some(row.get::<_, i64>(7)? != 0),
+                            item_id: row.get(8)?,
+                            turn_id: row.get(9)?,
+                            sequence: Some(row.get(10)?),
+                            hlc: row.get(11)?,
+                            origin_device_id: row.get(12)?,
+                            images: serde_json::from_str(&row.get::<_, String>(13)?)
+                                .unwrap_or_default(),
+                            quote_refs: serde_json::from_str(&row.get::<_, String>(14)?)
+                                .unwrap_or_default(),
+                        },
+                    ))
+                })
+                .map_err(|error| format!("A v14 regenerálási sorok bejárása sikertelen: {error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("A v14 regenerálási soradata hibás: {error}"))?;
+            rows
+        } else {
+            Vec::new()
+        };
+        let mut by_conversation = BTreeMap::<String, Vec<LocalMessage>>::new();
+        for (conversation_id, message) in rows {
+            by_conversation
+                .entry(conversation_id)
+                .or_default()
+                .push(message);
+        }
+        for messages in by_conversation.into_values() {
+            let kept_ids = collapse_abandoned_regeneration_retries(&messages)
+                .into_iter()
+                .filter_map(|message| message.id)
+                .collect::<HashSet<_>>();
+            for id in messages.into_iter().filter_map(|message| message.id) {
+                if !kept_ids.contains(&id) {
+                    transaction
+                        .execute("DELETE FROM messages WHERE id = ?1", params![id])
+                        .map_err(|error| {
+                            format!("A v14 duplikált regenerálási sor javítása sikertelen: {error}")
+                        })?;
+                }
+            }
+        }
+        transaction
+            .execute_batch("PRAGMA user_version = 14;")
+            .map_err(|error| format!("A lokális SQLite v14 verzió mentése sikertelen: {error}"))?;
+        transaction.commit().map_err(|error| {
+            format!("A lokális SQLite v14 migráció commitja sikertelen: {error}")
+        })?;
+    }
+    let migrated_version = read_schema_version(connection)?;
+    if migrated_version == 14 {
+        // Remove only provable aliases left by old checkpoint/reducer ids.
+        // Distinct user UUIDs with the same sequence remain intact.
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("A lokális SQLite v15 migráció nem indítható el: {error}"))?;
+        let message_columns = {
+            let mut statement = transaction
+                .prepare("PRAGMA table_info(messages)")
+                .map_err(|error| format!("A v15 messages schema nem olvasható: {error}"))?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|error| format!("A v15 messages schema nem járható be: {error}"))?
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(|error| format!("A v15 messages schema hibás: {error}"))?;
+            rows
+        };
+        if [
+            "id",
+            "conversation_id",
+            "role",
+            "body",
+            "sequence",
+            "hlc",
+            "turn_id",
+            "item_id",
+        ]
+        .iter()
+        .all(|column| message_columns.contains(*column))
+        {
+            transaction
+                .execute_batch(
+                    "DELETE FROM messages WHERE id IN (
+                     SELECT id FROM (
+                         SELECT id,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY conversation_id, role, turn_id
+                                    ORDER BY COALESCE(hlc, ''), sequence, id
+                                ) AS alias_rank
+                         FROM messages
+                         WHERE turn_id IS NOT NULL AND trim(turn_id) <> ''
+                     ) WHERE alias_rank > 1
+                 );
+                 DELETE FROM messages WHERE id IN (
+                     SELECT id FROM (
+                         SELECT id,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY conversation_id, role, item_id
+                                    ORDER BY COALESCE(hlc, ''), sequence, id
+                                ) AS alias_rank
+                         FROM messages
+                         WHERE item_id IS NOT NULL AND trim(item_id) <> ''
+                     ) WHERE alias_rank > 1
+                 );
+                 DELETE FROM messages WHERE id IN (
+                     SELECT id FROM (
+                         SELECT id,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY conversation_id, sequence, body
+                                    ORDER BY COALESCE(hlc, ''), id
+                                ) AS alias_rank
+                         FROM messages
+                         WHERE role = 'assistant'
+                           AND (turn_id IS NULL OR trim(turn_id) = '')
+                           AND (item_id IS NULL OR trim(item_id) = '')
+                     ) WHERE alias_rank > 1
+                 );",
+                )
+                .map_err(|error| format!("A v15 message-alias migráció sikertelen: {error}"))?;
+        }
+        transaction
+            .execute_batch("PRAGMA user_version = 15;")
+            .map_err(|error| format!("A v15 schema-verzió mentése sikertelen: {error}"))?;
+        transaction.commit().map_err(|error| {
+            format!("A lokális SQLite v15 migráció commitja sikertelen: {error}")
+        })?;
+    }
+    let migrated_version = read_schema_version(connection)?;
+    if migrated_version == 15 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("A lokális SQLite v16 migráció nem indítható el: {error}"))?;
+        let message_columns = {
+            let mut statement = transaction
+                .prepare("PRAGMA table_info(messages)")
+                .map_err(|error| format!("A v16 messages schema nem olvasható: {error}"))?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|error| format!("A v16 messages schema nem járható be: {error}"))?
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(|error| format!("A v16 messages schema hibás: {error}"))?;
+            rows
+        };
+        if [
+            "id",
+            "conversation_id",
+            "role",
+            "body",
+            "sequence",
+            "turn_id",
+            "live",
+            "final",
+            "attachments_json",
+            "quote_refs_json",
+        ]
+        .iter()
+        .all(|column| message_columns.contains(*column))
+        {
+            transaction
+                .execute_batch(
+                    "CREATE TEMP TABLE abandoned_regeneration_rows (id TEXT PRIMARY KEY);
+                 INSERT OR IGNORE INTO abandoned_regeneration_rows (id)
+                 SELECT retry_user.id
+                 FROM messages retry_user
+                 JOIN messages retry_answer
+                   ON retry_answer.conversation_id = retry_user.conversation_id
+                  AND retry_answer.role = 'assistant'
+                  AND retry_answer.turn_id = retry_user.turn_id
+                 WHERE retry_user.role = 'user'
+                   AND retry_user.turn_id IS NOT NULL
+                   AND trim(retry_user.turn_id) <> ''
+                   AND trim(retry_answer.body) = ''
+                   AND retry_answer.[final] = 0
+                   AND EXISTS (
+                       SELECT 1
+                       FROM messages answered_user
+                       JOIN messages answered_assistant
+                         ON answered_assistant.conversation_id = answered_user.conversation_id
+                        AND answered_assistant.role = 'assistant'
+                        AND answered_assistant.sequence > answered_user.sequence
+                       WHERE answered_user.conversation_id = retry_user.conversation_id
+                         AND answered_user.role = 'user'
+                         AND answered_user.id <> retry_user.id
+                         AND answered_user.body = retry_user.body
+                         AND answered_user.attachments_json = retry_user.attachments_json
+                         AND trim(answered_assistant.body) <> ''
+                   );
+                 INSERT OR IGNORE INTO abandoned_regeneration_rows (id)
+                 SELECT retry_answer.id
+                 FROM messages retry_answer
+                 JOIN messages retry_user
+                   ON retry_user.conversation_id = retry_answer.conversation_id
+                  AND retry_user.role = 'user'
+                  AND retry_user.turn_id = retry_answer.turn_id
+                 JOIN abandoned_regeneration_rows abandoned
+                   ON abandoned.id = retry_user.id
+                 WHERE retry_answer.role = 'assistant'
+                   AND trim(retry_answer.body) = ''
+                   AND retry_answer.[final] = 0;
+                 DELETE FROM messages
+                 WHERE id IN (SELECT id FROM abandoned_regeneration_rows);
+                 DROP TABLE abandoned_regeneration_rows;",
+                )
+                .map_err(|error| {
+                    format!("A v16 félbehagyott regenerálás javítása sikertelen: {error}")
+                })?;
+        }
+        transaction
+            .execute_batch("PRAGMA user_version = 16;")
+            .map_err(|error| format!("A v16 schema-verzió mentése sikertelen: {error}"))?;
+        transaction.commit().map_err(|error| {
+            format!("A lokális SQLite v16 migráció commitja sikertelen: {error}")
+        })?;
+    }
+    let migrated_version = read_schema_version(connection)?;
+    if migrated_version == 16 || migrated_version == 17 {
+        // A restarted legacy placeholder can remain live=1 even though no
+        // native request exists anymore. The answered identical source turn
+        // still proves that this empty pair is an abandoned regeneration.
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("A lokális SQLite v18 migráció nem indítható el: {error}"))?;
+        let message_columns = {
+            let mut statement = transaction
+                .prepare("PRAGMA table_info(messages)")
+                .map_err(|error| format!("A v18 messages schema nem olvasható: {error}"))?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|error| format!("A v18 messages schema nem járható be: {error}"))?
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(|error| format!("A v18 messages schema hibás: {error}"))?;
+            rows
+        };
+        let can_cleanup = [
+            "id",
+            "conversation_id",
+            "role",
+            "body",
+            "sequence",
+            "turn_id",
+            "final",
+            "attachments_json",
+        ]
+        .iter()
+        .all(|column| message_columns.contains(*column));
+        if can_cleanup {
+            transaction
+                .execute_batch(
+                    "WITH abandoned AS (
+                     SELECT retry_user.id AS user_id, retry_answer.id AS answer_id
+                     FROM messages retry_user
+                     JOIN messages retry_answer
+                       ON retry_answer.conversation_id = retry_user.conversation_id
+                      AND retry_answer.role = 'assistant'
+                      AND retry_answer.turn_id = retry_user.turn_id
+                     WHERE retry_user.role = 'user'
+                       AND retry_user.turn_id IS NOT NULL
+                       AND trim(retry_user.turn_id) <> ''
+                       AND trim(retry_answer.body) = ''
+                       AND retry_answer.[final] = 0
+                       AND EXISTS (
+                           SELECT 1
+                           FROM messages answered_user
+                           JOIN messages answered_assistant
+                             ON answered_assistant.conversation_id = answered_user.conversation_id
+                            AND answered_assistant.role = 'assistant'
+                            AND answered_assistant.sequence > answered_user.sequence
+                           WHERE answered_user.conversation_id = retry_user.conversation_id
+                             AND answered_user.role = 'user'
+                             AND answered_user.id <> retry_user.id
+                             AND answered_user.body = retry_user.body
+                             AND answered_user.attachments_json = retry_user.attachments_json
+                             AND trim(answered_assistant.body) <> ''
+                       )
+                 )
+                 DELETE FROM messages
+                 WHERE id IN (
+                     SELECT user_id FROM abandoned
+                     UNION SELECT answer_id FROM abandoned
+                 );
+                 PRAGMA user_version = 18;",
+                )
+                .map_err(|error| {
+                    format!("A v18 félbehagyott regenerálás javítása sikertelen: {error}")
+                })?;
+        } else {
+            transaction
+                .execute_batch("PRAGMA user_version = 18;")
+                .map_err(|error| format!("A v18 schema-verzió mentése sikertelen: {error}"))?;
+        }
+        transaction.commit().map_err(|error| {
+            format!("A lokális SQLite v18 migráció commitja sikertelen: {error}")
+        })?;
+    }
+    let migrated_version = read_schema_version(connection)?;
+    if migrated_version == 18 {
+        let has_scope_column = {
+            let mut statement = connection
+                .prepare("PRAGMA table_info(conversations)")
+                .map_err(|error| format!("A v19 schema oszlopai nem ellenőrizhetők: {error}"))?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|error| format!("A v19 schema oszloplista nem olvasható: {error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("A v19 schema oszloplista hibás: {error}"))?;
+            columns.iter().any(|column| column == "scope")
+        };
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("A lokális SQLite v19 migráció nem indítható el: {error}"))?;
+        if !has_scope_column {
+            transaction
+                .execute_batch(
+                    "ALTER TABLE conversations ADD COLUMN scope TEXT NOT NULL DEFAULT 'coding';",
+                )
+                .map_err(|error| format!("A lokális SQLite v19 migráció sikertelen: {error}"))?;
+        }
+        transaction
+            .execute_batch("PRAGMA user_version = 19;")
+            .map_err(|error| {
+                format!("A lokális SQLite v19 schema-verziója nem menthető: {error}")
+            })?;
+        transaction.commit().map_err(|error| {
+            format!("A lokális SQLite v19 migráció commitja sikertelen: {error}")
+        })?;
+    }
     Ok(())
 }
 
@@ -657,6 +1393,225 @@ fn stable_id(kind: &str, key: &str) -> String {
     .to_string()
 }
 
+fn message_identity_keys(message: &LocalMessage) -> Vec<String> {
+    let mut keys = Vec::new();
+    let turn_id = message
+        .turn_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let item_id = message
+        .item_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let id = message
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(turn_id) = turn_id {
+        keys.push(format!("turn:{turn_id}:{}", message.role));
+    }
+    if let Some(item_id) = item_id {
+        keys.push(format!("item:{item_id}:{}", message.role));
+    }
+    if let Some(id) = id {
+        keys.push(format!("id:{id}"));
+    }
+    if message.role == "assistant" && turn_id.is_none() && item_id.is_none() {
+        if let Some(sequence) = message.sequence {
+            keys.push(stable_id(
+                "legacy-assistant-alias",
+                &format!("{sequence}:{}", message.text),
+            ));
+        }
+    }
+    if turn_id.is_none() && item_id.is_none() && id.is_none() {
+        if let Some(sequence) = message.sequence {
+            keys.push(stable_id(
+                "legacy-message-alias",
+                &format!("{}:{sequence}:{}", message.role, message.text),
+            ));
+        }
+    }
+    keys
+}
+
+fn exact_repeated_unit(text: &str) -> Option<String> {
+    let characters = text.chars().collect::<Vec<_>>();
+    if characters.len() < 6 {
+        return None;
+    }
+
+    // KMP prefix table finds the smallest exact period in linear time and has
+    // no repetition cap. A real legacy row had already grown to 166 copies.
+    let mut prefix = vec![0usize; characters.len()];
+    let mut matched = 0usize;
+    for index in 1..characters.len() {
+        while matched > 0 && characters[index] != characters[matched] {
+            matched = prefix[matched - 1];
+        }
+        if characters[index] == characters[matched] {
+            matched += 1;
+        }
+        prefix[index] = matched;
+    }
+
+    let period_length = characters.len() - prefix[characters.len() - 1];
+    if period_length < 3
+        || period_length >= characters.len()
+        || characters.len() % period_length != 0
+        || characters.len() / period_length < 2
+    {
+        return None;
+    }
+    Some(characters[..period_length].iter().collect())
+}
+
+/// Repairs the historical stream-listener corruption where one completed
+/// assistant answer was appended once per duplicate listener. User text is
+/// intentionally left untouched because repeating a prompt is valid history.
+pub(crate) fn collapse_repeated_assistant_text(role: &str, text: &str) -> String {
+    if role != "assistant" || text.chars().count() < 6 {
+        return text.to_string();
+    }
+    if let Some(unit) = exact_repeated_unit(text) {
+        return unit;
+    }
+
+    // Interrupted legacy streams inserted this marker into only some copies.
+    // Strip it only for period detection and preserve one terminal marker.
+    let without_markers = text
+        .replace("\r\n\r\nA válasz megszakítva.", "")
+        .replace("\r\n\r\nA válasz megszakítva", "")
+        .replace("\n\nA válasz megszakítva.", "")
+        .replace("\n\nA válasz megszakítva", "");
+    if without_markers != text {
+        if let Some(unit) = exact_repeated_unit(&without_markers) {
+            return format!("{}\n\nA válasz megszakítva.", unit.trim_end());
+        }
+    }
+    text.to_string()
+}
+
+fn unavailable_assistant_message(message: &LocalMessage) -> bool {
+    if message.role != "assistant" {
+        return false;
+    }
+    let text = message.text.trim().to_lowercase();
+    text.is_empty()
+        || text.starts_with("a v\u{00e1}lasz megszak\u{00ed}tva")
+        || text.starts_with("nem siker\u{00fc}lt a codex-k\u{00e9}r\u{00e9}s:")
+}
+
+fn merge_snapshot_message_versions(
+    existing: &LocalMessage,
+    mut incoming: LocalMessage,
+) -> LocalMessage {
+    if existing.role != incoming.role {
+        return existing.clone();
+    }
+    if existing.role == "user" {
+        // Submitted user content and its position are write-once. Only enrich
+        // identity/provenance fields from later cache or sync copies.
+        incoming.id = existing.id.clone().or(incoming.id);
+        incoming.role = existing.role.clone();
+        incoming.text = existing.text.clone();
+        incoming.time = existing.time.clone();
+        incoming.code = existing.code.or(incoming.code);
+        incoming.live = Some(false);
+        incoming.final_message = existing.final_message.or(incoming.final_message);
+        incoming.sequence = existing.sequence.or(incoming.sequence);
+        incoming.images = existing.images.clone();
+        incoming.quote_refs = existing.quote_refs.clone();
+        incoming.item_id = existing.item_id.clone().or(incoming.item_id);
+        incoming.turn_id = existing.turn_id.clone().or(incoming.turn_id);
+        incoming.hlc = existing.hlc.clone().or(incoming.hlc);
+        incoming.origin_device_id = existing
+            .origin_device_id
+            .clone()
+            .or(incoming.origin_device_id);
+        return incoming;
+    }
+    incoming.id = existing.id.clone().or(incoming.id);
+    let existing_unavailable = unavailable_assistant_message(existing);
+    let incoming_unavailable = unavailable_assistant_message(&incoming);
+    if (incoming_unavailable && !existing_unavailable)
+        || (incoming_unavailable == existing_unavailable
+            && existing.text.trim().len() > incoming.text.trim().len())
+    {
+        incoming.text = existing.text.clone();
+    }
+    let final_message =
+        existing.final_message.unwrap_or(false) || incoming.final_message.unwrap_or(false);
+    incoming.final_message = Some(final_message);
+    incoming.live = Some(if final_message {
+        false
+    } else {
+        existing.live.unwrap_or(false) || incoming.live.unwrap_or(false)
+    });
+    incoming.code = Some(existing.code.unwrap_or(false) || incoming.code.unwrap_or(false));
+    if incoming.id.is_none() {
+        incoming.id = existing.id.clone();
+    }
+    if incoming.item_id.is_none() {
+        incoming.item_id = existing.item_id.clone();
+    }
+    if incoming.turn_id.is_none() {
+        incoming.turn_id = existing.turn_id.clone();
+    }
+    if incoming.sequence.is_none() {
+        incoming.sequence = existing.sequence;
+    }
+    if incoming.time.trim().is_empty()
+        || (incoming.time == "most" && !existing.time.trim().is_empty() && existing.time != "most")
+    {
+        incoming.time = existing.time.clone();
+    }
+    if incoming.images.is_empty() {
+        incoming.images = existing.images.clone();
+    }
+    if incoming.quote_refs.is_empty() {
+        incoming.quote_refs = existing.quote_refs.clone();
+    }
+    if incoming.hlc.is_none() {
+        incoming.hlc = existing.hlc.clone();
+    }
+    if incoming.origin_device_id.is_none() {
+        incoming.origin_device_id = existing.origin_device_id.clone();
+    }
+    incoming
+}
+
+fn coalesce_snapshot_messages(messages: &[LocalMessage]) -> Vec<LocalMessage> {
+    let mut merged = Vec::<LocalMessage>::new();
+    let mut indexes = HashMap::<String, usize>::new();
+    for original in messages {
+        let mut message = original.clone();
+        message.text = collapse_repeated_assistant_text(&message.role, &message.text);
+        let keys = message_identity_keys(&message);
+        let existing_index = keys.iter().find_map(|key| indexes.get(key).copied());
+        if let Some(existing_index) = existing_index {
+            merged[existing_index] =
+                merge_snapshot_message_versions(&merged[existing_index], message.clone());
+            for key in message_identity_keys(&merged[existing_index])
+                .into_iter()
+                .chain(keys)
+            {
+                indexes.insert(key, existing_index);
+            }
+        } else {
+            let index = merged.len();
+            merged.push(message.clone());
+            for key in keys {
+                indexes.insert(key, index);
+            }
+        }
+    }
+    merged
+}
+
 fn normalized_project_id(project: &LocalProject) -> String {
     let identity = project
         .relative_path
@@ -737,6 +1692,41 @@ fn project_matches_tombstone(project: &LocalProject, tombstone: &LocalTombstone)
         .unwrap_or(false)
 }
 
+fn conversation_matches_tombstone(
+    conversation: &LocalConversation,
+    tombstone: &LocalTombstone,
+) -> bool {
+    if tombstone.entity_type != "conversation" {
+        return false;
+    }
+
+    // GENERAL conversations have an explicit, title-independent identity. A
+    // later General chat may legitimately reuse the same title, so title-only
+    // matching must never hide it.
+    let conversation_id = conversation
+        .id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            stable_id(
+                "conversation",
+                &format!("{}:{}", conversation.project_id, conversation.title),
+            )
+        });
+    if tombstone.entity_id == conversation_id {
+        return true;
+    }
+    if conversation.scope == GENERAL_SCOPE {
+        return false;
+    }
+
+    // Coding keeps the legacy title/project fallback for rows whose local
+    // UUID was canonicalized between two snapshots.
+    tombstone.title.as_deref() == Some(conversation.title.as_str())
+        && tombstone.project_id.as_deref() == Some(conversation.project_id.as_str())
+}
+
 fn unique_sequence(candidate: i64, index: usize, used: &mut HashSet<i64>) -> i64 {
     if used.insert(candidate) {
         return candidate;
@@ -756,12 +1746,12 @@ pub(crate) fn load_snapshot_from_connection(
             .prepare(
                 "SELECT id, name, relative_path, canonical_path
                  FROM projects
-                 WHERE archived_at IS NULL AND local_available = 1
+                 WHERE archived_at IS NULL AND local_available = 1 AND id <> ?1
                  ORDER BY created_at, id",
             )
             .map_err(|error| format!("A lokális projektek lekérdezése sikertelen: {error}"))?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map(params![GENERAL_PROJECT_ID], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -794,14 +1784,14 @@ pub(crate) fn load_snapshot_from_connection(
     let conversation_rows = {
         let mut statement = connection
             .prepare(
-                "SELECT id, project_id, title, codex_thread_id, updated_at,
+                "SELECT id, project_id, scope, title, codex_thread_id, updated_at,
                         plan_history_json, commentary_json
                  FROM conversations
                  WHERE archived_at IS NULL
-                   AND project_id IN (
+                   AND (scope = 'general' OR project_id IN (
                        SELECT id FROM projects
                        WHERE archived_at IS NULL AND local_available = 1
-                   )
+                   ))
                  ORDER BY created_at, id",
             )
             .map_err(|error| format!("A lokális beszélgetések lekérdezése sikertelen: {error}"))?;
@@ -811,10 +1801,11 @@ pub(crate) fn load_snapshot_from_connection(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
                 ))
             })
             .map_err(|error| format!("A lokális beszélgetéslista bejárása sikertelen: {error}"))?
@@ -827,6 +1818,7 @@ pub(crate) fn load_snapshot_from_connection(
     for (
         conversation_id,
         project_id,
+        row_scope,
         title,
         thread_id,
         updated_at,
@@ -845,13 +1837,12 @@ pub(crate) fn load_snapshot_from_connection(
                             sequence, hlc, origin_device_id, attachments_json, quote_refs_json
                      FROM messages
                      WHERE conversation_id = ?1
-                     ORDER BY COALESCE(hlc, printf('%020d', sequence)),
-                              COALESCE(origin_device_id, ''), sequence, id",
+                     ORDER BY sequence, COALESCE(origin_device_id, ''), id",
                 )
                 .map_err(|error| format!("A lokális üzenetek lekérdezése sikertelen: {error}"))?;
             let rows = statement
                 .query_map(params![conversation_id], |row| {
-                    Ok(LocalMessage {
+                    let mut message = LocalMessage {
                         id: row.get(0)?,
                         role: row.get(1)?,
                         text: row.get(2)?,
@@ -868,7 +1859,9 @@ pub(crate) fn load_snapshot_from_connection(
                             .unwrap_or_default(),
                         quote_refs: serde_json::from_str(&row.get::<_, String>(13)?)
                             .unwrap_or_default(),
-                    })
+                    };
+                    message.text = collapse_repeated_assistant_text(&message.role, &message.text);
+                    Ok(message)
                 })
                 .map_err(|error| format!("A lokális üzenetlista bejárása sikertelen: {error}"))?
                 .collect::<Result<Vec<_>, _>>()
@@ -919,11 +1912,21 @@ pub(crate) fn load_snapshot_from_connection(
             rows
         };
 
-        let key = format!("{project_id}::{title}");
+        let row_scope = if row_scope == GENERAL_SCOPE {
+            GENERAL_SCOPE.to_string()
+        } else {
+            CODING_SCOPE.to_string()
+        };
+        let key = if row_scope == GENERAL_SCOPE {
+            format!("general::{conversation_id}")
+        } else {
+            format!("{project_id}::{title}")
+        };
         conversations.insert(
             key,
             LocalConversation {
                 id: Some(conversation_id),
+                scope: row_scope.clone(),
                 project_id: project_id.clone(),
                 title: title.clone(),
                 messages,
@@ -934,13 +1937,15 @@ pub(crate) fn load_snapshot_from_connection(
                 commentary,
             },
         );
-        if let Some(project_index) = project_indexes.get(&project_id) {
-            if !projects[*project_index]
-                .threads
-                .iter()
-                .any(|item| item == &title)
-            {
-                projects[*project_index].threads.push(title);
+        if row_scope == CODING_SCOPE {
+            if let Some(project_index) = project_indexes.get(&project_id) {
+                if !projects[*project_index]
+                    .threads
+                    .iter()
+                    .any(|item| item == &title)
+                {
+                    projects[*project_index].threads.push(title);
+                }
             }
         }
     }
@@ -985,7 +1990,13 @@ pub(crate) fn load_snapshot_from_connection(
         .iter()
         .map(|project| project.id.clone())
         .collect::<HashSet<_>>();
-    conversations.retain(|_, conversation| active_project_ids.contains(&conversation.project_id));
+    conversations.retain(|_, conversation| {
+        !tombstones
+            .iter()
+            .any(|tombstone| conversation_matches_tombstone(conversation, tombstone))
+            && (conversation.scope == GENERAL_SCOPE
+                || active_project_ids.contains(&conversation.project_id))
+    });
     for project in &mut projects {
         project.threads.clear();
     }
@@ -995,6 +2006,9 @@ pub(crate) fn load_snapshot_from_connection(
         .map(|(index, project)| (project.id.clone(), index))
         .collect::<HashMap<_, _>>();
     for conversation in conversations.values() {
+        if conversation.scope == GENERAL_SCOPE {
+            continue;
+        }
         if let Some(project_index) = project_indexes.get(&conversation.project_id) {
             if !projects[*project_index]
                 .threads
@@ -1021,7 +2035,7 @@ pub fn load_snapshot() -> Result<LocalStoreSnapshot, String> {
     load_snapshot_from_connection(&store.connection)
 }
 
-fn save_snapshot_in_connection(
+pub(crate) fn save_snapshot_in_connection(
     connection: &mut Connection,
     snapshot: LocalStoreSnapshot,
 ) -> Result<(), String> {
@@ -1052,7 +2066,13 @@ fn save_snapshot_in_connection(
         .collect::<HashSet<_>>();
     let conversations = conversations
         .into_iter()
-        .filter(|(_, conversation)| project_ids.contains(&conversation.project_id))
+        .filter(|(_, conversation)| {
+            !tombstones
+                .iter()
+                .any(|tombstone| conversation_matches_tombstone(conversation, tombstone))
+                && (conversation.scope == GENERAL_SCOPE
+                    || project_ids.contains(&conversation.project_id))
+        })
         .collect::<BTreeMap<_, _>>();
     let snapshot = LocalStoreSnapshot {
         schema_version,
@@ -1060,10 +2080,24 @@ fn save_snapshot_in_connection(
         conversations,
         tombstones,
     };
+    let has_general_conversations = snapshot
+        .conversations
+        .values()
+        .any(|conversation| conversation.scope == GENERAL_SCOPE);
     let now = now_millis();
     let transaction = connection
         .transaction()
         .map_err(|error| format!("A lokális snapshot tranzakciója nem indítható: {error}"))?;
+    if has_general_conversations {
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO projects
+                    (id, name, canonical_path, relative_path, local_available, archived_at, created_at, updated_at)
+                 VALUES (?1, 'GENERAL', '', NULL, 1, NULL, ?2, ?2)",
+                params![GENERAL_PROJECT_ID, now],
+            )
+            .map_err(|error| format!("A GENERAL storage scope nem hozható létre: {error}"))?;
+    }
     for tombstone in &snapshot.tombstones {
         transaction
             .execute(
@@ -1088,6 +2122,17 @@ fn save_snapshot_in_connection(
                 ],
             )
             .map_err(|error| format!("A lokális tombstone mentése sikertelen: {error}"))?;
+    }
+    for tombstone in &snapshot.tombstones {
+        if tombstone.entity_type != "conversation" {
+            continue;
+        }
+        transaction
+            .execute(
+                "UPDATE conversations SET archived_at = ?1, updated_at = ?1 WHERE id = ?2",
+                params![now, tombstone.entity_id],
+            )
+            .map_err(|error| format!("A tombstoned conversation archive failed: {error}"))?;
     }
     let incoming_tombstones = snapshot
         .tombstones
@@ -1161,9 +2206,14 @@ fn save_snapshot_in_connection(
         project_ids.insert(local_project_id.clone(), local_project_id.clone());
         seen_project_ids.insert(local_project_id);
     }
+    // GENERAL is a database-only storage scope, never a visible project.
+    seen_project_ids.insert(GENERAL_PROJECT_ID.to_string());
 
     let mut conversation_by_slot = HashMap::<(String, String), LocalConversation>::new();
     for conversation in snapshot.conversations.values() {
+        if conversation.scope == GENERAL_SCOPE {
+            continue;
+        }
         conversation_by_slot.insert(
             (conversation.project_id.clone(), conversation.title.clone()),
             conversation.clone(),
@@ -1184,6 +2234,7 @@ fn save_snapshot_in_connection(
                 .cloned()
                 .unwrap_or_else(|| LocalConversation {
                     id: None,
+                    scope: CODING_SCOPE.to_string(),
                     project_id: project.id.clone(),
                     title: title.clone(),
                     messages: Vec::new(),
@@ -1201,15 +2252,19 @@ fn save_snapshot_in_connection(
     }
 
     for conversation in snapshot.conversations.values() {
-        let local_project_id = project_ids
-            .get(&conversation.project_id)
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "A lokális beszélgetés projektje nem található: {}",
-                    conversation.project_id
-                )
-            })?;
+        let local_project_id = if conversation.scope == GENERAL_SCOPE {
+            GENERAL_PROJECT_ID.to_string()
+        } else {
+            project_ids
+                .get(&conversation.project_id)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "A lokális beszélgetés projektje nem található: {}",
+                        conversation.project_id
+                    )
+                })?
+        };
         let slot = (local_project_id.clone(), conversation.title.clone());
         if seen_slots.insert(slot) {
             conversation_inputs.push((local_project_id, conversation.clone()));
@@ -1264,10 +2319,11 @@ fn save_snapshot_in_connection(
             .map_err(|error| format!("A commentary nem szerializálható: {error}"))?;
         transaction
             .execute(
-                "INSERT INTO conversations (id, project_id, title, codex_thread_id, archived_at, created_at, updated_at, plan_history_json, commentary_json)
-                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?5, ?6, ?7)
+                "INSERT INTO conversations (id, project_id, scope, title, codex_thread_id, archived_at, created_at, updated_at, plan_history_json, commentary_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?6, ?7, ?8)
                  ON CONFLICT(id) DO UPDATE SET
                      project_id = excluded.project_id,
+                     scope = excluded.scope,
                      title = excluded.title,
                      codex_thread_id = excluded.codex_thread_id,
                      archived_at = NULL,
@@ -1283,6 +2339,11 @@ fn save_snapshot_in_connection(
                 params![
                     conversation_id,
                     local_project_id,
+                    if conversation.scope == GENERAL_SCOPE {
+                        GENERAL_SCOPE
+                    } else {
+                        CODING_SCOPE
+                    },
                     conversation.title,
                     conversation.thread_id,
                     updated_at,
@@ -1299,24 +2360,30 @@ fn save_snapshot_in_connection(
         // Restart recovery rows therefore survive the next partial save too.
         // Conversation/project tombstones remain the explicit removal path.
 
-        let mut message_sequences = HashSet::new();
+        let conversation_messages = coalesce_snapshot_messages(&conversation.messages);
         let mut message_ids = HashSet::new();
-        for (index, message) in conversation.messages.iter().enumerate() {
+        for (index, raw_message) in conversation_messages.iter().enumerate() {
+            let mut message = raw_message.clone();
+            message.text = collapse_repeated_assistant_text(&message.role, &message.text);
             if message.role != "user" && message.role != "assistant" {
                 return Err(format!("Ismeretlen lokális üzenetszerep: {}", message.role));
             }
-            let sequence = unique_sequence(
-                message.sequence.unwrap_or(index as i64),
-                index,
-                &mut message_sequences,
-            );
+            let sequence = message.sequence.unwrap_or(index as i64);
             let message_id = message
                 .id
                 .as_deref()
                 .filter(|value| Uuid::parse_str(value).is_ok())
                 .filter(|value| !message_ids.contains(*value))
                 .map(str::to_string)
-                .unwrap_or_else(|| stable_id("message", &format!("{conversation_id}:{sequence}")));
+                .unwrap_or_else(|| {
+                    stable_id(
+                        "message",
+                        &format!(
+                            "{conversation_id}:{sequence}:{}:{}:{}:{index}",
+                            message.role, message.time, message.text
+                        ),
+                    )
+                });
             message_ids.insert(message_id.clone());
             let message_time = if message.time.trim().is_empty() {
                 now.clone()
@@ -1327,18 +2394,30 @@ fn save_snapshot_in_connection(
                 .map_err(|error| format!("A képcsatolmányok nem szerializálhatók: {error}"))?;
             let quote_refs_json = serde_json::to_string(&message.quote_refs)
                 .map_err(|error| format!("Az idézet-hivatkozások nem szerializálhatók: {error}"))?;
+            let identity_role = message.role.clone();
+            let identity_turn_id = message
+                .turn_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let identity_item_id = message
+                .item_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
             transaction
                 .execute(
                     "INSERT INTO messages (id, conversation_id, role, body, sequence, hlc, item_id, turn_id, code, live, \"final\", origin_device_id, attachments_json, quote_refs_json, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-                     ON CONFLICT DO UPDATE SET
-                         conversation_id = excluded.conversation_id,
-                         role = excluded.role,
+                     ON CONFLICT(id) DO UPDATE SET
                          body = CASE
+                             WHEN messages.role = 'user' THEN messages.body
                              WHEN length(excluded.body) >= length(messages.body) THEN excluded.body
                              ELSE messages.body
                          END,
-                         sequence = excluded.sequence,
+                         sequence = messages.sequence,
                          hlc = COALESCE(excluded.hlc, messages.hlc),
                          item_id = COALESCE(excluded.item_id, messages.item_id),
                          turn_id = COALESCE(excluded.turn_id, messages.turn_id),
@@ -1350,10 +2429,12 @@ fn save_snapshot_in_connection(
                          \"final\" = MAX(messages.\"final\", excluded.\"final\"),
                          origin_device_id = COALESCE(excluded.origin_device_id, messages.origin_device_id),
                          attachments_json = CASE
+                             WHEN messages.role = 'user' THEN messages.attachments_json
                              WHEN excluded.attachments_json <> '[]' THEN excluded.attachments_json
                              ELSE messages.attachments_json
                          END,
                          quote_refs_json = CASE
+                             WHEN messages.role = 'user' THEN messages.quote_refs_json
                              WHEN excluded.quote_refs_json <> '[]' THEN excluded.quote_refs_json
                              ELSE messages.quote_refs_json
                          END",
@@ -1376,6 +2457,43 @@ fn save_snapshot_in_connection(
                     ],
                 )
                 .map_err(|error| format!("A lokális üzenet mentése sikertelen: {error}"))?;
+            if let Some(turn_id) = identity_turn_id.as_deref() {
+                transaction
+                    .execute(
+                        "DELETE FROM messages
+                         WHERE conversation_id = ?1 AND role = ?2 AND turn_id = ?3 AND id <> ?4",
+                        params![conversation_id, identity_role, turn_id, message_id],
+                    )
+                    .map_err(|error| format!("A turn message-alias törlése sikertelen: {error}"))?;
+            }
+            if let Some(item_id) = identity_item_id.as_deref() {
+                transaction
+                    .execute(
+                        "DELETE FROM messages
+                         WHERE conversation_id = ?1 AND role = ?2 AND item_id = ?3 AND id <> ?4",
+                        params![conversation_id, identity_role, item_id, message_id],
+                    )
+                    .map_err(|error| {
+                        format!("Az item message-alias törlése sikertelen: {error}")
+                    })?;
+            }
+            if identity_role == "assistant"
+                && identity_turn_id.is_none()
+                && identity_item_id.is_none()
+            {
+                transaction
+                    .execute(
+                        "DELETE FROM messages
+                         WHERE conversation_id = ?1 AND role = 'assistant'
+                           AND sequence = ?2 AND body = ?3 AND id <> ?4
+                           AND (turn_id IS NULL OR trim(turn_id) = '')
+                           AND (item_id IS NULL OR trim(item_id) = '')",
+                        params![conversation_id, sequence, message.text, message_id],
+                    )
+                    .map_err(|error| {
+                        format!("A legacy assistant message-alias törlése sikertelen: {error}")
+                    })?;
+            }
         }
 
         let mut work_item_sequences = HashSet::new();
@@ -1466,7 +2584,10 @@ fn save_snapshot_in_connection(
 
     let stale_conversations = {
         let mut statement = transaction
-            .prepare("SELECT id FROM conversations WHERE archived_at IS NULL")
+            .prepare(
+                "SELECT id, scope FROM conversations
+                 WHERE archived_at IS NULL AND scope <> 'general'",
+            )
             .map_err(|error| format!("A régi beszélgetések lekérdezése sikertelen: {error}"))?;
         let rows = statement
             .query_map([], |row| row.get::<_, String>(0))
@@ -1488,10 +2609,13 @@ fn save_snapshot_in_connection(
 
     let stale_projects = {
         let mut statement = transaction
-            .prepare("SELECT id FROM projects WHERE archived_at IS NULL AND local_available = 1")
+            .prepare(
+                "SELECT id FROM projects
+                 WHERE archived_at IS NULL AND local_available = 1 AND id <> ?1",
+            )
             .map_err(|error| format!("A régi projektek lekérdezése sikertelen: {error}"))?;
         let rows = statement
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map(params![GENERAL_PROJECT_ID], |row| row.get::<_, String>(0))
             .map_err(|error| format!("A régi projektlista bejárása sikertelen: {error}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("A régi projektazonosító hibás: {error}"))?;
@@ -1542,6 +2666,313 @@ mod tests {
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
             .expect("foreign_keys pragma");
         assert_eq!(foreign_keys, 1);
+    }
+
+    #[test]
+    fn historical_repeated_assistant_stream_output_is_collapsed() {
+        let answer = "Értettem:\n\nKonkrét végrehajtandó feladat nincs megadva.";
+        assert_eq!(
+            collapse_repeated_assistant_text("assistant", &answer.repeat(2)),
+            answer
+        );
+        assert_eq!(
+            collapse_repeated_assistant_text("assistant", &answer.repeat(17)),
+            answer
+        );
+        assert_eq!(
+            collapse_repeated_assistant_text("assistant", &answer.repeat(166)),
+            answer
+        );
+        assert_eq!(
+            collapse_repeated_assistant_text("user", &answer.repeat(17)),
+            answer.repeat(17)
+        );
+        assert_eq!(
+            collapse_repeated_assistant_text("assistant", "K-1K-1"),
+            "K-1"
+        );
+        assert_eq!(
+            collapse_repeated_assistant_text("assistant", "abcabcabc"),
+            "abc"
+        );
+        assert_eq!(
+            collapse_repeated_assistant_text("assistant", "abcabca"),
+            "abcabca"
+        );
+    }
+
+    #[test]
+    fn historical_repeated_interruption_markers_collapse_to_one_marker() {
+        let answer = "Igen, most mar futtathato.";
+        let marker = "\n\nA válasz megszakítva.";
+        let corrupted = format!("{answer}{marker}{}{answer}{marker}", answer.repeat(164));
+        assert_eq!(
+            collapse_repeated_assistant_text("assistant", &corrupted),
+            format!("{answer}{marker}")
+        );
+    }
+
+    #[test]
+    fn schema_v12_migration_repairs_unbounded_repeated_answer() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize current schema");
+        connection
+            .execute(
+                "INSERT INTO projects (id, name, canonical_path, created_at, updated_at)
+                 VALUES ('project', 'Project', 'C:\\Project', 'now', 'now')",
+                [],
+            )
+            .expect("insert project");
+        connection
+            .execute(
+                "INSERT INTO conversations (id, project_id, title, created_at, updated_at)
+                 VALUES ('conversation', 'project', 'Work 2', 'now', 'now')",
+                [],
+            )
+            .expect("insert conversation");
+        let answer = "Igen, most mar futtathato.";
+        let marker = "\n\nA válasz megszakítva.";
+        let corrupted = format!("{answer}{marker}{}{answer}{marker}", answer.repeat(164));
+        connection
+            .execute(
+                "INSERT INTO messages (id, conversation_id, role, body, sequence, created_at)
+                 VALUES ('message', 'conversation', 'assistant', ?1, 1, 'now')",
+                params![corrupted],
+            )
+            .expect("insert corrupted answer");
+        connection
+            .pragma_update(None, "user_version", 11)
+            .expect("rewind schema version");
+
+        initialize_connection(&mut connection).expect("run v12 migration");
+
+        let repaired: String = connection
+            .query_row(
+                "SELECT body FROM messages WHERE id = 'message'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read repaired answer");
+        assert_eq!(repaired, format!("{answer}{marker}"));
+        assert_eq!(
+            read_schema_version(&connection).expect("schema version"),
+            STORE_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn schema_v13_migration_repairs_exact_two_copy_answer() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize current schema");
+        connection
+            .execute(
+                "INSERT INTO projects (id, name, canonical_path, created_at, updated_at)
+                 VALUES ('project', 'Project', 'C:\\Project', 'now', 'now')",
+                [],
+            )
+            .expect("insert project");
+        connection
+            .execute(
+                "INSERT INTO conversations (id, project_id, title, created_at, updated_at)
+                 VALUES ('conversation', 'project', 'Work', 'now', 'now')",
+                [],
+            )
+            .expect("insert conversation");
+        let answer = "K-1";
+        connection
+            .execute(
+                "INSERT INTO messages (id, conversation_id, role, body, sequence, created_at)
+                 VALUES ('message', 'conversation', 'assistant', ?1, 1, 'now')",
+                params![answer.repeat(2)],
+            )
+            .expect("insert two-copy answer");
+        connection
+            .pragma_update(None, "user_version", 12)
+            .expect("rewind schema version");
+
+        initialize_connection(&mut connection).expect("run v13 migration");
+
+        let repaired: String = connection
+            .query_row(
+                "SELECT body FROM messages WHERE id = 'message'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read repaired answer");
+        assert_eq!(repaired, answer);
+        assert_eq!(
+            read_schema_version(&connection).expect("schema version"),
+            STORE_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn schema_v14_restores_first_user_event_and_allows_sequence_collisions() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize current schema");
+        connection
+            .execute_batch(
+                "INSERT INTO projects (id, name, canonical_path, created_at, updated_at)
+                 VALUES ('project', 'Project', 'C:\\Project', 'now', 'now');
+                 INSERT INTO conversations (id, project_id, title, created_at, updated_at)
+                 VALUES ('conversation', 'project', 'Work', 'now', 'now');
+                 INSERT INTO devices (id, name, created_at, updated_at)
+                 VALUES ('device', 'Device', 'now', 'now');
+                 INSERT INTO messages (id, conversation_id, role, body, sequence, created_at)
+                 VALUES ('message', 'conversation', 'user', 'HOSSZABB IDEGEN KERDES', 7, 'later');
+                 CREATE UNIQUE INDEX uq_messages_conversation_sequence
+                     ON messages(conversation_id, sequence);",
+            )
+            .expect("insert v13 fixture");
+        let original = serde_json::json!({
+            "projectId": "project",
+            "conversationId": "conversation",
+            "message": {
+                "id": "message",
+                "role": "user",
+                "text": "Eredeti kérdés",
+                "time": "first",
+                "sequence": 7
+            }
+        });
+        let corrupted = serde_json::json!({
+            "projectId": "project",
+            "conversationId": "conversation",
+            "message": {
+                "id": "message",
+                "role": "user",
+                "text": "HOSSZABB IDEGEN KERDES",
+                "time": "later",
+                "sequence": 7
+            }
+        });
+        for (sequence, hlc, payload) in [(1, "0001", original), (2, "0002", corrupted)] {
+            connection
+                .execute(
+                    "INSERT INTO sync_events
+                     (event_id, device_id, device_sequence, hlc, entity_id, event_type,
+                      payload_json, payload_hash, event_hash, imported_at)
+                     VALUES (?1, 'device', ?2, ?3, 'message', 'message.upsert', ?4, 'payload', ?1, 'now')",
+                    params![format!("event-{sequence}"), sequence, hlc, payload.to_string()],
+                )
+                .expect("insert message event");
+        }
+        connection
+            .pragma_update(None, "user_version", 13)
+            .expect("rewind schema version");
+
+        initialize_connection(&mut connection).expect("run v14 migration");
+
+        let repaired: (String, String) = connection
+            .query_row(
+                "SELECT body, created_at FROM messages WHERE id = 'message'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read repaired user");
+        assert_eq!(
+            repaired,
+            ("Eredeti kérdés".to_string(), "first".to_string())
+        );
+        connection
+            .execute(
+                "INSERT INTO messages (id, conversation_id, role, body, sequence, created_at)
+                 VALUES ('message-2', 'conversation', 'user', 'Másik gép', 7, 'now')",
+                [],
+            )
+            .expect("same sequence is not a row identity");
+    }
+
+    #[test]
+    fn schema_v15_removes_only_provable_message_aliases() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize current schema");
+        connection
+            .execute_batch(
+                "INSERT INTO projects (id, name, canonical_path, created_at, updated_at)
+                 VALUES ('project', 'Project', 'C:\\Project', 'now', 'now');
+                 INSERT INTO conversations (id, project_id, title, created_at, updated_at)
+                 VALUES ('conversation', 'project', 'Work', 'now', 'now');
+                 INSERT INTO messages (id, conversation_id, role, body, sequence, created_at)
+                 VALUES
+                   ('user-a', 'conversation', 'user', 'Első', 7, 'now'),
+                   ('user-b', 'conversation', 'user', 'Második', 7, 'now'),
+                   ('answer-a', 'conversation', 'assistant', 'Kész', 8, 'now'),
+                   ('answer-b', 'conversation', 'assistant', 'Kész', 8, 'now');
+                 INSERT INTO messages
+                   (id, conversation_id, role, body, sequence, turn_id, created_at)
+                 VALUES
+                   ('turn-answer-a', 'conversation', 'assistant', 'Kész', 9, 'turn-1', 'now'),
+                   ('turn-answer-b', 'conversation', 'assistant', 'Kész', 9, 'turn-1', 'now');
+                 PRAGMA user_version = 14;",
+            )
+            .expect("insert v14 aliases");
+
+        initialize_connection(&mut connection).expect("run v15 migration");
+
+        let users: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE role = 'user'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("user count");
+        let assistants: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE role = 'assistant'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("assistant count");
+        assert_eq!(users, 2);
+        assert_eq!(assistants, 2);
+    }
+
+    #[test]
+    fn schema_v16_removes_an_abandoned_non_adjacent_regeneration_pair() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize current schema");
+        connection
+            .execute_batch(
+                "INSERT INTO projects (id, name, canonical_path, created_at, updated_at)
+                 VALUES ('project', 'Project', 'C:\\Project', 'now', 'now');
+                 INSERT INTO conversations (id, project_id, title, created_at, updated_at)
+                 VALUES ('conversation', 'project', 'Work', 'now', 'now');
+                 INSERT INTO messages (id, conversation_id, role, body, sequence, created_at)
+                 VALUES
+                   ('source-user', 'conversation', 'user', 'Azonos kérdés', 1, 'now'),
+                   ('source-answer', 'conversation', 'assistant', 'Meglévő válasz', 2, 'now'),
+                   ('other-user', 'conversation', 'user', 'Másik kérdés', 3, 'now'),
+                   ('other-answer', 'conversation', 'assistant', 'Másik válasz', 4, 'now');
+                 INSERT INTO messages
+                   (id, conversation_id, role, body, sequence, turn_id, live, [final], created_at)
+                 VALUES
+                   ('retry-user', 'conversation', 'user', 'Azonos kérdés', 5, 'retry-turn', 0, 0, 'now'),
+                   ('retry-answer', 'conversation', 'assistant', '', 6, 'retry-turn', 0, 0, 'now');
+                 UPDATE messages SET quote_refs_json = 'legacy-context'
+                 WHERE id = 'retry-user';
+                 PRAGMA user_version = 15;",
+            )
+            .expect("insert abandoned retry");
+
+        initialize_connection(&mut connection).expect("run v16 migration");
+
+        let ids = connection
+            .prepare("SELECT id FROM messages ORDER BY sequence")
+            .expect("prepare ids")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("read ids")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect ids");
+        assert_eq!(
+            ids,
+            vec!["source-user", "source-answer", "other-user", "other-answer"]
+        );
     }
 
     #[test]
@@ -1617,6 +3048,7 @@ mod tests {
         let title = "Thread".to_string();
         let conversation = LocalConversation {
             id: None,
+            scope: CODING_SCOPE.to_string(),
             project_id: project_id.clone(),
             title: title.clone(),
             messages: vec![LocalMessage {
@@ -1691,6 +3123,45 @@ mod tests {
                 reason: Some("test".to_string()),
             }],
         }
+    }
+
+    #[test]
+    fn repeated_save_cannot_rewrite_an_existing_user_payload() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+        let message_id = Uuid::new_v4().to_string();
+        let mut original = test_snapshot();
+        let original_message = &mut original
+            .conversations
+            .values_mut()
+            .next()
+            .expect("conversation")
+            .messages[0];
+        original_message.id = Some(message_id.clone());
+        save_snapshot_in_connection(&mut connection, original.clone()).expect("save original");
+
+        let changed_message = &mut original
+            .conversations
+            .values_mut()
+            .next()
+            .expect("conversation")
+            .messages[0];
+        changed_message.text = "Egy teljesen más, hosszabb user input".to_string();
+        changed_message.time = "later".to_string();
+        changed_message.images.clear();
+        save_snapshot_in_connection(&mut connection, original).expect("save stale rewrite");
+
+        let stored: (String, String, String) = connection
+            .query_row(
+                "SELECT body, created_at, attachments_json FROM messages WHERE id = ?1",
+                params![message_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("stored user");
+        assert_eq!(stored.0, "Hello");
+        assert_eq!(stored.1, "1");
+        assert_ne!(stored.2, "[]");
     }
 
     #[test]
@@ -1784,6 +3255,103 @@ mod tests {
             .expect("load archived snapshot")
             .projects
             .is_empty());
+    }
+
+    #[test]
+    fn general_snapshot_round_trip_keeps_the_hidden_storage_scope_out_of_the_ui() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        let mut snapshot = test_snapshot();
+        snapshot.projects.clear();
+        let mut conversation = snapshot
+            .conversations
+            .into_values()
+            .next()
+            .expect("conversation fixture");
+        conversation.id = Some("123e4567-e89b-12d3-a456-426614174000".to_string());
+        conversation.scope = GENERAL_SCOPE.to_string();
+        conversation.project_id = GENERAL_PROJECT_ID.to_string();
+        conversation.title = "Tell me a joke".to_string();
+        conversation.thread_id = None;
+        snapshot.conversations = BTreeMap::from([(
+            "general::123e4567-e89b-12d3-a456-426614174000".to_string(),
+            conversation,
+        )]);
+        snapshot.tombstones.clear();
+
+        save_snapshot_in_connection(&mut connection, snapshot).expect("save General snapshot");
+        let loaded = load_snapshot_from_connection(&connection).expect("load General snapshot");
+
+        assert!(loaded.projects.is_empty());
+        let general = loaded
+            .conversations
+            .get("general::123e4567-e89b-12d3-a456-426614174000")
+            .expect("General conversation");
+        assert_eq!(general.scope, GENERAL_SCOPE);
+        assert_eq!(general.project_id, GENERAL_PROJECT_ID);
+        assert_eq!(general.title, "Tell me a joke");
+        assert_eq!(general.messages[0].text, "Hello");
+
+        let stored_projects: i64 = connection
+            .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+            .expect("count storage projects");
+        assert_eq!(stored_projects, 1);
+    }
+
+    #[test]
+    fn snapshot_save_coalesces_duplicate_message_aliases() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        let mut snapshot = test_snapshot();
+        let conversation = snapshot
+            .conversations
+            .values_mut()
+            .next()
+            .expect("conversation");
+        let placeholder = LocalMessage {
+            id: Some(Uuid::new_v4().to_string()),
+            role: "assistant".to_string(),
+            text: String::new(),
+            time: "most".to_string(),
+            code: Some(false),
+            live: Some(true),
+            final_message: Some(false),
+            item_id: None,
+            turn_id: Some("request:duplicate".to_string()),
+            sequence: Some(11),
+            hlc: None,
+            origin_device_id: None,
+            images: Vec::new(),
+            quote_refs: Vec::new(),
+        };
+        let mut completed = placeholder.clone();
+        completed.id = Some(Uuid::new_v4().to_string());
+        completed.text = "final answer".to_string();
+        completed.live = Some(false);
+        completed.final_message = Some(true);
+        conversation.messages.extend([placeholder, completed]);
+
+        save_snapshot_in_connection(&mut connection, snapshot).expect("save snapshot");
+        let loaded = load_snapshot_from_connection(&connection).expect("load snapshot");
+        let messages = &loaded
+            .conversations
+            .values()
+            .next()
+            .expect("conversation")
+            .messages;
+
+        assert_eq!(messages.len(), 2);
+        let answer = messages
+            .iter()
+            .find(|message| message.role == "assistant")
+            .expect("answer");
+        assert_eq!(answer.text, "final answer");
+        assert_eq!(answer.live, Some(false));
+        assert_eq!(answer.final_message, Some(true));
     }
 
     #[test]
@@ -1958,6 +3526,101 @@ mod tests {
             )
             .expect("count active projects");
         assert_eq!(active_rows, 0);
+    }
+
+    #[test]
+    fn general_conversation_tombstone_survives_stale_local_saves() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        let conversation_id = Uuid::new_v4().to_string();
+        let mut conversation = test_snapshot()
+            .conversations
+            .into_values()
+            .next()
+            .expect("conversation fixture");
+        conversation.id = Some(conversation_id.clone());
+        conversation.scope = GENERAL_SCOPE.to_string();
+        conversation.project_id = GENERAL_PROJECT_ID.to_string();
+        conversation.title = "Tell me a joke".to_string();
+        conversation.thread_id = None;
+
+        let snapshot = LocalStoreSnapshot {
+            schema_version: STORE_SCHEMA_VERSION,
+            projects: Vec::new(),
+            conversations: BTreeMap::from([(
+                format!("general::{conversation_id}"),
+                conversation.clone(),
+            )]),
+            tombstones: Vec::new(),
+        };
+        save_snapshot_in_connection(&mut connection, snapshot).expect("save General conversation");
+
+        let tombstone = LocalTombstone {
+            entity_type: "conversation".to_string(),
+            entity_id: conversation_id.clone(),
+            archived_at: "2".to_string(),
+            project_id: None,
+            title: Some(conversation.title.clone()),
+            relative_path: None,
+            path_hint: None,
+            reason: Some("deleted from General".to_string()),
+        };
+        let stale_snapshot = LocalStoreSnapshot {
+            schema_version: STORE_SCHEMA_VERSION,
+            projects: Vec::new(),
+            // Model the stale UI snapshot that still contains the row that
+            // was deleted just before the save/sync boundary.
+            conversations: BTreeMap::from([(
+                format!("general::{conversation_id}"),
+                conversation.clone(),
+            )]),
+            tombstones: vec![tombstone.clone()],
+        };
+        save_snapshot_in_connection(&mut connection, stale_snapshot.clone())
+            .expect("save General tombstone");
+
+        let after_delete = load_snapshot_from_connection(&connection).expect("load after delete");
+        assert!(!after_delete.conversations.values().any(|candidate| {
+            candidate.id.as_deref() == Some(conversation_id.as_str())
+        }));
+        let active_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM conversations WHERE scope = 'general' AND archived_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count active General conversations");
+        assert_eq!(active_rows, 0);
+
+        // Repeating the stale snapshot must not resurrect the deleted General
+        // row, exactly like a later sync poll or restart-time hydration.
+        save_snapshot_in_connection(&mut connection, stale_snapshot)
+            .expect("repeat stale General snapshot");
+        let after_repeat = load_snapshot_from_connection(&connection).expect("load repeated snapshot");
+        assert!(!after_repeat.conversations.values().any(|candidate| {
+            candidate.id.as_deref() == Some(conversation_id.as_str())
+        }));
+
+        // Removing the tombstone is the explicit restore path.
+        save_snapshot_in_connection(
+            &mut connection,
+            LocalStoreSnapshot {
+                schema_version: STORE_SCHEMA_VERSION,
+                projects: Vec::new(),
+                conversations: BTreeMap::from([(
+                    format!("general::{conversation_id}"),
+                    conversation,
+                )]),
+                tombstones: Vec::new(),
+            },
+        )
+        .expect("restore General conversation");
+        let restored = load_snapshot_from_connection(&connection).expect("load restored General");
+        assert!(restored.conversations.values().any(|candidate| {
+            candidate.id.as_deref() == Some(conversation_id.as_str())
+        }));
     }
 
     #[test]

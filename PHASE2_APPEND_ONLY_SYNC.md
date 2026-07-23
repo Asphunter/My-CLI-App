@@ -55,9 +55,22 @@
 - A Codex rollout/thread azonosító géphelyi app-server állapot, ezért nem kerül OneDrive-on használatra. Ha egy átvett beszélgetés régi rolloutja a másik gépen hiányzik, az app új helyi threadet indít, és a szinkronizált beszélgetés-előzményt kontextusként átadja.
 - A Rust/Cargo dev- és release-build targetje a `tauri:dev:local` és `tauri:build:local` parancsokkal gépenkénti `%LOCALAPPDATA%\min\cargo-target` mappába kerül; a OneDrive-ban nem marad build-cache.
 
+## 2026-07-21 – másik gépen folytatás hardening
+
+- A korábbi stream-listener hibából származó történeti assistant-üzeneteket a SQLite schema v11 migráció exact periodikus ismétlésként felismeri és egy példányra összevonja (a legacy 17× eseteket is); a user-sorok érintetlenek maradnak. Ugyanez a normalizálás fut a frontend merge/load/save és a v2 sync reducer/upsert útvonalain, ezért a hiba nem tud újra bekerülni.
+- Külön turnök tartalmuk alapján soha nem olvadnak össze. A frontend és a szinkron csak stabil `turnId + role`, `itemId + role`, `sequence + role` vagy sorazonosság alapján egyesíthet másolatot; azonos szövegű user promptok és válaszok külön history-sorként megmaradnak.
+- A beágyazott Codex app-server indítása explicit `notify=[]` override-ot kap. A befejezési hang kizárólag a Min kliens tulajdona, így a felhasználói globális Codex-hook nem indíthat el egy második, késleltetett hangsort.
+- A Tauri single-instance guard az alkalmazás indulásának első pluginje. Egy gépen egyszerre csak egy Min backend/WebView és egy hangqueue futhat; újabb indítás a már nyitott főablakot fókuszálja.
+- Minden Codex-esemény `requestId` és monoton request-local `sequence` mezőt kap. A kliens a másik vagy már lezárt kérésből érkező késői eseményt eldobja, az azonos sorszámú eseményt csak egyszer dolgozza fel.
+- A user- és assistant-sor ugyanazt a stabil kliens `turnId`-t kapja. Az üzenetazonosság sorrendje `turnId + role`, `itemId + role`, `sequence + role`, majd a lokális row UUID; az eltérő gépen keletkezett UUID-k ezért nem készítenek átmeneti másolatot.
+- A frontend merge, a sync reducer és a SQLite snapshot-mentés ugyanazt a logikai aliaselvet használja. A régi random ID-s journalbejegyzések a következő redukciónál adatvesztés nélkül kanonikus turn/item ID alá olvadnak.
+- Az üzenet-életciklus monoton: a `final` válasz nem válhat újra live/üres állapotúvá egy később beérkező stale snapshot miatt. A rolling answer checkpoint olvasása, merge-e és cseréje processzen belüli lock alatt fut, így egymást átfedő pull/publish nem írhatja felül újabb válasszal a régebbit.
+- A frontend tartalombiztonsági szabálya már nem korlátlan (`csp: null`): csak az alkalmazás saját protokolljai, IPC-je és lokális/data/blob médiaforrásai engedélyezettek.
+- A migráció nem töröl és nem ír át OneDrive-journal fájlt. A reducer és a lokális snapshot idempotensen egyesíti a régi aliasokat; a meglévő felhasználói adatok és recovery-lánc változatlanul megmaradnak.
+
 ## Ellenőrzés
 
-- Rust v2 sync unit tesztek: 12 passed; a teljes Rust library tesztcsomag: 39 passed. A binárisok `cargo check` ellenőrzése és a Vite production build is sikeres.
+- A teljes Rust library regressziós csomag: 69 passed, köztük a kétgépes reconnect/quarantine, idempotencia, 1200 eventes interleaving, property és hosszú soak tesztek, valamint az új hang-, esemény-, alias-, snapshot- és történeti ismétlés-regressziók. A `cargo check` és a Vite production build is sikeres.
 - Frontend TypeScript + Vite production build: sikeres.
 - `cargo check --bins`: sikeres.
 - A `npm run smoke:app-server` harness valódi ideiglenes Git- és nem-Git fixture-t hoz létre, mindkettőn sikeres `initialize` és `thread/start` választ ellenőriz, majd process-tree szinten takarít. A managed Codex fallbackdel mindkét smoke sikeres.

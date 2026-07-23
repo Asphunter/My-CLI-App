@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "test:timeline": "node --test tests/chatTimeline.test.ts",
+    "test:timeline": "node --test tests/*.test.ts",
     "smoke:app-server": "node scripts/app_server_smoke.cjs",
     "release:check": "node scripts/release_check.cjs",
     "release:test": "npm.cmd run test:timeline && npm.cmd run build && set \"CARGO_TARGET_DIR=%LOCALAPPDATA%\\min\\cargo-target\"&& cargo test --manifest-path src-tauri/Cargo.toml --no-default-features && node scripts/app_server_smoke.cjs",

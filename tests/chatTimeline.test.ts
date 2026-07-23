@@ -115,6 +115,27 @@ test("a no-tool turn remains a card after streaming completes", () => {
   assert.equal(messageBelongsToWorkGroup(messages, 1, groups[0]), true);
 });
 
+test("a recovered trace card can never sort before its user prompt", () => {
+  const messages = [
+    { id: "u", role: "user" as const, text: "question", sequence: 100 },
+    { id: "a", role: "assistant" as const, text: "answer", sequence: 101 },
+  ];
+  const groups = buildWorkLogGroups({
+    messages,
+    // Historical timing may be equal to or older than the prompt sequence.
+    activities: [{ id: 100, turnId: "legacy-trace" }],
+    planHistory: {
+      "legacy-trace": completedPlan("legacy-trace", 100),
+    },
+    commentary: [],
+  });
+
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].userMessageKey, "u");
+  assert.ok(groups[0].sequence > messages[0].sequence!);
+  assert.ok(groups[0].sequence < messages[1].sequence!);
+});
+
 test("explicit mismatched turn ids are never paired by proximity", () => {
   const messages = [
     { id: "u", role: "user" as const, text: "hello", sequence: 1 },

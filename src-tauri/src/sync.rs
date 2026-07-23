@@ -32,6 +32,9 @@ const RETENTION_SCHEMA_VERSION: i64 = 1;
 const MAX_RETENTION_METADATA_BYTES: u64 = 1024 * 1024;
 const MAX_RETENTION_BACKUP_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_COMPACTION_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
+const ANSWER_CHECKPOINT_SCHEMA_VERSION: i64 = 1;
+const MAX_ANSWER_CHECKPOINT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CHECKPOINT_ANSWERS: usize = 512;
 const MAX_RETENTION_AUDIT_ENTRIES: usize = 64;
 const QUARANTINE_SCHEMA_VERSION: i64 = 1;
 
@@ -69,7 +72,9 @@ struct EventHashInput<'a> {
 #[serde(rename_all = "camelCase")]
 struct ConversationEventPayload {
     id: String,
-    project_id: String,
+    #[serde(default = "default_coding_scope")]
+    scope: String,
+    project_id: Option<String>,
     title: String,
     thread_id: Option<String>,
     updated_at: String,
@@ -82,7 +87,7 @@ struct ConversationEventPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MessageEventPayload {
-    project_id: String,
+    project_id: Option<String>,
     conversation_id: String,
     message: LocalMessage,
 }
@@ -90,9 +95,29 @@ struct MessageEventPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkItemEventPayload {
-    project_id: String,
+    project_id: Option<String>,
     conversation_id: String,
     item: LocalWorkItem,
+}
+
+fn default_coding_scope() -> String {
+    store::CODING_SCOPE.to_string()
+}
+
+fn wire_project_id(scope: &str, project_id: &str) -> Option<String> {
+    if scope == store::GENERAL_SCOPE || project_id == store::GENERAL_PROJECT_ID {
+        None
+    } else {
+        Some(project_id.to_string())
+    }
+}
+
+fn storage_project_id(scope: &str, project_id: Option<&str>) -> String {
+    if scope == store::GENERAL_SCOPE {
+        store::GENERAL_PROJECT_ID.to_string()
+    } else {
+        project_id.unwrap_or_default().to_string()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,6 +348,36 @@ struct CompactionSnapshotHashInput<'a> {
     state: &'a LocalStoreSnapshot,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnswerCheckpointEntry {
+    project: LocalProject,
+    conversation_id: String,
+    conversation_title: String,
+    updated_at: String,
+    user_message: Option<LocalMessage>,
+    answer: LocalMessage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnswerCheckpointFile {
+    schema_version: i64,
+    device_id: String,
+    updated_at: String,
+    answers: Vec<AnswerCheckpointEntry>,
+    checkpoint_hash: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnswerCheckpointHashInput<'a> {
+    schema_version: i64,
+    device_id: &'a str,
+    updated_at: &'a str,
+    answers: &'a [AnswerCheckpointEntry],
+}
+
 #[derive(Debug, Clone)]
 struct PendingEvent {
     entity_id: String,
@@ -381,6 +436,22 @@ struct ConversationAccumulator {
 fn append_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn answer_checkpoint_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[derive(Debug, Clone)]
+struct IncrementalDirectoryStamp {
+    modified: Option<SystemTime>,
+    max_sequence: u64,
+}
+
+fn incremental_directory_cache() -> &'static Mutex<HashMap<PathBuf, IncrementalDirectoryStamp>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, IncrementalDirectoryStamp>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn now_millis() -> u64 {
@@ -596,6 +667,267 @@ fn read_latest_compaction_snapshot(root: &Path) -> Result<Option<CompactionSnaps
         }
     }
     Ok(latest)
+}
+
+fn answer_checkpoint_hash(checkpoint: &AnswerCheckpointFile) -> Result<String, String> {
+    let input = AnswerCheckpointHashInput {
+        schema_version: checkpoint.schema_version,
+        device_id: &checkpoint.device_id,
+        updated_at: &checkpoint.updated_at,
+        answers: &checkpoint.answers,
+    };
+    let bytes = serde_json::to_vec(&input)
+        .map_err(|error| format!("A válasz-checkpoint hash-inputja hibás: {error}"))?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn validate_answer_checkpoint(checkpoint: &AnswerCheckpointFile) -> Result<(), String> {
+    if checkpoint.schema_version != ANSWER_CHECKPOINT_SCHEMA_VERSION
+        || Uuid::parse_str(&checkpoint.device_id).is_err()
+        || checkpoint.updated_at.parse::<u64>().is_err()
+        || checkpoint.answers.len() > MAX_CHECKPOINT_ANSWERS
+        || !is_sha256(&checkpoint.checkpoint_hash)
+    {
+        return Err("A válasz-checkpoint fejléce hibás.".to_string());
+    }
+    for entry in &checkpoint.answers {
+        if Uuid::parse_str(&entry.project.id).is_err()
+            || Uuid::parse_str(&entry.conversation_id).is_err()
+            || entry.conversation_title.trim().is_empty()
+            || entry.answer.role != "assistant"
+            || entry.answer.text.trim().is_empty()
+            || entry.answer.final_message != Some(true)
+            || entry
+                .answer
+                .id
+                .as_deref()
+                .is_none_or(|id| Uuid::parse_str(id).is_err())
+            || entry.user_message.as_ref().is_some_and(|message| {
+                message.role != "user"
+                    || message
+                        .id
+                        .as_deref()
+                        .is_none_or(|id| Uuid::parse_str(id).is_err())
+            })
+        {
+            return Err("A válasz-checkpoint egyik bejegyzése hibás.".to_string());
+        }
+    }
+    if answer_checkpoint_hash(checkpoint)? != checkpoint.checkpoint_hash {
+        return Err("A válasz-checkpoint hash-e nem egyezik.".to_string());
+    }
+    Ok(())
+}
+
+fn answer_checkpoint_path(root: &Path, device_id: &str) -> PathBuf {
+    root.join("answer-checkpoints")
+        .join(format!("{device_id}.json"))
+}
+
+fn read_answer_checkpoint_file(path: &Path) -> Result<AnswerCheckpointFile, String> {
+    let bytes = read_event_with_retry(path)
+        .map_err(|error| format!("A válasz-checkpoint nem olvasható: {error}"))?;
+    if bytes.len() > MAX_ANSWER_CHECKPOINT_BYTES {
+        return Err("A válasz-checkpoint túl nagy.".to_string());
+    }
+    let checkpoint = serde_json::from_slice::<AnswerCheckpointFile>(&bytes)
+        .map_err(|error| format!("A válasz-checkpoint JSON-ja hibás: {error}"))?;
+    validate_answer_checkpoint(&checkpoint)?;
+    Ok(checkpoint)
+}
+
+fn read_answer_checkpoints(root: &Path) -> Vec<AnswerCheckpointFile> {
+    let directory = root.join("answer-checkpoints");
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        })
+        // A checkpoint is a redundant recovery path. A damaged or partially
+        // hydrated copy must not quarantine the authoritative event journal.
+        .filter_map(|path| read_answer_checkpoint_file(&path).ok())
+        .collect()
+}
+
+fn checkpoint_entries(snapshot: &LocalStoreSnapshot) -> Vec<AnswerCheckpointEntry> {
+    let projects = snapshot
+        .projects
+        .iter()
+        .map(|project| {
+            let mut normalized = project.clone();
+            normalized.id = normalized_project_id(project);
+            (project.id.clone(), normalized)
+        })
+        .collect::<HashMap<_, _>>();
+    let mut answers = Vec::new();
+    for conversation in snapshot.conversations.values() {
+        if conversation.scope == store::GENERAL_SCOPE {
+            continue;
+        }
+        let Some(project) = projects.get(&conversation.project_id) else {
+            continue;
+        };
+        let mut normalized_conversation = conversation.clone();
+        normalized_conversation.project_id = project.id.clone();
+        let conversation_id = normalized_conversation_id(&project.id, &normalized_conversation);
+        let mut ordered_messages = conversation.messages.iter().collect::<Vec<_>>();
+        ordered_messages.sort_by(|left, right| {
+            left.sequence
+                .unwrap_or(i64::MAX)
+                .cmp(&right.sequence.unwrap_or(i64::MAX))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        for (index, &message) in ordered_messages.iter().enumerate() {
+            if message.role != "assistant"
+                || message.final_message != Some(true)
+                || message.text.trim().is_empty()
+            {
+                continue;
+            }
+            let mut answer = message.clone();
+            answer.id = Some(normalized_message_id(&conversation_id, message, index));
+            answer.live = Some(false);
+            answer.final_message = Some(true);
+            answer.hlc = None;
+            answer.origin_device_id = None;
+            let answer_turn_id = message
+                .turn_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty());
+            let preceding = &ordered_messages[..index];
+            let user_message = preceding
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, candidate)| {
+                    candidate.role == "user"
+                        && answer_turn_id.is_some_and(|turn_id| {
+                            candidate.turn_id.as_deref().map(str::trim) == Some(turn_id)
+                        })
+                })
+                .or_else(|| {
+                    preceding
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|(_, candidate)| candidate.role == "user")
+                })
+                .map(|(user_index, candidate)| {
+                    let mut normalized = (*candidate).clone();
+                    normalized.id = Some(normalized_message_id(
+                        &conversation_id,
+                        candidate,
+                        user_index,
+                    ));
+                    normalized.live = Some(false);
+                    normalized.hlc = None;
+                    normalized.origin_device_id = None;
+                    normalized
+                });
+            answers.push(AnswerCheckpointEntry {
+                project: project.clone(),
+                conversation_id: conversation_id.clone(),
+                conversation_title: conversation.title.clone(),
+                updated_at: conversation.updated_at.clone(),
+                user_message,
+                answer,
+            });
+        }
+    }
+    answers.sort_by(|left, right| {
+        left.answer
+            .sequence
+            .unwrap_or(i64::MIN)
+            .cmp(&right.answer.sequence.unwrap_or(i64::MIN))
+            .then_with(|| left.answer.id.cmp(&right.answer.id))
+    });
+    if answers.len() > MAX_CHECKPOINT_ANSWERS {
+        answers.drain(..answers.len() - MAX_CHECKPOINT_ANSWERS);
+    }
+    answers
+}
+
+fn write_answer_checkpoint(
+    root: &Path,
+    device_id: &str,
+    snapshot: &LocalStoreSnapshot,
+) -> Result<(), String> {
+    // Pull and publish are separate Tauri commands and can overlap briefly.
+    // Serialize the read/merge/replace cycle so a stale pull cannot overwrite
+    // a checkpoint that has just learned about a completed answer.
+    let _guard = answer_checkpoint_lock()
+        .lock()
+        .map_err(|_| "A válasz-checkpoint lockja sérült.".to_string())?;
+    let path = answer_checkpoint_path(root, device_id);
+    let mut by_answer_id = BTreeMap::<String, AnswerCheckpointEntry>::new();
+    if let Ok(existing) = read_answer_checkpoint_file(&path) {
+        for entry in existing.answers {
+            if let Some(id) = entry.answer.id.clone() {
+                by_answer_id.insert(id, entry);
+            }
+        }
+    }
+    for mut entry in checkpoint_entries(snapshot) {
+        let Some(id) = entry.answer.id.clone() else {
+            continue;
+        };
+        if let Some(existing) = by_answer_id.remove(&id) {
+            entry.answer = merge_message_versions(&existing.answer, entry.answer);
+            entry.user_message = match (existing.user_message, entry.user_message) {
+                // The current reduced snapshot is authoritative. Checkpoints
+                // are redundant recovery data and may contain a historical
+                // wrong user/answer pairing; never blend those identities.
+                (_, Some(current)) => Some(current),
+                (Some(previous), None) => Some(previous),
+                (None, None) => None,
+            };
+        }
+        by_answer_id.insert(id, entry);
+    }
+    let mut answers = by_answer_id.into_values().collect::<Vec<_>>();
+    answers.sort_by(|left, right| {
+        left.answer
+            .sequence
+            .unwrap_or(i64::MIN)
+            .cmp(&right.answer.sequence.unwrap_or(i64::MIN))
+            .then_with(|| left.answer.id.cmp(&right.answer.id))
+    });
+    if answers.len() > MAX_CHECKPOINT_ANSWERS {
+        answers.drain(..answers.len() - MAX_CHECKPOINT_ANSWERS);
+    }
+    if answers.is_empty() {
+        return Ok(());
+    }
+    let mut checkpoint = AnswerCheckpointFile {
+        schema_version: ANSWER_CHECKPOINT_SCHEMA_VERSION,
+        device_id: device_id.to_string(),
+        updated_at: now_text(),
+        answers,
+        checkpoint_hash: String::new(),
+    };
+    loop {
+        checkpoint.checkpoint_hash = answer_checkpoint_hash(&checkpoint)?;
+        validate_answer_checkpoint(&checkpoint)?;
+        let bytes = serde_json::to_vec_pretty(&checkpoint)
+            .map_err(|error| format!("A válasz-checkpoint nem szerializálható: {error}"))?;
+        if bytes.len() <= MAX_ANSWER_CHECKPOINT_BYTES {
+            return write_atomic(&path, &bytes);
+        }
+        if checkpoint.answers.len() <= 1 {
+            return Err("A válasz-checkpoint egyetlen bejegyzése is túl nagy.".to_string());
+        }
+        // Retain the newest answers if the byte cap is reached. The file is a
+        // bounded repair index, so dropping its oldest entry is preferable to
+        // making ordinary sync writes fail forever.
+        checkpoint.answers.remove(0);
+    }
 }
 
 fn validate_retention_ack(ack: &RetentionAck) -> Result<(), String> {
@@ -1355,8 +1687,19 @@ fn validate_payload(event_type: &str, entity_id: &str, payload: &Value) -> Resul
         CONVERSATION_UPSERT => {
             let conversation: ConversationEventPayload = serde_json::from_value(payload.clone())
                 .map_err(|error| format!("A conversation event payloadja hibás: {error}"))?;
+            let valid_scope = matches!(
+                conversation.scope.as_str(),
+                store::CODING_SCOPE | store::GENERAL_SCOPE
+            );
             if conversation.id != entity_id
-                || conversation.project_id.trim().is_empty()
+                || !valid_scope
+                || (conversation.scope == store::CODING_SCOPE
+                    && conversation
+                        .project_id
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .is_empty())
                 || conversation.title.trim().is_empty()
             {
                 return Err("A conversation event identityje vagy tartalma hibás.".to_string());
@@ -1366,7 +1709,6 @@ fn validate_payload(event_type: &str, entity_id: &str, payload: &Value) -> Resul
             let message: MessageEventPayload = serde_json::from_value(payload.clone())
                 .map_err(|error| format!("A message event payloadja hibás: {error}"))?;
             if message.message.id.as_deref() != Some(entity_id)
-                || message.project_id.trim().is_empty()
                 || message.conversation_id.trim().is_empty()
             {
                 return Err("A message event identityje vagy tartalma hibás.".to_string());
@@ -1375,10 +1717,7 @@ fn validate_payload(event_type: &str, entity_id: &str, payload: &Value) -> Resul
         WORK_ITEM_UPSERT => {
             let item: WorkItemEventPayload = serde_json::from_value(payload.clone())
                 .map_err(|error| format!("A work item event payloadja hibás: {error}"))?;
-            if item.project_id.trim().is_empty()
-                || item.conversation_id.trim().is_empty()
-                || item.item.label.trim().is_empty()
-            {
+            if item.conversation_id.trim().is_empty() || item.item.label.trim().is_empty() {
                 return Err("A work item event tartalma hibás.".to_string());
             }
         }
@@ -1390,16 +1729,6 @@ fn validate_payload(event_type: &str, entity_id: &str, payload: &Value) -> Resul
                 || tombstone.archived_at.trim().is_empty()
             {
                 return Err("A tombstone event identityje vagy típusa hibás.".to_string());
-            }
-            if tombstone.entity_type == "conversation"
-                && tombstone
-                    .project_id
-                    .as_deref()
-                    .map(str::trim)
-                    .unwrap_or_default()
-                    .is_empty()
-            {
-                return Err("A conversation tombstone projektazonosítója hiányzik.".to_string());
             }
         }
         _ => return Err(format!("Ismeretlen v2 event type: {event_type}")),
@@ -1563,7 +1892,50 @@ fn quarantine_and_warn(
     }
 }
 
-fn scan_journal(root: &Path, importer_id: &str) -> Result<JournalScan, String> {
+fn local_sync_cursors(
+    connection: &Connection,
+) -> Result<BTreeMap<String, RetentionCursor>, String> {
+    let mut statement = connection
+        .prepare("SELECT source_device_id, last_sequence, last_hash FROM sync_cursors")
+        .map_err(|error| format!("A lokális sync cursorok nem olvashatók: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                RetentionCursor {
+                    sequence: row.get::<_, i64>(1)? as u64,
+                    event_hash: row.get(2)?,
+                },
+            ))
+        })
+        .map_err(|error| format!("A lokális sync cursorlista nem járható be: {error}"))?;
+    rows.collect::<Result<BTreeMap<_, _>, _>>()
+        .map_err(|error| format!("A lokális sync cursoradat hibás: {error}"))
+}
+
+fn newer_cursor<'a>(
+    compacted: Option<&'a RetentionCursor>,
+    local: Option<&'a RetentionCursor>,
+) -> Option<&'a RetentionCursor> {
+    match (compacted, local) {
+        (Some(compacted), Some(local)) if local.sequence > compacted.sequence => Some(local),
+        (Some(compacted), _) => Some(compacted),
+        (None, local) => local,
+    }
+}
+
+fn event_filename_sequence(path: &Path) -> Option<u64> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.split_once('-'))
+        .and_then(|(sequence, _)| sequence.parse::<u64>().ok())
+}
+
+fn scan_journal_with_cursor_floor(
+    root: &Path,
+    importer_id: &str,
+    cursor_floor: Option<&BTreeMap<String, RetentionCursor>>,
+) -> Result<JournalScan, String> {
     let events_root = root.join("events");
     let compaction_snapshot = read_latest_compaction_snapshot(root)?;
     let mut scan = JournalScan {
@@ -1592,6 +1964,39 @@ fn scan_journal(root: &Path, importer_id: &str) -> Result<JournalScan, String> {
                 .push(format!("A v2 eventmappa neve nem UUID: {source_device}."));
             continue;
         }
+        let compacted_cursor = compaction_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.cursors.get(&source_device));
+        let local_cursor = cursor_floor.and_then(|cursors| cursors.get(&source_device));
+        if let (Some(compacted), Some(local)) = (compacted_cursor, local_cursor) {
+            if compacted.sequence == local.sequence && compacted.event_hash != local.event_hash {
+                scan.blocked_devices.insert(source_device.clone());
+                scan.warnings.push(format!(
+                    "A lokális és a tömörített sync cursor hash-e nem egyezik: {source_device}/{}.",
+                    local.sequence
+                ));
+                continue;
+            }
+        }
+        let effective_cursor = newer_cursor(compacted_cursor, local_cursor);
+        let directory_modified = fs::metadata(&device_path)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        if cursor_floor.is_some()
+            && effective_cursor.is_some_and(|cursor| {
+                incremental_directory_cache()
+                    .lock()
+                    .ok()
+                    .and_then(|cache| cache.get(&device_path).cloned())
+                    .is_some_and(|stamp| {
+                        stamp.modified == directory_modified
+                            && cursor.sequence >= stamp.max_sequence
+                    })
+            })
+        {
+            continue;
+        }
+        let mut max_filename_sequence = 0_u64;
         let entries = match fs::read_dir(&device_path) {
             Ok(entries) => entries,
             Err(error) => {
@@ -1615,6 +2020,20 @@ fn scan_journal(root: &Path, importer_id: &str) -> Result<JournalScan, String> {
             };
             let path = file_entry.path();
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(sequence) = event_filename_sequence(&path) {
+                max_filename_sequence = max_filename_sequence.max(sequence);
+            }
+            // A local cursor is a verified hash-chain prefix already applied
+            // to SQLite. Re-reading thousands of immutable OneDrive files on
+            // every periodic pull made startup take minutes and kept the CPU
+            // busy continuously. Inspect only the suffix after the newest
+            // trusted local/compaction cursor; the first suffix event still
+            // has to chain to that cursor below.
+            if event_filename_sequence(&path).is_some_and(|sequence| {
+                effective_cursor.is_some_and(|cursor| sequence <= cursor.sequence)
+            }) {
                 continue;
             }
             let metadata = match fs::symlink_metadata(&path) {
@@ -1760,12 +2179,28 @@ fn scan_journal(root: &Path, importer_id: &str) -> Result<JournalScan, String> {
             }
             events.insert(event.device_sequence, event);
         }
+        if cursor_floor.is_some()
+            && effective_cursor.is_some_and(|cursor| cursor.sequence >= max_filename_sequence)
+            && !scan.blocked_devices.contains(&source_device)
+        {
+            if let Ok(mut cache) = incremental_directory_cache().lock() {
+                cache.insert(
+                    device_path,
+                    IncrementalDirectoryStamp {
+                        modified: directory_modified,
+                        max_sequence: max_filename_sequence,
+                    },
+                );
+            }
+        }
     }
 
     for (device_id, events) in device_events {
-        let base_cursor = compaction_snapshot
+        let compacted_cursor = compaction_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.cursors.get(&device_id));
+        let local_cursor = cursor_floor.and_then(|cursors| cursors.get(&device_id));
+        let base_cursor = newer_cursor(compacted_cursor, local_cursor);
         let events = events
             .into_iter()
             .filter(|(sequence, _)| {
@@ -1818,6 +2253,10 @@ fn scan_journal(root: &Path, importer_id: &str) -> Result<JournalScan, String> {
     Ok(scan)
 }
 
+fn scan_journal(root: &Path, importer_id: &str) -> Result<JournalScan, String> {
+    scan_journal_with_cursor_floor(root, importer_id, None)
+}
+
 fn cursor_from_transaction(
     transaction: &Transaction<'_>,
     device_id: &str,
@@ -1838,7 +2277,11 @@ fn cursor_from_transaction(
         .map(|value| value.unwrap_or((0, None)))
 }
 
-fn apply_events(store: &mut LocalStore, scan: &JournalScan) -> Result<usize, String> {
+fn apply_events_with_cursor_floor(
+    store: &mut LocalStore,
+    scan: &JournalScan,
+    cursor_floor: Option<&BTreeMap<String, RetentionCursor>>,
+) -> Result<usize, String> {
     let mut accepted_by_device = BTreeMap::<String, Vec<SyncEvent>>::new();
     for event in &scan.accepted {
         if !scan.blocked_devices.contains(&event.device_id) {
@@ -1912,6 +2355,7 @@ fn apply_events(store: &mut LocalStore, scan: &JournalScan) -> Result<usize, Str
                 .snapshot
                 .as_ref()
                 .and_then(|snapshot| snapshot.cursors.get(&device_id));
+            let trusted_local_cursor = cursor_floor.and_then(|cursors| cursors.get(&device_id));
             let cursor_matches = cursor_event
                 .map(|event| event.event_hash.as_str() == last_hash.as_deref().unwrap_or_default())
                 .unwrap_or_else(|| {
@@ -1921,6 +2365,12 @@ fn apply_events(store: &mut LocalStore, scan: &JournalScan) -> Result<usize, Str
                                 && Some(cursor.event_hash.as_str()) == last_hash.as_deref()
                         })
                         .unwrap_or(false)
+                        || trusted_local_cursor
+                            .map(|cursor| {
+                                cursor.sequence == last_sequence
+                                    && Some(cursor.event_hash.as_str()) == last_hash.as_deref()
+                            })
+                            .unwrap_or(false)
                 });
             if !cursor_matches {
                 return Err(format!(
@@ -2009,14 +2459,20 @@ fn apply_events(store: &mut LocalStore, scan: &JournalScan) -> Result<usize, Str
     Ok(imported)
 }
 
+#[cfg(test)]
+fn apply_events(store: &mut LocalStore, scan: &JournalScan) -> Result<usize, String> {
+    apply_events_with_cursor_floor(store, scan, None)
+}
+
 fn import_into_store(
     root: &Path,
     importer_id: &str,
     store: &mut LocalStore,
 ) -> Result<SyncImportReport, String> {
-    let scan = scan_journal(root, importer_id)?;
+    let cursors = local_sync_cursors(&store.connection)?;
+    let scan = scan_journal_with_cursor_floor(root, importer_id, Some(&cursors))?;
     let accepted_events = scan.accepted.len();
-    let imported_events = apply_events(store, &scan)?;
+    let imported_events = apply_events_with_cursor_floor(store, &scan, Some(&cursors))?;
     let mut blocked_devices = scan.blocked_devices.into_iter().collect::<Vec<_>>();
     blocked_devices.sort();
     Ok(SyncImportReport {
@@ -2172,6 +2628,59 @@ fn read_events(connection: &Connection) -> Result<Vec<SyncEvent>, String> {
     Ok(events)
 }
 
+#[derive(Debug)]
+struct FirstWrittenUserEvent {
+    device_id: String,
+    device_sequence: u64,
+    message: LocalMessage,
+}
+
+fn read_first_written_user_events(
+    connection: &Connection,
+) -> Result<BTreeMap<(String, String), FirstWrittenUserEvent>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT device_id, device_sequence, hlc, payload_json
+             FROM sync_events
+             WHERE event_type = 'message.upsert'
+             ORDER BY hlc, device_id, device_sequence, event_id",
+        )
+        .map_err(|error| format!("Az eredeti user eventek nem olvashatók: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|error| format!("Az eredeti user eventek nem járhatók be: {error}"))?;
+    let mut first = BTreeMap::new();
+    for row in rows {
+        let (device_id, device_sequence, hlc, payload_json) =
+            row.map_err(|error| format!("Az eredeti user event sora hibás: {error}"))?;
+        let Ok(mut payload) = serde_json::from_str::<MessageEventPayload>(&payload_json) else {
+            continue;
+        };
+        if payload.message.role != "user" {
+            continue;
+        }
+        let canonical_id = normalized_message_id(&payload.conversation_id, &payload.message, 0);
+        payload.message.id = Some(canonical_id.clone());
+        payload.message.hlc = Some(hlc);
+        payload.message.origin_device_id = Some(device_id.clone());
+        first
+            .entry((payload.conversation_id, canonical_id))
+            .or_insert(FirstWrittenUserEvent {
+                device_id,
+                device_sequence,
+                message: payload.message,
+            });
+    }
+    Ok(first)
+}
+
 fn event_rank(event: &SyncEvent) -> EventRank {
     EventRank {
         hlc: event.hlc.clone(),
@@ -2209,7 +2718,8 @@ fn seed_reducer_from_compaction_snapshot(
         let conversation_id = normalized_conversation_id(&conversation.project_id, conversation);
         let value = ConversationEventPayload {
             id: conversation_id.clone(),
-            project_id: conversation.project_id.clone(),
+            scope: conversation.scope.clone(),
+            project_id: wire_project_id(&conversation.scope, &conversation.project_id),
             title: conversation.title.clone(),
             thread_id: conversation.thread_id.clone(),
             updated_at: conversation.updated_at.clone(),
@@ -2260,6 +2770,223 @@ fn seed_reducer_from_compaction_snapshot(
     }
 }
 
+fn unavailable_assistant_text(message: &LocalMessage) -> bool {
+    if message.role != "assistant" {
+        return false;
+    }
+    let text = message.text.trim().to_lowercase();
+    text.is_empty()
+        || text.starts_with("a válasz megszakítva")
+        || text.starts_with("nem sikerült a codex-kérés:")
+}
+
+/// Message rows are immutable identities whose content becomes more complete
+/// while a turn is streaming.  A later snapshot from an offline device may be
+/// newer by HLC while still containing the old empty/live row, so lifecycle
+/// and answer text must form a monotonic join instead of plain last-write-wins.
+fn merge_message_versions(existing: &LocalMessage, mut incoming: LocalMessage) -> LocalMessage {
+    if existing.role != incoming.role {
+        return existing.clone();
+    }
+    if existing.role == "user" {
+        // User payloads are first-write immutable. Later upserts may only fill
+        // identity metadata; they cannot alter text, attachments, quotes,
+        // timestamp or timeline position.
+        let mut merged = existing.clone();
+        if merged.item_id.is_none() {
+            merged.item_id = incoming.item_id;
+        }
+        if merged.turn_id.is_none() {
+            merged.turn_id = incoming.turn_id;
+        }
+        merged.live = Some(false);
+        return merged;
+    }
+    incoming.id = existing.id.clone().or(incoming.id);
+    let existing_text = store::collapse_repeated_assistant_text(&existing.role, &existing.text);
+    incoming.text = store::collapse_repeated_assistant_text(&incoming.role, &incoming.text);
+    let existing_unavailable = unavailable_assistant_text(existing);
+    let incoming_unavailable = unavailable_assistant_text(&incoming);
+    if (incoming_unavailable && !existing_unavailable)
+        || (incoming_unavailable == existing_unavailable
+            && existing_text.trim().len() > incoming.text.trim().len())
+    {
+        incoming.text = existing_text;
+    }
+
+    let final_message =
+        existing.final_message.unwrap_or(false) || incoming.final_message.unwrap_or(false);
+    incoming.final_message = Some(final_message);
+    incoming.live = Some(if final_message {
+        false
+    } else {
+        existing.live.unwrap_or(false) || incoming.live.unwrap_or(false)
+    });
+    incoming.code = Some(existing.code.unwrap_or(false) || incoming.code.unwrap_or(false));
+    if incoming.item_id.is_none() {
+        incoming.item_id = existing.item_id.clone();
+    }
+    if incoming.turn_id.is_none() {
+        incoming.turn_id = existing.turn_id.clone();
+    }
+    if incoming.sequence.is_none() {
+        incoming.sequence = existing.sequence;
+    }
+    if incoming.time.trim().is_empty()
+        || (incoming.time == "most" && !existing.time.trim().is_empty() && existing.time != "most")
+    {
+        incoming.time = existing.time.clone();
+    }
+    if incoming.images.is_empty() {
+        incoming.images = existing.images.clone();
+    }
+    if incoming.quote_refs.is_empty() {
+        incoming.quote_refs = existing.quote_refs.clone();
+    }
+    if incoming.hlc.is_none() {
+        incoming.hlc = existing.hlc.clone();
+    }
+    if incoming.origin_device_id.is_none() {
+        incoming.origin_device_id = existing.origin_device_id.clone();
+    }
+    incoming
+}
+
+fn existing_message_alias_id(
+    messages: &BTreeMap<String, (EventRank, LocalMessage)>,
+    incoming: &LocalMessage,
+) -> Option<String> {
+    let turn_id = incoming
+        .turn_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let item_id = incoming
+        .item_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    messages.iter().find_map(|(id, (_, existing))| {
+        if existing.role != incoming.role {
+            return None;
+        }
+        let same_turn = turn_id
+            .is_some_and(|turn_id| existing.turn_id.as_deref().map(str::trim) == Some(turn_id));
+        let same_item = item_id
+            .is_some_and(|item_id| existing.item_id.as_deref().map(str::trim) == Some(item_id));
+        let same_legacy_assistant = incoming.role == "assistant"
+            && turn_id.is_none()
+            && item_id.is_none()
+            && existing
+                .turn_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .is_none()
+            && existing
+                .item_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .is_none()
+            && existing.sequence == incoming.sequence
+            && existing.text == incoming.text;
+        (same_turn || same_item || same_legacy_assistant).then(|| id.clone())
+    })
+}
+
+fn merge_checkpoint_message(messages: &mut Vec<LocalMessage>, incoming: LocalMessage) {
+    let incoming_id = incoming.id.clone();
+    if let Some(incoming_id) = incoming_id.as_deref() {
+        if let Some(existing) = messages
+            .iter_mut()
+            .find(|message| message.id.as_deref() == Some(incoming_id))
+        {
+            *existing = merge_message_versions(existing, incoming);
+            return;
+        }
+    }
+    messages.push(incoming);
+}
+
+fn merge_answer_checkpoints(
+    mut snapshot: LocalStoreSnapshot,
+    mut checkpoints: Vec<AnswerCheckpointFile>,
+) -> LocalStoreSnapshot {
+    checkpoints.sort_by(|left, right| {
+        left.updated_at
+            .cmp(&right.updated_at)
+            .then_with(|| left.device_id.cmp(&right.device_id))
+    });
+    for checkpoint in checkpoints {
+        for entry in checkpoint.answers {
+            let project_archived = snapshot.tombstones.iter().any(|tombstone| {
+                tombstone.entity_type == "project" && tombstone.entity_id == entry.project.id
+            });
+            let conversation_archived = snapshot.tombstones.iter().any(|tombstone| {
+                tombstone.entity_type == "conversation"
+                    && tombstone.entity_id == entry.conversation_id
+            });
+            if project_archived || conversation_archived {
+                continue;
+            }
+
+            if let Some(project) = snapshot
+                .projects
+                .iter_mut()
+                .find(|project| project.id == entry.project.id)
+            {
+                if !project.threads.contains(&entry.conversation_title) {
+                    project.threads.push(entry.conversation_title.clone());
+                }
+            } else {
+                let mut project = entry.project.clone();
+                if !project.threads.contains(&entry.conversation_title) {
+                    project.threads.push(entry.conversation_title.clone());
+                }
+                snapshot.projects.push(project);
+            }
+
+            let existing_key = snapshot
+                .conversations
+                .iter()
+                .find(|(_, conversation)| {
+                    conversation.id.as_deref() == Some(entry.conversation_id.as_str())
+                })
+                .map(|(key, _)| key.clone());
+            let key = existing_key
+                .unwrap_or_else(|| format!("{}::{}", entry.project.id, entry.conversation_title));
+            let conversation =
+                snapshot
+                    .conversations
+                    .entry(key)
+                    .or_insert_with(|| LocalConversation {
+                        id: Some(entry.conversation_id.clone()),
+                        scope: store::CODING_SCOPE.to_string(),
+                        project_id: entry.project.id.clone(),
+                        title: entry.conversation_title.clone(),
+                        messages: Vec::new(),
+                        work_items: Vec::new(),
+                        thread_id: None,
+                        updated_at: entry.updated_at.clone(),
+                        plan_history: BTreeMap::new(),
+                        commentary: Vec::new(),
+                    });
+            if let Some(user_message) = entry.user_message {
+                merge_checkpoint_message(&mut conversation.messages, user_message);
+            }
+            merge_checkpoint_message(&mut conversation.messages, entry.answer);
+            conversation.messages.sort_by(|left, right| {
+                left.sequence
+                    .unwrap_or(i64::MAX)
+                    .cmp(&right.sequence.unwrap_or(i64::MAX))
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+        }
+    }
+    snapshot
+}
+
 fn reduce_snapshot(connection: &Connection) -> Result<LocalStoreSnapshot, String> {
     let events = read_events(connection)?;
     let mut projects = BTreeMap::<String, ProjectAccumulator>::new();
@@ -2283,6 +3010,31 @@ fn reduce_snapshot(connection: &Connection) -> Result<LocalStoreSnapshot, String
             &mut conversations,
             &mut tombstones,
         );
+        // A compaction produced by an older client can already contain the
+        // historical wrong-pair/longer-text corruption. If its cursor proves
+        // that the original immutable user event was part of that compaction,
+        // restore the event payload before applying post-compaction updates.
+        for ((conversation_id, message_id), original) in read_first_written_user_events(connection)?
+        {
+            let included_in_compaction = snapshot
+                .cursors
+                .get(&original.device_id)
+                .is_some_and(|cursor| original.device_sequence <= cursor.sequence);
+            if !included_in_compaction {
+                continue;
+            }
+            let Some(conversation) = conversations.get_mut(&conversation_id) else {
+                continue;
+            };
+            let rank = conversation
+                .messages
+                .get(&message_id)
+                .map(|(rank, _)| rank.clone())
+                .unwrap_or_else(compaction_baseline_rank);
+            conversation
+                .messages
+                .insert(message_id, (rank, original.message));
+        }
     }
 
     for event in events {
@@ -2314,8 +3066,14 @@ fn reduce_snapshot(connection: &Connection) -> Result<LocalStoreSnapshot, String
                     serde_json::from_value(event.payload).map_err(|error| {
                         format!("A conversation event nem redukálható: {error}")
                     })?;
-                if let Some(project_id) = project_aliases.get(&conversation.project_id) {
-                    conversation.project_id = project_id.clone();
+                if conversation.scope == store::GENERAL_SCOPE {
+                    conversation.project_id = None;
+                } else if let Some(project_id) = conversation
+                    .project_id
+                    .as_deref()
+                    .and_then(|project_id| project_aliases.get(project_id))
+                {
+                    conversation.project_id = Some(project_id.clone());
                 }
                 let entry = conversations
                     .entry(conversation.id.clone())
@@ -2357,14 +3115,27 @@ fn reduce_snapshot(connection: &Connection) -> Result<LocalStoreSnapshot, String
             MESSAGE_UPSERT => {
                 let mut message: MessageEventPayload = serde_json::from_value(event.payload)
                     .map_err(|error| format!("A message event nem redukálható: {error}"))?;
-                if let Some(project_id) = project_aliases.get(&message.project_id) {
-                    message.project_id = project_id.clone();
+                message.message.text = store::collapse_repeated_assistant_text(
+                    &message.message.role,
+                    &message.message.text,
+                );
+                if let Some(project_id) = message
+                    .project_id
+                    .as_deref()
+                    .and_then(|project_id| project_aliases.get(project_id))
+                {
+                    message.project_id = Some(project_id.clone());
                 }
                 let entry = conversations
                     .entry(message.conversation_id.clone())
                     .or_insert_with(|| ConversationAccumulator {
                         value: ConversationEventPayload {
                             id: message.conversation_id.clone(),
+                            scope: if message.project_id.is_none() {
+                                store::GENERAL_SCOPE.to_string()
+                            } else {
+                                store::CODING_SCOPE.to_string()
+                            },
                             project_id: message.project_id.clone(),
                             title: "Importált beszélgetés".to_string(),
                             thread_id: None,
@@ -2378,31 +3149,73 @@ fn reduce_snapshot(connection: &Connection) -> Result<LocalStoreSnapshot, String
                         messages: BTreeMap::new(),
                         work_items: BTreeMap::new(),
                     });
+                // Older clients used a random row UUID as event identity.
+                // Normalize by client turn/item so the same SQLite/cache row
+                // cannot survive as two answers after another device pulls it.
+                let canonical_message_id =
+                    existing_message_alias_id(&entry.messages, &message.message).unwrap_or_else(
+                        || normalized_message_id(&message.conversation_id, &message.message, 0),
+                    );
+                message.message.id = Some(canonical_message_id.clone());
+                if message.message.role == "user" {
+                    if let Some((existing_rank, existing_message)) =
+                        entry.messages.get(&canonical_message_id).cloned()
+                    {
+                        // Events are read in deterministic ascending HLC order.
+                        // Preserve the first submitted payload forever; a later
+                        // device can only add missing identity metadata.
+                        let normalized_message =
+                            merge_message_versions(&existing_message, message.message);
+                        entry
+                            .messages
+                            .insert(canonical_message_id, (existing_rank, normalized_message));
+                    } else {
+                        message.message.hlc = Some(event.hlc.clone());
+                        message.message.origin_device_id = Some(event.device_id.clone());
+                        entry
+                            .messages
+                            .insert(canonical_message_id, (rank, message.message));
+                    }
+                    continue;
+                }
                 let should_replace = entry
                     .messages
-                    .get(&event.entity_id)
+                    .get(&canonical_message_id)
                     .map(|(existing_rank, _)| rank > *existing_rank)
                     .unwrap_or(true);
                 if should_replace {
                     let mut normalized_message = message.message;
+                    if let Some((_, existing_message)) = entry.messages.get(&canonical_message_id) {
+                        normalized_message =
+                            merge_message_versions(existing_message, normalized_message);
+                    }
                     normalized_message.hlc = Some(event.hlc.clone());
                     normalized_message.origin_device_id = Some(event.device_id.clone());
                     entry
                         .messages
-                        .insert(event.entity_id, (rank, normalized_message));
+                        .insert(canonical_message_id, (rank, normalized_message));
                 }
             }
             WORK_ITEM_UPSERT => {
                 let mut item: WorkItemEventPayload = serde_json::from_value(event.payload)
                     .map_err(|error| format!("A work item event nem redukálható: {error}"))?;
-                if let Some(project_id) = project_aliases.get(&item.project_id) {
-                    item.project_id = project_id.clone();
+                if let Some(project_id) = item
+                    .project_id
+                    .as_deref()
+                    .and_then(|project_id| project_aliases.get(project_id))
+                {
+                    item.project_id = Some(project_id.clone());
                 }
                 let entry = conversations
                     .entry(item.conversation_id.clone())
                     .or_insert_with(|| ConversationAccumulator {
                         value: ConversationEventPayload {
                             id: item.conversation_id.clone(),
+                            scope: if item.project_id.is_none() {
+                                store::GENERAL_SCOPE.to_string()
+                            } else {
+                                store::CODING_SCOPE.to_string()
+                            },
                             project_id: item.project_id.clone(),
                             title: "Importált beszélgetés".to_string(),
                             thread_id: None,
@@ -2489,8 +3302,14 @@ fn reduce_snapshot(connection: &Connection) -> Result<LocalStoreSnapshot, String
     let mut current_conversation_titles = BTreeMap::<String, BTreeSet<String>>::new();
     let mut retired_conversation_titles = BTreeMap::<String, BTreeSet<String>>::new();
     for conversation in conversations.values() {
+        if conversation.value.scope == store::GENERAL_SCOPE {
+            continue;
+        }
+        let Some(project_id) = conversation.value.project_id.as_ref() else {
+            continue;
+        };
         let project_archived = tombstones
-            .get(&("project".to_string(), conversation.value.project_id.clone()))
+            .get(&("project".to_string(), project_id.clone()))
             .map(|(_, archived, _)| *archived)
             .unwrap_or(false);
         let conversation_archived = tombstones
@@ -2501,11 +3320,11 @@ fn reduce_snapshot(connection: &Connection) -> Result<LocalStoreSnapshot, String
             continue;
         }
         current_conversation_titles
-            .entry(conversation.value.project_id.clone())
+            .entry(project_id.clone())
             .or_default()
             .insert(conversation.value.title.clone());
         retired_conversation_titles
-            .entry(conversation.value.project_id.clone())
+            .entry(project_id.clone())
             .or_default()
             .extend(
                 conversation
@@ -2531,7 +3350,8 @@ fn reduce_snapshot(connection: &Connection) -> Result<LocalStoreSnapshot, String
     project_ids.extend(
         conversations
             .values()
-            .map(|conversation| conversation.value.project_id.clone()),
+            .filter(|conversation| conversation.value.scope != store::GENERAL_SCOPE)
+            .filter_map(|conversation| conversation.value.project_id.clone()),
     );
 
     let mut output_projects = Vec::new();
@@ -2568,7 +3388,8 @@ fn reduce_snapshot(connection: &Connection) -> Result<LocalStoreSnapshot, String
         output_projects.push(project);
 
         for conversation in conversations.values().filter(|conversation| {
-            conversation.value.project_id == project_id
+            conversation.value.scope != store::GENERAL_SCOPE
+                && conversation.value.project_id.as_deref() == Some(project_id.as_str())
                 && !tombstones
                     .get(&("conversation".to_string(), conversation.value.id.clone()))
                     .map(|(_, archived, _)| *archived)
@@ -2593,10 +3414,11 @@ fn reduce_snapshot(connection: &Connection) -> Result<LocalStoreSnapshot, String
             work_items.sort_by(|left, right| left.id.cmp(&right.id));
             let value = &conversation.value;
             output_conversations.insert(
-                format!("{}::{}", value.project_id, value.title),
+                format!("{}::{}", project_id, value.title),
                 LocalConversation {
                     id: Some(value.id.clone()),
-                    project_id: value.project_id.clone(),
+                    scope: value.scope.clone(),
+                    project_id: storage_project_id(&value.scope, Some(project_id.as_str())),
                     title: value.title.clone(),
                     messages,
                     work_items,
@@ -2607,6 +3429,51 @@ fn reduce_snapshot(connection: &Connection) -> Result<LocalStoreSnapshot, String
                 },
             );
         }
+    }
+
+    for conversation in conversations
+        .values()
+        .filter(|conversation| conversation.value.scope == store::GENERAL_SCOPE)
+        .filter(|conversation| {
+            !tombstones
+                .get(&("conversation".to_string(), conversation.value.id.clone()))
+                .map(|(_, archived, _)| *archived)
+                .unwrap_or(false)
+        })
+    {
+        let mut messages = conversation
+            .messages
+            .values()
+            .map(|(_, message)| message.clone())
+            .collect::<Vec<_>>();
+        messages.sort_by(|left, right| {
+            left.sequence
+                .unwrap_or(i64::MAX)
+                .cmp(&right.sequence.unwrap_or(i64::MAX))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let mut work_items = conversation
+            .work_items
+            .values()
+            .map(|(_, item)| item.clone())
+            .collect::<Vec<_>>();
+        work_items.sort_by(|left, right| left.id.cmp(&right.id));
+        let value = &conversation.value;
+        output_conversations.insert(
+            format!("{}::{}", store::GENERAL_PROJECT_ID, value.title),
+            LocalConversation {
+                id: Some(value.id.clone()),
+                scope: store::GENERAL_SCOPE.to_string(),
+                project_id: storage_project_id(&value.scope, value.project_id.as_deref()),
+                title: value.title.clone(),
+                messages,
+                work_items,
+                thread_id: value.thread_id.clone(),
+                updated_at: value.updated_at.clone(),
+                plan_history: value.plan_history.clone(),
+                commentary: value.commentary.clone(),
+            },
+        );
     }
 
     let mut output_tombstones = tombstones
@@ -2666,6 +3533,15 @@ fn normalized_project_id(project: &LocalProject) -> String {
 }
 
 fn normalized_conversation_id(project_id: &str, conversation: &LocalConversation) -> String {
+    if conversation.scope == store::GENERAL_SCOPE {
+        if let Some(id) = conversation
+            .id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            return id.to_string();
+        }
+    }
     conversation
         .id
         .as_deref()
@@ -2680,24 +3556,48 @@ fn normalized_conversation_id(project_id: &str, conversation: &LocalConversation
 }
 
 fn normalized_message_id(conversation_id: &str, message: &LocalMessage, index: usize) -> String {
-    message
+    // A UUID created at submit time is the durable row identity and must stay
+    // unchanged between SQLite, journal, checkpoint and another device.
+    if let Some(id) = message
         .id
         .as_deref()
         .filter(|value| Uuid::parse_str(value).is_ok())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            stable_id(
-                "message",
-                &format!(
-                    "{conversation_id}:{}:{}:{}:{}:{}",
-                    message.sequence.unwrap_or(index as i64),
-                    message.role,
-                    message.time,
-                    message.text,
-                    index
-                ),
-            )
-        })
+    {
+        return id.to_string();
+    }
+    if let Some(turn_id) = message
+        .turn_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return stable_id(
+            "message",
+            &format!("{conversation_id}:turn:{turn_id}:{}", message.role),
+        );
+    }
+    if let Some(item_id) = message
+        .item_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return stable_id(
+            "message",
+            &format!("{conversation_id}:item:{item_id}:{}", message.role),
+        );
+    }
+    stable_id(
+        "message",
+        &format!(
+            "{conversation_id}:{}:{}:{}:{}:{}",
+            message.sequence.unwrap_or(index as i64),
+            message.role,
+            message.time,
+            message.text,
+            index
+        ),
+    )
 }
 
 fn normalized_work_item_id(conversation_id: &str, item: &LocalWorkItem, index: usize) -> String {
@@ -2765,6 +3665,10 @@ fn normalized_tombstone(
         }
     } else if Uuid::parse_str(&tombstone.entity_id).is_ok() {
         tombstone.entity_id.clone()
+    } else if normalized_project_id.is_none() {
+        // General conversation tombstones have no project scope. Preserve
+        // their explicit id even when an older client did not use UUIDs.
+        tombstone.entity_id.clone()
     } else {
         let project_id = normalized_project_id
             .as_deref()
@@ -2816,10 +3720,20 @@ fn canonicalize_snapshot_for_compaction(
     let mut conversations = BTreeMap::new();
     let mut seen_conversation_ids = HashSet::new();
     for (_, mut conversation) in snapshot.conversations {
-        let project_id = project_ids
-            .get(&conversation.project_id)
-            .cloned()
-            .unwrap_or_else(|| conversation.project_id.clone());
+        let is_general = conversation.scope == store::GENERAL_SCOPE;
+        let project_id = if is_general {
+            store::GENERAL_PROJECT_ID.to_string()
+        } else {
+            project_ids
+                .get(&conversation.project_id)
+                .cloned()
+                .unwrap_or_else(|| conversation.project_id.clone())
+        };
+        conversation.scope = if is_general {
+            store::GENERAL_SCOPE.to_string()
+        } else {
+            store::CODING_SCOPE.to_string()
+        };
         conversation.project_id = project_id.clone();
         let mut conversation_id = normalized_conversation_id(&project_id, &conversation);
         if !seen_conversation_ids.insert(conversation_id.clone()) {
@@ -2836,7 +3750,11 @@ fn canonicalize_snapshot_for_compaction(
         }
         conversation.id = Some(conversation_id);
         conversations.insert(
-            format!("{}::{}", conversation.project_id, conversation.title),
+            if is_general {
+                format!("general::{}", conversation.title)
+            } else {
+                format!("{}::{}", conversation.project_id, conversation.title)
+            },
             conversation,
         );
     }
@@ -3574,15 +4492,35 @@ fn pending_events(snapshot: &LocalStoreSnapshot) -> Result<Vec<PendingEvent>, St
     }
 
     for conversation in snapshot.conversations.values() {
-        let Some(project_id) = project_ids.get(&conversation.project_id).cloned() else {
-            // A stale conversation must not resurrect a project that is
-            // present only through a project tombstone.
-            continue;
+        let (scope, project_id) = if conversation.scope == store::GENERAL_SCOPE {
+            (
+                store::GENERAL_SCOPE.to_string(),
+                store::GENERAL_PROJECT_ID.to_string(),
+            )
+        } else {
+            let Some(project_id) = project_ids.get(&conversation.project_id).cloned() else {
+                // A stale conversation must not resurrect a project that is
+                // present only through a project tombstone.
+                continue;
+            };
+            (store::CODING_SCOPE.to_string(), project_id)
         };
         let conversation_id = normalized_conversation_id(&project_id, conversation);
+        let conversation_is_tombstoned = snapshot.tombstones.iter().any(|tombstone| {
+            normalized_tombstone(tombstone, &project_ids)
+                .map(|(entity_id, _)| entity_id == conversation_id)
+                .unwrap_or(false)
+        });
+        if conversation_is_tombstoned {
+            // A stale local snapshot may still contain the deleted row. The
+            // tombstone is authoritative; never publish a newer-looking
+            // conversation/message upsert that could resurrect it remotely.
+            continue;
+        }
         let metadata = ConversationEventPayload {
             id: conversation_id.clone(),
-            project_id: project_id.clone(),
+            scope: scope.clone(),
+            project_id: wire_project_id(&scope, &project_id),
             title: conversation.title.clone(),
             // Codex rollout IDs are local to one machine's app-server. Keep the
             // field in the wire schema for backwards compatibility, but never
@@ -3601,6 +4539,15 @@ fn pending_events(snapshot: &LocalStoreSnapshot) -> Result<Vec<PendingEvent>, St
         });
 
         for (index, message) in conversation.messages.iter().enumerate() {
+            // Empty settled assistant rows are restart-time placeholders, not
+            // shareable answers. Publishing them lets an offline device create
+            // a newer HLC record that hides the completed response elsewhere.
+            if message.role == "assistant"
+                && message.text.trim().is_empty()
+                && message.images.is_empty()
+            {
+                continue;
+            }
             let mut normalized_message = message.clone();
             normalized_message.id = Some(normalized_message_id(&conversation_id, message, index));
             normalized_message.sequence = Some(message.sequence.unwrap_or(index as i64));
@@ -3608,7 +4555,7 @@ fn pending_events(snapshot: &LocalStoreSnapshot) -> Result<Vec<PendingEvent>, St
             normalized_message.hlc = None;
             normalized_message.origin_device_id = None;
             let payload = MessageEventPayload {
-                project_id: project_id.clone(),
+                project_id: wire_project_id(&scope, &project_id),
                 conversation_id: conversation_id.clone(),
                 message: normalized_message.clone(),
             };
@@ -3625,7 +4572,7 @@ fn pending_events(snapshot: &LocalStoreSnapshot) -> Result<Vec<PendingEvent>, St
             sanitized_item.hlc = None;
             sanitized_item.origin_device_id = None;
             let payload = WorkItemEventPayload {
-                project_id: project_id.clone(),
+                project_id: wire_project_id(&scope, &project_id),
                 conversation_id: conversation_id.clone(),
                 item: sanitized_item,
             };
@@ -3688,7 +4635,11 @@ fn write_event(root: &Path, event: &SyncEvent) -> Result<(), String> {
     if bytes.len() > MAX_EVENT_BYTES {
         return Err("A v2 event szerializált mérete túl nagy.".to_string());
     }
-    write_atomic(&path, &bytes)
+    write_atomic(&path, &bytes)?;
+    if let Ok(mut cache) = incremental_directory_cache().lock() {
+        cache.remove(&directory);
+    }
+    Ok(())
 }
 
 fn append_pending_events(
@@ -3700,7 +4651,8 @@ fn append_pending_events(
     let _guard = append_lock()
         .lock()
         .map_err(|_| "A v2 sync append lockja sérült.".to_string())?;
-    let scan = scan_journal(root, device_id)?;
+    let local_cursors = local_sync_cursors(&store.connection)?;
+    let scan = scan_journal_with_cursor_floor(root, device_id, Some(&local_cursors))?;
     if !scan.warnings.is_empty() {
         return Err(format!(
             "A v2 journal nem írható karantén vagy hiányzó sequence miatt: {}",
@@ -3727,16 +4679,33 @@ fn append_pending_events(
         .snapshot
         .as_ref()
         .and_then(|snapshot| snapshot.cursors.get(device_id));
+    let local_cursor = local_cursors.get(device_id);
+    let base_cursor = newer_cursor(snapshot_cursor, local_cursor);
     let mut sequence = own_events
         .last()
         .map(|event| event.device_sequence)
-        .or_else(|| snapshot_cursor.map(|cursor| cursor.sequence))
+        .or_else(|| base_cursor.map(|cursor| cursor.sequence))
         .unwrap_or(0);
-    let mut last_hlc = own_events.last().map(|event| event.hlc.clone());
+    let mut last_hlc = own_events
+        .last()
+        .map(|event| event.hlc.clone())
+        .or_else(|| {
+            store
+                .connection
+                .query_row(
+                    "SELECT last_hlc FROM devices WHERE id = ?1",
+                    params![device_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .flatten()
+        });
     let mut previous_hash = own_events
         .last()
         .map(|event| event.event_hash.clone())
-        .or_else(|| snapshot_cursor.map(|cursor| cursor.event_hash.clone()));
+        .or_else(|| base_cursor.map(|cursor| cursor.event_hash.clone()));
     let mut written = 0_usize;
     for pending in pending_events {
         let payload_hash = sha256_hex(&payload_bytes(&pending.payload)?);
@@ -3790,7 +4759,7 @@ pub(crate) fn sync_v2_pull() -> Result<SyncV2Result, String> {
     let root = sync_root()?;
     let mut local_store = store::open_local_store()?;
     let mut local_snapshot_fallback = false;
-    let report = match import_into_store(&root, &device_id, &mut local_store) {
+    let mut report = match import_into_store(&root, &device_id, &mut local_store) {
         Ok(report) => report,
         Err(error) if is_recoverable_cursor_mismatch(&error) => {
             // The OneDrive journal may have been reset/purged while this
@@ -3815,12 +4784,40 @@ pub(crate) fn sync_v2_pull() -> Result<SyncV2Result, String> {
         }
         Err(error) => return Err(error),
     };
+    let materialized = store::load_snapshot_from_connection(&local_store.connection)?;
+    let materialized_is_empty = materialized.projects.is_empty()
+        && materialized.conversations.is_empty()
+        && materialized.tombstones.is_empty();
+    let base_snapshot =
+        if local_snapshot_fallback || (report.imported_events == 0 && !materialized_is_empty) {
+            materialized
+        } else {
+            reduce_snapshot(&local_store.connection)?
+        };
+    let base_bytes = serde_json::to_vec(&base_snapshot)
+        .map_err(|error| format!("A pull snapshot nem hasonlítható össze: {error}"))?;
+    let snapshot = merge_answer_checkpoints(base_snapshot, read_answer_checkpoints(&root));
+    let checkpoint_repaired = serde_json::to_vec(&snapshot)
+        .map_err(|error| format!("A javított pull snapshot nem hasonlítható össze: {error}"))?
+        != base_bytes;
+    if !local_snapshot_fallback && (report.imported_events > 0 || checkpoint_repaired) {
+        // A reducer result must become the next startup/poll fast path. Remote
+        // imports used to remain only in sync_events and were replayed on
+        // every poll; materializing once keeps SQLite authoritative without a
+        // redundant frontend save/publish cycle.
+        store::save_snapshot_in_connection(&mut local_store.connection, snapshot.clone())?;
+    }
+    // Seed/refresh the redundant answer checkpoint during an ordinary pull as
+    // well.  Recovery must not depend on the user producing another mutation
+    // after upgrading or restarting the app.
+    if report.can_write {
+        if let Err(error) = write_answer_checkpoint(&root, &device_id, &snapshot) {
+            report.warnings.push(format!(
+                "A redundáns válasz-checkpoint most nem frissült: {error}"
+            ));
+        }
+    }
     let health = build_sync_health(&root, &local_store.connection, &report)?;
-    let snapshot = if local_snapshot_fallback {
-        store::load_snapshot_from_connection(&local_store.connection)?
-    } else {
-        reduce_snapshot(&local_store.connection)?
-    };
     Ok(SyncV2Result {
         device_id,
         snapshot,
@@ -3981,7 +4978,16 @@ pub(crate) fn sync_v2_publish_snapshot(
         ));
     }
     let written_events = append_snapshot(&root, &device_id, &local_store, &snapshot)?;
-    let final_report = import_into_store(&root, &device_id, &mut local_store)?;
+    // The hash-chained journal remains authoritative, while this single
+    // rolling per-device file makes terminal answers recoverable when
+    // OneDrive delays or permanently omits one individual event file.
+    let checkpoint_warning = write_answer_checkpoint(&root, &device_id, &snapshot).err();
+    let mut final_report = import_into_store(&root, &device_id, &mut local_store)?;
+    if let Some(error) = checkpoint_warning {
+        final_report.warnings.push(format!(
+            "A redundáns válasz-checkpoint most nem frissült: {error}"
+        ));
+    }
     if !final_report.can_write {
         return Err(format!(
             "A v2 journal írás után nem validálható: {}",
@@ -3989,7 +4995,10 @@ pub(crate) fn sync_v2_publish_snapshot(
         ));
     }
     let health = build_sync_health(&root, &local_store.connection, &final_report)?;
-    let merged_snapshot = reduce_snapshot(&local_store.connection)?;
+    let merged_snapshot = merge_answer_checkpoints(
+        reduce_snapshot(&local_store.connection)?,
+        read_answer_checkpoints(&root),
+    );
     Ok(SyncV2Result {
         device_id,
         snapshot: merged_snapshot,
@@ -4010,7 +5019,10 @@ pub(crate) fn sync_v2_preview_restore_entity(
     let mut local_store = store::open_local_store()?;
     let report = import_into_store(&root, &device_id, &mut local_store)?;
     let health = build_sync_health(&root, &local_store.connection, &report)?;
-    let snapshot = reduce_snapshot(&local_store.connection)?;
+    let snapshot = merge_answer_checkpoints(
+        reduce_snapshot(&local_store.connection)?,
+        read_answer_checkpoints(&root),
+    );
     build_restore_preview(&tombstone, &snapshot, health)
 }
 
@@ -4097,7 +5109,10 @@ pub(crate) fn sync_v2_restore_entity(tombstone: LocalTombstone) -> Result<SyncV2
         ));
     }
     let health = build_sync_health(&root, &local_store.connection, &final_report)?;
-    let snapshot = reduce_snapshot(&local_store.connection)?;
+    let snapshot = merge_answer_checkpoints(
+        reduce_snapshot(&local_store.connection)?,
+        read_answer_checkpoints(&root),
+    );
     Ok(SyncV2Result {
         device_id,
         snapshot,
@@ -4192,6 +5207,484 @@ mod tests {
         }
     }
 
+    fn test_message(id: &str, role: &str, text: &str, final_message: bool) -> LocalMessage {
+        LocalMessage {
+            id: Some(id.to_string()),
+            role: role.to_string(),
+            text: text.to_string(),
+            time: "most".to_string(),
+            code: Some(false),
+            live: Some(!final_message),
+            final_message: Some(final_message),
+            item_id: None,
+            turn_id: Some("request:test".to_string()),
+            sequence: Some(1),
+            hlc: None,
+            origin_device_id: None,
+            images: Vec::new(),
+            quote_refs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn completed_answer_cannot_be_downgraded_by_newer_stale_snapshot() {
+        let mut completed = test_message("answer", "assistant", "Tartós válasz", true);
+        completed.time = "2026-07-20T17:12:00Z".to_string();
+        let stale = test_message("answer", "assistant", "", true);
+
+        let merged = merge_message_versions(&completed, stale);
+
+        assert_eq!(merged.text, "Tartós válasz");
+        assert_eq!(merged.final_message, Some(true));
+        assert_eq!(merged.live, Some(false));
+        assert_eq!(merged.time, "2026-07-20T17:12:00Z");
+    }
+
+    #[test]
+    fn later_sync_event_cannot_rewrite_a_user_payload() {
+        let mut original = test_message("user", "user", "Eredeti kérdés", true);
+        original.time = "first".to_string();
+        original.sequence = Some(10);
+        original.turn_id = None;
+        let mut corrupted = original.clone();
+        corrupted.text = "Egy sokkal hosszabb, idegen kérdés".to_string();
+        corrupted.time = "later".to_string();
+        corrupted.sequence = Some(999);
+        corrupted.turn_id = Some("later-metadata".to_string());
+
+        let merged = merge_message_versions(&original, corrupted);
+
+        assert_eq!(merged.text, "Eredeti kérdés");
+        assert_eq!(merged.time, "first");
+        assert_eq!(merged.sequence, Some(10));
+        assert_eq!(merged.turn_id.as_deref(), Some("later-metadata"));
+    }
+
+    #[test]
+    fn checkpoint_pairing_uses_immutable_sequence_not_snapshot_array_order() {
+        let project_id = Uuid::new_v4().to_string();
+        let conversation_id = Uuid::new_v4().to_string();
+        let project = LocalProject {
+            id: project_id.clone(),
+            name: "Shared".to_string(),
+            relative_path: Some("shared".to_string()),
+            path_hint: "C:\\shared".to_string(),
+            threads: vec!["Thread".to_string()],
+        };
+        let mut user_one = test_message(&Uuid::new_v4().to_string(), "user", "Első", true);
+        user_one.sequence = Some(1);
+        user_one.turn_id = None;
+        let mut answer_one =
+            test_message(&Uuid::new_v4().to_string(), "assistant", "Válasz 1", true);
+        answer_one.sequence = Some(2);
+        answer_one.turn_id = None;
+        let mut user_two = test_message(&Uuid::new_v4().to_string(), "user", "Második", true);
+        user_two.sequence = Some(3);
+        user_two.turn_id = None;
+        let mut answer_two =
+            test_message(&Uuid::new_v4().to_string(), "assistant", "Válasz 2", true);
+        answer_two.sequence = Some(4);
+        answer_two.turn_id = None;
+        let snapshot = LocalStoreSnapshot {
+            schema_version: STORE_SCHEMA_VERSION,
+            projects: vec![project],
+            conversations: BTreeMap::from([(
+                "thread".to_string(),
+                LocalConversation {
+                    id: Some(conversation_id),
+                    scope: store::CODING_SCOPE.to_string(),
+                    project_id,
+                    title: "Thread".to_string(),
+                    // This is the exact bad shape caused by sorting latest HLC
+                    // before immutable sequence.
+                    messages: vec![user_one, user_two, answer_one, answer_two],
+                    work_items: Vec::new(),
+                    thread_id: None,
+                    updated_at: "4".to_string(),
+                    plan_history: BTreeMap::new(),
+                    commentary: Vec::new(),
+                },
+            )]),
+            tombstones: Vec::new(),
+        };
+
+        let entries = checkpoint_entries(&snapshot);
+        let pairs = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.answer.text.as_str(),
+                    entry.user_message.as_ref().map(|user| user.text.as_str()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pairs,
+            vec![("Válasz 1", Some("Első")), ("Válasz 2", Some("Második"))]
+        );
+    }
+
+    #[test]
+    fn reducer_repairs_a_legacy_corrupt_compaction_from_its_original_user_event() {
+        let device_id = Uuid::new_v4().to_string();
+        let project_id = stable_id("project", "compaction-user-project");
+        let conversation_id = stable_id("conversation", "compaction-user-conversation");
+        let user_id = Uuid::new_v4().to_string();
+        let project_value = LocalProject {
+            id: project_id.clone(),
+            name: "Shared".to_string(),
+            relative_path: Some("shared".to_string()),
+            path_hint: "C:\\shared".to_string(),
+            threads: vec!["Thread".to_string()],
+        };
+        let project_event = make_event(
+            &device_id,
+            1,
+            format!("{:020}-{:08}", 1, 0),
+            None,
+            project_id.clone(),
+            PROJECT_UPSERT.to_string(),
+            serde_json::to_value(&project_value).expect("project payload"),
+        )
+        .expect("project event");
+        let conversation_event = make_event(
+            &device_id,
+            2,
+            format!("{:020}-{:08}", 2, 0),
+            Some(project_event.event_hash.clone()),
+            conversation_id.clone(),
+            CONVERSATION_UPSERT.to_string(),
+            serde_json::to_value(ConversationEventPayload {
+                id: conversation_id.clone(),
+                scope: store::CODING_SCOPE.to_string(),
+                project_id: Some(project_id.clone()),
+                title: "Thread".to_string(),
+                thread_id: None,
+                updated_at: "2".to_string(),
+                plan_history: BTreeMap::new(),
+                commentary: Vec::new(),
+            })
+            .expect("conversation payload"),
+        )
+        .expect("conversation event");
+        let mut original_user = test_message(&user_id, "user", "Eredeti kérdés", true);
+        original_user.turn_id = None;
+        original_user.sequence = Some(3);
+        let user_event = make_event(
+            &device_id,
+            3,
+            format!("{:020}-{:08}", 3, 0),
+            Some(conversation_event.event_hash.clone()),
+            user_id,
+            MESSAGE_UPSERT.to_string(),
+            serde_json::to_value(MessageEventPayload {
+                project_id: Some(project_id.clone()),
+                conversation_id: conversation_id.clone(),
+                message: original_user.clone(),
+            })
+            .expect("user payload"),
+        )
+        .expect("user event");
+        let scan = JournalScan {
+            accepted: vec![project_event, conversation_event, user_event.clone()],
+            scanned_events: 3,
+            blocked_devices: HashSet::new(),
+            warnings: Vec::new(),
+            snapshot: None,
+        };
+        let mut store = test_store();
+        apply_events(&mut store, &scan).expect("import source events");
+
+        let mut corrupt_user = original_user;
+        corrupt_user.text = "Hosszabb, másik user input".to_string();
+        let state = LocalStoreSnapshot {
+            schema_version: STORE_SCHEMA_VERSION,
+            projects: vec![project_value],
+            conversations: BTreeMap::from([(
+                "thread".to_string(),
+                LocalConversation {
+                    id: Some(conversation_id),
+                    scope: store::CODING_SCOPE.to_string(),
+                    project_id,
+                    title: "Thread".to_string(),
+                    messages: vec![corrupt_user],
+                    work_items: Vec::new(),
+                    thread_id: None,
+                    updated_at: "3".to_string(),
+                    plan_history: BTreeMap::new(),
+                    commentary: Vec::new(),
+                },
+            )]),
+            tombstones: Vec::new(),
+        };
+        let mut compaction = CompactionSnapshot {
+            schema_version: RETENTION_SCHEMA_VERSION,
+            snapshot_id: Uuid::new_v4().to_string(),
+            created_at: "3".to_string(),
+            event_count: 3,
+            journal_digest: sha256_hex(b"test-journal"),
+            cursors: BTreeMap::from([(
+                device_id,
+                RetentionCursor {
+                    sequence: 3,
+                    event_hash: user_event.event_hash,
+                },
+            )]),
+            state,
+            snapshot_hash: String::new(),
+        };
+        compaction.snapshot_hash = compaction_snapshot_hash(&compaction).expect("snapshot hash");
+        store
+            .connection
+            .execute(
+                "INSERT INTO store_meta (key, value) VALUES ('sync_compaction_snapshot', ?1)",
+                params![serde_json::to_string(&compaction).expect("snapshot JSON")],
+            )
+            .expect("store compaction");
+
+        let reduced = reduce_snapshot(&store.connection).expect("reduce repaired compaction");
+        let user = reduced
+            .conversations
+            .values()
+            .next()
+            .expect("conversation")
+            .messages
+            .iter()
+            .find(|message| message.role == "user")
+            .expect("user");
+        assert_eq!(user.text, "Eredeti kérdés");
+        assert_eq!(user.sequence, Some(3));
+    }
+
+    #[test]
+    fn pending_snapshot_does_not_publish_empty_assistant_placeholder() {
+        let project = LocalProject {
+            id: Uuid::new_v4().to_string(),
+            name: "Test".to_string(),
+            relative_path: Some("test".to_string()),
+            path_hint: "C:\\test".to_string(),
+            threads: vec!["Thread".to_string()],
+        };
+        let conversation_id = Uuid::new_v4().to_string();
+        let snapshot = LocalStoreSnapshot {
+            schema_version: STORE_SCHEMA_VERSION,
+            projects: vec![project.clone()],
+            conversations: BTreeMap::from([(
+                "thread".to_string(),
+                LocalConversation {
+                    id: Some(conversation_id),
+                    scope: store::CODING_SCOPE.to_string(),
+                    project_id: project.id,
+                    title: "Thread".to_string(),
+                    messages: vec![
+                        test_message("user", "user", "Kérdés", true),
+                        test_message("answer", "assistant", "", true),
+                    ],
+                    work_items: Vec::new(),
+                    thread_id: None,
+                    updated_at: "1".to_string(),
+                    plan_history: BTreeMap::new(),
+                    commentary: Vec::new(),
+                },
+            )]),
+            tombstones: Vec::new(),
+        };
+
+        let message_events = pending_events(&snapshot)
+            .expect("pending events")
+            .into_iter()
+            .filter(|event| event.event_type == MESSAGE_UPSERT)
+            .collect::<Vec<_>>();
+
+        assert_eq!(message_events.len(), 1);
+        let payload: MessageEventPayload =
+            serde_json::from_value(message_events[0].payload.clone()).expect("message payload");
+        assert_eq!(payload.message.role, "user");
+    }
+
+    #[test]
+    fn rolling_answer_checkpoint_repairs_a_missing_remote_answer_event() {
+        let root = test_root();
+        let device_id = Uuid::new_v4().to_string();
+        let project_id = Uuid::new_v4().to_string();
+        let conversation_id = Uuid::new_v4().to_string();
+        let user_id = Uuid::new_v4().to_string();
+        let answer_id = Uuid::new_v4().to_string();
+        let project = LocalProject {
+            id: project_id.clone(),
+            name: "Shared".to_string(),
+            relative_path: Some("shared".to_string()),
+            path_hint: "C:\\shared".to_string(),
+            threads: vec!["Thread".to_string()],
+        };
+        let conversation = |messages: Vec<LocalMessage>| LocalConversation {
+            id: Some(conversation_id.clone()),
+            scope: store::CODING_SCOPE.to_string(),
+            project_id: project_id.clone(),
+            title: "Thread".to_string(),
+            messages,
+            work_items: Vec::new(),
+            thread_id: None,
+            updated_at: "2".to_string(),
+            plan_history: BTreeMap::new(),
+            commentary: Vec::new(),
+        };
+        let mut user = test_message(&user_id, "user", "Kérdés", true);
+        user.sequence = Some(1);
+        let mut final_answer = test_message(&answer_id, "assistant", "Tartós válasz", true);
+        final_answer.sequence = Some(2);
+        let canonical_answer_id = normalized_message_id(&conversation_id, &final_answer, 1);
+        let source = LocalStoreSnapshot {
+            schema_version: STORE_SCHEMA_VERSION,
+            projects: vec![project.clone()],
+            conversations: BTreeMap::from([(
+                "source".to_string(),
+                conversation(vec![user.clone(), final_answer]),
+            )]),
+            tombstones: Vec::new(),
+        };
+        write_answer_checkpoint(&root, &device_id, &source).expect("write checkpoint");
+
+        let mut empty_answer = test_message(&answer_id, "assistant", "", true);
+        empty_answer.sequence = Some(2);
+        let remote_without_final_event = LocalStoreSnapshot {
+            schema_version: STORE_SCHEMA_VERSION,
+            projects: vec![project],
+            conversations: BTreeMap::from([(
+                "remote".to_string(),
+                conversation(vec![user, empty_answer]),
+            )]),
+            tombstones: Vec::new(),
+        };
+        let merged =
+            merge_answer_checkpoints(remote_without_final_event, read_answer_checkpoints(&root));
+        let repaired = merged
+            .conversations
+            .values()
+            .next()
+            .expect("repaired conversation");
+        let answer = repaired
+            .messages
+            .iter()
+            .find(|message| message.id.as_deref() == Some(canonical_answer_id.as_str()))
+            .expect("repaired answer");
+
+        assert_eq!(answer.text, "Tartós válasz");
+        assert_eq!(answer.final_message, Some(true));
+        assert_eq!(answer.live, Some(false));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reducer_coalesces_old_random_ids_for_the_same_client_turn() {
+        let root = test_root();
+        let device_a = Uuid::new_v4().to_string();
+        let device_b = Uuid::new_v4().to_string();
+        let importer = Uuid::new_v4().to_string();
+        let project_id = stable_id("project", "message-alias-project");
+        let conversation_id = stable_id("conversation", "message-alias-conversation");
+
+        let project = make_event(
+            &device_a,
+            1,
+            format!("{:020}-{:08}", 1, 0),
+            None,
+            project_id.clone(),
+            PROJECT_UPSERT.to_string(),
+            serde_json::to_value(LocalProject {
+                id: project_id.clone(),
+                name: "Shared".to_string(),
+                relative_path: Some("shared".to_string()),
+                path_hint: "C:\\shared".to_string(),
+                threads: vec!["Thread".to_string()],
+            })
+            .expect("project payload"),
+        )
+        .expect("project event");
+        let conversation = make_event(
+            &device_a,
+            2,
+            format!("{:020}-{:08}", 2, 0),
+            Some(project.event_hash.clone()),
+            conversation_id.clone(),
+            CONVERSATION_UPSERT.to_string(),
+            serde_json::to_value(ConversationEventPayload {
+                id: conversation_id.clone(),
+                scope: store::CODING_SCOPE.to_string(),
+                project_id: Some(project_id.clone()),
+                title: "Thread".to_string(),
+                thread_id: None,
+                updated_at: "2".to_string(),
+                plan_history: BTreeMap::new(),
+                commentary: Vec::new(),
+            })
+            .expect("conversation payload"),
+        )
+        .expect("conversation event");
+        let mut stale = test_message(&Uuid::new_v4().to_string(), "assistant", "", false);
+        stale.sequence = Some(2);
+        stale.turn_id = Some("request:shared-turn".to_string());
+        let first_message_id = stale.id.clone().expect("first message id");
+        let stale_event = make_event(
+            &device_a,
+            3,
+            format!("{:020}-{:08}", 3, 0),
+            Some(conversation.event_hash.clone()),
+            stale.id.clone().expect("stale id"),
+            MESSAGE_UPSERT.to_string(),
+            serde_json::to_value(MessageEventPayload {
+                project_id: Some(project_id.clone()),
+                conversation_id: conversation_id.clone(),
+                message: stale,
+            })
+            .expect("stale payload"),
+        )
+        .expect("stale event");
+        let mut completed = test_message(
+            &Uuid::new_v4().to_string(),
+            "assistant",
+            "final answer",
+            true,
+        );
+        completed.sequence = Some(2);
+        completed.turn_id = Some("request:shared-turn".to_string());
+        let completed_event = make_event(
+            &device_b,
+            1,
+            format!("{:020}-{:08}", 4, 0),
+            None,
+            completed.id.clone().expect("completed id"),
+            MESSAGE_UPSERT.to_string(),
+            serde_json::to_value(MessageEventPayload {
+                project_id: Some(project_id),
+                conversation_id: conversation_id.clone(),
+                message: completed,
+            })
+            .expect("completed payload"),
+        )
+        .expect("completed event");
+
+        for event in [&project, &conversation, &stale_event, &completed_event] {
+            write_event(&root, event).expect("write event");
+        }
+        let scan = scan_journal(&root, &importer).expect("scan journal");
+        let mut store = test_store();
+        apply_events(&mut store, &scan).expect("apply events");
+        let snapshot = reduce_snapshot(&store.connection).expect("reduce snapshot");
+        let messages = &snapshot
+            .conversations
+            .values()
+            .next()
+            .expect("conversation")
+            .messages;
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id.as_deref(), Some(first_message_id.as_str()));
+        assert_eq!(messages[0].text, "final answer");
+        assert_eq!(messages[0].final_message, Some(true));
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn event_hash_round_trip_is_validated() {
         let device_id = Uuid::new_v4().to_string();
@@ -4215,6 +5708,54 @@ mod tests {
     }
 
     #[test]
+    fn incremental_scan_reads_only_events_after_the_local_cursor() {
+        let root = test_root();
+        let device_id = Uuid::new_v4().to_string();
+        let importer = Uuid::new_v4().to_string();
+        let first = test_event(&device_id, 1, None);
+        let second = test_event(&device_id, 2, Some(first.event_hash.clone()));
+        write_event(&root, &first).expect("write first event");
+        write_event(&root, &second).expect("write second event");
+        let cursors = BTreeMap::from([(
+            device_id.clone(),
+            RetentionCursor {
+                sequence: first.device_sequence,
+                event_hash: first.event_hash.clone(),
+            },
+        )]);
+
+        let scan = scan_journal_with_cursor_floor(&root, &importer, Some(&cursors))
+            .expect("incremental scan");
+
+        assert_eq!(scan.scanned_events, 1);
+        assert_eq!(scan.accepted.len(), 1);
+        assert_eq!(scan.accepted[0].event_id, second.event_id);
+        assert_eq!(scan.accepted[0].event_hash, second.event_hash);
+        assert!(scan.blocked_devices.is_empty());
+        assert!(scan.warnings.is_empty());
+
+        let caught_up = BTreeMap::from([(
+            device_id.clone(),
+            RetentionCursor {
+                sequence: second.device_sequence,
+                event_hash: second.event_hash.clone(),
+            },
+        )]);
+        let idle = scan_journal_with_cursor_floor(&root, &importer, Some(&caught_up))
+            .expect("caught-up incremental scan");
+        assert_eq!(idle.scanned_events, 0);
+
+        let third = test_event(&device_id, 3, Some(second.event_hash.clone()));
+        write_event(&root, &third).expect("write third event");
+        let changed = scan_journal_with_cursor_floor(&root, &importer, Some(&caught_up))
+            .expect("incremental scan after append");
+        assert_eq!(changed.scanned_events, 1);
+        assert_eq!(changed.accepted.len(), 1);
+        assert_eq!(changed.accepted[0].event_hash, third.event_hash);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn pending_snapshot_events_have_stable_entity_ids() {
         let project = LocalProject {
             id: "project-legacy".to_string(),
@@ -4225,6 +5766,7 @@ mod tests {
         };
         let conversation = LocalConversation {
             id: None,
+            scope: store::CODING_SCOPE.to_string(),
             project_id: project.id.clone(),
             title: "Thread".to_string(),
             messages: vec![LocalMessage {
@@ -4294,6 +5836,132 @@ mod tests {
         assert!(conversation_payload.thread_id.is_none());
         assert_eq!(conversation_payload.plan_history.len(), 1);
         assert_eq!(conversation_payload.commentary.len(), 1);
+    }
+
+    #[test]
+    fn general_pending_events_publish_null_project_ids_without_a_project_event() {
+        let conversation_id = "general-conversation".to_string();
+        let conversation = LocalConversation {
+            id: Some(conversation_id.clone()),
+            scope: store::GENERAL_SCOPE.to_string(),
+            project_id: store::GENERAL_PROJECT_ID.to_string(),
+            title: "Tell me a joke".to_string(),
+            messages: vec![LocalMessage {
+                id: Some("general-user".to_string()),
+                role: "user".to_string(),
+                text: "Tell me a joke".to_string(),
+                time: "1".to_string(),
+                code: Some(false),
+                live: Some(false),
+                final_message: Some(true),
+                item_id: None,
+                turn_id: Some("request:general".to_string()),
+                sequence: Some(1),
+                hlc: None,
+                origin_device_id: None,
+                images: Vec::new(),
+                quote_refs: Vec::new(),
+            }],
+            work_items: Vec::new(),
+            thread_id: None,
+            updated_at: "1".to_string(),
+            plan_history: BTreeMap::new(),
+            commentary: Vec::new(),
+        };
+        let snapshot = LocalStoreSnapshot {
+            schema_version: STORE_SCHEMA_VERSION,
+            projects: Vec::new(),
+            conversations: BTreeMap::from([(
+                "general::general-conversation".to_string(),
+                conversation,
+            )]),
+            tombstones: Vec::new(),
+        };
+
+        let events = pending_events(&snapshot).expect("General pending events");
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == PROJECT_UPSERT));
+
+        let conversation_event = events
+            .iter()
+            .find(|event| event.event_type == CONVERSATION_UPSERT)
+            .expect("General conversation event");
+        let conversation_payload: ConversationEventPayload =
+            serde_json::from_value(conversation_event.payload.clone())
+                .expect("General conversation payload");
+        assert_eq!(conversation_payload.scope, store::GENERAL_SCOPE);
+        assert!(conversation_payload.project_id.is_none());
+
+        let message_event = events
+            .iter()
+            .find(|event| event.event_type == MESSAGE_UPSERT)
+            .expect("General message event");
+        let message_payload: MessageEventPayload =
+            serde_json::from_value(message_event.payload.clone()).expect("General message payload");
+        assert!(message_payload.project_id.is_none());
+        assert_eq!(message_payload.conversation_id, conversation_id);
+    }
+
+    #[test]
+    fn general_tombstone_suppresses_stale_conversation_upsert() {
+        let conversation_id = "general-conversation".to_string();
+        let conversation = LocalConversation {
+            id: Some(conversation_id.clone()),
+            scope: store::GENERAL_SCOPE.to_string(),
+            project_id: store::GENERAL_PROJECT_ID.to_string(),
+            title: "Tell me a joke".to_string(),
+            messages: vec![LocalMessage {
+                id: Some("general-user".to_string()),
+                role: "user".to_string(),
+                text: "Tell me a joke".to_string(),
+                time: "1".to_string(),
+                code: Some(false),
+                live: Some(false),
+                final_message: Some(true),
+                item_id: None,
+                turn_id: Some("request:general".to_string()),
+                sequence: Some(1),
+                hlc: None,
+                origin_device_id: None,
+                images: Vec::new(),
+                quote_refs: Vec::new(),
+            }],
+            work_items: Vec::new(),
+            thread_id: None,
+            updated_at: "1".to_string(),
+            plan_history: BTreeMap::new(),
+            commentary: Vec::new(),
+        };
+        let snapshot = LocalStoreSnapshot {
+            schema_version: STORE_SCHEMA_VERSION,
+            projects: Vec::new(),
+            conversations: BTreeMap::from([(
+                "general::general-conversation".to_string(),
+                conversation,
+            )]),
+            tombstones: vec![LocalTombstone {
+                entity_type: "conversation".to_string(),
+                entity_id: conversation_id.clone(),
+                archived_at: "2".to_string(),
+                project_id: None,
+                title: Some("Tell me a joke".to_string()),
+                relative_path: None,
+                path_hint: None,
+                reason: Some("deleted from General".to_string()),
+            }],
+        };
+
+        let events = pending_events(&snapshot).expect("General tombstone pending events");
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == CONVERSATION_UPSERT));
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == MESSAGE_UPSERT));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == TOMBSTONE_UPSERT));
     }
 
     #[test]
@@ -4541,7 +6209,8 @@ mod tests {
             CONVERSATION_UPSERT.to_string(),
             serde_json::to_value(ConversationEventPayload {
                 id: conversation_id.clone(),
-                project_id: project_id.clone(),
+                scope: store::CODING_SCOPE.to_string(),
+                project_id: Some(project_id.clone()),
                 title: "Shared thread".to_string(),
                 thread_id: Some("thread-a".to_string()),
                 updated_at: "3".to_string(),
@@ -4576,7 +6245,7 @@ mod tests {
             message_id.clone(),
             MESSAGE_UPSERT.to_string(),
             serde_json::to_value(MessageEventPayload {
-                project_id: project_id.clone(),
+                project_id: Some(project_id.clone()),
                 conversation_id: conversation_id.clone(),
                 message: LocalMessage {
                     id: Some(message_id),
@@ -5719,7 +7388,8 @@ mod tests {
             CONVERSATION_UPSERT.to_string(),
             serde_json::to_value(ConversationEventPayload {
                 id: conversation_id.clone(),
-                project_id: project_id.clone(),
+                scope: store::CODING_SCOPE.to_string(),
+                project_id: Some(project_id.clone()),
                 title: "Recoverable".to_string(),
                 thread_id: Some("thread-recoverable".to_string()),
                 updated_at: "2".to_string(),

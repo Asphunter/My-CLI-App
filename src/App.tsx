@@ -24,6 +24,24 @@ import {
   workGroupTurnKeys,
   type WorkLogGroup as TimelineWorkLogGroup,
 } from "./chatTimeline";
+import {
+  beginAssistantRegeneration,
+  collapseAbandonedRegenerationRetries,
+  collapseRepeatedAssistantText,
+  coalesceMessageIdentities,
+  isSettledHistoricalAssistant,
+  messagesShareIdentity,
+} from "./messageIdentity";
+import {
+  conversationTitleFromPrompt,
+  DEFAULT_APP_MODE,
+  GENERAL_PROJECT_ID,
+  generalConversationCacheKey,
+  isGeneralConversationCacheKey,
+  normalizeConversationScope,
+  type AppMode,
+  type ConversationScope,
+} from "./conversationScope";
 
 type Message = {
   id?: string;
@@ -96,6 +114,7 @@ type Project = {
   relativePath: string | null;
   threads: string[];
 };
+type TreeSortMode = "modified" | "time";
 type AgentGuardReport = {
   snapshotId: string;
   snapshotPath: string;
@@ -167,7 +186,13 @@ type CodexDelta = {
   phase?: string | null;
   sequence?: number;
 };
-type CodexEvent = { threadId: string; eventType: string; payload: unknown };
+type CodexEvent = {
+  requestId?: string | null;
+  sequence?: number;
+  threadId: string;
+  eventType: string;
+  payload: unknown;
+};
 type CodexTransportStatus = {
   requestId?: string | null;
   stage: string;
@@ -254,7 +279,7 @@ type CodexModel = {
   defaultReasoningEffort: string | null;
 };
 type ModelFamily = { key: string; label: string; models: CodexModel[] };
-type OpenMenu = { kind: "project" | "thread"; key: string } | null;
+type OpenMenu = { kind: "project" | "thread" | "general"; key: string } | null;
 type AppDialog =
   | {
       kind: "input";
@@ -474,7 +499,9 @@ const quoteBacklinkButtons = (
           aria-label={`Idézet ${index + 1} megnyitása`}
           title={quote.instruction || `Idézet ${index + 1} megnyitása`}
         >
-          💬{quotes.length > 1 ? <small>{index + 1}</small> : null}
+          <span className="quote-backlink-glyph" aria-hidden="true">
+            {quotes.length > 1 ? index + 1 : null}
+          </span>
         </button>
       ))}
     </span>
@@ -684,10 +711,15 @@ const DETAIL_MODE_STORAGE_KEY = "min-detail-mode";
 const WORK_LOG_STORAGE_KEY = "min-work-log";
 const PLAN_STORAGE_KEY = "min-plan-history";
 const COMMENTARY_STORAGE_KEY = "min-commentary-history";
+const GENERAL_HISTORY_STORAGE_KEY = "min-general-conversations";
 const DEVICE_ID_STORAGE_KEY = "min-device-id";
 const LOCAL_THREAD_IDS_STORAGE_KEY = "min-local-thread-ids";
+const ACTIVE_MODE_STORAGE_KEY = "min-active-mode";
+const ACTIVE_GENERAL_CONVERSATION_STORAGE_KEY =
+  "min-active-general-conversation-id";
+const TREE_SORT_MODE_STORAGE_KEY = "min-tree-sort-mode";
 const SYNC_SCHEMA_VERSION = 1;
-const LOCAL_STORE_SNAPSHOT_VERSION = 10;
+const LOCAL_STORE_SNAPSHOT_VERSION = 11;
 const MAX_IMAGE_ATTACHMENTS = 6;
 const MAX_IMAGE_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const SYNC_POLL_INTERVAL_MS = 15_000;
@@ -704,7 +736,8 @@ type SyncProject = {
 
 type SyncConversation = {
   id?: string;
-  projectId: string;
+  scope: ConversationScope;
+  projectId: string | null;
   title: string;
   messages: Message[];
   workItems?: CodeActivity[];
@@ -964,25 +997,6 @@ const preferredThreadForProject = (
   return populatedThreads[populatedThreads.length - 1]?.title || preferred || project.threads[0] || "";
 };
 
-const conversationTitleFromPrompt = (prompt: string) => {
-  const firstLine =
-    prompt
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .find(Boolean) ?? "";
-  const normalized = firstLine
-    .replace(/^[#>*\-\d.)\s]+/, "")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!normalized) return "Kódolási kör";
-  if (normalized.length <= 42) return normalized;
-  const shortened = normalized
-    .slice(0, 42)
-    .replace(/\s+\S*$/, "")
-    .trim();
-  return `${shortened || normalized.slice(0, 42).trim()}…`;
-};
-
 const uniqueConversationTitle = (
   project: Project,
   baseTitle: string,
@@ -1011,6 +1025,123 @@ const resolveSyncedPath = (
 
 const syncConversationKey = (projectId: string, title: string) =>
   `${projectId}::${title}`;
+
+const syncGeneralConversationKey = (conversationId: string) =>
+  generalConversationCacheKey(conversationId);
+
+const normalizeSyncConversation = (
+  conversation: SyncConversation,
+): SyncConversation => ({
+  ...conversation,
+  scope: normalizeConversationScope(conversation.scope, conversation.projectId),
+  projectId:
+    normalizeConversationScope(conversation.scope, conversation.projectId) ===
+    "general"
+      ? null
+      : conversation.projectId ?? null,
+});
+
+const normalizeLocalStoreSnapshot = (
+  snapshot: LocalStoreSnapshot,
+): LocalStoreSnapshot => {
+  const conversations: Record<string, SyncConversation> = {};
+  const tombstones = snapshot.tombstones ?? [];
+  for (const [rawKey, rawConversation] of Object.entries(
+    snapshot.conversations ?? {},
+  )) {
+    const conversation = normalizeSyncConversation(rawConversation);
+    const isGeneral =
+      conversation.scope === "general" || isGeneralConversationCacheKey(rawKey);
+    const conversationId =
+      conversation.id ??
+      (isGeneral && isGeneralConversationCacheKey(rawKey)
+        ? rawKey.slice("general::".length)
+        : undefined);
+    if (
+      conversationId &&
+      tombstones.some(
+        (tombstone) =>
+          tombstone.entityType === "conversation" &&
+          tombstone.entityId === conversationId,
+      )
+    ) {
+      // A local/sync snapshot can contain an older row beside its tombstone.
+      // Never hydrate that row into the Tree; the tombstone is authoritative.
+      continue;
+    }
+    const key =
+      isGeneral && conversationId
+        ? generalConversationCacheKey(conversationId)
+        : rawKey;
+    conversations[key] = {
+      ...conversation,
+      id: conversationId,
+      scope: isGeneral ? "general" : "coding",
+      projectId: isGeneral ? null : conversation.projectId,
+    };
+  }
+  return { ...snapshot, conversations };
+};
+
+const snapshotForStorage = (snapshot: LocalStoreSnapshot): LocalStoreSnapshot => ({
+  ...snapshot,
+  conversations: Object.fromEntries(
+    Object.entries(snapshot.conversations ?? {})
+      .filter(([, conversation]) => conversation.scope !== "coding" || Boolean(conversation.projectId))
+      .map(([key, conversation]) => [
+        key,
+        {
+          ...conversation,
+          projectId:
+            conversation.scope === "general"
+              ? GENERAL_PROJECT_ID
+              : conversation.projectId,
+        },
+      ]),
+  ),
+});
+
+const loadStoredGeneralConversations = (): Record<string, SyncConversation> => {
+  try {
+    const parsed = JSON.parse(
+      localStorage.getItem(GENERAL_HISTORY_STORAGE_KEY) ?? "{}",
+    ) as Record<string, SyncConversation>;
+    const entries: Array<[string, SyncConversation]> = [];
+    for (const [key, conversation] of Object.entries(parsed)) {
+      const normalized = normalizeSyncConversation(conversation);
+      const id =
+        normalized.id ??
+        (isGeneralConversationCacheKey(key)
+          ? key.slice("general::".length)
+          : undefined);
+      if (!id) continue;
+      entries.push([
+        generalConversationCacheKey(id),
+        {
+          ...normalized,
+          id,
+          scope: "general",
+          projectId: null,
+        },
+      ]);
+    }
+    return Object.fromEntries(entries);
+  } catch {
+    return {};
+  }
+};
+
+const persistStoredGeneralConversations = (
+  conversations: Record<string, SyncConversation>,
+) => {
+  const general = Object.fromEntries(
+    Object.entries(conversations).filter(
+      ([key, conversation]) =>
+        conversation.scope === "general" || isGeneralConversationCacheKey(key),
+    ),
+  );
+  localStorage.setItem(GENERAL_HISTORY_STORAGE_KEY, JSON.stringify(general));
+};
 
 const tombstoneMatchesProjectPath = (
   tombstone: SyncTombstone,
@@ -1112,6 +1243,49 @@ const messagePromptTimestamp = (message: Pick<Message, "time" | "sequence">) => 
     ? message.sequence
     : undefined;
 };
+
+const treeConversationTimestamp = (
+  conversation: SyncConversation | undefined,
+  mode: TreeSortMode,
+) => {
+  if (!conversation) return 0;
+  const messageTimes = (conversation.messages ?? [])
+    .filter((message) => mode !== "time" || message.role === "user")
+    .map((message) => messagePromptTimestamp(message))
+    .filter((timestamp): timestamp is number => timestamp !== undefined);
+  const activityTimes = (conversation.workItems ?? [])
+    .map((item) => parseMessageTimestamp(item.time))
+    .filter((timestamp): timestamp is number => timestamp !== undefined);
+  const allTimes = [...messageTimes, ...activityTimes];
+  const updatedTimestamp = parseMessageTimestamp(conversation.updatedAt);
+  if (mode === "time") {
+    return messageTimes[0] !== undefined
+      ? Math.min(...messageTimes)
+      : allTimes.length > 0
+        ? Math.min(...allTimes)
+        : updatedTimestamp ?? 0;
+  }
+  return Math.max(updatedTimestamp ?? 0, ...allTimes);
+};
+
+const treeProjectTimestamp = (
+  project: Project,
+  cache: Record<string, SyncConversation>,
+  mode: TreeSortMode,
+) =>
+  Math.max(
+    0,
+    ...project.threads.map((title) =>
+      treeConversationTimestamp(cache[`${project.path}/${title}`], mode),
+    ),
+  );
+
+const compareTreeItems = (
+  leftTimestamp: number,
+  rightTimestamp: number,
+  leftLabel: string,
+  rightLabel: string,
+) => rightTimestamp - leftTimestamp || leftLabel.localeCompare(rightLabel);
 
 const formatPromptTime = (timestamp: number | undefined) => {
   if (timestamp === undefined) return "";
@@ -1249,14 +1423,20 @@ const compactMessages = (messages: Message[]) => {
   return compacted;
 };
 
+const repairHistoricalAssistantText = (message: Message): Message => {
+  const text = collapseRepeatedAssistantText(message.role, message.text);
+  return text === message.text ? message : { ...message, text };
+};
+
 // A Codex request cannot remain live across an app reload. Every persisted
 // assistant row is therefore settled and never remains an active stream.
 const interruptedMarkerPattern = /(?:\n\s*){0,2}A válasz megszakítva\.?\s*$/i;
 
 // A persisted assistant row may still be a provisional failure marker when
-// the WebView was closed during the finalization race. A durable rollout can
-// replace it in Rust; anything that cannot be recovered must stay hidden
-// instead of rendering an empty/error answer panel on every startup.
+// the WebView was closed during the finalization race. Treat it as an
+// incomplete version only while merging the same logical message identity.
+// When no completed copy exists, the marker is real conversation history and
+// must remain visible after reload.
 const persistedUnavailableAssistantPattern =
   /^(?:A v\u00e1lasz megszak\u00edtva\.?|Nem siker\u00fclt a Codex-k\u00e9r\u00e9s:)/i;
 
@@ -1274,9 +1454,15 @@ const isUnavailablePersistedAssistant = (message: Message) => {
 
 const dropUnrecoverablePersistedAnswers = (messages: Message[]) =>
   messages.filter(
-    (message) =>
-      !isUnavailablePersistedAssistant(message) ||
-      Boolean(message.images?.length),
+    (message, index) =>
+      message.role !== "assistant" ||
+      message.live ||
+      Boolean(message.text.trim()) ||
+      Boolean(message.images?.length) ||
+      // Keep a durable empty assistant row when it belongs to a submitted
+      // user turn. There is no answer text to recover, but silently deleting
+      // the row makes the GUI look as if conversation history vanished.
+      messages[index - 1]?.role === "user",
   );
 
 const stripStaleInterruptionMarker = (message: Message): Message => {
@@ -1286,21 +1472,21 @@ const stripStaleInterruptionMarker = (message: Message): Message => {
 };
 
 // Settling a persisted row must never invent an interruption message for an
-// empty placeholder. Explicit user cancellations carry `interrupted: true`;
-// old rows without that flag are repaired by removing the stale marker.
+// empty placeholder. Explicit interruption/error text already stored in the
+// row is conversation history, even when an older client omitted the private
+// `interrupted` flag, so reloading must not erase it.
 const settleInterruptedMessages = (messages: Message[]) =>
   messages.map((message) => {
-    const normalized = stripStaleInterruptionMarker(message);
-    return normalized.role === "assistant"
+    return message.role === "assistant"
       ? {
-          ...normalized,
+          ...message,
           text:
-            normalized.text.trim() ||
-            (normalized.interrupted ? "A válasz megszakítva." : ""),
+            message.text.trim() ||
+            (message.interrupted ? "A válasz megszakítva." : ""),
           live: false,
           final: true,
         }
-      : normalized;
+      : message;
   });
 
 const normalizedThreadStorageKey = (key: string) =>
@@ -1484,83 +1670,80 @@ const compareWorkItems = (left: CodeActivity, right: CodeActivity) =>
     },
   );
 
-const messageMergeKey = (message: Message, index: number) =>
-  message.id ??
-  (message.sequence !== undefined
-    ? `sequence:${message.sequence}`
-    : `${message.role}:${message.time}:${index}:${message.text}`);
-
 const mergeMessages = (
   primary: Message[],
   secondary: Message[] = [],
   settleInterrupted = false,
 ) => {
-  const merged: Message[] = [];
-  const indexes = new Map<string, number>();
-  for (const message of [...primary, ...secondary].map(stripStaleInterruptionMarker)) {
-    const key = messageMergeKey(message, merged.length);
-    const existingIndex = indexes.get(key);
-    if (existingIndex === undefined) {
-      indexes.set(key, merged.length);
-      merged.push(message);
-      continue;
-    }
-
-    // Sync and SQLite can contain the same row with different private/runtime
-    // fields. Keep the most complete text and merge lifecycle flags instead of
-    // letting the sanitized remote copy hide the local live/final state.
-    const existing = merged[existingIndex];
-    const final = Boolean(existing.final || message.final);
-    const existingUnavailable = isUnavailablePersistedAssistant(existing);
-    const messageUnavailable = isUnavailablePersistedAssistant(message);
-    const mergedText =
-      existingUnavailable && !messageUnavailable
-        ? message.text
-        : !existingUnavailable && messageUnavailable
+  const merged = coalesceMessageIdentities(
+    [...primary, ...secondary],
+    (existing, message) => {
+      // Sync and SQLite can contain the same row with different private/runtime
+      // fields. Keep the most complete text and merge lifecycle flags instead of
+      // letting the sanitized remote copy hide the local live/final state.
+      const final = Boolean(existing.final || message.final);
+      const existingUnavailable = isUnavailablePersistedAssistant(existing);
+      const messageUnavailable = isUnavailablePersistedAssistant(message);
+      // A submitted user payload is immutable. In particular, never let the
+      // old "longer text wins" assistant heuristic splice two user turns when
+      // a stale cache and a pulled snapshot meet.
+      const mergedText =
+        existing.role === "user"
           ? existing.text
-          : message.text.trim().length > existing.text.trim().length
+          : existingUnavailable && !messageUnavailable
             ? message.text
-            : existing.text;
-    merged[existingIndex] = {
-      ...existing,
-      time:
-        parseMessageTimestamp(existing.time) !== undefined ||
-        parseMessageTimestamp(message.time) === undefined
-          ? existing.time
-          : message.time,
-      text: mergedText,
-      code: existing.code ?? message.code,
-      // Prefer the settled lifecycle once either source knows that the
-      // answer is final. Otherwise a stale SQLite/browser row can hide the
-      // answer by keeping the merged row in the live state forever.
-      live: final ? false : Boolean(existing.live || message.live),
-      final,
-      interrupted: message.interrupted ?? existing.interrupted,
-      itemId: existing.itemId ?? message.itemId,
-      sequence: existing.sequence ?? message.sequence,
-      turnId: message.turnId ?? existing.turnId,
-      hlc: existing.hlc ?? message.hlc,
-      originDeviceId: existing.originDeviceId ?? message.originDeviceId,
-      images:
-        existing.images && existing.images.length > 0
-          ? existing.images
-          : message.images,
-      quoteRefs:
-        existing.quoteRefs && existing.quoteRefs.length > 0
-          ? existing.quoteRefs
-          : message.quoteRefs,
-      detailed: existing.detailed ?? message.detailed,
-      changeSummary:
-        existing.changeSummary && existing.changeSummary.length > 0
-          ? existing.changeSummary
-          : message.changeSummary,
-    };
-  }
-  const compacted = compactMessages(merged).map(stripStaleInterruptionMarker);
-  return (settleInterrupted
+            : !existingUnavailable && messageUnavailable
+              ? existing.text
+              : message.text.trim().length > existing.text.trim().length
+                ? message.text
+                : existing.text;
+      return {
+        ...existing,
+        time:
+          existing.role === "user" ||
+          parseMessageTimestamp(existing.time) !== undefined ||
+          parseMessageTimestamp(message.time) === undefined
+            ? existing.time
+            : message.time,
+        text: mergedText,
+        code: existing.code ?? message.code,
+        // Prefer the settled lifecycle once either source knows that the
+        // answer is final. Otherwise a stale SQLite/browser row can hide the
+        // answer by keeping the merged row in the live state forever.
+        live: final ? false : Boolean(existing.live || message.live),
+        final,
+        interrupted: message.interrupted ?? existing.interrupted,
+        itemId: existing.itemId ?? message.itemId,
+        sequence: existing.sequence ?? message.sequence,
+        turnId: message.turnId ?? existing.turnId,
+        hlc: existing.hlc ?? message.hlc,
+        originDeviceId: existing.originDeviceId ?? message.originDeviceId,
+        images:
+          existing.role === "user"
+            ? existing.images
+            : existing.images && existing.images.length > 0
+              ? existing.images
+              : message.images,
+        quoteRefs:
+          existing.role === "user"
+            ? existing.quoteRefs
+            : existing.quoteRefs && existing.quoteRefs.length > 0
+              ? existing.quoteRefs
+              : message.quoteRefs,
+        detailed: existing.detailed ?? message.detailed,
+        changeSummary:
+          existing.changeSummary && existing.changeSummary.length > 0
+            ? existing.changeSummary
+            : message.changeSummary,
+      };
+    },
+  );
+  const compacted = compactMessages(merged).map(repairHistoricalAssistantText);
+  const ordered = (settleInterrupted
     ? settleInterruptedMessages(compacted)
     : compacted
   ).sort(compareMessages);
+  return collapseAbandonedRegenerationRetries(ordered);
 };
 
 const loadThreadMessages = (key: string): Message[] => {
@@ -1583,7 +1766,7 @@ const loadThreadMessages = (key: string): Message[] => {
                   (message.role === "user" || message.role === "assistant") &&
                   typeof message.text === "string",
               ),
-            ),
+            ).map(repairHistoricalAssistantText),
           ).sort(compareMessages),
         )
       : [];
@@ -1610,7 +1793,10 @@ const saveThreadMessages = (key: string, messages: Message[]) => {
     ) as Record<string, Message[]>;
     localStorage.setItem(
       MESSAGE_HISTORY_STORAGE_KEY,
-      JSON.stringify({ ...saved, [key]: messages }),
+      JSON.stringify({
+        ...saved,
+        [key]: messages.map(repairHistoricalAssistantText),
+      }),
     );
   } catch {
     // A storage quota error must not break the conversation.
@@ -2310,7 +2496,9 @@ const removeThreadMessages = (key: string) => {
 };
 
 const messagesForSync = (messages: Message[]) =>
-  compactMessages(messages).map((message) => ({ ...message, live: false }));
+  compactMessages(messages)
+    .map(repairHistoricalAssistantText)
+    .map((message) => ({ ...message, live: false }));
 
 const isSyncState = (value: unknown): value is SyncState => {
   if (typeof value !== "object" || value === null || Array.isArray(value))
@@ -2360,12 +2548,22 @@ const normalizeCodexEvent = (value: unknown): CodexEvent | null => {
       : typeof envelope.thread_id === "string"
         ? envelope.thread_id
         : "";
+  const requestId =
+    typeof envelope.requestId === "string"
+      ? envelope.requestId
+      : typeof envelope.request_id === "string"
+        ? envelope.request_id
+        : null;
+  const sequence =
+    typeof envelope.sequence === "number" && Number.isFinite(envelope.sequence)
+      ? envelope.sequence
+      : undefined;
   const payload = Object.prototype.hasOwnProperty.call(envelope, "payload")
     ? envelope.payload
     : Object.prototype.hasOwnProperty.call(envelope, "params")
       ? envelope.params
       : envelope;
-  return { threadId, eventType, payload };
+  return { requestId, sequence, threadId, eventType, payload };
 };
 
 const normalizeCodexDelta = (value: unknown): CodexDelta | null => {
@@ -4235,7 +4433,7 @@ function PlanProgressCard({
                   : step.status === "error"
                     ? "!"
                     : step.status === "inProgress"
-                      ? "›"
+                      ? <span className="plan-step-spinner" aria-label="Fut" />
                       : index + 1}
               </span>
               <span className="plan-step-copy">{step.step}</span>
@@ -4390,6 +4588,20 @@ function TurnProgressCard({
   const hasPlanStepEvidence = (stepId: string) =>
     activities.some((activity) => activity.planStepId === stepId) ||
     commentary.some((entry) => entry.stepId === stepId);
+  const hasMeaningfulStepTiming = (stepId: string) => {
+    const timing = plan.stepTimes?.[stepId];
+    return (
+      (timing?.startedAt !== undefined || timing?.completedAt !== undefined) &&
+      !(
+        timing?.startedAt !== undefined &&
+        timing?.completedAt !== undefined &&
+        timing.completedAt <= timing.startedAt
+      )
+    );
+  };
+  const hasMeaningfulPlanTiming = plan.steps.some((step) => {
+    return hasMeaningfulStepTiming(step.id);
+  });
   const normalizedPlannedSteps = plan.steps
     .filter(
       (step) =>
@@ -4406,7 +4618,8 @@ function TurnProgressCard({
       // pending so historical cards do not claim work that never ran.
       return step.status === "completed" &&
         hasZeroStoredTiming &&
-        !hasPlanStepEvidence(step.id)
+        !hasPlanStepEvidence(step.id) &&
+        !hasMeaningfulPlanTiming
         ? { ...step, status: "pending" as const }
         : step;
     });
@@ -4420,15 +4633,16 @@ function TurnProgressCard({
           !(timing?.startedAt !== undefined &&
             timing?.completedAt !== undefined &&
             timing.completedAt <= timing.startedAt);
-        // A model can announce more work than it actually performs. Once the
-        // turn is finished, remove only rows with no trace/timing evidence;
-        // completed steps with a real boundary and error/in-progress rows are
-        // retained even when their displayed duration is 0:00.
+        // A completed plan with at least one real timing boundary is
+        // authoritative: retain its explicitly completed zero-duration rows
+        // too. Older all-zero phantom plans are normalized to pending above
+        // and remain hidden here.
         return (
           hasTraceEvidence ||
           hasMeaningfulTiming ||
           step.status === "error" ||
-          step.status === "inProgress"
+          step.status === "inProgress" ||
+          (hasMeaningfulPlanTiming && step.status === "completed")
         );
       });
   const fallbackStep: PlanStep = {
@@ -4766,11 +4980,30 @@ function TurnProgressCard({
   ) : null;
   type TraceView = "answer" | "steps";
   const [traceView, setTraceView] = useState<TraceView>(
-    streaming ? (hasAnswer ? "answer" : "steps") : expanded ? "steps" : "answer",
+    streaming ? (hasAnswer ? "answer" : "steps") : "answer",
   );
+  const manualTraceViewRef = useRef(false);
+  const wasStreamingRef = useRef(streaming);
   useEffect(() => {
-    setTraceView(expanded ? "steps" : "answer");
-  }, [expanded]);
+    // A completed answer is the primary view, including after a cold start
+    // where the persisted expansion flag may still be true. Only a live turn
+    // follows the phase flow; an answer-less historical card can still open
+    // its trace when explicitly expanded.
+    const enteredStreaming = streaming && !wasStreamingRef.current;
+    const leftStreaming = !streaming && wasStreamingRef.current;
+    wasStreamingRef.current = streaming;
+    if (enteredStreaming || leftStreaming) manualTraceViewRef.current = false;
+    if (manualTraceViewRef.current) return;
+    if (streaming) {
+      setTraceView(hasAnswer ? "answer" : "steps");
+    } else if (hasAnswer) {
+      // Recovery can populate the answer after the first render. Do not leave
+      // the user on LÉPÉSEK just because the placeholder initially had no text.
+      setTraceView("answer");
+    } else {
+      setTraceView(expanded ? "steps" : "answer");
+    }
+  }, [expanded, hasAnswer, streaming]);
   useEffect(() => {
     if (!streaming) return;
     const nextView: TraceView = hasAnswer ? "answer" : "steps";
@@ -4783,6 +5016,7 @@ function TurnProgressCard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasAnswer, streaming]);
   const selectTraceView = (next: TraceView) => {
+    manualTraceViewRef.current = true;
     setTraceView(next);
     if ((next === "steps") !== expanded) onToggle();
   };
@@ -4806,7 +5040,7 @@ function TurnProgressCard({
   const stepIndicator = (step: PlanStep) => {
     const currentStatus = displayStatus(step);
     if (currentStatus === "inProgress")
-      return <span className="trace-step-active-marker" aria-label="Fut">›</span>;
+      return <span className="trace-step-spinner" aria-label="Fut" />;
     if (currentStatus === "error")
       return <span className="trace-step-error-indicator">!</span>;
     if (currentStatus !== "completed") return null;
@@ -5708,17 +5942,46 @@ function App() {
   const [projects, setProjects] = useState<Project[]>(
     isTauri ? [] : loadStoredProjects,
   );
+  const [activeMode, setActiveMode] = useState<AppMode>(() => {
+    const stored = localStorage.getItem(ACTIVE_MODE_STORAGE_KEY);
+    return stored === "coding" || stored === "general"
+      ? stored
+      : DEFAULT_APP_MODE;
+  });
+  const [activeGeneralConversationId, setActiveGeneralConversationId] =
+    useState<string | null>(
+      () => localStorage.getItem(ACTIVE_GENERAL_CONVERSATION_STORAGE_KEY),
+    );
   const [workspaceRoot, setWorkspaceRoot] = useState("");
   const [activeProject, setActiveProject] = useState(
-    () => (isTauri ? "" : (localStorage.getItem("min-active-project") ?? "")),
+    () => localStorage.getItem("min-active-project") ?? "",
   );
   const [activeThread, setActiveThread] = useState(
     () =>
-      isTauri ? "" : (localStorage.getItem("min-active-thread") ?? "Új beszélgetés"),
+      localStorage.getItem("min-active-thread") ??
+      (isTauri ? "" : "Új beszélgetés"),
   );
   const [openProjects, setOpenProjects] = useState<Record<string, boolean>>({});
+  const [treeSortMode, setTreeSortMode] = useState<TreeSortMode>(() =>
+    localStorage.getItem(TREE_SORT_MODE_STORAGE_KEY) === "time"
+      ? "time"
+      : "modified",
+  );
+  const [treeSortMenuOpen, setTreeSortMenuOpen] = useState(false);
   const [messages, setMessages] = useState<Message[]>(
-    isTauri ? [] : loadInitialMessages,
+    () => {
+      if (isTauri) return [];
+      if (activeMode === "general") {
+        const id = localStorage.getItem(
+          ACTIVE_GENERAL_CONVERSATION_STORAGE_KEY,
+        );
+        return id
+          ? loadStoredGeneralConversations()[generalConversationCacheKey(id)]
+              ?.messages ?? []
+          : [];
+      }
+      return loadInitialMessages();
+    },
   );
   const [composerQuotes, setComposerQuotes] = useState<QuoteReference[]>([]);
   const [showDetailedTrace, setShowDetailedTrace] = useState(false);
@@ -5834,9 +6097,10 @@ function App() {
     useState(!isTauri);
   const [localConversationCache, setLocalConversationCache] = useState<
     Record<string, SyncConversation>
-  >({});
+  >(isTauri ? {} : loadStoredGeneralConversations);
   const [tombstones, setTombstones] = useState<SyncTombstone[]>([]);
   const [restoreBusyKey, setRestoreBusyKey] = useState<string | null>(null);
+  const [localMutationRevision, setLocalMutationRevision] = useState(0);
   const projectMutationRevisionRef = useRef(0);
   const pendingLocalMutationRef = useRef(false);
   const pendingRestoreSelectionRef = useRef<SyncTombstone | null>(null);
@@ -5845,11 +6109,14 @@ function App() {
   const markLocalMutation = () => {
     projectMutationRevisionRef.current += 1;
     pendingLocalMutationRef.current = true;
+    setLocalMutationRevision((current) => current + 1);
     // Pull must not merge a stale remote snapshot between the user's local
     // mutation and its debounced SQLite/journal write.
     if (isTauri && localStoreReady) setSyncReady(false);
   };
   const markProjectMutation = markLocalMutation;
+  const historyHydrating =
+    isTauri && projects.length === 0 && (!localStoreReady || !syncReady);
 
   const activeProjectData = useMemo(
     () =>
@@ -5863,8 +6130,74 @@ function App() {
       },
     [activeProject, projects, workspaceRoot],
   );
-  const activeProjectPath = activeProjectData?.path ?? workspaceRoot;
-  const threadKey = `${activeProjectPath}/${activeThread}`;
+  const generalConversations = useMemo(
+    () =>
+      Object.entries(localConversationCache)
+        .filter(
+          ([key, conversation]) =>
+            conversation.scope === "general" ||
+            isGeneralConversationCacheKey(key),
+        )
+        .map(([key, conversation]) => ({ key, conversation }))
+        .filter(({ conversation }) => Boolean(conversation.id))
+        .sort((left, right) =>
+          compareTreeItems(
+            treeConversationTimestamp(left.conversation, treeSortMode),
+            treeConversationTimestamp(right.conversation, treeSortMode),
+            left.conversation.title,
+            right.conversation.title,
+          ),
+        ),
+    [localConversationCache, treeSortMode],
+  );
+  const sortedProjects = useMemo(
+    () =>
+      projects
+        .map((project) => ({
+          ...project,
+          threads: [...project.threads].sort((left, right) =>
+            compareTreeItems(
+              treeConversationTimestamp(
+                localConversationCache[`${project.path}/${left}`],
+                treeSortMode,
+              ),
+              treeConversationTimestamp(
+                localConversationCache[`${project.path}/${right}`],
+                treeSortMode,
+              ),
+              left,
+              right,
+            ),
+          ),
+        }))
+        .sort((left, right) =>
+          compareTreeItems(
+            treeProjectTimestamp(left, localConversationCache, treeSortMode),
+            treeProjectTimestamp(right, localConversationCache, treeSortMode),
+            left.name,
+            right.name,
+          ),
+        ),
+    [localConversationCache, projects, treeSortMode],
+  );
+  useEffect(() => {
+    localStorage.setItem(TREE_SORT_MODE_STORAGE_KEY, treeSortMode);
+  }, [treeSortMode]);
+  const activeGeneralConversation = activeGeneralConversationId
+    ? localConversationCache[
+        generalConversationCacheKey(activeGeneralConversationId)
+      ]
+    : undefined;
+  const activeGeneralConversationKey = activeGeneralConversationId
+    ? generalConversationCacheKey(activeGeneralConversationId)
+    : "general::new";
+  const activeProjectPath = activeMode === "general"
+    ? ""
+    : activeProjectData?.path ?? workspaceRoot;
+  const threadKey =
+    activeMode === "general"
+      ? activeGeneralConversationKey
+      : `${activeProjectPath}/${activeThread}`;
 
   useEffect(() => {
     const updateSelectionQuote = () => {
@@ -5917,8 +6250,10 @@ function App() {
   const messageKeyRef = useRef(threadKey);
   const workLogKeyRef = useRef<string | null>(null);
   const projectsRef = useRef(projects);
+  const activeModeRef = useRef(activeMode);
   const activeProjectRef = useRef(activeProject);
   const activeThreadRef = useRef(activeThread);
+  const activeGeneralConversationIdRef = useRef(activeGeneralConversationId);
   const messagesRef = useRef(messages);
   const codeActivityRef = useRef(codeActivity);
   const planHistoryRef = useRef(planHistory);
@@ -5934,6 +6269,13 @@ function App() {
   commentaryEntriesRef.current = commentaryEntries;
   threadIdsRef.current = threadIds;
   localConversationCacheRef.current = localConversationCache;
+  // These two refs are navigation authorities. Keep them under the explicit
+  // mode/conversation handlers so an asynchronous hydration render cannot
+  // overwrite a selection that the user has just made.
+  const updateActiveGeneralConversationId = (conversationId: string | null) => {
+    activeGeneralConversationIdRef.current = conversationId;
+    setActiveGeneralConversationId(conversationId);
+  };
   const timelineSequenceRef = useRef(Date.now());
   const activeTurnIdRef = useRef<string | undefined>(undefined);
   const activePlanRef = useRef(activePlan);
@@ -5944,6 +6286,10 @@ function App() {
   const planTextBufferRef = useRef<Record<string, string>>({});
   const messageStreamRef = useRef<HTMLDivElement>(null);
   const composerFormRef = useRef<HTMLFormElement>(null);
+  const regenerationTargetRef = useRef<{
+    source: Message;
+    answer: Message;
+  } | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const quoteInputRefs = useRef<Record<string, HTMLTextAreaElement | null>>({});
   // Keep fast quote typing out of the root render path. The conversation can
@@ -5984,6 +6330,7 @@ function App() {
   const autoScrollFrameRef = useRef<number | null>(null);
   const activeRequestIdRef = useRef<string | null>(null);
   const completionSoundRequestsRef = useRef<Set<string>>(new Set());
+  const processedCodexEventsRef = useRef<Set<string>>(new Set());
   const activeLiveMessageIdRef = useRef<string | null>(null);
   const preparingRequestIdRef = useRef<string | null>(null);
   const turnCompletedRequestIdRef = useRef<string | null>(null);
@@ -6009,12 +6356,6 @@ function App() {
       return resolved;
     });
   };
-
-  useEffect(() => {
-    const sanitized = messages.map(stripStaleInterruptionMarker);
-    if (sanitized.some((message, index) => message.text !== messages[index]?.text))
-      commitMessages(sanitized);
-  }, [messages]);
 
   const maxKnownTimelineSequence = [
     Date.now(),
@@ -6608,6 +6949,7 @@ function App() {
         cached?.commentary ?? loadThreadCommentary(fallbackKey);
       cache[key] = {
         id: remote?.id ?? cached?.id,
+        scope: "coding",
         projectId: project.id,
         title,
         messages: dropUnrecoverablePersistedAnswers(
@@ -6851,14 +7193,22 @@ function App() {
   };
   const setExpandedForWorkGroup = (group: WorkLogGroup, expanded: boolean) =>
     setExpandedForKeys(workGroupExpansionKeys(group), expanded);
-  const planForWorkGroup = (group: WorkLogGroup) => {
+  const planForWorkGroup = (group: WorkLogGroup, preferredTurnKey?: string) => {
     const candidates = workGroupTurnKeys(group)
-      .map((key, index) => ({ plan: planHistory[key], index }))
+      .map((key, index) => ({ key, plan: planHistory[key], index }))
       .filter(
-        (candidate): candidate is { plan: PlanSnapshot; index: number } =>
+        (candidate): candidate is { key: string; plan: PlanSnapshot; index: number } =>
           Boolean(candidate.plan),
       );
     if (candidates.length === 0) return undefined;
+    const preferred = preferredTurnKey
+      ? candidates.find(
+          ({ key, plan }) =>
+            plan.turnId === preferredTurnKey ||
+            key === preferredTurnKey,
+        )
+      : undefined;
+    if (preferred) return preferred.plan;
     // A session can contain more than one server turn key. Prefer the
     // settled snapshot, then the newest timestamp, instead of the first key
     // that happened to create an activity. This prevents a stale pending
@@ -6879,8 +7229,13 @@ function App() {
         right.index - left.index;
     })[0].plan;
   };
-  const commentaryForWorkGroup = (group: WorkLogGroup) => {
-    const keys = new Set(workGroupTurnKeys(group));
+  const commentaryForWorkGroup = (
+    group: WorkLogGroup,
+    preferredTurnKey?: string,
+  ) => {
+    const keys = new Set(
+      preferredTurnKey ? [preferredTurnKey] : workGroupTurnKeys(group),
+    );
     return commentaryEntries.filter(
       (entry) => entry.turnId && keys.has(entry.turnId),
     );
@@ -6975,7 +7330,9 @@ function App() {
         }
 
         const reports = await invoke<V1ImportReport[]>("local_store_import_v1");
-        const snapshot = await invoke<LocalStoreSnapshot>("local_store_load");
+        const snapshot = normalizeLocalStoreSnapshot(
+          await invoke<LocalStoreSnapshot>("local_store_load"),
+        );
         if (!active) return;
 
         if (projectMutationRevisionRef.current !== hydrationRevision) {
@@ -6992,7 +7349,26 @@ function App() {
         const browserWorkItems = loadStoredWorkItemMap();
         const localProjects = projects;
         const mergedThreadIds: Record<string, string> = { ...threadIds };
-        const localConversationCache: Record<string, SyncConversation> = {};
+        const localConversationCache: Record<string, SyncConversation> =
+          isTauri ? {} : loadStoredGeneralConversations();
+        for (const [key, conversation] of Object.entries(
+          snapshot.conversations,
+        )) {
+          if (conversation.scope !== "general") continue;
+          const id = conversation.id;
+          if (!id) continue;
+          const generalKey = generalConversationCacheKey(id);
+          localConversationCache[generalKey] = {
+            ...conversation,
+            id,
+            scope: "general",
+            projectId: null,
+            messages: dropUnrecoverablePersistedAnswers(
+              conversation.messages ?? [],
+            ),
+            workItems: mergeWorkItems(conversation.workItems ?? [], []),
+          };
+        }
         const matchedLocalProjectIds = new Set<string>();
         const dbProjects = snapshot.projects
           .map((project) => {
@@ -7105,6 +7481,7 @@ function App() {
             );
             localConversationCache[localKey] = {
               id: databaseConversation?.id,
+              scope: "coding",
               projectId: project.id,
               title,
               messages: dropUnrecoverablePersistedAnswers(
@@ -7178,6 +7555,7 @@ function App() {
             );
             localConversationCache[localKey] = {
               id: databaseConversation?.id,
+              scope: "coding",
               projectId: local.id,
               title,
               messages: dropUnrecoverablePersistedAnswers(
@@ -7210,30 +7588,62 @@ function App() {
         localConversationCacheRef.current = localConversationCache;
         setLocalConversationCache(localConversationCache);
 
-        const selectedProject =
-          nextProjects.find((project) => project.name === activeProject) ??
-          nextProjects[0];
-        if (selectedProject) {
-          const selectedThread = preferredThreadForProject(
-            selectedProject,
-            localConversationCache,
-            activeThread,
-          );
-          const selectedKey = `${selectedProject.path}/${selectedThread}`;
+        // Hydration is asynchronous. The user may select another project or
+        // thread while SQLite is loading; using the render-time closure here
+        // used to snap the GUI back to the stale startup selection seconds
+        // later (and could send the next prompt into the wrong conversation).
+        if (activeModeRef.current === "general") {
+          const selectedId = activeGeneralConversationIdRef.current;
+          const selectedKey = selectedId
+            ? generalConversationCacheKey(selectedId)
+            : "general::new";
+          const selectedConversation = selectedId
+            ? localConversationCache[selectedKey]
+            : undefined;
+          const resolvedId = selectedConversation?.id ?? null;
+          updateActiveGeneralConversationId(resolvedId);
+          if (resolvedId) {
+            localStorage.setItem(
+              ACTIVE_GENERAL_CONVERSATION_STORAGE_KEY,
+              resolvedId,
+            );
+          } else {
+            localStorage.removeItem(ACTIVE_GENERAL_CONVERSATION_STORAGE_KEY);
+          }
           messageKeyRef.current = selectedKey;
           workLogKeyRef.current = selectedKey;
-          setActiveProject(selectedProject.name);
-          setActiveThread(selectedThread);
-          const selectedConversation = localConversationCache[selectedKey];
           commitMessages(selectedConversation?.messages ?? []);
-          setCodeActivity(selectedConversation?.workItems ?? []);
-          const selectedHistory = selectedConversation?.planHistory ?? {};
-          setPlanHistory(selectedHistory);
-          setActivePlan(
-            Object.values(selectedHistory).at(-1) ??
-              loadThreadPlan(selectedKey),
-          );
+          setCodeActivity([]);
+          setPlanHistory(selectedConversation?.planHistory ?? {});
+          setActivePlan({ turnId: null, explanation: "", steps: [] });
           setCommentaryEntries(selectedConversation?.commentary ?? []);
+        } else {
+          const selectedProject =
+            nextProjects.find(
+              (project) => project.name === activeProjectRef.current,
+            ) ?? nextProjects[0];
+          if (selectedProject) {
+            const selectedThread = preferredThreadForProject(
+              selectedProject,
+              localConversationCache,
+              activeThreadRef.current,
+            );
+            const selectedKey = `${selectedProject.path}/${selectedThread}`;
+            messageKeyRef.current = selectedKey;
+            workLogKeyRef.current = selectedKey;
+            setActiveProject(selectedProject.name);
+            setActiveThread(selectedThread);
+            const selectedConversation = localConversationCache[selectedKey];
+            commitMessages(selectedConversation?.messages ?? []);
+            setCodeActivity(selectedConversation?.workItems ?? []);
+            const selectedHistory = selectedConversation?.planHistory ?? {};
+            setPlanHistory(selectedHistory);
+            setActivePlan(
+              Object.values(selectedHistory).at(-1) ??
+                loadThreadPlan(selectedKey),
+            );
+            setCommentaryEntries(selectedConversation?.commentary ?? []);
+          }
         }
 
         const inserted = reports.reduce(
@@ -7263,13 +7673,13 @@ function App() {
   }, [workspaceRoot, localStoreReady]);
 
   useEffect(() => {
-    if (!isTauri || !activeProjectData.path) return;
+    if (activeMode !== "coding" || !isTauri || !activeProjectData.path) return;
     void invoke<boolean>("ensure_project_instructions", {
       path: activeProjectData.path,
     }).catch((error) => {
       console.warn("Projekt AGENTS.md seeding failed", error);
     });
-  }, [activeProjectData.path]);
+  }, [activeMode, activeProjectData.path]);
 
   useEffect(() => {
     if (
@@ -7293,7 +7703,10 @@ function App() {
         const currentConversationCache = localConversationCacheRef.current;
         const currentThreadIds = threadIdsRef.current;
         setSyncHealth(result.health);
-        const state = result.snapshot;
+        const state = normalizeLocalStoreSnapshot(result.snapshot);
+        const hasGeneralConversations = Object.values(state.conversations).some(
+          (conversation) => conversation.scope === "general",
+        );
         const remoteTombstones = state.tombstones ?? [];
         const localCursorRecovery = result.warnings.some((warning) =>
           warning.includes("helyi sync cursor"),
@@ -7324,7 +7737,11 @@ function App() {
         }
 
         setTombstones(remoteTombstones);
-        if (state.projects.length === 0 && remoteTombstones.length === 0) {
+        if (
+          state.projects.length === 0 &&
+          remoteTombstones.length === 0 &&
+          !hasGeneralConversations
+        ) {
           setSyncReady(true);
           return;
         }
@@ -7425,7 +7842,7 @@ function App() {
           }
         }
         const visibleProjects = dedupeProjects(mergedProjects);
-        if (visibleProjects.length === 0) {
+        if (visibleProjects.length === 0 && activeModeRef.current !== "general") {
           if (remoteTombstones.length > 0) {
             setProjects([]);
             setLocalConversationCache({});
@@ -7455,6 +7872,37 @@ function App() {
           ...currentConversationCache,
         };
         const syncedThreadIds: Record<string, string> = { ...currentThreadIds };
+        for (const conversation of Object.values(state.conversations)) {
+          if (conversation.scope !== "general" || !conversation.id) continue;
+          const key = generalConversationCacheKey(conversation.id);
+          const cached = currentConversationCache[key];
+          nextLocalConversationCache[key] = {
+            ...conversation,
+            id: conversation.id,
+            scope: "general",
+            projectId: null,
+            messages: dropUnrecoverablePersistedAnswers(
+              mergeMessages(
+                conversation.messages ?? [],
+                cached?.messages ?? [],
+                false,
+              ),
+            ),
+            workItems: mergeWorkItems(
+              conversation.workItems ?? [],
+              cached?.workItems ?? [],
+            ),
+            planHistory: mergePlanHistory(
+              conversation.planHistory ?? {},
+              cached?.planHistory ?? {},
+            ),
+            commentary: mergeCommentary(
+              conversation.commentary ?? [],
+              cached?.commentary ?? [],
+            ),
+            threadId: null,
+          };
+        }
         for (const project of visibleProjects) {
           const localProject = matchingLocalProject(project);
           for (const title of project.threads) {
@@ -7539,6 +7987,7 @@ function App() {
             cachedWorkLogs[localKey] = mergedWorkItems;
             nextLocalConversationCache[localKey] = {
               id: conversation?.id ?? cachedConversation?.id,
+              scope: "coding",
               projectId: project.id,
               title,
               messages: mergedMessages,
@@ -7554,6 +8003,43 @@ function App() {
             };
             if (localThreadId) syncedThreadIds[localKey] = localThreadId;
           }
+        }
+        if (activeModeRef.current === "general") {
+          const selectedId = activeGeneralConversationIdRef.current;
+          const selectedKey = selectedId
+            ? generalConversationCacheKey(selectedId)
+            : "general::new";
+          const selectedConversation = selectedId
+            ? nextLocalConversationCache[selectedKey]
+            : undefined;
+          const resolvedId = selectedConversation?.id ?? null;
+          projectsRef.current = visibleProjects;
+          threadIdsRef.current = syncedThreadIds;
+          localConversationCacheRef.current = nextLocalConversationCache;
+          setLocalConversationCache(nextLocalConversationCache);
+          setThreadIds(syncedThreadIds);
+          setProjects(visibleProjects);
+          updateActiveGeneralConversationId(resolvedId);
+          if (resolvedId) {
+            localStorage.setItem(
+              ACTIVE_GENERAL_CONVERSATION_STORAGE_KEY,
+              resolvedId,
+            );
+          } else {
+            localStorage.removeItem(ACTIVE_GENERAL_CONVERSATION_STORAGE_KEY);
+          }
+          commitMessages(selectedConversation?.messages ?? []);
+          setCodeActivity([]);
+          const selectedHistory = selectedConversation?.planHistory ?? {};
+          setPlanHistory(selectedHistory);
+          setActivePlan({ turnId: null, explanation: "", steps: [] });
+          setCommentaryEntries(selectedConversation?.commentary ?? []);
+          messageKeyRef.current = selectedKey;
+          workLogKeyRef.current = selectedKey;
+          setSyncWriteEnabled(result.canWrite);
+          setSyncStatus(result.canWrite ? "szinkronizÃ¡lva" : "karantÃ©n Â· olvasÃ¡s");
+          setSyncReady(true);
+          return;
         }
         const pendingRestore = pendingRestoreSelectionRef.current;
         const restoredProject = pendingRestore
@@ -7717,7 +8203,12 @@ function App() {
       // This cache is only a browser-preview fallback. Keeping it in the
       // desktop profile can resurrect deleted Tree entries on the next boot.
       localStorage.removeItem(PROJECTS_STORAGE_KEY);
-      if (projects.length === 0) {
+      // `projects` is intentionally empty while SQLite/OneDrive hydration is
+      // running. Clearing the active keys during that transient state made
+      // every restart forget the exact conversation and fall back to the
+      // newest thread. Only clear a selection after the canonical store has
+      // finished loading and is genuinely empty.
+      if (localStoreReady && projects.length === 0) {
         localStorage.removeItem("min-active-project");
         localStorage.removeItem("min-active-thread");
         if (activeProject) setActiveProject("");
@@ -7750,6 +8241,19 @@ function App() {
     () => localStorage.setItem("min-active-thread", activeThread),
     [activeThread],
   );
+  useEffect(() => {
+    localStorage.setItem(ACTIVE_MODE_STORAGE_KEY, activeMode);
+  }, [activeMode]);
+  useEffect(() => {
+    if (activeGeneralConversationId) {
+      localStorage.setItem(
+        ACTIVE_GENERAL_CONVERSATION_STORAGE_KEY,
+        activeGeneralConversationId,
+      );
+    } else {
+      localStorage.removeItem(ACTIVE_GENERAL_CONVERSATION_STORAGE_KEY);
+    }
+  }, [activeGeneralConversationId]);
 
   useEffect(() => {
     if (isTauri && (!syncReady || !localStoreReady)) return;
@@ -7768,15 +8272,23 @@ function App() {
           ...current,
           [threadKey]: {
           ...(existing ?? {
-            projectId: activeProjectData.id,
-            title: activeThread,
+            scope: activeMode,
+            projectId: activeMode === "general" ? null : activeProjectData.id,
+            title:
+              activeMode === "general"
+                ? activeGeneralConversation?.title ?? "Új beszélgetés"
+                : activeThread,
             messages: [],
             workItems: [],
-            threadId: threadIds[threadKey] ?? null,
+            threadId: activeMode === "general" ? null : threadIds[threadKey] ?? null,
             updatedAt: new Date().toISOString(),
           }),
-          projectId: activeProjectData.id,
-          title: activeThread,
+          scope: activeMode,
+          projectId: activeMode === "general" ? null : activeProjectData.id,
+          title:
+            activeMode === "general"
+              ? activeGeneralConversation?.title ?? "Új beszélgetés"
+              : activeThread,
           messages: mergeMessages(existing?.messages ?? [], messages, false),
           updatedAt: new Date().toISOString(),
         },
@@ -7787,11 +8299,41 @@ function App() {
       return;
     }
     saveThreadMessages(threadKey, messages);
+    if (activeMode === "general") {
+      setLocalConversationCache((current) => {
+        const existing = current[threadKey];
+        const next = {
+          ...current,
+          [threadKey]: {
+            ...(existing ?? {
+              id: activeGeneralConversationId ?? undefined,
+              scope: "general" as const,
+              projectId: null,
+              title: activeGeneralConversation?.title ?? "Új beszélgetés",
+              messages: [],
+              workItems: [],
+              threadId: null,
+              updatedAt: new Date().toISOString(),
+            }),
+            id: existing?.id ?? activeGeneralConversationId ?? undefined,
+            scope: "general" as const,
+            projectId: null,
+            title: activeGeneralConversation?.title ?? "Új beszélgetés",
+            messages,
+            updatedAt: new Date().toISOString(),
+          },
+        };
+        localConversationCacheRef.current = next;
+        return next;
+      });
+    }
   }, [
     threadKey,
     messages,
     syncReady,
     localStoreReady,
+    activeMode,
+    activeGeneralConversation?.title,
     activeProjectData.id,
     activeThread,
     threadIds,
@@ -7816,15 +8358,23 @@ function App() {
           ...current,
           [threadKey]: {
           ...(existing ?? {
-            projectId: activeProjectData.id,
-            title: activeThread,
+            scope: activeMode,
+            projectId: activeMode === "general" ? null : activeProjectData.id,
+            title:
+              activeMode === "general"
+                ? activeGeneralConversation?.title ?? "Új beszélgetés"
+                : activeThread,
             messages: [],
             workItems: [],
-            threadId: threadIds[threadKey] ?? null,
+            threadId: activeMode === "general" ? null : threadIds[threadKey] ?? null,
             updatedAt: new Date().toISOString(),
           }),
-          projectId: activeProjectData.id,
-          title: activeThread,
+          scope: activeMode,
+          projectId: activeMode === "general" ? null : activeProjectData.id,
+          title:
+            activeMode === "general"
+              ? activeGeneralConversation?.title ?? "Új beszélgetés"
+              : activeThread,
           workItems: mergeWorkItems(existing?.workItems ?? [], codeActivity),
           updatedAt: new Date().toISOString(),
         },
@@ -7840,6 +8390,8 @@ function App() {
     codeActivity,
     syncReady,
     localStoreReady,
+    activeMode,
+    activeGeneralConversation?.title,
     activeProjectData.id,
     activeThread,
     threadIds,
@@ -7873,7 +8425,33 @@ function App() {
         };
       });
     }
-  }, [threadKey, planHistory, isTauri, localStoreReady]);
+    if (!isTauri && activeMode === "general") {
+      setLocalConversationCache((current) => ({
+        ...current,
+        [threadKey]: {
+          ...(current[threadKey] ?? {
+            id: activeGeneralConversationId ?? undefined,
+            scope: "general" as const,
+            projectId: null,
+            title: activeGeneralConversation?.title ?? "Új beszélgetés",
+            messages,
+            workItems: [],
+            threadId: null,
+            updatedAt: new Date().toISOString(),
+          }),
+          planHistory,
+        },
+      }));
+    }
+  }, [
+    threadKey,
+    planHistory,
+    isTauri,
+    localStoreReady,
+    activeMode,
+    activeGeneralConversationId,
+    activeGeneralConversation?.title,
+  ]);
 
   useEffect(() => {
     if (commentaryKeyRef.current !== threadKey) {
@@ -7898,7 +8476,37 @@ function App() {
         };
       });
     }
-  }, [threadKey, commentaryEntries, isTauri, localStoreReady]);
+    if (!isTauri && activeMode === "general") {
+      setLocalConversationCache((current) => ({
+        ...current,
+        [threadKey]: {
+          ...(current[threadKey] ?? {
+            id: activeGeneralConversationId ?? undefined,
+            scope: "general" as const,
+            projectId: null,
+            title: activeGeneralConversation?.title ?? "Új beszélgetés",
+            messages,
+            workItems: [],
+            threadId: null,
+            updatedAt: new Date().toISOString(),
+          }),
+          commentary: commentaryEntries,
+        },
+      }));
+    }
+  }, [
+    threadKey,
+    commentaryEntries,
+    isTauri,
+    localStoreReady,
+    activeMode,
+    activeGeneralConversationId,
+    activeGeneralConversation?.title,
+  ]);
+
+  useEffect(() => {
+    if (!isTauri) persistStoredGeneralConversations(localConversationCache);
+  }, [localConversationCache]);
 
   useEffect(() => {
     const stream = messageStreamRef.current;
@@ -7947,7 +8555,7 @@ function App() {
       !workspaceRoot ||
       !localStoreReady ||
       !localStoreWriteEnabled ||
-      (!syncReady && !pendingLocalMutationRef.current)
+      !pendingLocalMutationRef.current
     )
       return;
     const revisionAtSchedule = projectMutationRevisionRef.current;
@@ -7973,7 +8581,12 @@ function App() {
         for (const title of project.threads) {
           const localKey = `${project.path}/${title}`;
           const cached = localConversationCacheRef.current[localKey];
-          const projectIsActive = project.name === currentActiveProject;
+          // GENERAL renders the same composer/message state while the last
+          // Coding project remains selected in the background. Never copy a
+          // General message into that project's conversation during the
+          // debounced SQLite snapshot save.
+          const projectIsActive =
+            activeMode === "coding" && project.name === currentActiveProject;
           const conversationMessages =
             projectIsActive && title === currentActiveThread
               ? mergeMessages(
@@ -8016,6 +8629,7 @@ function App() {
             currentThreadIds[localKey] ?? cached?.threadId ?? null;
           conversations[syncConversationKey(project.id, title)] = {
             id: cached?.id,
+            scope: "coding",
             projectId: project.id,
             title,
             messages: compactMessages(conversationMessages),
@@ -8026,6 +8640,46 @@ function App() {
             updatedAt: cached?.updatedAt ?? new Date().toISOString(),
           };
         }
+      }
+
+      for (const [key, cached] of Object.entries(
+        localConversationCacheRef.current,
+      )) {
+        if (cached.scope !== "general" || !cached.id) continue;
+        const selectedGeneralId =
+          activeMode === "general"
+            ? activeGeneralConversationId ??
+              activeGeneralConversationIdRef.current
+            : null;
+        const activeGeneralKey =
+          activeMode === "general"
+            ? selectedGeneralId
+              ? generalConversationCacheKey(selectedGeneralId)
+              : "general::new"
+            : null;
+        const isActive =
+          activeGeneralKey !== null && key === activeGeneralKey;
+        const conversationMessages = isActive
+          ? mergeMessages(cached.messages ?? [], currentMessages, false)
+          : cached.messages ?? [];
+        conversations[key] = {
+          ...cached,
+          id: cached.id,
+          scope: "general",
+          projectId: null,
+          messages: compactMessages(conversationMessages),
+          workItems: isActive
+            ? mergeWorkItems(cached.workItems ?? [], currentWorkItems)
+            : cached.workItems ?? [],
+          planHistory: isActive
+            ? mergePlanHistory(cached.planHistory ?? {}, planHistoryRef.current)
+            : cached.planHistory ?? {},
+          commentary: isActive
+            ? mergeCommentary(cached.commentary ?? [], commentaryEntriesRef.current)
+            : cached.commentary ?? [],
+          threadId: null,
+          updatedAt: isActive ? new Date().toISOString() : cached.updatedAt,
+        };
       }
 
       const snapshot: LocalStoreSnapshot = {
@@ -8041,9 +8695,11 @@ function App() {
           // mutation. Never let that stale snapshot archive the newer state.
           if (projectMutationRevisionRef.current !== revisionAtSchedule) return;
           setLocalStoreStatus("mentés…");
-          const saved = await invoke<LocalStoreSnapshot>("local_store_save", {
-            snapshot,
-          });
+          const saved = normalizeLocalStoreSnapshot(
+            await invoke<LocalStoreSnapshot>("local_store_save", {
+              snapshot: snapshotForStorage(snapshot),
+            }),
+          );
           if (projectMutationRevisionRef.current !== revisionAtSchedule) {
             setLocalStoreStatus("újabb módosítás mentése…");
             return;
@@ -8075,12 +8731,12 @@ function App() {
             return next;
           });
           setLocalStoreStatus("kész");
-          if (syncWriteEnabled && (syncReady || pendingMutationAtSchedule)) {
+          if (syncWriteEnabled && pendingMutationAtSchedule) {
             setSyncStatus("journal…");
             try {
               const result = await invoke<SyncV2Result>(
                 "sync_v2_publish_snapshot",
-                { snapshot: saved },
+                { snapshot: snapshotForStorage(saved) },
               );
               setSyncHealth(result.health);
               if (!result.canWrite) {
@@ -8114,16 +8770,25 @@ function App() {
         setLocalStoreStatus("karantén · mentési hiba");
         console.warn("Local SQLite snapshot save failed", error);
       });
-    }, 350);
+    // A completed turn must reach SQLite before the user can close/restart
+    // the desktop app. Keep the debounce while deltas are arriving, but
+    // flush the settled/final answer on the next event-loop turn instead of
+    // leaving it in a 350 ms crash window.
+    }, isStreaming && !turnCompletedRequestId ? 350 : 0);
     return () => window.clearTimeout(timer);
   }, [
     activeProject,
     activeThread,
+    activeMode,
+    activeGeneralConversationId,
     codeActivity,
     localStoreReady,
     localStoreWriteEnabled,
+    localMutationRevision,
     messages,
     projects,
+    isStreaming,
+    turnCompletedRequestId,
     syncReady,
     syncWriteEnabled,
     threadIds,
@@ -8284,6 +8949,21 @@ function App() {
       if (!activeRequestIdRef.current) return;
       const codexEvent = normalizeCodexEvent(event.payload);
       if (!codexEvent) return;
+      if (
+        codexEvent.requestId &&
+        codexEvent.requestId !== activeRequestIdRef.current
+      )
+        return;
+      if (codexEvent.sequence !== undefined) {
+        const eventKey = `${codexEvent.requestId ?? activeRequestIdRef.current}:${codexEvent.sequence}`;
+        const processed = processedCodexEventsRef.current;
+        if (processed.has(eventKey)) return;
+        processed.add(eventKey);
+        if (processed.size > 4096) {
+          const oldest = processed.values().next().value;
+          if (oldest) processed.delete(oldest);
+        }
+      }
       const params = asRecord(codexEvent.payload);
       const item = asRecord(params.item);
       const explicitTurnId = eventTurnId(codexEvent, params, item);
@@ -8526,11 +9206,70 @@ function App() {
         setCodeStatus("dolgozik");
       } else if (codexEvent.eventType === "turn/completed") {
         const completedRequestId = activeRequestIdRef.current;
+        const completedAt = Date.now();
+        const completedAnswerText = firstString(
+          params.finalText,
+          params.final_text,
+        );
+        const completedMessageId = activeLiveMessageIdRef.current;
+        commitMessages((current) => {
+          const targetIndex = completedMessageId
+            ? current.findIndex((message) => message.id === completedMessageId)
+            : -1;
+          const fallbackIndex = current.findIndex(
+            (message) =>
+              message.role === "assistant" &&
+              message.live &&
+              message.turnId === uiTurnId,
+          );
+          const answerIndex = targetIndex >= 0 ? targetIndex : fallbackIndex;
+          if (answerIndex >= 0) {
+            return current.map((message, index) => {
+              if (index !== answerIndex) return message;
+              return {
+                ...message,
+                text:
+                  completedAnswerText ||
+                  stripStaleInterruptionMarker(message).text,
+                time:
+                  message.time === "most"
+                    ? new Date(completedAt).toISOString()
+                    : message.time,
+                live: false,
+                final: true,
+                interrupted: false,
+              };
+            });
+          }
+          if (!completedAnswerText) return current;
+          // A stale sync pull may have removed the optimistic live row before
+          // the terminal event. Preserve the completed answer in the visible
+          // turn instead of silently dropping it.
+          return [
+            ...current,
+            {
+              id: completedMessageId ?? createEntityId(),
+              role: "assistant" as const,
+              time: new Date(completedAt).toISOString(),
+              text: completedAnswerText,
+              live: false,
+              final: true,
+              interrupted: false,
+              sequence: nextTimelineSequence(),
+              turnId: uiTurnId,
+            },
+          ];
+        });
+        // `turn/completed` is the durable answer boundary. Protect this
+        // terminal message from an in-flight pull and force the zero-delay
+        // SQLite + journal flush before the slower workspace guard finishes.
+        projectMutationRevisionRef.current += 1;
+        pendingLocalMutationRef.current = true;
+        setSyncReady(false);
         if (completedRequestId) {
           turnCompletedRequestIdRef.current = completedRequestId;
           setTurnCompletedRequestId(completedRequestId);
         }
-        const completedAt = Date.now();
         const completedSteps = activePlanRef.current.steps.map((step) =>
           step.status === "inProgress"
             ? { ...step, status: "completed" as const }
@@ -8732,6 +9471,10 @@ function App() {
       .filter((file): file is File => Boolean(file));
     if (imageFiles.length === 0) return;
     event.preventDefault();
+    if (activeMode === "general") {
+      notify("A GENERAL mód jelenleg szöveges beszélgetésre készült.", "notify");
+      return;
+    }
     const pastedText = event.clipboardData.getData("text/plain");
     if (pastedText) {
       const textarea = event.currentTarget;
@@ -9140,6 +9883,123 @@ function App() {
     });
   };
 
+  const renameGeneralConversation = (conversation: SyncConversation) => {
+    if (blockConversationMutationDuringStream() || !conversation.id) return;
+    setAppDialog({
+      kind: "input",
+      title: "Beszélgetés átnevezése",
+      label: "Beszélgetés neve",
+      value: conversation.title,
+      confirmLabel: "Mentés",
+      onConfirm: (value) => {
+        if (blockConversationMutationDuringStream()) return false;
+        const nextTitle = value.trim();
+        if (!nextTitle) return false;
+        if (nextTitle === conversation.title) return true;
+        const duplicate = Object.values(localConversationCacheRef.current).some(
+          (candidate) =>
+            candidate.scope === "general" &&
+            candidate.id !== conversation.id &&
+            candidate.title.trim().toLowerCase() === nextTitle.toLowerCase(),
+        );
+        if (duplicate) {
+          notify("Ez a beszélgetésnév már használatban van a GENERAL módban");
+          return false;
+        }
+        const key = generalConversationCacheKey(conversation.id!);
+        const current = localConversationCacheRef.current[key];
+        if (!current) return false;
+        const nextConversation: SyncConversation = {
+          ...current,
+          scope: "general",
+          projectId: null,
+          title: nextTitle,
+          updatedAt: new Date().toISOString(),
+        };
+        const nextCache = {
+          ...localConversationCacheRef.current,
+          [key]: nextConversation,
+        };
+        markLocalMutation();
+        localConversationCacheRef.current = nextCache;
+        setLocalConversationCache(nextCache);
+        setOpenMenu(null);
+        notify(`Beszélgetés átnevezve: ${nextTitle}`);
+        return true;
+      },
+    });
+  };
+
+  const performDeleteGeneralConversation = (conversation: SyncConversation) => {
+    if (blockConversationMutationDuringStream() || !conversation.id) return;
+    const conversationId = conversation.id;
+    const key = generalConversationCacheKey(conversationId);
+    const nextCache = { ...localConversationCacheRef.current };
+    delete nextCache[key];
+    markLocalMutation();
+    localConversationCacheRef.current = nextCache;
+    setLocalConversationCache(nextCache);
+    if (isTauri) {
+      setTombstones((current) => [
+        ...current.filter(
+          (tombstone) =>
+            !(
+              tombstone.entityType === "conversation" &&
+              tombstone.entityId === conversationId
+            ),
+        ),
+        {
+          entityType: "conversation",
+          entityId: conversationId,
+          archivedAt: new Date().toISOString(),
+          projectId: null,
+          title: conversation.title,
+          reason: "GENERAL beszélgetés eltávolítva az alkalmazásból",
+        },
+      ]);
+    }
+    setOpenMenu(null);
+    if (activeGeneralConversationIdRef.current === conversationId) {
+      const replacement = Object.values(nextCache)
+        .filter(
+          (candidate) =>
+            candidate.scope === "general" && Boolean(candidate.id),
+        )
+        .sort((left, right) => {
+          const leftTime = Date.parse(left.updatedAt ?? "");
+          const rightTime = Date.parse(right.updatedAt ?? "");
+          return (
+            (Number.isFinite(rightTime) ? rightTime : 0) -
+              (Number.isFinite(leftTime) ? leftTime : 0) ||
+            (right.id ?? "").localeCompare(left.id ?? "")
+          );
+        })[0];
+      const replacementId = replacement?.id ?? null;
+      activeModeRef.current = "general";
+      updateActiveGeneralConversationId(replacementId);
+      resetConversationView(
+        replacementId
+          ? generalConversationCacheKey(replacementId)
+          : "general::new",
+        replacement,
+        "general",
+      );
+    }
+    notify(`Beszélgetés törölve: ${conversation.title}`);
+  };
+
+  const deleteGeneralConversation = (conversation: SyncConversation) => {
+    if (blockConversationMutationDuringStream()) return;
+    setAppDialog({
+      kind: "confirm",
+      title: "Beszélgetés törlése",
+      message: `Biztosan törlöd a(z) „${conversation.title}” GENERAL beszélgetést?`,
+      confirmLabel: "Beszélgetés törlése",
+      danger: true,
+      onConfirm: () => performDeleteGeneralConversation(conversation),
+    });
+  };
+
   const changeProjectsRoot = async () => {
     if (blockConversationMutationDuringStream()) return;
     if (!isTauri) return;
@@ -9268,6 +10128,9 @@ function App() {
 
   const selectThread = (project: Project, thread: string) => {
     if (blockConversationMutationDuringStream()) return;
+    activeModeRef.current = "coding";
+    localStorage.setItem(ACTIVE_MODE_STORAGE_KEY, "coding");
+    setActiveMode("coding");
     setActiveProject(project.name);
     setActiveThread(thread);
     commitMessages(messagesForThread(`${project.path}/${thread}`));
@@ -9279,6 +10142,131 @@ function App() {
     );
     setExpandedWorkLogs({});
     notify(`Megnyitva: ${thread}`);
+  };
+
+  const resetConversationView = (
+    key: string,
+    conversation?: SyncConversation,
+    mode: AppMode = activeMode,
+  ) => {
+    messageKeyRef.current = key;
+    workLogKeyRef.current = key;
+    planKeyRef.current = key;
+    commentaryKeyRef.current = key;
+    commitMessages(conversation?.messages ?? []);
+    setCodeActivity(conversation?.workItems ?? []);
+    setCodeStatus(conversation?.workItems?.length ? "kÃ©sz" : "kÃ©szen");
+    const history = conversation?.planHistory ?? {};
+    setPlanHistory(history);
+    setActivePlan(
+      mode === "general"
+        ? { turnId: null, explanation: "", steps: [] }
+        : Object.values(history).at(-1) ?? loadThreadPlan(key),
+    );
+    setCommentaryEntries(conversation?.commentary ?? []);
+    setExpandedWorkLogs({});
+    shouldStickToBottom.current = true;
+    setIsAtBottom(true);
+  };
+
+  const touchGeneralConversation = (conversationId: string) => {
+    const key = generalConversationCacheKey(conversationId);
+    const conversation = localConversationCacheRef.current[key];
+    if (!conversation) return undefined;
+    const touchedConversation: SyncConversation = {
+      ...conversation,
+      scope: "general",
+      projectId: null,
+      updatedAt: new Date().toISOString(),
+    };
+    const nextCache = {
+      ...localConversationCacheRef.current,
+      [key]: touchedConversation,
+    };
+    localConversationCacheRef.current = nextCache;
+    setLocalConversationCache(nextCache);
+    markLocalMutation();
+    return touchedConversation;
+  };
+
+  const selectGeneralConversation = (conversationId: string) => {
+    if (blockConversationMutationDuringStream()) return;
+    const key = generalConversationCacheKey(conversationId);
+    const conversation = localConversationCacheRef.current[key];
+    if (!conversation) return;
+    activeModeRef.current = "general";
+    localStorage.setItem(ACTIVE_MODE_STORAGE_KEY, "general");
+    updateActiveGeneralConversationId(conversationId);
+    resetConversationView(
+      key,
+      touchGeneralConversation(conversationId) ?? conversation,
+      "general",
+    );
+    setOpenMenu(null);
+  };
+
+  const newGeneralConversation = () => {
+    if (blockConversationMutationDuringStream()) return;
+    activeModeRef.current = "general";
+    localStorage.setItem(ACTIVE_MODE_STORAGE_KEY, "general");
+    updateActiveGeneralConversationId(null);
+    resetConversationView("general::new", undefined, "general");
+    setOpenMenu(null);
+    setSettingsOpen(false);
+    inputRef.current?.focus();
+  };
+
+  const selectAppMode = (mode: AppMode) => {
+    if (
+      mode === activeModeRef.current ||
+      blockConversationMutationDuringStream()
+    )
+      return;
+    // Keep the selection authoritative immediately. Hydration and sync are
+    // asynchronous and must not finish by routing the next prompt into the
+    // mode that was active when their request started.
+    activeModeRef.current = mode;
+    localStorage.setItem(ACTIVE_MODE_STORAGE_KEY, mode);
+    setActiveMode(mode);
+    setNewProjectMenuOpen(false);
+    if (mode === "general") {
+      const selectedId = activeGeneralConversationIdRef.current;
+      const conversation = selectedId
+        ? localConversationCacheRef.current[
+            generalConversationCacheKey(selectedId)
+          ]
+        : undefined;
+      resetConversationView(
+        selectedId
+          ? generalConversationCacheKey(selectedId)
+          : "general::new",
+        conversation,
+        "general",
+      );
+      return;
+    }
+    const project =
+      projectsRef.current.find(
+        (candidate) => candidate.name === activeProjectRef.current,
+      ) ?? projectsRef.current[0];
+    if (!project) {
+      resetConversationView("/", undefined, "coding");
+      return;
+    }
+    const thread = preferredThreadForProject(
+      project,
+      localConversationCacheRef.current,
+      activeThreadRef.current,
+    );
+    activeProjectRef.current = project.name;
+    activeThreadRef.current = thread;
+    setActiveProject(project.name);
+    setActiveThread(thread);
+    resetConversationView(
+      `${project.path}/${thread}`,
+      localConversationCacheRef.current[`${project.path}/${thread}`],
+      "coding",
+    );
   };
 
   const createRequestId = () =>
@@ -9342,8 +10330,14 @@ function App() {
         ),
       );
       settleActivePlan("error");
+      isStreamingRef.current = false;
       setIsStreaming(false);
       setIsCancelling(false);
+      // `codex_send` runs in a native background task and may only settle
+      // after the process has been killed. Release the client-side submit
+      // guard here so a cancelled request cannot block the next message.
+      submitBusyRef.current = false;
+      setImagesPreparing(false);
       setCodeStatus("kész");
       setWatchdogMessage("");
     };
@@ -9392,9 +10386,13 @@ function App() {
 
   useEffect(() => {
     const onSendButtonClick = (event: MouseEvent) => {
+      const requestId = activeRequestIdRef.current;
+      const completed = Boolean(
+        requestId && turnCompletedRequestIdRef.current === requestId,
+      );
       if (
-        !isStreaming ||
-        activeTurnHasCompleted ||
+        !isStreamingRef.current ||
+        completed ||
         !(event.target instanceof Element)
       )
         return;
@@ -9410,8 +10408,14 @@ function App() {
 
   const submitMessage = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const generalInstruction = inputDraftRef.current.trim();
-    const quoteSnapshot = composerQuotes
+    const pendingRegeneration = regenerationTargetRef.current;
+    regenerationTargetRef.current = null;
+    const generalInstruction = (
+      pendingRegeneration?.source.text ?? inputDraftRef.current
+    ).trim();
+    const quoteSnapshot = (
+      pendingRegeneration?.source.quoteRefs ?? composerQuotes
+    )
       .map((quote) => ({
         ...quote,
         instruction: (
@@ -9444,10 +10448,12 @@ function App() {
     ]
       .filter(Boolean)
       .join("\n\n");
-    const pendingImageSnapshot = [...pendingImages];
+    const pendingImageSnapshot = pendingRegeneration ? [] : [...pendingImages];
+    const requestMode = activeModeRef.current;
+    const isGeneralMode = requestMode === "general";
     if (
       (!text && quoteSnapshot.length === 0 && pendingImageSnapshot.length === 0) ||
-      isStreaming ||
+      isStreamingRef.current ||
       submitBusyRef.current
     )
       return;
@@ -9459,13 +10465,19 @@ function App() {
       notify("A natív Tauri appban érhető el a Codex-kapcsolat");
       return;
     }
-    if (!activeProjectData?.path) {
+    if (!isGeneralMode && !activeProjectData?.path) {
       notify("Előbb válassz vagy adj hozzá egy projektmappát");
+      return;
+    }
+    if (isGeneralMode && pendingImageSnapshot.length > 0) {
+      notify("A GENERAL kepfeltoltes meg nincs bekapcsolva.", "notify");
       return;
     }
     submitBusyRef.current = true;
     setImagesPreparing(true);
-    let storedImages: MessageImageAttachment[] = [];
+    let storedImages: MessageImageAttachment[] = [
+      ...(pendingRegeneration?.source.images ?? []),
+    ];
     try {
       if (pendingImageSnapshot.length > 0) {
         storedImages = await invoke<MessageImageAttachment[]>(
@@ -9491,47 +10503,112 @@ function App() {
     // restart-time sync pull that began before the user pressed Send, so its
     // older snapshot cannot replace the visible history mid-request.
     markLocalMutation();
-    const promptText = text || "Vizsgáld meg a csatolt képet vagy képeket.";
-    shouldStickToBottom.current = true;
-    setIsAtBottom(true);
+    shouldStickToBottom.current = !pendingRegeneration;
+    if (!pendingRegeneration) setIsAtBottom(true);
     const requestId = createRequestId();
-    const clientTurnId = `request:${requestId}`;
-    const liveMessageId = createEntityId();
-    const userSequence = nextTimelineSequence();
-    const liveSequence = nextTimelineSequence();
+    const fallbackTurnId = `request:${requestId}`;
     const requestStartedAt = Date.now();
-    const liveMessage: Message = {
-      id: liveMessageId,
-      role: "assistant",
-      time: "most",
-      text: "",
-      live: true,
-      final: false,
-      sequence: liveSequence,
-      turnId: clientTurnId,
-    };
+    const promptText = text || "VizsgÃ¡ld meg a csatolt kÃ©pet vagy kÃ©peket.";
+    let requestThreadKey = isGeneralMode
+      ? activeGeneralConversationIdRef.current
+        ? generalConversationCacheKey(activeGeneralConversationIdRef.current)
+        : "general::new"
+      : threadKey;
+    if (isGeneralMode && !activeGeneralConversationIdRef.current) {
+      activeModeRef.current = "general";
+      const conversationId = createEntityId();
+      const title = conversationTitleFromPrompt(
+        generalInstruction || quoteInstructionText || selectedQuote || promptText,
+      );
+      const generalKey = generalConversationCacheKey(conversationId);
+      const newConversation: SyncConversation = {
+        id: conversationId,
+        scope: "general",
+        projectId: null,
+        title,
+        messages: [],
+        workItems: [],
+        threadId: null,
+        updatedAt: new Date(requestStartedAt).toISOString(),
+      };
+      requestThreadKey = generalKey;
+      updateActiveGeneralConversationId(conversationId);
+      localConversationCacheRef.current = {
+        ...localConversationCacheRef.current,
+        [generalKey]: newConversation,
+      };
+      setLocalConversationCache((current) => ({
+        ...current,
+        [generalKey]: newConversation,
+      }));
+      messageKeyRef.current = generalKey;
+      workLogKeyRef.current = generalKey;
+      planKeyRef.current = generalKey;
+      commentaryKeyRef.current = generalKey;
+    }
     const previousMessages = mergeMessages(
-      localConversationCacheRef.current[threadKey]?.messages ?? [],
+      localConversationCacheRef.current[requestThreadKey]?.messages ?? [],
       messagesRef.current,
       false,
     );
-    const userMessageId = createEntityId();
-    const userMessage: Message = {
-      id: userMessageId,
-      role: "user",
-      time: new Date(requestStartedAt).toISOString(),
-      text,
-      images: storedImages,
-      quoteRefs: quoteSnapshot,
-      detailed: showDetailedTrace,
-      sequence: userSequence,
-    };
+    const regeneration = pendingRegeneration
+      ? beginAssistantRegeneration(
+          previousMessages,
+          pendingRegeneration.source,
+          pendingRegeneration.answer,
+          fallbackTurnId,
+        )
+      : undefined;
+    const clientTurnId = regeneration?.turnId ?? fallbackTurnId;
+    const userSequence = regeneration?.source.sequence ?? nextTimelineSequence();
+    const liveSequence =
+      regeneration?.originalAnswer.sequence ?? nextTimelineSequence();
+    const liveMessageId =
+      regeneration?.originalAnswer.id ?? createEntityId();
+    const liveMessage: Message = regeneration
+      ? {
+          ...regeneration.liveAnswer,
+          id: liveMessageId,
+          sequence: liveSequence,
+          interrupted: false,
+          changeSummary: undefined,
+        }
+      : {
+          id: liveMessageId,
+          role: "assistant",
+          time: "most",
+          text: "",
+          live: true,
+          final: false,
+          sequence: liveSequence,
+          turnId: clientTurnId,
+        };
+    const userMessageId = regeneration?.source.id ?? createEntityId();
+    const userMessage: Message = regeneration
+      ? regeneration.source
+      : {
+          id: userMessageId,
+          role: "user",
+          time: new Date(requestStartedAt).toISOString(),
+          text,
+          images: storedImages,
+          quoteRefs: quoteSnapshot,
+          detailed: showDetailedTrace,
+          sequence: userSequence,
+          // User and assistant rows share one client turn identity. This is the
+          // cross-device idempotency key even when cache/SQLite copies carry
+          // different row UUIDs.
+          turnId: clientTurnId,
+        };
     rememberDetailMode(userMessageId, showDetailedTrace);
-    const nextMessages = [...previousMessages, userMessage, liveMessage];
-    let requestThreadKey = threadKey;
-    const activeProjectForNaming = projects.find(
-      (project) => project.id === activeProjectData.id,
-    );
+    const nextMessages = regeneration
+      ? regeneration.messages.map((message, index) =>
+          index === regeneration.answerIndex ? liveMessage : message,
+        )
+      : [...previousMessages, userMessage, liveMessage];
+    const activeProjectForNaming = isGeneralMode
+      ? undefined
+      : projects.find((project) => project.id === activeProjectData.id);
     if (
       activeProjectForNaming &&
       (isUntitledConversation(activeThread) || !activeThread.trim()) &&
@@ -9562,6 +10639,7 @@ function App() {
           localConversationCacheRef.current[previousThreadKey];
         const nextConversation: SyncConversation = {
           ...(cachedConversation ?? {
+            scope: "coding",
             projectId: activeProjectForNaming.id,
             title: nextTitle,
             messages: [],
@@ -9569,6 +10647,7 @@ function App() {
             threadId: null,
             updatedAt: new Date().toISOString(),
           }),
+          scope: "coding",
           projectId: activeProjectForNaming.id,
           title: nextTitle,
           messages: nextMessages,
@@ -9642,17 +10721,21 @@ function App() {
     const initialPlan: PlanSnapshot = {
       turnId: clientTurnId,
       explanation: "",
-      steps: [
+      steps: isGeneralMode
+        ? []
+        : [
         {
           id: "client-pre-plan",
           step: "0. Terv előkészítése és feladatértelmezése",
           status: "inProgress",
         },
-      ],
+          ],
       startedAt: requestStartedAt,
-      stepTimes: {
+      stepTimes: isGeneralMode
+        ? {}
+        : {
         "client-pre-plan": { startedAt: requestStartedAt },
-      },
+          },
     };
     updatePlanState(initialPlan);
     commitMessages(nextMessages);
@@ -9664,6 +10747,7 @@ function App() {
     setPendingImages([]);
     turnCompletedRequestIdRef.current = null;
     setTurnCompletedRequestId(null);
+    processedCodexEventsRef.current.clear();
     preparingRequestIdRef.current = requestId;
     activeRequestIdRef.current = requestId;
     activeLiveMessageIdRef.current = liveMessageId;
@@ -9672,9 +10756,12 @@ function App() {
     setCodeStatus("dolgozik");
     const baseCodexPrompt = modelPrompt || promptText;
     let codexPrompt = baseCodexPrompt;
+    const requestContextMessages = regeneration
+      ? previousMessages.slice(0, regeneration.sourceIndex)
+      : previousMessages;
     const rehydrationContext =
-      conversationContextForRehydration(previousMessages);
-    if (isTauri && activeProjectData?.path) {
+      conversationContextForRehydration(requestContextMessages);
+    if (!isGeneralMode && isTauri && activeProjectData?.path) {
       const localFileContext = await loadLocalFileContext(
         promptText,
         rehydrationContext,
@@ -9684,6 +10771,15 @@ function App() {
         codexPrompt = `${baseCodexPrompt}\n\n${localFileContext}`;
     }
     if (cancelledRequestIdsRef.current.delete(requestId)) {
+      if (regeneration) {
+        commitMessages((current) =>
+          current.map((message) =>
+            message.id === liveMessageId
+              ? regeneration.originalAnswer
+              : message,
+          ),
+        );
+      }
       preparingRequestIdRef.current = null;
       activeRequestIdRef.current = null;
       activeLiveMessageIdRef.current = null;
@@ -9696,11 +10792,14 @@ function App() {
       const response = await invoke<CodexResponse>("codex_send", {
         request: {
           prompt: codexPrompt,
-          threadId: threadIds[requestThreadKey] ?? null,
+          // Regeneration creates a fresh branch from the context preceding the
+          // source prompt; the old native thread already contains the answer
+          // that is being replaced.
+          threadId: regeneration ? null : (threadIds[requestThreadKey] ?? null),
           conversationContext: rehydrationContext || null,
           model: selectedModel,
           effort: effectiveEffort,
-          cwd: activeProjectData.path,
+          cwd: isGeneralMode ? null : activeProjectData.path,
           images: storedImages,
           requestId,
         },
@@ -9710,10 +10809,10 @@ function App() {
         response.guard.changedFiles.length > 0 ||
         response.guard.addedFiles.length > 0 ||
         response.guard.removedFiles.length > 0;
-      let responseChangeSummary = hasAgentChanges
+      let responseChangeSummary = hasAgentChanges && !isGeneralMode
         ? changeSummaryFromGuard(response.guard)
         : [];
-      if (hasAgentChanges && isTauri) {
+      if (hasAgentChanges && !isGeneralMode && isTauri) {
         try {
           const preview = await invoke<AgentDiffPreview>("codex_preview_snapshot", {
             snapshotId: response.guard.snapshotId,
@@ -9724,35 +10823,63 @@ function App() {
           console.warn("Agent diff preview unavailable", error);
         }
       }
-      if (hasAgentChanges)
+      if (hasAgentChanges && !isGeneralMode)
         await applyAgentSnapshotAutomatically(response.guard);
-      setThreadIds((current) => ({
-        ...current,
-        [requestThreadKey]: response.threadId,
-      }));
+      if (!isGeneralMode) {
+        setThreadIds((current) => ({
+          ...current,
+          [requestThreadKey]: response.threadId,
+        }));
+      }
       commitMessages((current) => {
         const targetIndex = current.findIndex(
           (message) => message.id === liveMessageId,
         );
-        if (targetIndex < 0) return current;
-        return current.map((message, index) =>
-          index === targetIndex
-            ? {
-                ...message,
-                text: stripStaleInterruptionMarker(message).text || response.text,
-                turnId: message.turnId ?? activeTurnIdRef.current,
-                live: false,
-                final: true,
-                interrupted: false,
-                changeSummary:
-                  responseChangeSummary.length > 0
-                    ? responseChangeSummary
-                    : undefined,
-              }
-            : message,
+        const fallbackIndex = current.findIndex(
+          (message) =>
+            message.role === "assistant" &&
+            message.live &&
+            message.turnId === clientTurnId,
         );
+        const answerIndex = targetIndex >= 0 ? targetIndex : fallbackIndex;
+        const answerText =
+          answerIndex >= 0
+            ? stripStaleInterruptionMarker(current[answerIndex]).text ||
+              response.text
+            : response.text;
+        const answerFields = {
+          text: answerText,
+          turnId: clientTurnId,
+          live: false,
+          final: true,
+          interrupted: false,
+          changeSummary:
+            responseChangeSummary.length > 0
+              ? responseChangeSummary
+              : undefined,
+        };
+        if (answerIndex >= 0) {
+          return current.map((message, index) =>
+            index === answerIndex ? { ...message, ...answerFields } : message,
+          );
+        }
+        // A stale sync pull can replace the optimistic live row before the
+        // native command resolves. Do not lose the durable answer in that
+        // case; append it to this turn exactly once.
+        return [
+          ...current,
+          {
+            id: liveMessageId,
+            role: "assistant" as const,
+            time: new Date().toISOString(),
+            ...answerFields,
+            sequence: nextTimelineSequence(),
+          },
+        ];
       });
-      for (const filePath of extractMentionedFilePaths(response.text)) {
+      for (const filePath of isGeneralMode
+        ? []
+        : extractMentionedFilePaths(response.text)) {
         void invoke<string | null>("read_code_file", {
           cwd: activeProjectPathRef.current,
           path: filePath,
@@ -9836,6 +10963,7 @@ function App() {
                 ...message,
                 text:
                   stripStaleInterruptionMarker(message).text.trim() ||
+                  regeneration?.originalAnswer.text ||
                   (wasCancelled
                     ? "A válasz megszakítva."
                     : `Nem sikerült a Codex-kérés: ${errorText}`),
@@ -9860,6 +10988,7 @@ function App() {
       );
     } finally {
       if (activeRequestIdRef.current === requestId) {
+        isStreamingRef.current = false;
         setIsStreaming(false);
         setIsCancelling(false);
         activeRequestIdRef.current = null;
@@ -9867,8 +10996,8 @@ function App() {
         preparingRequestIdRef.current = null;
         turnCompletedRequestIdRef.current = null;
         setTurnCompletedRequestId(null);
+        submitBusyRef.current = false;
       }
-      submitBusyRef.current = false;
     }
   };
 
@@ -9895,6 +11024,17 @@ function App() {
       notify("Az eredeti prompt nem található");
       return;
     }
+    const latestAnswer = [...messagesRef.current]
+      .reverse()
+      .find(
+        (message) =>
+          message.role === "assistant" && Boolean(message.text.trim()),
+      );
+    if (!messagesShareIdentity(answer, latestAnswer)) {
+      notify("Csak a legutóbbi válasz generálható újra");
+      return;
+    }
+    regenerationTargetRef.current = { source, answer };
     inputDraftRef.current = source.text;
     if (inputRef.current) {
       inputRef.current.value = source.text;
@@ -9942,6 +11082,9 @@ function App() {
 
   const newConversationForProject = (project: Project) => {
     if (blockConversationMutationDuringStream()) return;
+    activeModeRef.current = "coding";
+    localStorage.setItem(ACTIVE_MODE_STORAGE_KEY, "coding");
+    setActiveMode("coding");
     const baseTitle = "Új beszélgetés";
     const archivedTitles = tombstones
       .filter(
@@ -9968,6 +11111,7 @@ function App() {
         ...current,
         [`${project.path}/${title}`]: {
           id: conversationId,
+          scope: "coding",
           projectId: project.id,
           title,
           messages: [],
@@ -10005,6 +11149,9 @@ function App() {
 
   const selectProject = (project: Project) => {
     if (blockConversationMutationDuringStream()) return;
+    activeModeRef.current = "coding";
+    localStorage.setItem(ACTIVE_MODE_STORAGE_KEY, "coding");
+    setActiveMode("coding");
     const thread =
       project.name === activeProject && project.threads.includes(activeThread)
         ? activeThread
@@ -10122,31 +11269,10 @@ function App() {
       );
     if (nonInterrupted) return nonInterrupted.message;
     if (candidates.length > 0) return candidates[candidates.length - 1].message;
-    // A normal user-scoped group already had an exact chronological/identity
-    // chance above. Do not steal the nearest answer from another turn merely
-    // to fill an otherwise empty card.
-    if (group.userMessageKey) return undefined;
-    const completedAssistants = messages
-      .map((message, index) => ({ message, index }))
-      .filter(
-        ({ message }) =>
-          message.role === "assistant" &&
-          !message.live &&
-          message.text.trim().length > 0,
-      );
-    const nearest = completedAssistants.reduce<
-      { message: Message; index: number } | undefined
-    >((current, item) => {
-      if (!current) return item;
-      const currentDistance = Math.abs(
-        (current.message.sequence ?? current.index) - group.sequence,
-      );
-      const itemDistance = Math.abs(
-        (item.message.sequence ?? item.index) - group.sequence,
-      );
-      return itemDistance < currentDistance ? item : current;
-    }, undefined);
-    return nearest?.message;
+    // A trace without a user bucket has no reliable owner. Never attach the
+    // nearest answer to it: stale plan metadata would otherwise render an
+    // orphaned VÃLASZ card before the first visible user message.
+    return undefined;
   };
   const workGroupForMessage = (message: Message, messageIndex: number) =>
     workLogGroups.find(
@@ -10167,38 +11293,62 @@ function App() {
     const userMessage = userMessageForWorkGroup(group);
     return userMessage ? messageUsesDetailedTrace(userMessage) : true;
   };
-  const timelineContent = timelineEntries.map((entry) => {
+  const timelineContent = timelineEntries
+    .filter((entry) => activeMode === "coding" || entry.kind === "message")
+    .map((entry) => {
     if (entry.kind === "message") {
-      // A persisted turn may contain an empty final assistant placeholder.
-      // Rendering it creates nothing but a full-width bordered line between
-      // the user prompt and the next turn. Keep real text/image rows only.
+      // A persisted turn may contain an empty assistant row when the app was
+      // closed before any final text was stored. Do not silently erase that
+      // half of the conversation: render an explicit, truthful recovery
+      // marker after its user prompt instead of an empty bordered line.
       if (
         entry.message.role === "assistant" &&
         !entry.message.text.trim() &&
         !(entry.message.images && entry.message.images.length > 0)
-      )
-        return null;
+      ) {
+        const previousMessage = messages[entry.messageIndex - 1];
+        if (entry.message.live || previousMessage?.role !== "user") return null;
+        return (
+          <MessageRow
+            key={entry.key}
+            message={{
+              ...entry.message,
+              text: "Ehhez a kéréshez nem maradt eltárolt válasz.",
+              live: false,
+              final: true,
+            }}
+            projectPath={activeProjectPath}
+            isFinal
+            onQuoteJump={jumpToQuote}
+          />
+        );
+      }
       const nextMessage = messages[entry.messageIndex + 1];
       const isFinal =
-        entry.message.final ??
-        (entry.message.role === "assistant" &&
-          entry.message.text.trim().length > 0 &&
-          (!nextMessage || nextMessage.role === "user"));
+        entry.message.role === "assistant"
+          ? isSettledHistoricalAssistant(
+              entry.message,
+              nextMessage?.role,
+              Boolean(entry.message.images?.length),
+            )
+          : entry.message.final;
       if (entry.message.role === "assistant" && !isFinal) return null;
       const showAvatar =
         entry.message.role === "user" ||
         messages[entry.messageIndex - 1]?.role !== "assistant";
       const associatedGroup =
-        entry.message.role === "assistant" && isFinal
+        activeMode === "coding" && entry.message.role === "assistant" && isFinal
           ? workGroupForMessage(entry.message, entry.messageIndex)
           : undefined;
-      // A completed assistant response is rendered inside its own trace
-      // session. Keeping the standalone MessageRow as well created the
-      // apparent "answer above VÁLASZ" duplicate.
-      // The response already lives inside its trace card. Starting a later
-      // request must not make the old standalone assistant row reappear and
-      // duplicate the VÁLASZ panel above the new user message.
-      if (associatedGroup) return null;
+      // Hide the standalone row only when this exact logical message is the
+      // answer rendered inside the trace card. A stale group can overlap more
+      // than one historical assistant row; suppressing every associated row
+      // made valid earlier answers disappear from Work 3.
+      const associatedGroupAnswer = associatedGroup
+        ? answerForWorkGroup(associatedGroup)
+        : undefined;
+      if (messagesShareIdentity(entry.message, associatedGroupAnswer))
+        return null;
       return (
         <MessageRow
           key={entry.key}
@@ -10216,11 +11366,19 @@ function App() {
     // assistant answer. Rendering that orphaned trace produces a stray
     // horizontal rule between messages, so keep the timeline clean.
     if (!groupAnswer?.text.trim()) return null;
-    const storedPlan = planForWorkGroup(entry.group);
+    const storedPlan = planForWorkGroup(entry.group, groupAnswer.turnId);
+    const groupCommentary = commentaryForWorkGroup(
+      entry.group,
+      groupAnswer.turnId,
+    );
     if (!workGroupHasVisibleTrace(entry.group)) return null;
     const isLatestGroup = entry.group.key === latestWorkGroup?.key;
     const isCurrentGroup = entry.group.key === currentWorkGroup?.key;
-    const expanded = expandedForWorkGroup(entry.group, isLatestGroup);
+    // A completed turn should open on its answer after a restart as well.
+    // The live card owns the expanded LÉPÉSEK state while streaming; falling
+    // back to `true` here made a recovered final answer look missing behind
+    // the steps panel until the user clicked VÁLASZ.
+    const expanded = expandedForWorkGroup(entry.group, isLatestGroup && isStreaming);
     const compact = !workGroupUsesDetailedTrace(entry.group);
     const basePlan =
       storedPlan ??
@@ -10256,7 +11414,7 @@ function App() {
         key={entry.key}
         plan={plan}
         activities={entry.group.activities}
-        commentary={commentaryForWorkGroup(entry.group)}
+        commentary={groupCommentary}
         status={isCurrentGroup ? codeStatus : "kész"}
         streaming={false}
         expanded={expanded}
@@ -10296,7 +11454,7 @@ function App() {
   const liveCompact = activeUserMessage
     ? !messageUsesDetailedTrace(activeUserMessage)
     : !showDetailedTrace;
-  const liveTurnContent = isStreaming && (
+  const liveTurnContent = activeMode === "coding" && isStreaming && (
     <div className="live-turn-anchor">
       <TurnProgressCard
         plan={activePlan}
@@ -10332,6 +11490,17 @@ function App() {
       />
     </div>
   );
+  const generalLiveTurnContent =
+    activeMode === "general" && isStreaming && liveAnswer ? (
+      <div className="general-live-answer">
+        <MessageRow
+          message={liveAnswer}
+          projectPath=""
+          isFinal={false}
+          onQuoteJump={jumpToQuote}
+        />
+      </div>
+    ) : null;
 
   return (
     <FileActionContext.Provider value={handleFileClick}>
@@ -10380,11 +11549,67 @@ function App() {
         )}
 
       <main className="workspace">
-        <aside className="sidebar panel-edge">
+        <aside
+          className={`sidebar panel-edge${activeMode === "general" ? " is-general" : ""}`}
+        >
           <div className="sidebar-heading">
             <span>Projektek</span>
-            <div className="new-project-wrap">
+            <div className="sidebar-heading-actions">
+              <div className="tree-sort-wrap">
+                <button
+                  type="button"
+                  className="tree-sort-button"
+                  onClick={() => setTreeSortMenuOpen((open) => !open)}
+                  aria-haspopup="menu"
+                  aria-expanded={treeSortMenuOpen}
+                  aria-label="Tree rendezése"
+                  title={`Rendezés: ${treeSortMode === "modified" ? "módosítás szerint" : "idő szerint"}`}
+                >
+                  ↕
+                </button>
+                {treeSortMenuOpen && (
+                  <div className="tree-sort-menu" role="menu">
+                    <button
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={treeSortMode === "modified"}
+                      className={treeSortMode === "modified" ? "is-selected" : ""}
+                      onClick={() => {
+                        setTreeSortMode("modified");
+                        setTreeSortMenuOpen(false);
+                      }}
+                    >
+                      Módosítás szerint
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={treeSortMode === "time"}
+                      className={treeSortMode === "time" ? "is-selected" : ""}
+                      onClick={() => {
+                        setTreeSortMode("time");
+                        setTreeSortMenuOpen(false);
+                      }}
+                    >
+                      Idő szerint
+                    </button>
+                  </div>
+                )}
+              </div>
+              {activeMode === "general" ? (
               <button
+                type="button"
+                className="new-button"
+                onClick={newGeneralConversation}
+                aria-label="Új beszélgetés"
+                title="Új beszélgetés"
+              >
+                +
+              </button>
+            ) : (
+              <div className="new-project-wrap">
+              <button
+                type="button"
                 className="new-button"
                 onClick={() => setNewProjectMenuOpen((open) => !open)}
                 aria-haspopup="menu"
@@ -10417,10 +11642,37 @@ function App() {
                   </button>
                 </div>
               )}
+              </div>
+            )}
             </div>
           </div>
+          <div className="mode-switch" role="tablist" aria-label="Alkalmazasi mod">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeMode === "coding"}
+              className={activeMode === "coding" ? "is-active" : ""}
+              onClick={() => selectAppMode("coding")}
+            >
+              CODING
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeMode === "general"}
+              className={activeMode === "general" ? "is-active" : ""}
+              onClick={() => selectAppMode("general")}
+            >
+              GENERAL
+            </button>
+          </div>
           <div className="project-list">
-            {projects.map((project) => {
+            {historyHydrating && (
+              <div className="project-list-loading" role="status">
+                Helyi előzmények betöltése…
+              </div>
+            )}
+            {sortedProjects.map((project) => {
               const isOpen = Boolean(openProjects[project.path]);
               return (
                 <section
@@ -10568,6 +11820,73 @@ function App() {
                 </section>
               );
             })}
+          </div>
+          <div className="general-history" aria-label="General beszélgetések">
+            {generalConversations.length === 0 ? (
+              <div className="general-history-empty">
+                A korábbi GENERAL beszélgetések itt jelennek meg.
+              </div>
+            ) : (
+              generalConversations.map(({ conversation }) => {
+                const id = conversation.id ?? "";
+                return (
+                  <div className="general-history-row-wrap" key={id}>
+                    <button
+                      type="button"
+                      className={`general-history-row${id === activeGeneralConversationId ? " is-active" : ""}`}
+                      onClick={() => selectGeneralConversation(id)}
+                      title={conversation.title}
+                    >
+                      <span className="general-history-dot" />
+                      <span>{conversation.title}</span>
+                    </button>
+                    <div className="overflow-menu-wrap">
+                      <button
+                        type="button"
+                        className="overflow-button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setOpenMenu(
+                            openMenu?.kind === "general" &&
+                              openMenu.key === id
+                              ? null
+                              : { kind: "general", key: id },
+                          );
+                        }}
+                        aria-haspopup="menu"
+                        aria-expanded={
+                          openMenu?.kind === "general" && openMenu.key === id
+                        }
+                        title="Beszélgetés menüje"
+                      >
+                        ⋮
+                      </button>
+                      {openMenu?.kind === "general" &&
+                        openMenu.key === id && (
+                          <div className="overflow-menu" role="menu">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setOpenMenu(null);
+                                renameGeneralConversation(conversation);
+                              }}
+                            >
+                              Átnevezés
+                            </button>
+                            <button
+                              type="button"
+                              className="danger-action"
+                              onClick={() => deleteGeneralConversation(conversation)}
+                            >
+                              Törlés
+                            </button>
+                          </div>
+                        )}
+                    </div>
+                  </div>
+                );
+              })
+            )}
           </div>
           <div className="sidebar-footer">
             <button
@@ -10851,12 +12170,24 @@ function App() {
           </div>
         </aside>
 
-        <section className="chat panel-edge">
+        <section
+          className={`chat panel-edge${activeMode === "general" ? " is-general" : ""}`}
+        >
           <div className="chat-header">
             <div>
-              <div className="chat-header-project">{activeProjectData.name}</div>
+              <div className="chat-header-project">
+                {activeMode === "general"
+                  ? "GENERAL"
+                  : historyHydrating
+                    ? "Előzmények"
+                    : activeProjectData.name}
+              </div>
               <div className="chat-header-thread">
-                {activeThread || "Nincs beszélgetés"}
+                {activeMode === "general"
+                  ? activeGeneralConversation?.title ?? "Új beszélgetés"
+                  : historyHydrating
+                    ? "Betöltés folyamatban…"
+                    : activeThread || "Nincs beszélgetés"}
               </div>
             </div>
           </div>
@@ -10866,8 +12197,17 @@ function App() {
             onScroll={handleMessageScroll}
             onWheelCapture={handleMessageWheel}
           >
+            {activeMode === "general" &&
+              messages.length === 0 &&
+              !isStreaming && (
+                <div className="general-home">
+                  <div className="general-home-mark">m</div>
+                  <h1>Miben segíthetek?</h1>
+                  <p>Kérdezz bármit — ez a min mindennapi beszélgetős módja.</p>
+                </div>
+              )}
             {timelineContent}
-            {liveTurnContent}
+            {activeMode === "general" ? generalLiveTurnContent : liveTurnContent}
             {isStreaming && !isAtBottom && (
               <button
                 type="button"
@@ -10973,27 +12313,31 @@ function App() {
                 placeholder="Írj egy üzenetet, vagy illessz be egy screenshotot…"
                 />
               </div>
-              <input
-                ref={imageInputRef}
-                className="hidden-file-input"
-                type="file"
-                accept="image/png,image/jpeg,image/webp"
-                multiple
-                tabIndex={-1}
-                onChange={handleImageInputChange}
-              />
+              {activeMode !== "general" && (
+                <input
+                  ref={imageInputRef}
+                  className="hidden-file-input"
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp"
+                  multiple
+                  tabIndex={-1}
+                  onChange={handleImageInputChange}
+                />
+              )}
               <div className="composer-toolbar">
                 <div className="composer-tools">
-                  <button
-                    type="button"
-                    className="tool-button"
-                    title="Kép megnyitása"
-                    aria-label="Kép megnyitása és csatolása"
-                    disabled={imagesPreparing || pendingImages.length >= MAX_IMAGE_ATTACHMENTS}
-                    onClick={() => imageInputRef.current?.click()}
-                  >
-                    ＋
-                  </button>
+                  {activeMode !== "general" && (
+                    <button
+                      type="button"
+                      className="tool-button"
+                      title="Kép megnyitása"
+                      aria-label="Kép megnyitása és csatolása"
+                      disabled={imagesPreparing || pendingImages.length >= MAX_IMAGE_ATTACHMENTS}
+                      onClick={() => imageInputRef.current?.click()}
+                    >
+                      ＋
+                    </button>
+                  )}
                   <ModelPicker
                     open={modelMenuOpen}
                     loading={modelsLoading}

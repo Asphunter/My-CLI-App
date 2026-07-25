@@ -630,6 +630,36 @@ struct AgentSnapshot {
     manifest: GuardManifest,
 }
 
+/// Provider-neutral workspace guard handle.
+///
+/// The Codex runtime owns the snapshot implementation, but Claude and future
+/// runtimes must use the exact same fail-closed guard. Keeping the inner
+/// snapshot private prevents adapters from bypassing the manifest checks.
+pub struct AgentWorkspaceSnapshot {
+    inner: AgentSnapshot,
+}
+
+pub fn begin_agent_workspace_snapshot(root: &Path) -> Result<AgentWorkspaceSnapshot, String> {
+    create_agent_snapshot(root).map(|inner| AgentWorkspaceSnapshot { inner })
+}
+
+pub fn finalize_agent_workspace_snapshot(
+    snapshot: &AgentWorkspaceSnapshot,
+) -> Result<AgentGuardReport, String> {
+    finalize_agent_snapshot(&snapshot.inner)
+}
+
+pub fn stage_agent_workspace_snapshot(
+    snapshot: &AgentWorkspaceSnapshot,
+    report: AgentGuardReport,
+) -> Result<AgentGuardReport, String> {
+    stage_agent_snapshot(&snapshot.inner, report)
+}
+
+pub fn agent_workspace_snapshot_id(snapshot: &AgentWorkspaceSnapshot) -> &str {
+    &snapshot.inner.id
+}
+
 const GUARD_MAX_FILES: usize = 10_000;
 const GUARD_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const GUARD_MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
@@ -1024,6 +1054,10 @@ fn requested_cwd(cwd: Option<&str>) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
+pub fn requested_agent_cwd(cwd: Option<&str>) -> Result<PathBuf, String> {
+    requested_cwd(cwd)
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -1054,14 +1088,14 @@ fn is_guard_excluded_directory(path: &Path) -> bool {
         .map(|name| {
             matches!(
                 name.to_ascii_lowercase().as_str(),
-        ".git"
-            | ".min-sync"
-            | "node_modules"
-            | "target"
-            | "dist"
-            | ".vite"
-            | "artifacts"
-            | "conversation audits"
+                ".git"
+                    | ".min-sync"
+                    | "node_modules"
+                    | "target"
+                    | "dist"
+                    | ".vite"
+                    | "artifacts"
+                    | "conversation audits"
             )
         })
         .unwrap_or(false);
@@ -3307,6 +3341,21 @@ fn resolve_codex_image_paths(
         .collect()
 }
 
+/// SVG is markup, not a magic-byte format, so it needs its own sniff.
+///
+/// The caller renders the result through an `<img>` data URL, which does not
+/// execute scripts or fetch external resources — so agent-written SVG can be
+/// previewed without giving it a way to run.
+fn svg_bytes_mime(bytes: &[u8]) -> Option<&'static str> {
+    // Enough to see the root element without scanning a large file.
+    let head = std::str::from_utf8(&bytes[..bytes.len().min(1024)]).ok()?;
+    let head = head.trim_start_matches('\u{feff}').trim_start();
+    let looks_like_svg = head.starts_with("<svg")
+        || (head.starts_with("<?xml") && head.to_ascii_lowercase().contains("<svg"))
+        || (head.starts_with("<!--") && head.to_ascii_lowercase().contains("<svg"));
+    looks_like_svg.then_some("image/svg+xml")
+}
+
 pub fn read_project_image(cwd: &str, path: &str) -> Result<Option<String>, String> {
     let root = requested_cwd(Some(cwd))?;
     let attachment = CodexImageAttachment {
@@ -3325,6 +3374,7 @@ pub fn read_project_image(cwd: &str, path: &str) -> Result<Option<String>, Strin
     let mime_type = ["image/png", "image/jpeg", "image/webp"]
         .into_iter()
         .find(|mime| image_bytes_match_mime(&bytes, mime))
+        .or_else(|| svg_bytes_mime(&bytes))
         .ok_or_else(|| "A projektkép formátuma nem támogatott.".to_string())?;
     Ok(Some(format!(
         "data:{mime_type};base64,{}",
@@ -4013,6 +4063,143 @@ mod sync_tests {
         std::fs::write(root.join("main.txt"), "new work").expect("post-rollback change");
         let blocked = rollback_agent_snapshot_at(&snapshot_root, &snapshot.id, None);
         assert!(blocked.is_err());
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(snapshot_root);
+    }
+
+    /// An agent-written diagram is markup, so it needs a content sniff rather
+    /// than a magic-byte match — otherwise the preview rejects every SVG.
+    #[test]
+    fn svg_content_is_recognised_but_arbitrary_text_is_not() {
+        assert_eq!(
+            svg_bytes_mime(b"<svg xmlns=\"http://www.w3.org/2000/svg\"><rect/></svg>"),
+            Some("image/svg+xml")
+        );
+        assert_eq!(
+            svg_bytes_mime(b"<?xml version=\"1.0\"?>\n<svg viewBox=\"0 0 10 10\"></svg>"),
+            Some("image/svg+xml")
+        );
+        // A leading byte-order mark or comment must not hide the root element.
+        assert_eq!(
+            svg_bytes_mime("\u{feff}  <svg></svg>".as_bytes()),
+            Some("image/svg+xml")
+        );
+        assert_eq!(
+            svg_bytes_mime(b"<!-- generated --><svg></svg>"),
+            Some("image/svg+xml")
+        );
+
+        assert_eq!(svg_bytes_mime(b"# Just a markdown file"), None);
+        assert_eq!(
+            svg_bytes_mime(b"<html><body>not a drawing</body></html>"),
+            None
+        );
+        assert_eq!(svg_bytes_mime(&[0xff, 0xd8, 0xff, 0xe0]), None);
+        assert_eq!(svg_bytes_mime(b""), None);
+    }
+
+    /// The 14.3/8–9 acceptance chain at the guard level: snapshot the fixture,
+    /// let an agent edit it the way Claude does, read the diff preview the GUI
+    /// renders, then roll back. The preview is what the user approves against,
+    /// so an edit that never surfaces there would be applied unseen.
+    #[test]
+    fn agent_diff_preview_surfaces_the_edit_before_rollback() {
+        let root =
+            std::env::temp_dir().join(format!("min-agent-preview-root-{}", uuid::Uuid::new_v4()));
+        let snapshot_root = std::env::temp_dir().join(format!(
+            "min-agent-preview-snapshots-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("preview root fixture");
+        // Mirrors the claude-fixture bug: multiply adds instead of multiplying.
+        std::fs::write(
+            root.join("math.js"),
+            "export const add = (left, right) => left + right;\nexport const multiply = (left, right) => left + right;\n",
+        )
+        .expect("base fixture file");
+        std::fs::write(root.join("README.md"), "fixture\n").expect("untouched base file");
+
+        let snapshot =
+            create_agent_snapshot_at(&root, &snapshot_root).expect("create preview snapshot");
+
+        // The agent fixes the bug and adds a note; README stays untouched.
+        std::fs::write(
+            root.join("math.js"),
+            "export const add = (left, right) => left + right;\nexport const multiply = (left, right) => left * right;\n",
+        )
+        .expect("agent edit");
+        std::fs::write(root.join("NOTES.md"), "fixed multiply\n").expect("agent added file");
+
+        let report = finalize_agent_snapshot(&snapshot).expect("finalize preview snapshot");
+        assert_eq!(report.changed_files, vec!["math.js"]);
+        assert_eq!(report.added_files, vec!["NOTES.md"]);
+
+        let preview = agent_diff_preview_at(&snapshot_root, &snapshot.id, None)
+            .expect("diff preview after the agent edit");
+
+        // Only the touched files appear, and each carries the right status.
+        let mut previewed: Vec<(&str, &str)> = preview
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file.status.as_str()))
+            .collect();
+        previewed.sort();
+        assert_eq!(
+            previewed,
+            vec![("NOTES.md", "added"), ("math.js", "modified")],
+            "the preview must list exactly the agent's edits"
+        );
+
+        // The changed file's line diff must actually show the fix, because this
+        // is the text the user reads before approving.
+        let math = preview
+            .files
+            .iter()
+            .find(|file| file.path == "math.js")
+            .expect("math.js in the preview");
+        assert!(!math.binary_or_truncated);
+        let removed: Vec<&str> = math
+            .lines
+            .iter()
+            .filter(|line| line.kind == "removed")
+            .map(|line| line.text.as_str())
+            .collect();
+        let added: Vec<&str> = math
+            .lines
+            .iter()
+            .filter(|line| line.kind == "added")
+            .map(|line| line.text.as_str())
+            .collect();
+        assert!(
+            removed
+                .iter()
+                .any(|line| line.contains("left + right") && line.contains("multiply")),
+            "the buggy line must show as removed, got {removed:?}"
+        );
+        assert!(
+            added
+                .iter()
+                .any(|line| line.contains("left * right") && line.contains("multiply")),
+            "the fixed line must show as added, got {added:?}"
+        );
+        assert_eq!(preview.base_hash, snapshot.manifest.base_hash);
+        assert_eq!(preview.current_hash, preview.post_hash);
+
+        let rollback = rollback_agent_snapshot_at(&snapshot_root, &snapshot.id, None)
+            .expect("rollback after preview");
+        assert_eq!(rollback.resulting_hash, snapshot.manifest.base_hash);
+        assert!(!root.join("NOTES.md").exists());
+        assert!(
+            std::fs::read_to_string(root.join("math.js"))
+                .expect("restored math.js")
+                .contains("multiply = (left, right) => left + right"),
+            "rollback must restore the original buggy fixture"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("README.md")).expect("untouched file survives"),
+            "fixture\n"
+        );
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(snapshot_root);

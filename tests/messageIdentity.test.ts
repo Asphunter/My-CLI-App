@@ -6,6 +6,7 @@ import {
   collapseRepeatedAssistantText,
   collapseAbandonedRegenerationRetries,
   coalesceMessageIdentities,
+  isNewerSettledAssistantVersion,
   isSettledHistoricalAssistant,
   messagesShareIdentity,
   type MessageIdentityLike,
@@ -18,15 +19,23 @@ type TestMessage = MessageIdentityLike & {
 
 const mergeVersions = (existing: TestMessage, incoming: TestMessage) => {
   const final = Boolean(existing.final || incoming.final);
+  const preferIncoming = isNewerSettledAssistantVersion(existing, incoming);
   return {
     ...existing,
-    text:
-      incoming.text.trim().length > existing.text.trim().length
+    id: preferIncoming ? incoming.id ?? existing.id : existing.id ?? incoming.id,
+    text: preferIncoming
+      ? incoming.text
+      : incoming.text.trim().length > existing.text.trim().length
         ? incoming.text
         : existing.text,
     live: final ? false : Boolean(existing.live || incoming.live),
     final,
-    itemId: existing.itemId ?? incoming.itemId,
+    itemId: preferIncoming
+      ? incoming.itemId ?? existing.itemId
+      : existing.itemId ?? incoming.itemId,
+    sequence: preferIncoming
+      ? incoming.sequence ?? existing.sequence
+      : existing.sequence ?? incoming.sequence,
     turnId: existing.turnId ?? incoming.turnId,
   };
 };
@@ -108,6 +117,35 @@ test("a completed copy monotonically replaces the live placeholder", () => {
   assert.equal(result[0].text, "Vegleges valasz");
   assert.equal(result[0].live, false);
   assert.equal(result[0].final, true);
+});
+
+test("a newer settled answer replaces a longer stale same-turn alias", () => {
+  const result = coalesceMessageIdentities<TestMessage>(
+    [
+      {
+        id: "stale-alias",
+        role: "assistant",
+        text: "PPHASE1012_RESPONSE_INSPECT_OKHASE1012_RESPONSE_INSPECT_OK",
+        sequence: 10,
+        turnId: "request:canonical",
+        final: true,
+      },
+      {
+        id: "canonical-answer",
+        role: "assistant",
+        text: "PHASE1012_FINAL_GUI_ACCEPTANCE_OK",
+        sequence: 20,
+        turnId: "request:canonical",
+        final: true,
+      },
+    ],
+    mergeVersions,
+  );
+
+  assert.equal(result.length, 1);
+  assert.equal(result[0].id, "canonical-answer");
+  assert.equal(result[0].sequence, 20);
+  assert.equal(result[0].text, "PHASE1012_FINAL_GUI_ACCEPTANCE_OK");
 });
 
 test("identical answers from distinct turns remain distinct", () => {

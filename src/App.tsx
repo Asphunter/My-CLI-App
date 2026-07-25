@@ -29,6 +29,7 @@ import {
   collapseAbandonedRegenerationRetries,
   collapseRepeatedAssistantText,
   coalesceMessageIdentities,
+  isNewerSettledAssistantVersion,
   isSettledHistoricalAssistant,
   messagesShareIdentity,
 } from "./messageIdentity";
@@ -42,6 +43,16 @@ import {
   type AppMode,
   type ConversationScope,
 } from "./conversationScope";
+import {
+  acceptTerminalAgentEvent,
+  agentEventIdentity,
+  normalizeAgentEventEnvelope,
+} from "./agentEvent";
+import { ensureCanonicalConversationId } from "./conversationIdentity";
+import {
+  describeAgentError,
+  describeThrownAgentError,
+} from "./agentError";
 
 type Message = {
   id?: string;
@@ -138,6 +149,14 @@ type AgentApplyResult = {
   resultingHash: string;
   rollbackAvailable: boolean;
 };
+type AgentRollbackResult = {
+  snapshotId: string;
+  root: string;
+  restoredFiles: number;
+  removedFiles: number;
+  baseHash: string;
+  resultingHash: string;
+};
 type AgentDiffLine = {
   kind: "context" | "added" | "removed" | "empty" | "meta" | string;
   oldLine?: number | null;
@@ -189,9 +208,12 @@ type CodexDelta = {
 type CodexEvent = {
   requestId?: string | null;
   sequence?: number;
+  messageId?: string | null;
   threadId: string;
   eventType: string;
   payload: unknown;
+  providerTurnId?: string | null;
+  terminalEventId?: string | null;
 };
 type CodexTransportStatus = {
   requestId?: string | null;
@@ -278,6 +300,45 @@ type CodexModel = {
   supportedReasoningEfforts: string[];
   defaultReasoningEffort: string | null;
 };
+type ClaudeAuthStatus = {
+  configured: boolean;
+  source: string;
+  preview: string | null;
+  apiKeyConfigured: boolean;
+  subscriptionConfigured: boolean;
+  subscriptionPlan: string | null;
+};
+type ClaudeConnectionResult = {
+  success: boolean;
+  model: string;
+  effort: string;
+  text: string | null;
+  sessionId: string | null;
+  totalCostUsd: number | null;
+  requestId: string;
+  errorCode: string | null;
+  error: string | null;
+};
+type ClaudeApprovalRequest = {
+  approvalId: string;
+  requestId: string;
+  toolName: string;
+  input: Record<string, unknown>;
+  title: string | null;
+  reason: string | null;
+  displayName: string | null;
+  description: string | null;
+};
+type ClaudeQuestionRequest = {
+  questionId: string;
+  requestId: string;
+  questions: Array<{
+    question?: string;
+    header?: string;
+    multiSelect?: boolean;
+    options?: Array<{ label?: string; description?: string }>;
+  }>;
+};
 type ModelFamily = { key: string; label: string; models: CodexModel[] };
 type OpenMenu = { kind: "project" | "thread" | "general"; key: string } | null;
 type AppDialog =
@@ -302,6 +363,14 @@ const isTauri =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const DEFAULT_MODEL = "gpt-5.6-luna";
 const DEFAULT_EFFORT = "low";
+const DEFAULT_CLAUDE_MODEL = "claude-sonnet-5";
+const DEFAULT_CLAUDE_EFFORT = "low";
+const DEFAULT_CLAUDE_BUDGET_USD = "0.05";
+// A tool-using coding turn needs several agent turns: read, edit, run the test,
+// then answer. The old default of 1 came from the API-key era where every turn
+// cost money; with subscription auth the turn limit is the only guard, so it has
+// to be high enough for the work to actually finish.
+const DEFAULT_CLAUDE_MAX_TURNS = "40";
 const MODEL_PREFERENCE_VERSION = "4";
 const EFFORT_PREFERENCE_VERSION = "1";
 const READING_SETTINGS_VERSION = "3";
@@ -366,6 +435,14 @@ const fallbackModels: CodexModel[] = [
     defaultReasoningEffort: "high",
   },
 ];
+
+const claudeCodingModel: CodexModel = {
+  id: DEFAULT_CLAUDE_MODEL,
+  displayName: "Claude Sonnet 5",
+  description: "Claude coding runtime az Anthropic API-kulccsal.",
+  supportedReasoningEfforts: ["low", "medium", "high"],
+  defaultReasoningEffort: DEFAULT_CLAUDE_EFFORT,
+};
 
 type AppSound = "notify" | "complete";
 const APP_SOUND_FILES: Record<AppSound, string> = {
@@ -745,6 +822,18 @@ type SyncConversation = {
   updatedAt: string;
   planHistory?: Record<string, PlanSnapshot>;
   commentary?: CommentaryEntry[];
+};
+
+type AgentConversationStatus = {
+  conversationId: string;
+  provider: string | null;
+  runtime: string | null;
+  model: string | null;
+  effort: string | null;
+  activeSessionId: string | null;
+  sessionHeadTurnId: string | null;
+  conversationHeadTurnId: string | null;
+  hasConflict: boolean;
 };
 
 type SyncTombstone = {
@@ -1543,6 +1632,22 @@ const findStoredThreadValue = (
   return compatibleMatch?.[1] ?? direct;
 };
 
+const findCachedConversation = (
+  cache: Record<string, SyncConversation>,
+  key: string,
+) => {
+  const candidate = findStoredThreadValue(
+    cache as Record<string, unknown>,
+    key,
+    (value): value is SyncConversation => {
+      if (!value || typeof value !== "object" || Array.isArray(value))
+        return false;
+      return Array.isArray((value as Partial<SyncConversation>).messages);
+    },
+  );
+  return candidate as SyncConversation | undefined;
+};
+
 const conversationContextForRehydration = (messages: Message[]) =>
   compactMessages(messages)
     .filter(
@@ -1684,11 +1789,15 @@ const mergeMessages = (
       const final = Boolean(existing.final || message.final);
       const existingUnavailable = isUnavailablePersistedAssistant(existing);
       const messageUnavailable = isUnavailablePersistedAssistant(message);
+      const preferIncomingSettledAssistant =
+        isNewerSettledAssistantVersion(existing, message);
       // A submitted user payload is immutable. In particular, never let the
       // old "longer text wins" assistant heuristic splice two user turns when
       // a stale cache and a pulled snapshot meet.
       const mergedText =
-        existing.role === "user"
+        preferIncomingSettledAssistant
+          ? message.text
+          : existing.role === "user"
           ? existing.text
           : existingUnavailable && !messageUnavailable
             ? message.text
@@ -1700,7 +1809,9 @@ const mergeMessages = (
       return {
         ...existing,
         time:
-          existing.role === "user" ||
+          preferIncomingSettledAssistant
+            ? message.time
+            : existing.role === "user" ||
           parseMessageTimestamp(existing.time) !== undefined ||
           parseMessageTimestamp(message.time) === undefined
             ? existing.time
@@ -1713,8 +1824,15 @@ const mergeMessages = (
         live: final ? false : Boolean(existing.live || message.live),
         final,
         interrupted: message.interrupted ?? existing.interrupted,
-        itemId: existing.itemId ?? message.itemId,
-        sequence: existing.sequence ?? message.sequence,
+        id: preferIncomingSettledAssistant
+          ? message.id ?? existing.id
+          : existing.id ?? message.id,
+        itemId: preferIncomingSettledAssistant
+          ? message.itemId ?? existing.itemId
+          : existing.itemId ?? message.itemId,
+        sequence: preferIncomingSettledAssistant
+          ? message.sequence ?? existing.sequence
+          : existing.sequence ?? message.sequence,
         turnId: message.turnId ?? existing.turnId,
         hlc: existing.hlc ?? message.hlc,
         originDeviceId: existing.originDeviceId ?? message.originDeviceId,
@@ -1744,6 +1862,50 @@ const mergeMessages = (
     : compacted
   ).sort(compareMessages);
   return collapseAbandonedRegenerationRetries(ordered);
+};
+
+const mergeLocalStoreSnapshotForHydration = (
+  syncSnapshot: LocalStoreSnapshot,
+  localSnapshot: LocalStoreSnapshot,
+): LocalStoreSnapshot => {
+  const conversations = { ...syncSnapshot.conversations };
+  const tombstones = syncSnapshot.tombstones ?? [];
+  for (const [rawKey, localConversation] of Object.entries(
+    localSnapshot.conversations ?? {},
+  )) {
+    if (
+      localConversation.id &&
+      tombstones.some(
+        (tombstone) =>
+          tombstone.entityType === "conversation" &&
+          tombstone.entityId === localConversation.id,
+      )
+    ) {
+      continue;
+    }
+    const existingEntry = Object.entries(conversations).find(
+      ([key, conversation]) =>
+        key === rawKey ||
+        Boolean(
+          localConversation.id &&
+            conversation.id &&
+            localConversation.id === conversation.id,
+        ),
+    );
+    if (!existingEntry) {
+      conversations[rawKey] = localConversation;
+      continue;
+    }
+    const [key, conversation] = existingEntry;
+    conversations[key] = {
+      ...conversation,
+      messages: mergeMessages(
+        conversation.messages ?? [],
+        localConversation.messages ?? [],
+      ),
+    };
+  }
+  return { ...syncSnapshot, conversations };
 };
 
 const loadThreadMessages = (key: string): Message[] => {
@@ -2533,6 +2695,8 @@ const parseEventValue = (value: unknown): unknown => {
 
 const normalizeCodexEvent = (value: unknown): CodexEvent | null => {
   const envelope = asRecord(parseEventValue(value));
+  const normalizedAgentEvent = normalizeAgentEventEnvelope(envelope);
+  if (normalizedAgentEvent) return normalizedAgentEvent;
   const eventType =
     typeof envelope.eventType === "string"
       ? envelope.eventType
@@ -2558,12 +2722,18 @@ const normalizeCodexEvent = (value: unknown): CodexEvent | null => {
     typeof envelope.sequence === "number" && Number.isFinite(envelope.sequence)
       ? envelope.sequence
       : undefined;
+  const messageId =
+    typeof envelope.messageId === "string"
+      ? envelope.messageId
+      : typeof envelope.message_id === "string"
+        ? envelope.message_id
+        : null;
   const payload = Object.prototype.hasOwnProperty.call(envelope, "payload")
     ? envelope.payload
     : Object.prototype.hasOwnProperty.call(envelope, "params")
       ? envelope.params
       : envelope;
-  return { requestId, sequence, threadId, eventType, payload };
+  return { requestId, sequence, messageId, threadId, eventType, payload };
 };
 
 const normalizeCodexDelta = (value: unknown): CodexDelta | null => {
@@ -3228,6 +3398,7 @@ const localFileExtensions = new Set([
   "mp3",
   "mp4",
   "pdf",
+  "png",
   "ps1",
   "ppt",
   "pptx",
@@ -3827,6 +3998,8 @@ function ModelPicker({
                   <div className="model-menu-label">
                     {activeFamily.label === "Codex"
                       ? "Codex"
+                      : activeFamily.label === "Claude"
+                        ? "Claude"
                       : `GPT-${activeFamily.label}`}
                   </div>
                   {activeFamily.models.map((model) => (
@@ -4480,7 +4653,203 @@ function PlanProgressCard({
   );
 }
 
-function ChangeSummaryPanel({ files }: { files: ChangeSummaryFile[] }) {
+const PREVIEW_MIN_SCALE = 0.2;
+const PREVIEW_MAX_SCALE = 12;
+
+/**
+ * Full-size preview for an agent-generated image.
+ *
+ * A block diagram is only useful if its labels can be read, so the view zooms
+ * toward the pointer and pans by dragging. The image is rendered from a data
+ * URL, which keeps SVG inert: no scripts, no network access.
+ */
+function ImagePreviewOverlay({
+  path,
+  source,
+  error,
+  onClose,
+  onOpenExternal,
+}: {
+  path: string;
+  source: string | null;
+  error: string | null;
+  onClose: () => void;
+  onOpenExternal: () => void;
+}) {
+  const [scale, setScale] = useState(1);
+  const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const dragRef = useRef<{ x: number; y: number; ox: number; oy: number } | null>(null);
+
+  const reset = () => {
+    setScale(1);
+    setOffset({ x: 0, y: 0 });
+  };
+
+  // A new image should never inherit the previous one's zoom.
+  useEffect(() => {
+    reset();
+  }, [path]);
+
+  useEffect(() => {
+    const onKey = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+      if (event.key === "0") reset();
+      if (event.key === "+" || event.key === "=") setScale((s) => Math.min(PREVIEW_MAX_SCALE, s * 1.25));
+      if (event.key === "-") setScale((s) => Math.max(PREVIEW_MIN_SCALE, s / 1.25));
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  // Attached manually because a passive React wheel handler cannot stop the
+  // page from scrolling behind the overlay.
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const onWheel = (event: globalThis.WheelEvent) => {
+      event.preventDefault();
+      const rect = viewport.getBoundingClientRect();
+      const pointerX = event.clientX - rect.left - rect.width / 2;
+      const pointerY = event.clientY - rect.top - rect.height / 2;
+      setScale((previous) => {
+        const next = Math.min(
+          PREVIEW_MAX_SCALE,
+          Math.max(PREVIEW_MIN_SCALE, previous * (event.deltaY < 0 ? 1.15 : 1 / 1.15)),
+        );
+        // Keep the point under the cursor fixed while the scale changes.
+        const ratio = next / previous;
+        setOffset((current) => ({
+          x: pointerX - (pointerX - current.x) * ratio,
+          y: pointerY - (pointerY - current.y) * ratio,
+        }));
+        return next;
+      });
+    };
+    viewport.addEventListener("wheel", onWheel, { passive: false });
+    return () => viewport.removeEventListener("wheel", onWheel);
+  }, []);
+
+  const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    dragRef.current = { x: event.clientX, y: event.clientY, ox: offset.x, oy: offset.y };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+  const onPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag) return;
+    setOffset({
+      x: drag.ox + (event.clientX - drag.x),
+      y: drag.oy + (event.clientY - drag.y),
+    });
+  };
+  const endDrag = () => {
+    dragRef.current = null;
+  };
+
+  return (
+    <div
+      className="agent-interaction-overlay"
+      role="presentation"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <section
+        className="image-preview-card"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Előnézet: ${path}`}
+      >
+        <div className="image-preview-header">
+          <div>
+            <span className="approval-eyebrow">ELŐNÉZET</span>
+            <h2>{path}</h2>
+          </div>
+          <div className="image-preview-actions">
+            <button
+              type="button"
+              className="settings-compact-button"
+              onClick={() => setScale((s) => Math.max(PREVIEW_MIN_SCALE, s / 1.25))}
+              aria-label="Kicsinyítés"
+            >
+              −
+            </button>
+            <button type="button" className="settings-compact-button" onClick={reset}>
+              {Math.round(scale * 100)}%
+            </button>
+            <button
+              type="button"
+              className="settings-compact-button"
+              onClick={() => setScale((s) => Math.min(PREVIEW_MAX_SCALE, s * 1.25))}
+              aria-label="Nagyítás"
+            >
+              +
+            </button>
+            <button type="button" className="settings-compact-button" onClick={onOpenExternal}>
+              Külső program
+            </button>
+            <button
+              type="button"
+              className="inline-code-diff-close"
+              onClick={onClose}
+              aria-label="Előnézet bezárása"
+            >
+              ×
+            </button>
+          </div>
+        </div>
+        <div
+          className="image-preview-body"
+          ref={viewportRef}
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={endDrag}
+          onPointerCancel={endDrag}
+          onDoubleClick={reset}
+          style={{ cursor: dragRef.current ? "grabbing" : "grab" }}
+        >
+          {error ? (
+            <p className="image-preview-error">{error}</p>
+          ) : source ? (
+            <img
+              src={source}
+              alt={path}
+              draggable={false}
+              style={{
+                transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})`,
+              }}
+            />
+          ) : (
+            <p className="image-preview-error">Betöltés…</p>
+          )}
+        </div>
+        <p className="image-preview-hint">
+          Görgetés: nagyítás · húzás: mozgatás · dupla kattintás vagy 0: alaphelyzet · Esc: bezárás
+        </p>
+      </section>
+    </div>
+  );
+}
+
+/** Files the preview overlay can render; everything else stays plain text. */
+const PREVIEWABLE_IMAGE_EXTENSIONS = ["svg", "png", "jpg", "jpeg", "webp"];
+const isPreviewableImagePath = (filePath: string) => {
+  const extension = filePath.split(".").pop()?.toLowerCase() ?? "";
+  return PREVIEWABLE_IMAGE_EXTENSIONS.includes(extension);
+};
+
+function ChangeSummaryPanel({
+  files,
+  onRollback,
+  rollbackBusy,
+  onPreviewImage,
+}: {
+  files: ChangeSummaryFile[];
+  onRollback?: () => void;
+  rollbackBusy?: boolean;
+  onPreviewImage?: (path: string) => void;
+}) {
   if (files.length === 0) return null;
   const added = files.reduce((total, file) => total + file.added, 0);
   const removed = files.reduce((total, file) => total + file.removed, 0);
@@ -4495,7 +4864,18 @@ function ChangeSummaryPanel({ files }: { files: ChangeSummaryFile[] }) {
       <ul className="trace-change-list">
         {files.map((file) => (
           <li key={`${file.status}:${file.path}`} title={file.path}>
-            <code>{file.path}</code>
+            {onPreviewImage && isPreviewableImagePath(file.path) ? (
+              <button
+                type="button"
+                className="trace-change-preview"
+                onClick={() => onPreviewImage(file.path)}
+                title="Előnézet megnyitása"
+              >
+                <code>{file.path}</code>
+              </button>
+            ) : (
+              <code>{file.path}</code>
+            )}
             <span className="trace-change-status">{statusLabel(file.status)}</span>
             <span className="trace-change-added">+{file.added}</span>
             <span className="trace-change-removed">−{file.removed}</span>
@@ -4505,6 +4885,17 @@ function ChangeSummaryPanel({ files }: { files: ChangeSummaryFile[] }) {
       <div className="trace-change-footer" aria-label="Változási összesítő">
         <span><i className="trace-change-dot is-added" />{added} hozzáadva</span>
         <span><i className="trace-change-dot is-removed" />{removed} kivéve</span>
+        {onRollback && (
+          <button
+            type="button"
+            className="trace-change-rollback"
+            onClick={onRollback}
+            disabled={rollbackBusy}
+            title="A turn összes fájlváltozásának visszaállítása a turn előtti állapotra"
+          >
+            {rollbackBusy ? "Visszavonás…" : "↺ Visszavonás"}
+          </button>
+        )}
       </div>
     </aside>
   );
@@ -4546,6 +4937,9 @@ type TurnProgressCardProps = {
   compact?: boolean;
   onCopyAnswer?: (answer: Message) => Promise<void> | void;
   onRegenerate?: (answer: Message) => void;
+  onRollbackChanges?: () => void;
+  rollbackBusy?: boolean;
+  onPreviewImage?: (path: string) => void;
 };
 
 function TurnProgressCard({
@@ -4565,6 +4959,9 @@ function TurnProgressCard({
   compact = false,
   onCopyAnswer,
   onRegenerate,
+  onRollbackChanges,
+  rollbackBusy,
+  onPreviewImage,
 }: TurnProgressCardProps) {
   const quoteAnchor = (suffix: string) =>
     `${quoteAnchorPrefix}:${suffix}`;
@@ -5168,7 +5565,12 @@ function TurnProgressCard({
         </div>
         {changeSummary.length > 0 && (
           <div className="compact-answer-changes">
-            <ChangeSummaryPanel files={changeSummary} />
+            <ChangeSummaryPanel
+              files={changeSummary}
+              onRollback={onRollbackChanges}
+              rollbackBusy={rollbackBusy}
+              onPreviewImage={onPreviewImage}
+            />
           </div>
         )}
       </article>
@@ -5249,7 +5651,12 @@ function TurnProgressCard({
                   )}
               </div>}
             </div>
-            <ChangeSummaryPanel files={changeSummary} />
+            <ChangeSummaryPanel
+              files={changeSummary}
+              onRollback={onRollbackChanges}
+              rollbackBusy={rollbackBusy}
+              onPreviewImage={onPreviewImage}
+            />
           </div>
         </section>
       )}
@@ -6011,13 +6418,47 @@ function App() {
     useState<Record<string, string>>(loadLocalThreadIds);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [readingSettingsOpen, setReadingSettingsOpen] = useState(false);
+  const [claudeSettingsOpen, setClaudeSettingsOpen] = useState(false);
+  const [claudeAuthStatus, setClaudeAuthStatus] =
+    useState<ClaudeAuthStatus | null>(null);
+  const [claudeApiKeyInput, setClaudeApiKeyInput] = useState("");
+  const [claudeAuthBusy, setClaudeAuthBusy] = useState(false);
+  const [claudeTestBusy, setClaudeTestBusy] = useState(false);
+  const [claudeTestResult, setClaudeTestResult] =
+    useState<ClaudeConnectionResult | null>(null);
+  const [claudeModel, setClaudeModel] = useState(
+    () => localStorage.getItem("min-claude-model") ?? DEFAULT_CLAUDE_MODEL,
+  );
+  const [claudeEffort, setClaudeEffort] = useState(
+    () => localStorage.getItem("min-claude-effort") ?? DEFAULT_CLAUDE_EFFORT,
+  );
+  const [claudeBudgetUsd, setClaudeBudgetUsd] = useState(
+    () => localStorage.getItem("min-claude-budget-usd") ?? DEFAULT_CLAUDE_BUDGET_USD,
+  );
+  const [claudeMaxTurns, setClaudeMaxTurns] = useState(
+    () => localStorage.getItem("min-claude-max-turns") ?? DEFAULT_CLAUDE_MAX_TURNS,
+  );
+  const [claudeSessionIds, setClaudeSessionIds] = useState<Record<string, string>>(() => {
+    try {
+      const parsed = JSON.parse(localStorage.getItem("min-claude-sessions") ?? "{}");
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  });
+  const [pendingClaudeApproval, setPendingClaudeApproval] =
+    useState<ClaudeApprovalRequest | null>(null);
+  const [pendingClaudeQuestion, setPendingClaudeQuestion] =
+    useState<ClaudeQuestionRequest | null>(null);
+  const [claudeQuestionDraft, setClaudeQuestionDraft] = useState("");
+  const [claudeQuestionSelections, setClaudeQuestionSelections] = useState<string[]>([]);
   const [commandsOpen, setCommandsOpen] = useState(false);
   const [openMenu, setOpenMenu] = useState<OpenMenu>(null);
   const [newProjectMenuOpen, setNewProjectMenuOpen] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [activeFamilyKey, setActiveFamilyKey] = useState<string | null>(null);
   const [modelCatalog, setModelCatalog] =
-    useState<CodexModel[]>(fallbackModels);
+    useState<CodexModel[]>([...fallbackModels, claudeCodingModel]);
   const [modelsLoading, setModelsLoading] = useState(isTauri);
   const [selectedModel, setSelectedModel] = useState<string | null>(() => {
     if (
@@ -6060,8 +6501,23 @@ function App() {
   );
   const [transportStatus, setTransportStatus] =
     useState<CodexTransportStatus | null>(null);
+  const [agentConversationStatus, setAgentConversationStatus] =
+    useState<AgentConversationStatus | null>(null);
+  const [agentStatusRevision, setAgentStatusRevision] = useState(0);
   const [watchdogMessage, setWatchdogMessage] = useState("");
   const [agentApplyBusy, setAgentApplyBusy] = useState(false);
+  const [agentRollbackBusy, setAgentRollbackBusy] = useState(false);
+  // A generated diagram is only useful if it can be looked at; the data URL is
+  // fetched on demand so a large image never sits in state unopened.
+  const [imagePreview, setImagePreview] = useState<{
+    path: string;
+    source: string | null;
+    error: string | null;
+  } | null>(null);
+  // The snapshot whose changes are currently on disk and can still be undone.
+  const [undoableSnapshot, setUndoableSnapshot] = useState<{
+    snapshotId: string;
+  } | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
   // The model turn can be complete while the native command is still
@@ -6198,6 +6654,35 @@ function App() {
     activeMode === "general"
       ? activeGeneralConversationKey
       : `${activeProjectPath}/${activeThread}`;
+  const activeConversationId =
+    localConversationCache[threadKey]?.id ?? null;
+
+  // The undoable snapshot belongs to one conversation's workspace. Switching
+  // conversations must drop it, otherwise the undo control would offer to
+  // restore another project's files.
+  useEffect(() => {
+    setUndoableSnapshot(null);
+  }, [activeConversationId]);
+
+  useEffect(() => {
+    if (!isTauri || !localStoreReady || !activeConversationId) {
+      setAgentConversationStatus(null);
+      return;
+    }
+    let active = true;
+    void invoke<AgentConversationStatus | null>("agent_conversation_status", {
+      conversationId: activeConversationId,
+    })
+      .then((status) => {
+        if (active) setAgentConversationStatus(status);
+      })
+      .catch(() => {
+        if (active) setAgentConversationStatus(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [activeConversationId, agentStatusRevision, isTauri, localStoreReady]);
 
   useEffect(() => {
     const updateSelectionQuote = () => {
@@ -6329,8 +6814,11 @@ function App() {
   const shouldStickToBottom = useRef(true);
   const autoScrollFrameRef = useRef<number | null>(null);
   const activeRequestIdRef = useRef<string | null>(null);
+  const activeAgentConversationIdRef = useRef<string | null>(null);
+  const activeProviderRef = useRef<"codex" | "anthropic">("codex");
   const completionSoundRequestsRef = useRef<Set<string>>(new Set());
   const processedCodexEventsRef = useRef<Set<string>>(new Set());
+  const completedTerminalTurnsRef = useRef<Set<string>>(new Set());
   const activeLiveMessageIdRef = useRef<string | null>(null);
   const preparingRequestIdRef = useRef<string | null>(null);
   const turnCompletedRequestIdRef = useRef<string | null>(null);
@@ -6539,17 +7027,80 @@ function App() {
       });
   };
 
+  // Changes are applied to the workspace automatically, so the only way back
+  // is an explicit undo. The snapshot that produced the current on-disk state
+  // is kept here so the change summary can offer it.
+  const rollbackAgentChanges = async () => {
+    const snapshot = undoableSnapshot;
+    if (!isTauri || !snapshot || agentRollbackBusy) return;
+    setAgentRollbackBusy(true);
+    try {
+      await invoke<AgentRollbackResult>("agent_rollback_snapshot", {
+        snapshotId: snapshot.snapshotId,
+      });
+      setUndoableSnapshot(null);
+      setCodeStatus("változások visszavonva");
+      notify("A turn fájlváltozásai visszaálltak a turn előtti állapotra");
+    } catch (error) {
+      // The guard refuses to roll back when the files changed after the turn,
+      // which is the correct outcome — say so instead of failing silently.
+      notify(`A visszavonás nem lehetséges: ${String(error)}`, "notify");
+    } finally {
+      setAgentRollbackBusy(false);
+    }
+  };
+
+  const openImagePreview = (path: string) => {
+    setImagePreview({ path, source: null, error: null });
+    if (!isTauri) return;
+    const load = (attempt: number) => {
+      void invoke<string | null>("read_project_image", {
+        cwd: activeProjectPathRef.current || activeProjectPath,
+        path,
+      })
+        .then((source) => {
+          setImagePreview((current) =>
+            current && current.path === path
+              ? {
+                  ...current,
+                  source,
+                  error: source ? null : "A fájl nem jeleníthető meg képként.",
+                }
+              : current,
+          );
+        })
+        .catch((error) => {
+          // A turn stages its changes and the workspace is restored to base
+          // until the automatic apply lands, so a click right after the answer
+          // can arrive while the file briefly does not exist. Retry once.
+          const missing = /os error 2|cannot find the file|nem található/i.test(
+            String(error),
+          );
+          if (missing && attempt === 0) {
+            window.setTimeout(() => load(1), 1200);
+            return;
+          }
+          setImagePreview((current) =>
+            current && current.path === path
+              ? { ...current, error: String(error) }
+              : current,
+          );
+        });
+    };
+    load(0);
+  };
+
   const applyAgentSnapshotAutomatically = async (guard: AgentGuardReport) => {
     if (!isTauri || !guard.applyAvailable) return true;
     setAgentApplyBusy(true);
     try {
-      await invoke<AgentApplyResult>("codex_apply_snapshot", {
+      await invoke<AgentApplyResult>("agent_apply_snapshot", {
         snapshotId: guard.snapshotId,
       });
       return true;
     } catch (error) {
-      // There is intentionally no review dock anymore. Surface only a short
-      // toast and release the UI so a later turn can still be attempted.
+      // Applying is automatic, so a failure only warrants a short toast; the
+      // undo affordance stays pointed at the last snapshot that did apply.
       setCodeStatus("apply hiba");
       notify(
         `A létrehozott fájlok automatikus alkalmazása sikertelen: ${String(error)}`,
@@ -7044,6 +7595,11 @@ function App() {
         label: "Codex",
         matches: (id: string) => id.includes("codex"),
       },
+      {
+        key: "claude",
+        label: "Claude",
+        matches: (id: string) => id.startsWith("claude-"),
+      },
       { key: "other", label: "Egyéb", matches: (_id: string) => true },
     ];
     return definitions
@@ -7078,6 +7634,7 @@ function App() {
     modelCatalog.find((model) => model.id === selectedModel) ??
     fallbackModels.find((model) => model.id === DEFAULT_MODEL) ??
     fallbackModels[0];
+  const selectedClaudeModel = Boolean(selectedModel?.startsWith("claude-"));
   const activeLabel = selectedModel ? modelLabel(activeModel) : "Automatikus";
   const supportedEfforts = activeModel.supportedReasoningEfforts.length
     ? activeModel.supportedReasoningEfforts
@@ -7311,6 +7868,34 @@ function App() {
     })();
     return () => {
       active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri) return;
+    let disposed = false;
+    let cleanup: Array<() => void> = [];
+    void Promise.all([
+      listen<ClaudeApprovalRequest>("agent-approval", (event) => {
+        setPendingClaudeApproval(event.payload);
+        setPendingClaudeQuestion(null);
+      }),
+      listen<ClaudeQuestionRequest>("agent-question", (event) => {
+        setPendingClaudeQuestion(event.payload);
+        setPendingClaudeApproval(null);
+        setClaudeQuestionDraft("");
+        setClaudeQuestionSelections([]);
+      }),
+    ])
+      .then((unlisteners) => {
+        if (disposed) unlisteners.forEach((unlisten) => unlisten());
+        else cleanup = unlisteners;
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      cleanup.forEach((unlisten) => unlisten());
+      cleanup = [];
     };
   }, []);
 
@@ -7694,7 +8279,7 @@ function App() {
     const pullRevision = projectMutationRevisionRef.current;
     let active = true;
     void invoke<SyncV2Result>("sync_v2_pull")
-      .then((result) => {
+      .then(async (result) => {
         if (!active) return;
         // The pull is asynchronous. Always merge against the state that is
         // current when it finishes, not the render that started it; otherwise
@@ -7703,7 +8288,17 @@ function App() {
         const currentConversationCache = localConversationCacheRef.current;
         const currentThreadIds = threadIdsRef.current;
         setSyncHealth(result.health);
-        const state = normalizeLocalStoreSnapshot(result.snapshot);
+        const localSnapshot = await invoke<LocalStoreSnapshot>(
+          "local_store_load",
+        ).catch(() => null);
+        const state = normalizeLocalStoreSnapshot(
+          localSnapshot
+            ? mergeLocalStoreSnapshotForHydration(
+                result.snapshot,
+                localSnapshot,
+              )
+            : result.snapshot,
+        );
         const hasGeneralConversations = Object.values(state.conversations).some(
           (conversation) => conversation.scope === "general",
         );
@@ -8259,10 +8854,33 @@ function App() {
     if (isTauri && (!syncReady || !localStoreReady)) return;
     if (messageKeyRef.current !== threadKey) {
       messageKeyRef.current = threadKey;
-      commitMessages(
-        localConversationCacheRef.current[threadKey]?.messages ??
-          loadThreadMessages(threadKey),
+      const cachedConversation = findCachedConversation(
+        localConversationCacheRef.current,
+        threadKey,
       );
+      if (cachedConversation) {
+        // SQLite/sync may canonicalize the project path (for example with or
+        // without the Windows \\?\\ prefix). Keep the hydrated conversation
+        // under the exact render key as well, otherwise this effect would
+        // fall back to the browser cache and hide freshly restored answers.
+        const next = {
+          ...localConversationCacheRef.current,
+          [threadKey]: {
+            ...cachedConversation,
+            scope: activeMode,
+            projectId: activeMode === "general" ? null : activeProjectData.id,
+            title:
+              activeMode === "general"
+                ? activeGeneralConversation?.title ?? "Új beszélgetés"
+                : activeThread,
+          },
+        };
+        localConversationCacheRef.current = next;
+        setLocalConversationCache(next);
+        commitMessages(cachedConversation.messages);
+      } else {
+        commitMessages(loadThreadMessages(threadKey));
+      }
       return;
     }
     if (isTauri) {
@@ -8804,7 +9422,8 @@ function App() {
     let active = true;
     void invoke<CodexModel[]>("codex_models")
       .then((models) => {
-        if (active && models.length > 0) setModelCatalog(models);
+        if (active && models.length > 0)
+          setModelCatalog([...models, claudeCodingModel]);
       })
       .catch(() => undefined)
       .finally(() => {
@@ -8816,9 +9435,27 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!isTauri) return;
+    let active = true;
+    void invoke<ClaudeAuthStatus>("claude_auth_status")
+      .then((status) => {
+        if (active) setClaudeAuthStatus(status);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
     if (activeModel && !supportedEfforts.includes(selectedEffort))
       setSelectedEffort(effectiveEffort);
   }, [modelCatalog, selectedModel]);
+
+  useEffect(() => {
+    if (selectedClaudeModel && supportedEfforts.includes(claudeEffort))
+      setSelectedEffort(claudeEffort);
+  }, [selectedClaudeModel, claudeEffort, supportedEfforts]);
 
   useEffect(() => {
     if (
@@ -8833,6 +9470,26 @@ function App() {
     if (selectedModel) localStorage.setItem("min-model", selectedModel);
     else localStorage.removeItem("min-model");
   }, [selectedModel]);
+
+  useEffect(() => {
+    localStorage.setItem("min-claude-model", claudeModel);
+  }, [claudeModel]);
+
+  useEffect(() => {
+    localStorage.setItem("min-claude-effort", claudeEffort);
+  }, [claudeEffort]);
+
+  useEffect(() => {
+    localStorage.setItem("min-claude-budget-usd", claudeBudgetUsd);
+  }, [claudeBudgetUsd]);
+
+  useEffect(() => {
+    localStorage.setItem("min-claude-max-turns", claudeMaxTurns);
+  }, [claudeMaxTurns]);
+
+  useEffect(() => {
+    localStorage.setItem("min-claude-sessions", JSON.stringify(claudeSessionIds));
+  }, [claudeSessionIds]);
 
   useEffect(
     () => localStorage.setItem("min-effort", selectedEffort),
@@ -8940,14 +9597,14 @@ function App() {
 
   useEffect(() => {
     if (!isTauri) return;
-    let cleanup: (() => void) | undefined;
+    let cleanup: Array<() => void> = [];
     let disposed = false;
-    void listen<CodexEvent>("codex-event", (event) => {
+    const handleAgentEvent = (value: unknown) => {
       // Events are meaningful only for the request currently owned by this
       // view. Late notifications from a completed/cancelled request must not
       // leak into a conversation selected afterwards.
       if (!activeRequestIdRef.current) return;
-      const codexEvent = normalizeCodexEvent(event.payload);
+      const codexEvent = normalizeCodexEvent(value);
       if (!codexEvent) return;
       if (
         codexEvent.requestId &&
@@ -8955,7 +9612,7 @@ function App() {
       )
         return;
       if (codexEvent.sequence !== undefined) {
-        const eventKey = `${codexEvent.requestId ?? activeRequestIdRef.current}:${codexEvent.sequence}`;
+        const eventKey = agentEventIdentity(codexEvent);
         const processed = processedCodexEventsRef.current;
         if (processed.has(eventKey)) return;
         processed.add(eventKey);
@@ -8972,6 +9629,31 @@ function App() {
       // The UI identity is created before the request leaves the client and
       // remains stable even if app-server emits multiple/fallback turn ids.
       const uiTurnId = activeTurnIdRef.current ?? explicitTurnId;
+      const terminalTurnKey =
+        codexEvent.terminalEventId ??
+        `${codexEvent.requestId ?? activeRequestIdRef.current}:${uiTurnId}`;
+      if (
+        completedTerminalTurnsRef.current.has(terminalTurnKey) &&
+        codexEvent.eventType !== "turn/completed"
+      ) {
+        return;
+      }
+      if (codexEvent.eventType === "turn/completed") {
+        const completed = completedTerminalTurnsRef.current;
+        if (
+          !acceptTerminalAgentEvent(completed, {
+            requestId: codexEvent.requestId ?? activeRequestIdRef.current,
+            threadId: uiTurnId,
+            terminalEventId: codexEvent.terminalEventId,
+            eventType: codexEvent.eventType,
+          })
+        )
+          return;
+        if (completed.size > 128) {
+          const oldest = completed.values().next().value;
+          if (oldest) completed.delete(oldest);
+        }
+      }
       let planStepIdOverride: string | undefined;
 
       if (
@@ -9212,6 +9894,13 @@ function App() {
           params.final_text,
         );
         const completedMessageId = activeLiveMessageIdRef.current;
+        const currentVisibleAnswer = messagesRef.current.find(
+          (message) =>
+            message.role === "assistant" &&
+            (message.id === completedMessageId || message.turnId === uiTurnId),
+        );
+        let checkpointAnswerText =
+          completedAnswerText ?? currentVisibleAnswer?.text ?? "";
         commitMessages((current) => {
           const targetIndex = completedMessageId
             ? current.findIndex((message) => message.id === completedMessageId)
@@ -9226,11 +9915,13 @@ function App() {
           if (answerIndex >= 0) {
             return current.map((message, index) => {
               if (index !== answerIndex) return message;
+              const answerText =
+                completedAnswerText ??
+                stripStaleInterruptionMarker(message).text;
+              if (answerText.trim()) checkpointAnswerText = answerText;
               return {
                 ...message,
-                text:
-                  completedAnswerText ||
-                  stripStaleInterruptionMarker(message).text,
+                text: answerText,
                 time:
                   message.time === "most"
                     ? new Date(completedAt).toISOString()
@@ -9241,7 +9932,16 @@ function App() {
               };
             });
           }
-          if (!completedAnswerText) return current;
+          const recoveredAnswer = current.find(
+            (message) =>
+              message.role === "assistant" &&
+              (message.id === completedMessageId ||
+                message.turnId === uiTurnId),
+          );
+          const answerText =
+            completedAnswerText ?? recoveredAnswer?.text ?? "";
+          if (!answerText.trim()) return current;
+          checkpointAnswerText = answerText;
           // A stale sync pull may have removed the optimistic live row before
           // the terminal event. Preserve the completed answer in the visible
           // turn instead of silently dropping it.
@@ -9251,7 +9951,7 @@ function App() {
               id: completedMessageId ?? createEntityId(),
               role: "assistant" as const,
               time: new Date(completedAt).toISOString(),
-              text: completedAnswerText,
+              text: answerText,
               live: false,
               final: true,
               interrupted: false,
@@ -9260,12 +9960,32 @@ function App() {
             },
           ];
         });
+        // The UI has the authoritative streamed text even when an older
+        // provider/session path returns an empty native response payload.
+        // Checkpoint that exact visible answer through the same durable SQLite
+        // writer; the native RPC checkpoint remains the first line of defense.
+        const checkpointConversationId =
+          activeAgentConversationIdRef.current ??
+          localConversationCacheRef.current[messageKeyRef.current]?.id;
+        if (
+          isTauri &&
+          completedRequestId &&
+          checkpointConversationId &&
+          checkpointAnswerText.trim()
+        ) {
+          void invoke("agent_answer_checkpoint", {
+            conversationId: checkpointConversationId,
+            requestId: completedRequestId,
+            text: checkpointAnswerText,
+          }).catch(() => undefined);
+        }
         // `turn/completed` is the durable answer boundary. Protect this
         // terminal message from an in-flight pull and force the zero-delay
         // SQLite + journal flush before the slower workspace guard finishes.
-        projectMutationRevisionRef.current += 1;
-        pendingLocalMutationRef.current = true;
-        setSyncReady(false);
+        // Use the stateful mutation path too: a ref-only revision bump does
+        // not re-run the persistence effect when the stream already flushed
+        // its provisional empty assistant row.
+        markLocalMutation();
         if (completedRequestId) {
           turnCompletedRequestIdRef.current = completedRequestId;
           setTurnCompletedRequestId(completedRequestId);
@@ -9287,20 +10007,27 @@ function App() {
           activeRequestIdRef.current ?? explicitTurnId,
         );
       } else if (codexEvent.eventType.includes("error")) setCodeStatus("hiba");
-    })
-      .then((unlisten) => {
+    };
+    void Promise.all([
+      listen<unknown>("agent-event", (event) =>
+        handleAgentEvent(event.payload),
+      ),
+      listen<unknown>("codex-event", (event) =>
+        handleAgentEvent(event.payload),
+      ),
+    ])
+      .then((unlisteners) => {
         if (disposed) {
-          unlisten();
+          unlisteners.forEach((unlisten) => unlisten());
         } else {
-          cleanup = unlisten;
+          cleanup = unlisteners;
         }
       })
       .catch(() => undefined);
     return () => {
       disposed = true;
-      const unlisten = cleanup;
-      cleanup = undefined;
-      unlisten?.();
+      cleanup.forEach((unlisten) => unlisten());
+      cleanup = [];
     };
   }, []);
 
@@ -9309,8 +10036,51 @@ function App() {
     if (sound) playAppSound(sound);
   };
 
+  const respondClaudeApproval = async (decision: string, reason?: string) => {
+    const pending = pendingClaudeApproval;
+    if (!pending) return;
+    // Close the modal immediately. The turn may already have ended while the
+    // interaction was visible (for example after a budget/cancellation error),
+    // in which case the backend correctly rejects the late response.
+    setPendingClaudeApproval(null);
+    try {
+      await invoke("claude_approval_response", {
+        approvalId: pending.approvalId,
+        decision,
+        reason: reason ?? null,
+      });
+    } catch (error) {
+      notify(`A Claude jóváhagyás nem küldhető el: ${String(error)}`, "notify");
+    }
+  };
+
+  const respondClaudeQuestion = async (answer: Record<string, unknown>) => {
+    const pending = pendingClaudeQuestion;
+    if (!pending) return;
+    // See the approval flow above: never leave a stale question blocking the
+    // composer when the underlying bridge turn has already terminated.
+    setPendingClaudeQuestion(null);
+    setClaudeQuestionDraft("");
+    setClaudeQuestionSelections([]);
+    try {
+      await invoke("claude_question_response", {
+        questionId: pending.questionId,
+        answer,
+      });
+    } catch (error) {
+      notify(`A Claude kérdés-válasz nem küldhető el: ${String(error)}`, "notify");
+    }
+  };
+
   const handleFileClick: FileClickHandler = (path, x, y) => {
     setSelectionQuote(null);
+    // An image is almost always clicked to be looked at, so show it in place.
+    // Launching the OS handler for that costs seconds of application startup;
+    // the overlay still offers it for when the external editor is the point.
+    if (isPreviewableImagePath(path)) {
+      openImagePreview(path);
+      return;
+    }
     setFileActionMenu({
       path,
       x: Math.min(Math.max(12, x), Math.max(12, window.innerWidth - 236)),
@@ -9520,11 +10290,13 @@ function App() {
           modelData.supportedReasoningEfforts[0] ??
           DEFAULT_EFFORT,
       );
+    if (model?.startsWith("claude-"))
+      setSelectedEffort(claudeEffort);
     setModelMenuOpen(false);
     notify(
       model
         ? `Modell kiválasztva: ${modelData?.displayName ?? model}`
-        : "Automatikus Codex-modell kiválasztva",
+        : "Automatikus modell kiválasztva",
     );
   };
 
@@ -10000,6 +10772,101 @@ function App() {
     });
   };
 
+  const saveClaudeApiKey = async () => {
+    if (!isTauri) {
+      notify("A Claude-kulcs mentése a natív Tauri appban érhető el");
+      return;
+    }
+    const apiKey = claudeApiKeyInput.trim();
+    if (!apiKey) {
+      notify("Adj meg egy Claude API-kulcsot");
+      return;
+    }
+    setClaudeAuthBusy(true);
+    setClaudeTestResult(null);
+    try {
+      const status = await invoke<ClaudeAuthStatus>("claude_save_api_key", {
+        apiKey,
+      });
+      setClaudeAuthStatus(status);
+      setClaudeApiKeyInput("");
+      notify("A Claude API-kulcs biztonságosan elmentve");
+    } catch (error) {
+      notify(`Nem sikerült elmenteni a Claude API-kulcsot: ${String(error)}`);
+    } finally {
+      setClaudeAuthBusy(false);
+    }
+  };
+
+  const deleteClaudeApiKey = async () => {
+    if (!isTauri) return;
+    setClaudeAuthBusy(true);
+    setClaudeTestResult(null);
+    try {
+      const status = await invoke<ClaudeAuthStatus>("claude_delete_api_key");
+      setClaudeAuthStatus(status);
+      setClaudeApiKeyInput("");
+      notify("A Claude API-kulcs törölve");
+    } catch (error) {
+      notify(`Nem sikerült törölni a Claude API-kulcsot: ${String(error)}`);
+    } finally {
+      setClaudeAuthBusy(false);
+    }
+  };
+
+  const testClaudeConnection = async () => {
+    if (!isTauri) {
+      notify("A Claude kapcsolat-teszt a natív Tauri appban érhető el");
+      return;
+    }
+    setClaudeTestBusy(true);
+    setClaudeTestResult(null);
+    try {
+      const result = await invoke<ClaudeConnectionResult>(
+        "claude_test_connection",
+        {
+          model: claudeModel,
+          effort: claudeEffort,
+          maxBudgetUsd: Number(claudeBudgetUsd) || 0.05,
+          maxTurns: Number(claudeMaxTurns) || Number(DEFAULT_CLAUDE_MAX_TURNS),
+          cwd: workspaceRoot || null,
+        },
+      );
+      setClaudeTestResult(result);
+      if (result.success) {
+        const cost =
+          typeof result.totalCostUsd === "number"
+            ? ` · ${result.totalCostUsd.toFixed(4)} USD`
+            : "";
+        notify(`Claude kapcsolat rendben${cost}`);
+      } else {
+        const description = describeAgentError(
+          result.errorCode,
+          result.error,
+          "Claude",
+        );
+        notify(description.notification);
+      }
+    } catch (error) {
+      const description = describeThrownAgentError(error, "Claude");
+      const failed: ClaudeConnectionResult = {
+        success: false,
+        model: claudeModel,
+        effort: claudeEffort,
+        text: null,
+        sessionId: null,
+        totalCostUsd: null,
+        requestId: "",
+        errorCode: description.code,
+        error: description.detail,
+      };
+      setClaudeTestResult(failed);
+      notify(description.notification);
+    } finally {
+      setClaudeTestBusy(false);
+    }
+  };
+
   const changeProjectsRoot = async () => {
     if (blockConversationMutationDuringStream()) return;
     if (!isTauri) return;
@@ -10348,7 +11215,12 @@ function App() {
     }
     setIsCancelling(true);
     try {
-      await invoke("codex_cancel", { requestId });
+      await invoke(
+        activeProviderRef.current === "anthropic"
+          ? "claude_cancel"
+          : "codex_cancel",
+        { requestId },
+      );
       finalizeCancellation();
       notify("A válaszgenerálás leállítva");
     } catch (error) {
@@ -10451,6 +11323,8 @@ function App() {
     const pendingImageSnapshot = pendingRegeneration ? [] : [...pendingImages];
     const requestMode = activeModeRef.current;
     const isGeneralMode = requestMode === "general";
+    const useClaude = !isGeneralMode && selectedClaudeModel;
+    activeProviderRef.current = useClaude ? "anthropic" : "codex";
     if (
       (!text && quoteSnapshot.length === 0 && pendingImageSnapshot.length === 0) ||
       isStreamingRef.current ||
@@ -10748,6 +11622,7 @@ function App() {
     turnCompletedRequestIdRef.current = null;
     setTurnCompletedRequestId(null);
     processedCodexEventsRef.current.clear();
+    completedTerminalTurnsRef.current.clear();
     preparingRequestIdRef.current = requestId;
     activeRequestIdRef.current = requestId;
     activeLiveMessageIdRef.current = liveMessageId;
@@ -10789,21 +11664,112 @@ function App() {
     preparingRequestIdRef.current = null;
 
     try {
-      const response = await invoke<CodexResponse>("codex_send", {
-        request: {
-          prompt: codexPrompt,
-          // Regeneration creates a fresh branch from the context preceding the
-          // source prompt; the old native thread already contains the answer
-          // that is being replaced.
-          threadId: regeneration ? null : (threadIds[requestThreadKey] ?? null),
-          conversationContext: rehydrationContext || null,
-          model: selectedModel,
-          effort: effectiveEffort,
-          cwd: isGeneralMode ? null : activeProjectData.path,
-          images: storedImages,
-          requestId,
-        },
-      });
+      // The UI cache key is path/title based for Tree navigation, while the
+      // agent/session tables need the durable SQLite conversation id. Keep the
+      // UI key for local state and use the persisted id for agent metadata.
+      const cachedRequestConversation =
+        localConversationCacheRef.current[requestThreadKey];
+      const requestConversationId =
+        ensureCanonicalConversationId(cachedRequestConversation?.id, createEntityId);
+      if (!cachedRequestConversation?.id) {
+        // A brand-new Coding thread has a path/title UI key before its first
+        // SQLite snapshot exists. Seed the canonical conversation id before
+        // agent_send so the first Claude turn/session never falls back to a
+        // non-portable path/title identity.
+        const seededConversation: SyncConversation = {
+          ...(cachedRequestConversation ?? {
+            scope: isGeneralMode ? "general" : "coding",
+            projectId: isGeneralMode ? null : activeProjectData.id,
+            title:
+              isGeneralMode
+                ? activeGeneralConversation?.title ?? "Új beszélgetés"
+                : activeThread,
+            messages: [],
+            workItems: [],
+            threadId: isGeneralMode
+              ? null
+              : threadIds[requestThreadKey] ?? null,
+            updatedAt: new Date(requestStartedAt).toISOString(),
+          }),
+          id: requestConversationId,
+          scope: isGeneralMode ? "general" : "coding",
+          projectId: isGeneralMode ? null : activeProjectData.id,
+          title:
+            isGeneralMode
+              ? activeGeneralConversation?.title ?? "Új beszélgetés"
+              : activeThread,
+          updatedAt: new Date(requestStartedAt).toISOString(),
+        };
+        localConversationCacheRef.current = {
+          ...localConversationCacheRef.current,
+          [requestThreadKey]: seededConversation,
+        };
+        setLocalConversationCache((current) => ({
+          ...current,
+          [requestThreadKey]: seededConversation,
+        }));
+      }
+      activeAgentConversationIdRef.current = requestConversationId;
+      // The durable provider session lives in SQLite keyed by the stable
+      // conversation id. The localStorage cache is keyed by project path plus
+      // a truncated conversation title, so an app restart or a title change
+      // silently misses it and the turn starts a brand-new Claude session —
+      // the transcript then has to be re-sent as context on every turn.
+      // Prefer the durable value; fall back to the cache for conversations
+      // that predate it. A flagged head conflict still forks deliberately.
+      // Asked at send time for exactly the conversation being sent to, rather
+      // than read off React state: the cached status can belong to another
+      // conversation or not have loaded yet, and either way the turn would
+      // silently start a new provider session.
+      let durableClaudeSessionId: string | null = null;
+      if (useClaude && isTauri && !regeneration) {
+        try {
+          const status = await invoke<AgentConversationStatus | null>(
+            "agent_conversation_status",
+            { conversationId: requestConversationId },
+          );
+          if (status && !status.hasConflict)
+            durableClaudeSessionId = status.activeSessionId;
+        } catch (error) {
+          console.warn("Agent conversation status unavailable", error);
+        }
+      }
+      const resumeClaudeSessionId = regeneration
+        ? null
+        : (durableClaudeSessionId ?? claudeSessionIds[requestThreadKey] ?? null);
+      const response = useClaude
+        ? await invoke<CodexResponse>("agent_send", {
+            request: {
+              prompt: codexPrompt,
+              images: storedImages,
+              provider: "anthropic",
+              runtime: "claudeAgentBridge",
+              conversationId: requestConversationId,
+              sessionId: resumeClaudeSessionId,
+              conversationContext: rehydrationContext || null,
+              model: selectedModel,
+              effort: claudeEffort || effectiveEffort,
+              cwd: activeProjectData.path,
+              requestId,
+              maxBudgetUsd: Number(claudeBudgetUsd),
+              maxTurns: Number(claudeMaxTurns),
+            },
+          })
+        : await invoke<CodexResponse>("codex_send", {
+            request: {
+              prompt: codexPrompt,
+              // Regeneration creates a fresh branch from the context preceding the
+              // source prompt; the old native thread already contains the answer
+              // that is being replaced.
+              threadId: regeneration ? null : (threadIds[requestThreadKey] ?? null),
+              conversationContext: rehydrationContext || null,
+              model: selectedClaudeModel ? DEFAULT_MODEL : selectedModel,
+              effort: effectiveEffort,
+              cwd: isGeneralMode ? null : activeProjectData.path,
+              images: storedImages,
+              requestId,
+            },
+          });
       if (cancelledRequestIdsRef.current.delete(requestId)) return;
       const hasAgentChanges =
         response.guard.changedFiles.length > 0 ||
@@ -10814,7 +11780,7 @@ function App() {
         : [];
       if (hasAgentChanges && !isGeneralMode && isTauri) {
         try {
-          const preview = await invoke<AgentDiffPreview>("codex_preview_snapshot", {
+          const preview = await invoke<AgentDiffPreview>("agent_preview_snapshot", {
             snapshotId: response.guard.snapshotId,
           });
           const previewSummary = changeSummaryFromDiffFiles(preview.files);
@@ -10823,13 +11789,33 @@ function App() {
           console.warn("Agent diff preview unavailable", error);
         }
       }
-      if (hasAgentChanges && !isGeneralMode)
-        await applyAgentSnapshotAutomatically(response.guard);
+      if (hasAgentChanges && !isGeneralMode) {
+        const applied = await applyAgentSnapshotAutomatically(response.guard);
+        // A Claude turn is staged first: the workspace is restored to base and
+        // the report says rollbackAvailable=false / applyAvailable=true, then
+        // the automatic apply puts the changes on disk. So the undo is offered
+        // when the apply succeeded, or when a non-staged flow already reports
+        // the snapshot as rollbackable. Either way the changes are on disk.
+        setUndoableSnapshot(
+          applied || response.guard.rollbackAvailable
+            ? { snapshotId: response.guard.snapshotId }
+            : null,
+        );
+      }
       if (!isGeneralMode) {
-        setThreadIds((current) => ({
-          ...current,
-          [requestThreadKey]: response.threadId,
-        }));
+        if (useClaude) {
+          const sessionId = response.threadId || null;
+          if (sessionId)
+            setClaudeSessionIds((current) => ({
+              ...current,
+              [requestThreadKey]: sessionId,
+            }));
+        } else {
+          setThreadIds((current) => ({
+            ...current,
+            [requestThreadKey]: response.threadId,
+          }));
+        }
       }
       commitMessages((current) => {
         const targetIndex = current.findIndex(
@@ -10877,6 +11863,11 @@ function App() {
           },
         ];
       });
+      // The native response can arrive after the terminal event and after
+      // the streaming debounce has already persisted the placeholder. Mark
+      // this final RPC result as a fresh mutation so the completed text is
+      // guaranteed to reach SQLite as well.
+      markLocalMutation();
       for (const filePath of isGeneralMode
         ? []
         : extractMentionedFilePaths(response.text)) {
@@ -10941,7 +11932,9 @@ function App() {
           : "Codex válasz megérkezett",
       );
     } catch (error) {
-      const errorText = String(error);
+      const providerName = useClaude ? "Claude" : "Codex";
+      const errorDescription = describeThrownAgentError(error, providerName);
+      const errorText = errorDescription.detail;
       // The native command performs snapshot finalization after the model has
       // emitted its final answer. Preserve that streamed answer if only the
       // later workspace post-processing failed.
@@ -10966,7 +11959,7 @@ function App() {
                   regeneration?.originalAnswer.text ||
                   (wasCancelled
                     ? "A válasz megszakítva."
-                    : `Nem sikerült a Codex-kérés: ${errorText}`),
+                    : `Nem sikerült a ${providerName}-kérés: ${errorDescription.userMessage}`),
                 turnId: message.turnId ?? activeTurnIdRef.current,
                 live: false,
                 final: true,
@@ -10975,18 +11968,28 @@ function App() {
             : message,
         );
       });
+      // Persist a streamed answer/error even when the native post-processing
+      // fails after the provider has already produced visible text.
+      markLocalMutation();
       const answerArrived = !wasCancelled && hasStreamedAnswer;
       settleActivePlan(wasCancelled || answerArrived ? "completed" : "error");
       setCodeStatus(wasCancelled || answerArrived ? "kész" : "hiba");
+      setTransportStatus({
+        requestId,
+        stage: wasCancelled ? "cancelled" : "error",
+        detail: `${errorDescription.code}: ${errorDescription.detail}`,
+        threadId: activeTurnIdRef.current,
+      });
       notify(
         answerArrived
           ? "A válasz megérkezett; a lezárás utóellenőrzése nem sikerült"
           : wasCancelled
-            ? "Codex-kérés megszakítva"
-            : "Codex-kapcsolati hiba",
+            ? `${providerName}-kérés megszakítva`
+            : errorDescription.notification,
         hasStreamedAnswer || wasCancelled ? undefined : "notify",
       );
     } finally {
+      setAgentStatusRevision((current) => current + 1);
       if (activeRequestIdRef.current === requestId) {
         isStreamingRef.current = false;
         setIsStreaming(false);
@@ -11427,6 +12430,13 @@ function App() {
         compact={compact}
         onCopyAnswer={copyAnswerToClipboard}
         onRegenerate={regenerateAnswer}
+        onRollbackChanges={
+          isCurrentGroup && undoableSnapshot
+            ? () => void rollbackAgentChanges()
+            : undefined
+        }
+        rollbackBusy={agentRollbackBusy}
+        onPreviewImage={openImagePreview}
         onToggle={() =>
           setExpandedForWorkGroup(entry.group, !expanded)
         }
@@ -11454,42 +12464,50 @@ function App() {
   const liveCompact = activeUserMessage
     ? !messageUsesDetailedTrace(activeUserMessage)
     : !showDetailedTrace;
-  const liveTurnContent = activeMode === "coding" && isStreaming && (
-    <div className="live-turn-anchor">
-      <TurnProgressCard
-        plan={activePlan}
-        activities={liveWorkGroup?.activities ?? []}
-        commentary={
-          liveWorkGroup
-            ? commentaryForWorkGroup(liveWorkGroup)
-            : commentaryEntries.filter((commentary) =>
-                Boolean(liveTurnId && commentary.turnId === liveTurnId),
-              )
-        }
-        status={codeStatus}
-        streaming={isStreaming && !activeTurnHasCompleted}
-        expanded={liveExpanded}
-        transport={transportStatus}
-        watchdogMessage={watchdogMessage}
-        answer={liveAnswer}
-        quoteRefs={allQuoteRefs}
-        quoteAnchorPrefix={`trace:${liveTurnKey}`}
-        onQuoteJump={jumpToQuote}
-        compact={liveCompact}
-        onCopyAnswer={copyAnswerToClipboard}
-        onRegenerate={regenerateAnswer}
-        onToggle={() =>
-          setExpandedForKeys(
-            [
-              liveTurnKey,
-              ...(liveWorkGroup ? workGroupExpansionKeys(liveWorkGroup) : []),
-            ],
-            !liveExpanded,
-          )
-        }
-      />
-    </div>
-  );
+  const liveTurnContent =
+    activeMode === "coding" &&
+    isStreaming &&
+    !activeTurnHasCompleted && (
+      <div className="live-turn-anchor">
+        <TurnProgressCard
+          plan={activePlan}
+          activities={liveWorkGroup?.activities ?? []}
+          commentary={
+            liveWorkGroup
+              ? commentaryForWorkGroup(liveWorkGroup)
+              : commentaryEntries.filter((commentary) =>
+                  Boolean(liveTurnId && commentary.turnId === liveTurnId),
+                )
+          }
+          status={codeStatus}
+          streaming={isStreaming && !activeTurnHasCompleted}
+          expanded={liveExpanded}
+          transport={transportStatus}
+          watchdogMessage={watchdogMessage}
+          answer={liveAnswer}
+          quoteRefs={allQuoteRefs}
+          quoteAnchorPrefix={`trace:${liveTurnKey}`}
+          onQuoteJump={jumpToQuote}
+          compact={liveCompact}
+          onCopyAnswer={copyAnswerToClipboard}
+          onRegenerate={regenerateAnswer}
+          onRollbackChanges={
+            undoableSnapshot ? () => void rollbackAgentChanges() : undefined
+          }
+          rollbackBusy={agentRollbackBusy}
+          onPreviewImage={openImagePreview}
+          onToggle={() =>
+            setExpandedForKeys(
+              [
+                liveTurnKey,
+                ...(liveWorkGroup ? workGroupExpansionKeys(liveWorkGroup) : []),
+              ],
+              !liveExpanded,
+            )
+          }
+        />
+      </div>
+    );
   const generalLiveTurnContent =
     activeMode === "general" && isStreaming && liveAnswer ? (
       <div className="general-live-answer">
@@ -12154,6 +13172,169 @@ function App() {
                   type="button"
                   className="settings-option"
                   disabled={!isTauri}
+                  aria-expanded={claudeSettingsOpen}
+                  onClick={() => {
+                    if (isTauri) setClaudeSettingsOpen((open) => !open);
+                  }}
+                >
+                  <span>
+                    <strong>Claude</strong>
+                    <small className="settings-option-hint">
+                      {claudeAuthStatus?.subscriptionConfigured
+                        ? `${claudeAuthStatus.preview ?? "Előfizetés"} · aktív`
+                        : claudeAuthStatus?.apiKeyConfigured
+                          ? "API-kulcs beállítva"
+                          : "Nincs hitelesítés"}
+                    </small>
+                  </span>
+                  <span aria-hidden="true">
+                    {claudeSettingsOpen ? "⌃" : "⌄"}
+                  </span>
+                </button>
+                {claudeSettingsOpen && (
+                  <div className="settings-subpanel claude-settings-panel">
+                    <div className="claude-auth-status">
+                      <span>Hitelesítés</span>
+                      <strong>
+                        {claudeAuthStatus?.subscriptionConfigured
+                          ? `${claudeAuthStatus.preview ?? "Előfizetés"} · bejelentkezve`
+                          : claudeAuthStatus?.apiKeyConfigured
+                            ? `API-kulcs${claudeAuthStatus.preview ? ` · ${claudeAuthStatus.preview}` : ""}`
+                            : "Nincs beállítva"}
+                      </strong>
+                    </div>
+                    <p className="claude-auth-hint">
+                      {claudeAuthStatus?.subscriptionConfigured
+                        ? claudeAuthStatus.apiKeyConfigured
+                          ? "A coding turnök az előfizetéssel futnak. A mentett API-kulcs csak akkor lép be, ha kilépsz a Claude Code bejelentkezésből."
+                          : "A coding turnök az előfizetéssel futnak, nincs per-turn USD költség. A turnlimit a guard."
+                        : "Előfizetéses futtatáshoz jelentkezz be a Claude Code-ba ezen a gépen, vagy add meg egy pay-per-token API-kulcsot."}
+                    </p>
+                    <div className="claude-runtime-grid">
+                      <label>
+                        <span>Modell</span>
+                        <select
+                          value={claudeModel}
+                          onChange={(event) => setClaudeModel(event.target.value)}
+                        >
+                          <option value="claude-sonnet-5">Claude Sonnet 5</option>
+                        </select>
+                      </label>
+                      <label>
+                        <span>Effort</span>
+                        <select
+                          value={claudeEffort}
+                          onChange={(event) => setClaudeEffort(event.target.value)}
+                        >
+                          <option value="low">Low</option>
+                          <option value="medium">Medium</option>
+                          <option value="high">High</option>
+                        </select>
+                      </label>
+                      <label>
+                        <span>
+                          {claudeAuthStatus?.subscriptionConfigured
+                            ? "Budget / turn (USD, előfizetésnél inaktív)"
+                            : "Budget / turn (USD)"}
+                        </span>
+                        <input
+                          type="number"
+                          min="0.01"
+                          max="5"
+                          step="0.01"
+                          value={claudeBudgetUsd}
+                          onChange={(event) => setClaudeBudgetUsd(event.target.value)}
+                          disabled={claudeAuthStatus?.subscriptionConfigured ?? false}
+                        />
+                      </label>
+                      <label>
+                        <span>Turnlimit</span>
+                        <input
+                          type="number"
+                          min="1"
+                          max="200"
+                          step="1"
+                          value={claudeMaxTurns}
+                          onChange={(event) => setClaudeMaxTurns(event.target.value)}
+                        />
+                      </label>
+                    </div>
+                    <label className="claude-key-field">
+                      <span>API-kulcs</span>
+                      <input
+                        type="password"
+                        value={claudeApiKeyInput}
+                        onChange={(event) =>
+                          setClaudeApiKeyInput(event.target.value)
+                        }
+                        placeholder={
+                          claudeAuthStatus?.configured
+                            ? "Új kulcs megadása a cseréhez"
+                            : "sk-ant-…"
+                        }
+                        autoComplete="off"
+                        spellCheck={false}
+                        disabled={claudeAuthBusy || claudeTestBusy}
+                      />
+                    </label>
+                    <div className="claude-settings-actions">
+                      <button
+                        type="button"
+                        className="settings-compact-button"
+                        onClick={() => void saveClaudeApiKey()}
+                        disabled={
+                          claudeAuthBusy || claudeTestBusy || !claudeApiKeyInput.trim()
+                        }
+                      >
+                        Mentés
+                      </button>
+                      <button
+                        type="button"
+                        className="settings-compact-button"
+                        onClick={() => void testClaudeConnection()}
+                        disabled={
+                          claudeAuthBusy || claudeTestBusy || !claudeAuthStatus?.configured
+                        }
+                      >
+                        {claudeTestBusy ? "Tesztelés…" : "Kapcsolat tesztelése"}
+                      </button>
+                      <button
+                        type="button"
+                        className="settings-compact-button danger"
+                        onClick={() => void deleteClaudeApiKey()}
+                        disabled={
+                          claudeAuthBusy ||
+                          claudeTestBusy ||
+                          !claudeAuthStatus?.apiKeyConfigured
+                        }
+                      >
+                        Törlés
+                      </button>
+                    </div>
+                    {claudeTestResult && (
+                      <div
+                        className={`claude-test-result ${claudeTestResult.success ? "is-success" : "is-error"}`}
+                      >
+                        <strong>
+                          {claudeTestResult.success ? "Kapcsolat rendben" : "Kapcsolat-hiba"}
+                        </strong>
+                        <span>
+                          {claudeTestResult.success
+                            ? `${claudeTestResult.model}${
+                                typeof claudeTestResult.totalCostUsd === "number"
+                                  ? ` · ${claudeTestResult.totalCostUsd.toFixed(4)} USD`
+                                  : ""
+                              }`
+                            : `${claudeTestResult.errorCode ? `${claudeTestResult.errorCode}: ` : ""}${claudeTestResult.error ?? "Ismeretlen hiba"}`}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )}
+                <button
+                  type="button"
+                  className="settings-option"
+                  disabled={!isTauri}
                   onClick={() => {
                     if (isTauri) {
                       void changeProjectsRoot();
@@ -12189,6 +13370,15 @@ function App() {
                     ? "Betöltés folyamatban…"
                     : activeThread || "Nincs beszélgetés"}
               </div>
+              {agentConversationStatus?.hasConflict && (
+                <div
+                  className="agent-conflict-indicator"
+                  role="status"
+                  title="A megosztott Claude session egy masik eszkoz agan maradt; a kovetkezo turn uj sessionben folytatodik."
+                >
+                  Claude session fork
+                </div>
+              )}
             </div>
           </div>
           <div
@@ -12382,6 +13572,24 @@ function App() {
         </button>
       )}
 
+      {imagePreview && (
+        <ImagePreviewOverlay
+          path={imagePreview.path}
+          source={imagePreview.source}
+          error={imagePreview.error}
+          onClose={() => setImagePreview(null)}
+          onOpenExternal={() => {
+            const target = imagePreview.path;
+            setImagePreview(null);
+            void invoke("run_project_file", {
+              cwd: activeProjectPathRef.current || activeProjectPath,
+              path: target,
+            }).catch((error) =>
+              notify(`Nem sikerült megnyitni: ${String(error)}`, "notify"),
+            );
+          }}
+        />
+      )}
       {fileActionMenu && (
         <div
           className="file-action-menu"
@@ -12470,6 +13678,97 @@ function App() {
           </form>
         </div>
       )}
+      {pendingClaudeApproval && (
+        <div className="agent-interaction-overlay" role="presentation">
+          <section className="agent-interaction-card" role="dialog" aria-modal="true" aria-labelledby="claude-approval-title">
+            <span className="approval-eyebrow">CLAUDE JÓVÁHAGYÁS</span>
+            <h2 id="claude-approval-title">
+              {pendingClaudeApproval.title || `${pendingClaudeApproval.toolName} futtatása`}
+            </h2>
+            {pendingClaudeApproval.description && <p>{pendingClaudeApproval.description}</p>}
+            {pendingClaudeApproval.reason && <p className="agent-interaction-reason">{pendingClaudeApproval.reason}</p>}
+            <pre className="agent-interaction-preview">
+              {JSON.stringify(pendingClaudeApproval.input, null, 2)}
+            </pre>
+            <div className="agent-interaction-actions">
+              <button type="button" onClick={() => void respondClaudeApproval("decline", "A felhasználó elutasította a műveletet.")}>Tiltás</button>
+              <button type="button" onClick={() => void respondClaudeApproval("acceptForSession")}>Engedélyezés erre a munkamenetre</button>
+              <button type="button" className="agent-interaction-primary" onClick={() => void respondClaudeApproval("accept")}>Engedélyezés egyszer</button>
+            </div>
+          </section>
+        </div>
+      )}
+      {pendingClaudeQuestion && (() => {
+        const question = pendingClaudeQuestion.questions[0];
+        if (!question) return null;
+        // The Agent SDK keys the answers record by the question's full text.
+        // Using the short header instead makes the SDK drop the answer and tell
+        // the model "no answer provided", losing the selection silently.
+        const answerKey = question.question || question.header || "answer";
+        const options = question.options ?? [];
+        const multiSelect = question.multiSelect === true;
+        const selected = multiSelect
+          ? claudeQuestionSelections
+          : claudeQuestionDraft
+            ? [claudeQuestionDraft]
+            : [];
+        return (
+          <div className="agent-interaction-overlay" role="presentation">
+            <section className="agent-interaction-card" role="dialog" aria-modal="true" aria-labelledby="claude-question-title">
+              <span className="approval-eyebrow">CLAUDE KÉRDÉS</span>
+              <h2 id="claude-question-title">{question.question || question.header || "Válassz egy lehetőséget"}</h2>
+              <div className="agent-question-options">
+                {options.map((option) => {
+                  const label = option.label || "Választás";
+                  const active = selected.includes(label);
+                  return (
+                    <button
+                      type="button"
+                      className={active ? "is-selected" : ""}
+                      key={label}
+                      onClick={() => {
+                        if (multiSelect) {
+                          setClaudeQuestionSelections((current) =>
+                            current.includes(label)
+                              ? current.filter((item) => item !== label)
+                              : [...current, label],
+                          );
+                        } else {
+                          setClaudeQuestionDraft(label);
+                        }
+                      }}
+                    >
+                      <strong>{label}</strong>
+                      {option.description && <small>{option.description}</small>}
+                    </button>
+                  );
+                })}
+              </div>
+              <input
+                className="agent-question-free-text"
+                value={multiSelect ? claudeQuestionDraft : claudeQuestionDraft}
+                onChange={(event) => setClaudeQuestionDraft(event.target.value)}
+                placeholder="Saját válasz…"
+                aria-label="Saját válasz"
+              />
+              <div className="agent-interaction-actions">
+                <button type="button" onClick={() => void respondClaudeQuestion({ [answerKey]: "" })}>Mégse</button>
+                <button
+                  type="button"
+                  className="agent-interaction-primary"
+                  disabled={selected.length === 0 && !claudeQuestionDraft.trim()}
+                  onClick={() => {
+                    const answer = claudeQuestionDraft.trim() || (multiSelect ? selected : selected[0]);
+                    void respondClaudeQuestion({ [answerKey]: answer });
+                  }}
+                >
+                  Válasz küldése
+                </button>
+              </div>
+            </section>
+          </div>
+        );
+      })()}
       {toast && (
         <div className="toast is-visible" role="status">
           {toast}

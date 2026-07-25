@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
-pub const STORE_SCHEMA_VERSION: i64 = 19;
+pub const STORE_SCHEMA_VERSION: i64 = 20;
 // The public snapshot and sync contracts represent GENERAL with
 // projectId = null. SQLite keeps this hidden FK target only because the
 // existing conversations.project_id column is intentionally NOT NULL and
@@ -51,7 +51,12 @@ CREATE TABLE IF NOT EXISTS conversations (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     plan_history_json TEXT NOT NULL DEFAULT '{}',
-    commentary_json TEXT NOT NULL DEFAULT '[]'
+    commentary_json TEXT NOT NULL DEFAULT '[]',
+    agent_runtime TEXT NOT NULL DEFAULT 'codex_app_server',
+    agent_provider TEXT NOT NULL DEFAULT 'openai',
+    agent_model TEXT,
+    agent_effort TEXT,
+    active_agent_session_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -82,8 +87,65 @@ CREATE TABLE IF NOT EXISTS turns (
     codex_thread_id TEXT,
     codex_turn_id TEXT,
     status TEXT NOT NULL,
+    agent_runtime TEXT,
+    provider_session_id TEXT,
+    provider_turn_id TEXT,
+    base_head_turn_id TEXT,
+    max_budget_usd REAL,
+    total_cost_usd REAL,
+    terminal_event_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_sessions (
+    id TEXT PRIMARY KEY NOT NULL,
+    conversation_id TEXT NOT NULL,
+    project_key TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    provider_session_id TEXT NOT NULL,
+    head_turn_id TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    origin_device_id TEXT,
+    hlc TEXT,
+    UNIQUE(conversation_id, provider, provider_session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_project
+    ON agent_sessions(project_key, updated_at);
+
+CREATE TABLE IF NOT EXISTS agent_session_entries (
+    id TEXT PRIMARY KEY NOT NULL,
+    agent_session_id TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+    subpath TEXT NOT NULL DEFAULT '',
+    entry_uuid TEXT,
+    sequence INTEGER NOT NULL,
+    body_json TEXT NOT NULL,
+    origin_device_id TEXT,
+    hlc TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(agent_session_id, subpath, sequence)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_session_entry_uuid
+    ON agent_session_entries(agent_session_id, subpath, entry_uuid)
+    WHERE entry_uuid IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_agent_session_entries_load
+    ON agent_session_entries(agent_session_id, subpath, sequence);
+
+CREATE TABLE IF NOT EXISTS agent_approvals (
+    id TEXT PRIMARY KEY NOT NULL,
+    request_id TEXT NOT NULL,
+    tool_use_id TEXT,
+    tool_name TEXT NOT NULL,
+    input_json TEXT NOT NULL,
+    decision TEXT,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS work_items (
@@ -202,6 +264,45 @@ pub struct LocalStoreSnapshot {
     pub conversations: BTreeMap<String, LocalConversation>,
     #[serde(default)]
     pub tombstones: Vec<LocalTombstone>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentSessionCompactionState {
+    #[serde(default)]
+    pub sessions: Vec<AgentSessionCompactionRow>,
+    #[serde(default)]
+    pub entries: Vec<AgentSessionCompactionEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentSessionCompactionRow {
+    pub id: String,
+    pub conversation_id: String,
+    pub project_key: String,
+    pub provider: String,
+    pub provider_session_id: String,
+    pub head_turn_id: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub origin_device_id: Option<String>,
+    pub hlc: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentSessionCompactionEntry {
+    pub id: String,
+    pub agent_session_id: String,
+    pub subpath: String,
+    pub entry_uuid: Option<String>,
+    pub sequence: i64,
+    pub body: serde_json::Value,
+    pub origin_device_id: Option<String>,
+    pub hlc: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1286,6 +1387,125 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
             format!("A lokális SQLite v19 migráció commitja sikertelen: {error}")
         })?;
     }
+    let migrated_version = read_schema_version(connection)?;
+    if migrated_version == 19 {
+        let transaction = connection.transaction().map_err(|error| {
+            format!("A lokÃ¡lis SQLite v20 migrÃ¡ciÃ³ nem indÃ­thatÃ³ el: {error}")
+        })?;
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS turns (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     conversation_id TEXT NOT NULL,
+                     request_id TEXT,
+                     codex_thread_id TEXT,
+                     codex_turn_id TEXT,
+                     status TEXT NOT NULL,
+                     created_at TEXT NOT NULL,
+                     updated_at TEXT NOT NULL
+                 );",
+            )
+            .map_err(|error| {
+                format!("A v20 turns alapstruktÃºrÃ¡ja nem hozhatÃ³ lÃ©tre: {error}")
+            })?;
+        let ensure_column = |table: &str, column: &str, definition: &str| -> Result<(), String> {
+            let has_column = {
+                let mut statement = transaction
+                    .prepare(&format!("PRAGMA table_info({table})"))
+                    .map_err(|error| format!("A v20 {table} schema nem olvashatÃ³: {error}"))?;
+                let columns = statement
+                    .query_map([], |row| row.get::<_, String>(1))
+                    .map_err(|error| format!("A v20 {table} oszloplista nem olvashatÃ³: {error}"))?
+                    .collect::<Result<HashSet<_>, _>>()
+                    .map_err(|error| format!("A v20 {table} schema hibÃ¡s: {error}"))?;
+                columns.contains(column)
+            };
+            if !has_column {
+                transaction
+                    .execute_batch(&format!(
+                        "ALTER TABLE {table} ADD COLUMN {column} {definition};"
+                    ))
+                    .map_err(|error| {
+                        format!("A v20 {table}.{column} oszlop nem hozhatÃ³ lÃ©tre: {error}")
+                    })?;
+            }
+            Ok(())
+        };
+        ensure_column(
+            "conversations",
+            "agent_runtime",
+            "TEXT NOT NULL DEFAULT 'codex_app_server'",
+        )?;
+        ensure_column(
+            "conversations",
+            "agent_provider",
+            "TEXT NOT NULL DEFAULT 'openai'",
+        )?;
+        ensure_column("conversations", "agent_model", "TEXT")?;
+        ensure_column("conversations", "agent_effort", "TEXT")?;
+        ensure_column("conversations", "active_agent_session_id", "TEXT")?;
+        ensure_column("turns", "agent_runtime", "TEXT")?;
+        ensure_column("turns", "provider_session_id", "TEXT")?;
+        ensure_column("turns", "provider_turn_id", "TEXT")?;
+        ensure_column("turns", "base_head_turn_id", "TEXT")?;
+        ensure_column("turns", "max_budget_usd", "REAL")?;
+        ensure_column("turns", "total_cost_usd", "REAL")?;
+        ensure_column("turns", "terminal_event_id", "TEXT")?;
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS agent_sessions (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     conversation_id TEXT NOT NULL,
+                     project_key TEXT NOT NULL,
+                     provider TEXT NOT NULL,
+                     provider_session_id TEXT NOT NULL,
+                     head_turn_id TEXT,
+                     status TEXT NOT NULL DEFAULT 'active',
+                     created_at TEXT NOT NULL,
+                     updated_at TEXT NOT NULL,
+                     origin_device_id TEXT,
+                     hlc TEXT,
+                     UNIQUE(conversation_id, provider, provider_session_id)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_agent_sessions_project
+                     ON agent_sessions(project_key, updated_at);
+                 CREATE TABLE IF NOT EXISTS agent_session_entries (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     agent_session_id TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+                     subpath TEXT NOT NULL DEFAULT '',
+                     entry_uuid TEXT,
+                     sequence INTEGER NOT NULL,
+                     body_json TEXT NOT NULL,
+                     origin_device_id TEXT,
+                     hlc TEXT,
+                     created_at TEXT NOT NULL,
+                     UNIQUE(agent_session_id, subpath, sequence)
+                 );
+                 CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_session_entry_uuid
+                     ON agent_session_entries(agent_session_id, subpath, entry_uuid)
+                     WHERE entry_uuid IS NOT NULL;
+                 CREATE INDEX IF NOT EXISTS idx_agent_session_entries_load
+                     ON agent_session_entries(agent_session_id, subpath, sequence);
+                 CREATE TABLE IF NOT EXISTS agent_approvals (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     request_id TEXT NOT NULL,
+                     tool_use_id TEXT,
+                     tool_name TEXT NOT NULL,
+                     input_json TEXT NOT NULL,
+                     decision TEXT,
+                     status TEXT NOT NULL,
+                     created_at TEXT NOT NULL,
+                     resolved_at TEXT
+                 );
+                 PRAGMA user_version = 20;",
+            )
+            .map_err(|error| {
+                format!("A v20 agent/session tÃ¡blÃ¡k lÃ©trehozÃ¡sa sikertelen: {error}")
+            })?;
+        transaction.commit().map_err(|error| {
+            format!("A lokÃ¡lis SQLite v20 migrÃ¡ciÃ³ commitja sikertelen: {error}")
+        })?;
+    }
     Ok(())
 }
 
@@ -1307,9 +1527,1568 @@ pub fn open_local_store() -> Result<LocalStore, String> {
     Ok(store)
 }
 
+fn agent_provider_wire(provider: crate::agent::AgentProvider) -> &'static str {
+    match provider {
+        crate::agent::AgentProvider::Codex => "openai",
+        crate::agent::AgentProvider::Anthropic => "anthropic",
+    }
+}
+
+fn agent_runtime_wire(runtime: crate::agent::AgentRuntimeKind) -> &'static str {
+    match runtime {
+        crate::agent::AgentRuntimeKind::CodexAppServer => "codex_app_server",
+        crate::agent::AgentRuntimeKind::ClaudeAgentBridge => "claude_agent_bridge",
+    }
+}
+
+fn agent_session_head_conflicts(
+    session_head: Option<&str>,
+    conversation_head: Option<&str>,
+) -> bool {
+    matches!((session_head, conversation_head), (Some(session), Some(conversation)) if session != conversation)
+}
+
+pub(crate) fn record_agent_turn_start(
+    request: &mut crate::agent::AgentTurnRequest,
+) -> Result<(), String> {
+    let Some(conversation_id) = request
+        .conversation_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let Some(request_id) = request
+        .request_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let store = open_local_store()?;
+    let now = now_millis();
+    let turn_id = stable_id("agent-turn", request_id);
+    let provider = agent_provider_wire(request.provider);
+    let runtime = agent_runtime_wire(request.runtime);
+    let conversation_exists: bool = store
+        .connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?1 AND archived_at IS NULL)",
+            params![conversation_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| {
+            format!("Az agent conversation lÃ©tezÃ©se nem ellenÅ‘rizhetÅ‘: {error}")
+        })?
+        != 0;
+    if !conversation_exists {
+        return Ok(());
+    }
+    if request.provider == crate::agent::AgentProvider::Anthropic {
+        // Compare agent turn to agent turn. The local row for the message being
+        // sent right now carries no provider session, and counting it as the
+        // head made every follow-up look like a cross-device divergence — so
+        // the resume below was dropped and each turn opened a new session.
+        let current_head: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT id FROM turns
+                 WHERE conversation_id = ?1 AND provider_session_id IS NOT NULL
+                 ORDER BY updated_at DESC, id DESC LIMIT 1",
+                params![conversation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Az agent conversation headje nem olvasható: {error}"))?;
+        if let Some(provider_session_id) = request.session_id.as_deref() {
+            let session_head: Option<String> = store
+                .connection
+                .query_row(
+                    "SELECT head_turn_id FROM agent_sessions
+                     WHERE conversation_id = ?1
+                       AND provider = 'anthropic'
+                     AND provider_session_id = ?2
+                     AND status <> 'deleted'
+                     LIMIT 1",
+                    params![conversation_id, provider_session_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(|error| format!("Az agent session headje nem olvasható: {error}"))?
+                .flatten();
+            if agent_session_head_conflicts(session_head.as_deref(), current_head.as_deref()) {
+                // A shared conversation/session már egy másik headre lépett.
+                // Resume helyett új provider session indul, így a két ág nem
+                // appendel vakon ugyanabba a Claude transcriptbe.
+                request.session_id = None;
+            }
+        }
+    }
+    store
+        .connection
+        .execute(
+            "UPDATE conversations
+             SET agent_runtime = ?1,
+                 agent_provider = ?2,
+                 agent_model = COALESCE(?3, agent_model),
+                 agent_effort = COALESCE(?4, agent_effort),
+                 active_agent_session_id = COALESCE(?5, active_agent_session_id),
+                 updated_at = ?6
+             WHERE id = ?7",
+            params![
+                runtime,
+                provider,
+                request.model,
+                request.effort,
+                request.session_id,
+                now,
+                conversation_id,
+            ],
+        )
+        .map_err(|error| format!("Az agent conversation metadata nem menthetÅ‘: {error}"))?;
+    store
+        .connection
+        .execute(
+            "INSERT INTO turns (
+                 id, conversation_id, request_id, codex_thread_id, codex_turn_id,
+                 status, agent_runtime, provider_session_id, provider_turn_id,
+                 base_head_turn_id, max_budget_usd, total_cost_usd, terminal_event_id,
+                 created_at, updated_at
+             ) VALUES (
+                 ?1, ?2, ?3, NULL, NULL, 'running', ?4, ?5, NULL,
+                 (SELECT id FROM turns WHERE conversation_id = ?2 AND id <> ?1
+                  ORDER BY updated_at DESC, id DESC LIMIT 1),
+                 ?6, NULL, NULL, ?7, ?7
+             )
+             ON CONFLICT(id) DO UPDATE SET
+                 status = 'running',
+                 agent_runtime = excluded.agent_runtime,
+                 provider_session_id = COALESCE(excluded.provider_session_id, turns.provider_session_id),
+                 max_budget_usd = excluded.max_budget_usd,
+                 updated_at = excluded.updated_at",
+            params![
+                turn_id,
+                conversation_id,
+                request_id,
+                runtime,
+                request.session_id,
+                request.max_budget_usd,
+                now,
+            ],
+        )
+        .map_err(|error| format!("Az agent turn indulÃ¡si metadata nem menthetÅ‘: {error}"))?;
+    Ok(())
+}
+
+fn append_agent_answer_delta(buffer: &mut String, delta: &str) {
+    if delta.is_empty() || delta == buffer {
+        return;
+    }
+    if !buffer.is_empty() && delta.starts_with(buffer.as_str()) {
+        *buffer = delta.to_string();
+    } else {
+        buffer.push_str(delta);
+    }
+}
+
+fn agent_response_answer_text(response: &crate::agent::AgentResponse) -> String {
+    let mut event_text = String::new();
+    for event in &response.events {
+        let normalized_event_type =
+            crate::agent::normalize_event_type(&event.event_type, &event.payload);
+        let final_answer_delta = normalized_event_type == "assistant/text_delta"
+            && event
+                .payload
+                .get("phase")
+                .and_then(serde_json::Value::as_str)
+                .map(|phase| phase != "commentary")
+                .unwrap_or(true);
+        if final_answer_delta {
+            if let Some(delta) = event
+                .payload
+                .get("delta")
+                .and_then(serde_json::Value::as_str)
+            {
+                append_agent_answer_delta(&mut event_text, delta);
+            }
+        }
+        if crate::agent::is_terminal_event_type(&normalized_event_type) {
+            let terminal_text = event
+                .payload
+                .get("finalText")
+                .or_else(|| event.payload.get("final_text"))
+                .or_else(|| event.payload.get("text"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if terminal_text.len() > event_text.len() {
+                event_text = terminal_text.to_string();
+            }
+        }
+    }
+    let response_text = collapse_repeated_assistant_text("assistant", &response.text);
+    let event_text = collapse_repeated_assistant_text("assistant", &event_text);
+    if event_text.trim().len() > response_text.trim().len() {
+        event_text
+    } else {
+        response_text
+    }
+}
+
+#[allow(dead_code)]
+fn record_agent_answer_in_connection_legacy(
+    connection: &mut Connection,
+    conversation_id: &str,
+    request_id: &str,
+    text: &str,
+) -> Result<(), String> {
+    let text = text.trim_end();
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let turn_id = format!("request:{request_id}");
+    let existing = connection
+        .query_row(
+            "SELECT id, sequence FROM messages
+             WHERE conversation_id = ?1 AND role = 'assistant' AND turn_id = ?2
+             ORDER BY \"final\" DESC, length(body) DESC, sequence DESC, id
+             LIMIT 1",
+            params![conversation_id, turn_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("Az agent válasz-aliasa nem olvasható: {error}"))?;
+    let (message_id, sequence) = if let Some(existing) = existing {
+        existing
+    } else {
+        let sequence = connection
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) + 1
+                 FROM messages WHERE conversation_id = ?1",
+                params![conversation_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("Az agent válasz-sorszáma nem képezhető: {error}"))?;
+        (
+            stable_id("agent-answer", &format!("{conversation_id}:{request_id}")),
+            sequence,
+        )
+    };
+    let now = now_millis();
+    connection
+        .execute(
+            "INSERT INTO messages (
+                 id, conversation_id, role, body, sequence, hlc, item_id, turn_id,
+                 code, live, \"final\", origin_device_id, attachments_json,
+                 quote_refs_json, created_at
+             ) VALUES (?1, ?2, 'assistant', ?3, ?4, NULL, NULL, ?5, 0, 0, 1, NULL, '[]', '[]', ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                 body = CASE
+                     WHEN length(excluded.body) >= length(messages.body)
+                         THEN excluded.body
+                     ELSE messages.body
+                 END,
+                 sequence = messages.sequence,
+                 turn_id = COALESCE(messages.turn_id, excluded.turn_id),
+                 live = 0,
+                 \"final\" = 1,
+                 created_at = messages.created_at",
+            params![message_id, conversation_id, text, sequence, turn_id, now],
+        )
+        .map_err(|error| format!("A végleges agent válasz nem menthető: {error}"))?;
+    connection
+        .execute(
+            "DELETE FROM messages
+             WHERE conversation_id = ?1 AND role = 'assistant' AND turn_id = ?2
+               AND id <> ?3 AND (trim(body) = '' OR \"final\" = 0)",
+            params![conversation_id, turn_id, message_id],
+        )
+        .map_err(|error| format!("A régi agent válasz-alias nem törölhető: {error}"))?;
+    Ok(())
+}
+
+fn record_agent_answer_in_connection(
+    connection: &mut Connection,
+    conversation_id: &str,
+    request_id: &str,
+    text: &str,
+) -> Result<(), String> {
+    let normalized_text = collapse_repeated_assistant_text("assistant", text);
+    let text = normalized_text.trim_end();
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+
+    let turn_id = format!("request:{request_id}");
+    let canonical_id = stable_id("agent-answer", &format!("{conversation_id}:{request_id}"));
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("The agent answer transaction could not start: {error}"))?;
+
+    // The request UUID is the durable answer identity. A stale random UI row
+    // with the same turn must not preserve an older answer or move the new
+    // answer to an earlier timeline position.
+    transaction
+        .execute(
+            "DELETE FROM messages
+             WHERE conversation_id = ?1 AND role = 'assistant' AND turn_id = ?2
+               AND id <> ?3",
+            params![conversation_id, turn_id, canonical_id],
+        )
+        .map_err(|error| format!("The stale agent answer alias could not be removed: {error}"))?;
+
+    let user_sequence = transaction
+        .query_row(
+            "SELECT sequence FROM messages
+             WHERE conversation_id = ?1 AND role = 'user' AND turn_id = ?2
+             ORDER BY sequence DESC, id DESC
+             LIMIT 1",
+            params![conversation_id, turn_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| format!("The agent user turn sequence could not be read: {error}"))?;
+    let existing_sequence = transaction
+        .query_row(
+            "SELECT sequence FROM messages WHERE id = ?1 AND conversation_id = ?2 AND role = 'assistant'",
+            params![canonical_id, conversation_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| format!("The canonical agent answer could not be read: {error}"))?;
+    let fallback_sequence: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(sequence), 0) + 1
+             FROM messages WHERE conversation_id = ?1",
+            params![conversation_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("The agent answer sequence could not be created: {error}"))?;
+    let mut sequence = user_sequence
+        .and_then(|value| value.checked_add(1))
+        .or(existing_sequence)
+        .unwrap_or(fallback_sequence);
+    let sequence_taken: Option<String> = transaction
+        .query_row(
+            "SELECT id FROM messages
+             WHERE conversation_id = ?1 AND sequence = ?2 AND id <> ?3
+             LIMIT 1",
+            params![conversation_id, sequence, canonical_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| {
+            format!("The agent answer sequence collision could not be checked: {error}")
+        })?;
+    if sequence_taken.is_some() {
+        sequence = fallback_sequence;
+    }
+
+    let now = now_millis();
+    transaction
+        .execute(
+            "INSERT INTO messages (
+                 id, conversation_id, role, body, sequence, hlc, item_id, turn_id,
+                 code, live, \"final\", origin_device_id, attachments_json,
+                 quote_refs_json, created_at
+             ) VALUES (?1, ?2, 'assistant', ?3, ?4, NULL, NULL, ?5, 0, 0, 1, NULL, '[]', '[]', ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                 body = CASE
+                     WHEN length(excluded.body) >= length(messages.body)
+                         THEN excluded.body
+                     ELSE messages.body
+                 END,
+                 sequence = excluded.sequence,
+                 turn_id = COALESCE(messages.turn_id, excluded.turn_id),
+                 live = 0,
+                 \"final\" = 1,
+                 created_at = messages.created_at",
+            params![canonical_id, conversation_id, text, sequence, turn_id, now],
+        )
+        .map_err(|error| format!("The final agent answer could not be saved: {error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("The final agent answer commit failed: {error}"))?;
+    Ok(())
+}
+
+pub(crate) fn record_agent_answer_text(
+    conversation_id: &str,
+    request_id: &str,
+    answer_text: &str,
+) -> Result<(), String> {
+    if conversation_id.trim().is_empty() || request_id.trim().is_empty() {
+        return Ok(());
+    }
+    let mut last_error = None;
+    for attempt in 0..6 {
+        match open_local_store().and_then(|mut store| {
+            record_agent_answer_in_connection(
+                &mut store.connection,
+                conversation_id,
+                request_id,
+                &answer_text,
+            )
+        }) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if attempt < 5
+                    && (error.to_ascii_lowercase().contains("locked")
+                        || error.to_ascii_lowercase().contains("busy")) =>
+            {
+                last_error = Some(error);
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "A végleges agent válasz nem menthető.".to_string()))
+}
+
+pub(crate) fn record_agent_answer(
+    request: &crate::agent::AgentTurnRequest,
+    response: &crate::agent::AgentResponse,
+) -> Result<(), String> {
+    let Some(conversation_id) = request
+        .conversation_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let Some(request_id) = request
+        .request_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let answer_text = agent_response_answer_text(response);
+    record_agent_answer_text(conversation_id, request_id, &answer_text)
+}
+
+pub(crate) fn record_agent_turn_terminal(
+    request: &crate::agent::AgentTurnRequest,
+    response: &crate::agent::AgentResponse,
+    status: &str,
+) -> Result<(), String> {
+    let Some(conversation_id) = request
+        .conversation_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let Some(request_id) = request
+        .request_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let turn_id = stable_id("agent-turn", request_id);
+    let provider_turn_id = response
+        .events
+        .iter()
+        .rev()
+        .find_map(|event| event.provider_turn_id.clone())
+        .or_else(|| response.session_id.clone());
+    let terminal_event_id = response
+        .events
+        .iter()
+        .rev()
+        .find_map(|event| event.terminal_event_id.clone());
+    let total_cost_usd = response.events.iter().rev().find_map(|event| {
+        event
+            .payload
+            .get("totalCostUsd")
+            .and_then(serde_json::Value::as_f64)
+    });
+    let store = open_local_store()?;
+    let now = now_millis();
+    store
+        .connection
+        .execute(
+            "UPDATE turns SET
+                 status = ?1,
+                 provider_session_id = COALESCE(?2, provider_session_id),
+                 provider_turn_id = COALESCE(?3, provider_turn_id),
+                 total_cost_usd = COALESCE(?4, total_cost_usd),
+                 terminal_event_id = COALESCE(?5, terminal_event_id),
+                 updated_at = ?6
+             WHERE id = ?7 AND conversation_id = ?8 AND request_id = ?9",
+            params![
+                status,
+                response.session_id,
+                provider_turn_id,
+                total_cost_usd,
+                terminal_event_id,
+                now,
+                turn_id,
+                conversation_id,
+                request_id,
+            ],
+        )
+        .map_err(|error| format!("Az agent turn lezÃ¡rÃ¡si metadata nem menthetÅ‘: {error}"))?;
+    store
+        .connection
+        .execute(
+            "UPDATE conversations SET
+                 active_agent_session_id = COALESCE(?1, active_agent_session_id),
+                 updated_at = ?2
+             WHERE id = ?3",
+            params![response.session_id, now, conversation_id],
+        )
+        .map_err(|error| {
+            format!("Az agent conversation lezÃ¡rÃ¡si metadata nem menthetÅ‘: {error}")
+        })?;
+    if let Some(provider_session_id) = response.session_id.as_deref() {
+        store
+            .connection
+            .execute(
+                "UPDATE agent_sessions SET
+                     head_turn_id = ?1,
+                     updated_at = ?2
+                 WHERE conversation_id = ?3
+                   AND provider = ?4
+                   AND provider_session_id = ?5
+                   AND status <> 'deleted'",
+                params![
+                    turn_id,
+                    now,
+                    conversation_id,
+                    agent_provider_wire(request.provider),
+                    provider_session_id,
+                ],
+            )
+            .map_err(|error| format!("Az agent session headje nem menthető: {error}"))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn record_agent_turn_failure(
+    request: &crate::agent::AgentTurnRequest,
+    status: &str,
+) -> Result<(), String> {
+    let Some(conversation_id) = request
+        .conversation_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let Some(request_id) = request
+        .request_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let turn_id = stable_id("agent-turn", request_id);
+    let store = open_local_store()?;
+    let now = now_millis();
+    store
+        .connection
+        .execute(
+            "UPDATE turns SET
+                 status = ?1,
+                 provider_session_id = COALESCE(?2, provider_session_id),
+                 terminal_event_id = COALESCE(terminal_event_id, ?3),
+                 updated_at = ?4
+             WHERE id = ?5 AND conversation_id = ?6 AND request_id = ?7",
+            params![
+                status,
+                request.session_id,
+                format!("{turn_id}:{status}"),
+                now,
+                turn_id,
+                conversation_id,
+                request_id,
+            ],
+        )
+        .map_err(|error| format!("Az agent turn hibás lezárása nem menthető: {error}"))?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentConversationStatus {
+    pub conversation_id: String,
+    pub provider: Option<String>,
+    pub runtime: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub active_session_id: Option<String>,
+    pub session_head_turn_id: Option<String>,
+    pub conversation_head_turn_id: Option<String>,
+    pub has_conflict: bool,
+}
+
+pub(crate) fn agent_conversation_status(
+    conversation_id: &str,
+) -> Result<Option<AgentConversationStatus>, String> {
+    let store = open_local_store()?;
+    agent_conversation_status_from_connection(&store.connection, conversation_id)
+}
+
+/// Connection-scoped body so the cross-device fallback can be tested without
+/// touching the real local store.
+pub(crate) fn agent_conversation_status_from_connection(
+    connection: &Connection,
+    conversation_id: &str,
+) -> Result<Option<AgentConversationStatus>, String> {
+    let metadata = connection
+        .query_row(
+            "SELECT agent_provider, agent_runtime, agent_model, agent_effort,
+                    active_agent_session_id
+             FROM conversations
+             WHERE id = ?1 AND archived_at IS NULL",
+            params![conversation_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("Az agent conversation státusza nem olvasható: {error}"))?;
+    let Some((provider, runtime, model, effort, active_session_id)) = metadata else {
+        return Ok(None);
+    };
+    // `conversations.active_agent_session_id` is local bookkeeping and is not
+    // part of the sync payload, so a conversation that arrived from another
+    // device has it empty. The `agent_sessions` rows do sync, so the newest
+    // live session for this conversation is the authoritative fallback —
+    // without it the other device would open a fresh provider session and
+    // re-send the whole transcript as context.
+    let active_session_id = match active_session_id {
+        Some(value) if !value.trim().is_empty() => Some(value),
+        _ => connection
+            .query_row(
+                "SELECT provider_session_id FROM agent_sessions
+                 WHERE conversation_id = ?1 AND status <> 'deleted'
+                 ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+                params![conversation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                format!("Az agent conversation aktív sessionje nem olvasható: {error}")
+            })?,
+    };
+    let conversation_head_turn_id = connection
+        .query_row(
+            // Only agent turns count as the conversation head. A local row for
+            // the message being sent right now would otherwise always sit ahead
+            // of the session head and report a permanent false conflict, which
+            // in turn suppresses every resume.
+            "SELECT id FROM turns
+             WHERE conversation_id = ?1 AND provider_session_id IS NOT NULL
+             ORDER BY updated_at DESC, id DESC LIMIT 1",
+            params![conversation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("A conversation headje nem olvasható: {error}"))?;
+    let session_head_turn_id = active_session_id
+        .as_deref()
+        .map(|session_id| {
+            connection
+                .query_row(
+                    // `conversations.active_agent_session_id` stores the
+                    // provider session id, which is not the internal row id.
+                    // Matching on `id` never found a row, so the session head
+                    // always read as unknown and the conflict indicator could
+                    // never fire.
+                    "SELECT head_turn_id FROM agent_sessions
+                     WHERE provider_session_id = ?1 AND status <> 'deleted'
+                     ORDER BY updated_at DESC LIMIT 1",
+                    params![session_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(|error| format!("Az agent session headje nem olvasható: {error}"))
+                .map(|value| value.flatten())
+        })
+        .transpose()?
+        .flatten();
+    let has_conflict = provider.as_deref() == Some("anthropic")
+        && agent_session_head_conflicts(
+            session_head_turn_id.as_deref(),
+            conversation_head_turn_id.as_deref(),
+        );
+    Ok(Some(AgentConversationStatus {
+        conversation_id: conversation_id.to_string(),
+        provider,
+        runtime,
+        model,
+        effort,
+        active_session_id,
+        session_head_turn_id,
+        conversation_head_turn_id,
+        has_conflict,
+    }))
+}
+
+/// Strips the Windows extended-length prefix from a project key.
+///
+/// The Agent SDK derives its own key by sanitizing the working directory, so a
+/// canonicalized extended-length root turns into `----C--Users-...` while the
+/// plain form gives `C--Users-...`. Two spellings of one project split the
+/// session lineage in half, so one device would never find the other's
+/// sessions. The bridge no longer passes the prefixed root, so this mainly
+/// canonicalizes keys arriving from an older peer or from existing rows.
+fn normalize_project_key(value: &str) -> String {
+    let trimmed = value.trim();
+    let literal_unc = concat!(r"\\?\", "UNC", r"\");
+    let literal = concat!(r"\\?\");
+    let without_literal = if let Some(rest) = trimmed.strip_prefix(literal_unc) {
+        format!("{}{}", r"\\", rest)
+    } else {
+        trimmed.strip_prefix(literal).unwrap_or(trimmed).to_string()
+    };
+    // The same prefix after the SDK sanitized it: four dashes, then a drive
+    // letter and its own separator.
+    let sanitized = without_literal
+        .strip_prefix("----")
+        .filter(|rest| {
+            rest.chars()
+                .next()
+                .is_some_and(|letter| letter.is_ascii_alphabetic())
+                && rest.len() > 1
+                && rest[1..].starts_with("--")
+        })
+        .unwrap_or(&without_literal);
+    sanitized.to_string()
+}
+
+fn session_key_value(payload: &serde_json::Value, name: &str) -> Result<String, String> {
+    payload
+        .get("key")
+        .and_then(|key| key.get(name))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("A Claude SessionStore key {name} mezÅ‘je hiÃ¡nyzik."))
+}
+
+fn session_subpath(payload: &serde_json::Value) -> String {
+    payload
+        .get("key")
+        .and_then(|key| key.get("subpath"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn session_row_id(conversation_id: &str, provider_session_id: &str) -> String {
+    stable_id(
+        "agent-session",
+        &format!("{conversation_id}:anthropic:{provider_session_id}"),
+    )
+}
+
+fn ensure_agent_session(
+    transaction: &Transaction<'_>,
+    conversation_id: &str,
+    project_key: &str,
+    provider_session_id: &str,
+    now: &str,
+) -> Result<String, String> {
+    let id = session_row_id(conversation_id, provider_session_id);
+    transaction
+        .execute(
+            "INSERT INTO agent_sessions (
+                 id, conversation_id, project_key, provider, provider_session_id,
+                 head_turn_id, status, created_at, updated_at, origin_device_id, hlc
+             ) VALUES (?1, ?2, ?3, 'anthropic', ?4, NULL, 'active', ?5, ?5, NULL, NULL)
+             ON CONFLICT(id) DO UPDATE SET
+                 project_key = excluded.project_key,
+                 status = CASE WHEN agent_sessions.status = 'deleted' THEN 'deleted' ELSE 'active' END,
+                 updated_at = CASE WHEN agent_sessions.status = 'deleted'
+                                   THEN agent_sessions.updated_at ELSE excluded.updated_at END",
+            params![id, conversation_id, project_key, provider_session_id, now],
+        )
+        .map_err(|error| format!("Az agent session nem menthetÅ‘: {error}"))?;
+    Ok(id)
+}
+
+pub(crate) fn agent_session_store_rpc(
+    conversation_id: Option<&str>,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let conversation_id = conversation_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            "A Claude SessionStore kÃ©rÃ©sbÅ‘l hiÃ¡nyzik a conversationId.".to_string()
+        })?;
+    let operation = payload
+        .get("operation")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "A Claude SessionStore mÅ±velete hiÃ¡nyzik.".to_string())?;
+    let project_key = normalize_project_key(&session_key_value(payload, "projectKey")?);
+    let subpath = session_subpath(payload);
+    let now = now_millis();
+    let mut store = open_local_store()?;
+    let transaction = store
+        .connection
+        .transaction()
+        .map_err(|error| format!("A SessionStore tranzakciÃ³ja nem indÃ­thatÃ³: {error}"))?;
+    let session_id = if matches!(operation, "listSessions" | "listSessionSummaries") {
+        None
+    } else {
+        let provider_session_id = session_key_value(payload, "sessionId")?;
+        Some(ensure_agent_session(
+            &transaction,
+            conversation_id,
+            &project_key,
+            &provider_session_id,
+            &now,
+        )?)
+    };
+    let result = match operation {
+        "append" => {
+            let session_id = session_id
+                .as_deref()
+                .ok_or_else(|| "Az agent session azonosÃ­tÃ³ja hiÃ¡nyzik.".to_string())?;
+            let entries = payload
+                .get("entries")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| "A SessionStore append entries mezÅ‘je hiÃ¡nyzik.".to_string())?;
+            for entry in entries {
+                let body_json = serde_json::to_string(entry).map_err(|error| {
+                    format!("A Claude session entry nem szerializÃ¡lhatÃ³: {error}")
+                })?;
+                let entry_uuid = entry
+                    .get("uuid")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string);
+                let entry_id = entry_uuid
+                    .as_deref()
+                    .map(|uuid| {
+                        stable_id(
+                            "agent-session-entry",
+                            &format!("{session_id}:{subpath}:{uuid}"),
+                        )
+                    })
+                    .unwrap_or_else(|| Uuid::new_v4().to_string());
+                let sequence: i64 = transaction
+                    .query_row(
+                        "SELECT COALESCE(MAX(sequence), 0) + 1
+                         FROM agent_session_entries
+                         WHERE agent_session_id = ?1 AND subpath = ?2",
+                        params![session_id, subpath],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| {
+                        format!("A Claude session entry sorrendje nem olvashatÃ³: {error}")
+                    })?;
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO agent_session_entries (
+                             id, agent_session_id, subpath, entry_uuid, sequence,
+                             body_json, origin_device_id, hlc, created_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7)",
+                        params![
+                            entry_id, session_id, subpath, entry_uuid, sequence, body_json, now
+                        ],
+                    )
+                    .map_err(|error| format!("A Claude session entry nem menthetÅ‘: {error}"))?;
+            }
+            transaction
+                .execute(
+                    "UPDATE agent_sessions SET updated_at = ?1 WHERE id = ?2 AND status <> 'deleted'",
+                    params![now, session_id],
+                )
+                .map_err(|error| format!("A Claude session frissÃ­tÃ©se sikertelen: {error}"))?;
+            serde_json::Value::Null
+        }
+        "load" => {
+            let session_id = session_id
+                .as_deref()
+                .ok_or_else(|| "Az agent session azonosÃ­tÃ³ja hiÃ¡nyzik.".to_string())?;
+            let status: Option<String> = transaction
+                .query_row(
+                    "SELECT status FROM agent_sessions WHERE id = ?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| format!("A Claude session Ã¡llapota nem olvashatÃ³: {error}"))?;
+            if status.as_deref() == Some("deleted") || status.is_none() {
+                serde_json::Value::Null
+            } else {
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT body_json FROM agent_session_entries
+                         WHERE agent_session_id = ?1 AND subpath = ?2
+                         ORDER BY sequence, id",
+                    )
+                    .map_err(|error| format!("A Claude session entryk nem olvashatÃ³k: {error}"))?;
+                let rows = statement
+                    .query_map(params![session_id, subpath], |row| row.get::<_, String>(0))
+                    .map_err(|error| format!("A Claude session entry lista hibÃ¡s: {error}"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        format!("A Claude session entry lista nem olvashatÃ³: {error}")
+                    })?;
+                let entries = rows
+                    .into_iter()
+                    .map(|body| {
+                        serde_json::from_str(&body).map_err(|error| {
+                            format!("A Claude session entry JSON-ja hibÃ¡s: {error}")
+                        })
+                    })
+                    .collect::<Result<Vec<serde_json::Value>, _>>()?;
+                if entries.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::Array(entries)
+                }
+            }
+        }
+        "listSessions" => {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT provider_session_id, updated_at FROM agent_sessions
+                     WHERE project_key = ?1 AND provider = 'anthropic' AND status <> 'deleted'
+                     ORDER BY updated_at DESC, provider_session_id",
+                )
+                .map_err(|error| format!("A Claude sessionlista nem olvashatÃ³: {error}"))?;
+            let rows = statement
+                .query_map(params![project_key], |row| {
+                    let session_id: String = row.get(0)?;
+                    let mtime_text: String = row.get(1)?;
+                    Ok(serde_json::json!({
+                        "sessionId": session_id,
+                        "mtime": mtime_text.parse::<i64>().unwrap_or_default()
+                    }))
+                })
+                .map_err(|error| format!("A Claude sessionlista hibÃ¡s: {error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("A Claude sessionlista nem gyÅ±jthetÅ‘: {error}"))?;
+            serde_json::Value::Array(rows)
+        }
+        "listSessionSummaries" => {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT provider_session_id, updated_at FROM agent_sessions
+                     WHERE project_key = ?1 AND provider = 'anthropic' AND status <> 'deleted'
+                     ORDER BY updated_at DESC, provider_session_id",
+                )
+                .map_err(|error| {
+                    format!("A Claude session summary lista nem olvashatÃ³: {error}")
+                })?;
+            let rows = statement
+                .query_map(params![project_key], |row| {
+                    let session_id: String = row.get(0)?;
+                    let mtime_text: String = row.get(1)?;
+                    Ok(serde_json::json!({
+                        "sessionId": session_id,
+                        "mtime": mtime_text.parse::<i64>().unwrap_or_default(),
+                        "data": {}
+                    }))
+                })
+                .map_err(|error| format!("A Claude session summary lista hibÃ¡s: {error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    format!("A Claude session summary lista nem gyÅ±jthetÅ‘: {error}")
+                })?;
+            serde_json::Value::Array(rows)
+        }
+        "listSubkeys" => {
+            let session_id = session_id
+                .as_deref()
+                .ok_or_else(|| "Az agent session azonosÃ­tÃ³ja hiÃ¡nyzik.".to_string())?;
+            let mut statement = transaction
+                .prepare(
+                    "SELECT DISTINCT subpath FROM agent_session_entries
+                     WHERE agent_session_id = ?1 AND subpath <> '' ORDER BY subpath",
+                )
+                .map_err(|error| {
+                    format!("A Claude session subpath lista nem olvashatÃ³: {error}")
+                })?;
+            let rows = statement
+                .query_map(params![session_id], |row| row.get::<_, String>(0))
+                .map_err(|error| format!("A Claude session subpath lista hibÃ¡s: {error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    format!("A Claude session subpath lista nem gyÅ±jthetÅ‘: {error}")
+                })?;
+            serde_json::Value::Array(rows.into_iter().map(serde_json::Value::String).collect())
+        }
+        "delete" => {
+            let session_id = session_id
+                .as_deref()
+                .ok_or_else(|| "Az agent session azonosÃ­tÃ³ja hiÃ¡nyzik.".to_string())?;
+            transaction
+                .execute(
+                    "UPDATE agent_sessions SET status = 'deleted', updated_at = ?1 WHERE id = ?2",
+                    params![now, session_id],
+                )
+                .map_err(|error| format!("A Claude session tÃ¶rlÃ©se sikertelen: {error}"))?;
+            serde_json::Value::Null
+        }
+        other => return Err(format!("Ismeretlen Claude SessionStore mÅ±velet: {other}")),
+    };
+    transaction
+        .commit()
+        .map_err(|error| format!("A SessionStore tranzakciÃ³ commitja sikertelen: {error}"))?;
+    Ok(result)
+}
+
+pub(crate) fn export_agent_session_compaction_state_from_connection(
+    connection: &Connection,
+) -> Result<AgentSessionCompactionState, String> {
+    let mut session_statement = connection
+        .prepare(
+            "SELECT id, conversation_id, project_key, provider, provider_session_id,
+                    head_turn_id, status, created_at, updated_at, origin_device_id, hlc
+             FROM agent_sessions ORDER BY id",
+        )
+        .map_err(|error| format!("Az agent session compaction export nem olvasható: {error}"))?;
+    let sessions = session_statement
+        .query_map([], |row| {
+            Ok(AgentSessionCompactionRow {
+                id: row.get(0)?,
+                conversation_id: row.get(1)?,
+                project_key: row.get(2)?,
+                provider: row.get(3)?,
+                provider_session_id: row.get(4)?,
+                head_turn_id: row.get(5)?,
+                status: row.get(6)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+                origin_device_id: row.get(9)?,
+                hlc: row.get(10)?,
+            })
+        })
+        .map_err(|error| format!("Az agent session compaction export listája hibás: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Az agent session compaction export nem gyűjthető: {error}"))?;
+
+    let mut entry_statement = connection
+        .prepare(
+            "SELECT entries.id, entries.agent_session_id, entries.subpath,
+                    entries.entry_uuid, entries.sequence, entries.body_json,
+                    entries.origin_device_id, entries.hlc, entries.created_at
+             FROM agent_session_entries entries
+             JOIN agent_sessions sessions ON sessions.id = entries.agent_session_id
+             WHERE sessions.status <> 'deleted'
+             ORDER BY entries.agent_session_id, entries.subpath, entries.sequence, entries.id",
+        )
+        .map_err(|error| {
+            format!("Az agent session entry compaction export nem olvasható: {error}")
+        })?;
+    let raw_entries = entry_statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?,
+            ))
+        })
+        .map_err(|error| {
+            format!("Az agent session entry compaction export listája hibás: {error}")
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            format!("Az agent session entry compaction export nem gyűjthető: {error}")
+        })?;
+    let entries = raw_entries
+        .into_iter()
+        .map(
+            |(
+                id,
+                agent_session_id,
+                subpath,
+                entry_uuid,
+                sequence,
+                body_json,
+                origin_device_id,
+                hlc,
+                created_at,
+            )| {
+                Ok(AgentSessionCompactionEntry {
+                    id,
+                    agent_session_id,
+                    subpath,
+                    entry_uuid,
+                    sequence,
+                    body: serde_json::from_str(&body_json).map_err(|error| {
+                        format!("Az agent session entry compaction JSON-ja hibás: {error}")
+                    })?,
+                    origin_device_id,
+                    hlc,
+                    created_at,
+                })
+            },
+        )
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(AgentSessionCompactionState { sessions, entries })
+}
+
+pub(crate) fn apply_agent_session_compaction_state(
+    transaction: &Transaction<'_>,
+    state: &AgentSessionCompactionState,
+) -> Result<(), String> {
+    for session in &state.sessions {
+        let existing_hlc: Option<String> = transaction
+            .query_row(
+                "SELECT hlc FROM agent_sessions WHERE id = ?1",
+                params![session.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                format!("Az agent session compaction státusza nem olvasható: {error}")
+            })?
+            .flatten();
+        let incoming_hlc = session.hlc.as_deref();
+        let should_apply = existing_hlc.is_none()
+            || incoming_hlc.is_some_and(|incoming| {
+                existing_hlc
+                    .as_deref()
+                    .is_some_and(|existing| existing <= incoming)
+            });
+        if !should_apply {
+            continue;
+        }
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO agent_sessions (
+                     id, conversation_id, project_key, provider, provider_session_id,
+                     head_turn_id, status, created_at, updated_at, origin_device_id, hlc
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    session.id,
+                    session.conversation_id,
+                    session.project_key,
+                    session.provider,
+                    session.provider_session_id,
+                    session.head_turn_id,
+                    session.status,
+                    session.created_at,
+                    session.updated_at,
+                    session.origin_device_id,
+                    session.hlc,
+                ],
+            )
+            .map_err(|error| {
+                format!("Az agent session compaction beszúrása sikertelen: {error}")
+            })?;
+        transaction
+            .execute(
+                "UPDATE agent_sessions SET
+                     conversation_id = ?1,
+                     project_key = ?2,
+                     provider = ?3,
+                     provider_session_id = ?4,
+                     head_turn_id = ?5,
+                     status = ?6,
+                     created_at = ?7,
+                     updated_at = ?8,
+                     origin_device_id = ?9,
+                     hlc = ?10
+                 WHERE id = ?11",
+                params![
+                    session.conversation_id,
+                    session.project_key,
+                    session.provider,
+                    session.provider_session_id,
+                    session.head_turn_id,
+                    session.status,
+                    session.created_at,
+                    session.updated_at,
+                    session.origin_device_id,
+                    session.hlc,
+                    session.id,
+                ],
+            )
+            .map_err(|error| {
+                format!("Az agent session compaction frissítése sikertelen: {error}")
+            })?;
+        if session.status == "deleted" {
+            transaction
+                .execute(
+                    "DELETE FROM agent_session_entries WHERE agent_session_id = ?1",
+                    params![session.id],
+                )
+                .map_err(|error| {
+                    format!("Az agent session entry tombstone alkalmazása sikertelen: {error}")
+                })?;
+        }
+    }
+    for entry in &state.entries {
+        let session_status: Option<String> = transaction
+            .query_row(
+                "SELECT status FROM agent_sessions WHERE id = ?1",
+                params![entry.agent_session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                format!("Az agent session compaction entry státusza nem olvasható: {error}")
+            })?;
+        if !matches!(session_status.as_deref(), Some(status) if status != "deleted") {
+            continue;
+        }
+        let body_json = serde_json::to_string(&entry.body)
+            .map_err(|error| format!("Az agent session compaction body-ja hibás: {error}"))?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO agent_session_entries (
+                     id, agent_session_id, subpath, entry_uuid, sequence,
+                     body_json, origin_device_id, hlc, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    entry.id,
+                    entry.agent_session_id,
+                    entry.subpath,
+                    entry.entry_uuid,
+                    entry.sequence,
+                    body_json,
+                    entry.origin_device_id,
+                    entry.hlc,
+                    entry.created_at,
+                ],
+            )
+            .map_err(|error| {
+                format!("Az agent session entry compaction mentése sikertelen: {error}")
+            })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn export_agent_session_events(
+) -> Result<Vec<(String, String, serde_json::Value)>, String> {
+    let store = open_local_store()?;
+    let mut session_statement = store
+        .connection
+        .prepare(
+            "SELECT id, conversation_id, project_key, provider, provider_session_id,
+                    head_turn_id, status, created_at, updated_at, origin_device_id, hlc
+             FROM agent_sessions ORDER BY id",
+        )
+        .map_err(|error| format!("Az agent session export nem olvashatÃ³: {error}"))?;
+    let sessions = session_statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+            ))
+        })
+        .map_err(|error| format!("Az agent session export listÃ¡ja hibÃ¡s: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Az agent session export nem gyÅ±jthetÅ‘: {error}"))?;
+    let mut events = Vec::new();
+    for (
+        id,
+        conversation_id,
+        project_key,
+        provider,
+        provider_session_id,
+        head_turn_id,
+        status,
+        created_at,
+        updated_at,
+        origin_device_id,
+        hlc,
+    ) in sessions
+    {
+        let base = serde_json::json!({
+            "id": id.clone(),
+            "conversationId": conversation_id.clone(),
+            "projectKey": project_key.clone(),
+            "provider": provider.clone(),
+            "providerSessionId": provider_session_id.clone(),
+            "headTurnId": head_turn_id.clone(),
+            "status": status.clone(),
+            "createdAt": created_at.clone(),
+            "updatedAt": updated_at.clone(),
+            "originDeviceId": origin_device_id.clone(),
+            "hlc": hlc.clone(),
+        });
+        if status == "deleted" {
+            events.push((
+                format!("agent-session:{id}"),
+                "agent_session.tombstone".to_string(),
+                base,
+            ));
+            continue;
+        }
+        events.push((
+            format!("agent-session:{id}"),
+            "agent_session.upsert".to_string(),
+            base.clone(),
+        ));
+        let mut entry_statement = store
+            .connection
+            .prepare(
+                "SELECT id, subpath, entry_uuid, sequence, body_json, created_at
+                 FROM agent_session_entries
+                 WHERE agent_session_id = ?1 ORDER BY subpath, sequence, id",
+            )
+            .map_err(|error| format!("Az agent session entry export nem olvashatÃ³: {error}"))?;
+        let entries = entry_statement
+            .query_map(params![id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|error| format!("Az agent session entry export listÃ¡ja hibÃ¡s: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Az agent session entry export nem gyÅ±jthetÅ‘: {error}"))?;
+        for (entry_id, subpath, entry_uuid, sequence, body_json, entry_created_at) in entries {
+            let body: serde_json::Value = serde_json::from_str(&body_json).map_err(|error| {
+                format!("Az agent session entry export JSON-ja hibÃ¡s: {error}")
+            })?;
+            let payload = serde_json::json!({
+                "id": entry_id,
+                "session": base.clone(),
+                "subpath": subpath,
+                "entryUuid": entry_uuid,
+                "sequence": sequence,
+                "body": body,
+                "createdAt": entry_created_at,
+            });
+            events.push((
+                format!("agent-entry:{entry_id}"),
+                "agent_session.entry_append".to_string(),
+                payload,
+            ));
+        }
+    }
+    Ok(events)
+}
+
+pub(crate) fn apply_agent_sync_event(
+    transaction: &Transaction<'_>,
+    event_type: &str,
+    entity_id: &str,
+    payload: &serde_json::Value,
+    event_hlc: &str,
+    device_id: &str,
+) -> Result<(), String> {
+    match event_type {
+        "agent_session.upsert" | "agent_session.tombstone" => {
+            let id = payload
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "Az agent session sync ID-ja hiÃ¡nyzik.".to_string())?;
+            if format!("agent-session:{id}") != entity_id {
+                return Err("Az agent session sync identityje hibÃ¡s.".to_string());
+            }
+            let conversation_id = payload
+                .get("conversationId")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "Az agent session conversationId-ja hiÃ¡nyzik.".to_string())?;
+            let project_key = payload
+                .get("projectKey")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let provider = payload
+                .get("provider")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("anthropic");
+            let provider_session_id = payload
+                .get("providerSessionId")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "Az agent session providerSessionId-ja hiÃ¡nyzik.".to_string())?;
+            let status = if event_type == "agent_session.tombstone" {
+                "deleted"
+            } else {
+                payload
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("active")
+            };
+            let created_at = payload
+                .get("createdAt")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(event_hlc);
+            let updated_at = payload
+                .get("updatedAt")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(event_hlc);
+            let head_turn_id = payload
+                .get("headTurnId")
+                .and_then(serde_json::Value::as_str);
+            transaction
+                .execute(
+                    "INSERT INTO agent_sessions (
+                         id, conversation_id, project_key, provider, provider_session_id,
+                         head_turn_id, status, created_at, updated_at, origin_device_id, hlc
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                     ON CONFLICT(id) DO UPDATE SET
+                         conversation_id = excluded.conversation_id,
+                         project_key = excluded.project_key,
+                         provider = excluded.provider,
+                         provider_session_id = excluded.provider_session_id,
+                         head_turn_id = COALESCE(excluded.head_turn_id, agent_sessions.head_turn_id),
+                         status = excluded.status,
+                         updated_at = excluded.updated_at,
+                         origin_device_id = excluded.origin_device_id,
+                         hlc = excluded.hlc
+                     WHERE agent_sessions.hlc IS NULL OR agent_sessions.hlc <= excluded.hlc",
+                    params![
+                        id,
+                        conversation_id,
+                        project_key,
+                        provider,
+                        provider_session_id,
+                        head_turn_id,
+                        status,
+                        created_at,
+                        updated_at,
+                        device_id,
+                        event_hlc,
+                    ],
+                )
+                .map_err(|error| format!("Az agent session sync mentÃ©se sikertelen: {error}"))?;
+            Ok(())
+        }
+        "agent_session.entry_append" => {
+            let entry_id = payload
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "Az agent session entry sync ID-ja hiÃ¡nyzik.".to_string())?;
+            if format!("agent-entry:{entry_id}") != entity_id {
+                return Err("Az agent session entry sync identityje hibÃ¡s.".to_string());
+            }
+            let session = payload
+                .get("session")
+                .ok_or_else(|| "Az agent session entry session mezÅ‘je hiÃ¡nyzik.".to_string())?;
+            let session_id = session
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "Az agent session entry session ID-ja hiÃ¡nyzik.".to_string())?;
+            let existing_session: Option<(String, Option<String>)> = transaction
+                .query_row(
+                    "SELECT status, hlc FROM agent_sessions WHERE id = ?1",
+                    params![session_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|error| {
+                    format!("Az agent session tÃ¶rlÃ©si Ã¡llapota nem olvashatÃ³: {error}")
+                })?;
+            if existing_session.as_ref().is_some_and(|(status, hlc)| {
+                status == "deleted" && hlc.as_deref().unwrap_or_default() >= event_hlc
+            }) {
+                return Ok(());
+            }
+            let session_payload = serde_json::json!({
+                "id": session_id,
+                "conversationId": session.get("conversationId").and_then(serde_json::Value::as_str).unwrap_or_default(),
+                "projectKey": session.get("projectKey").and_then(serde_json::Value::as_str).unwrap_or_default(),
+                "provider": session.get("provider").and_then(serde_json::Value::as_str).unwrap_or("anthropic"),
+                "providerSessionId": session.get("providerSessionId").and_then(serde_json::Value::as_str).unwrap_or_default(),
+                "headTurnId": session.get("headTurnId").and_then(serde_json::Value::as_str),
+                "status": "active",
+                "createdAt": session.get("createdAt").and_then(serde_json::Value::as_str).unwrap_or(event_hlc),
+                "updatedAt": session.get("updatedAt").and_then(serde_json::Value::as_str).unwrap_or(event_hlc),
+            });
+            apply_agent_sync_event(
+                transaction,
+                "agent_session.upsert",
+                &format!("agent-session:{session_id}"),
+                &session_payload,
+                event_hlc,
+                device_id,
+            )?;
+            let entry_body = payload
+                .get("body")
+                .ok_or_else(|| "Az agent session entry body-ja hiÃ¡nyzik.".to_string())?;
+            let body_json = serde_json::to_string(entry_body).map_err(|error| {
+                format!("Az agent session entry body-ja nem szerializÃ¡lhatÃ³: {error}")
+            })?;
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO agent_session_entries (
+                         id, agent_session_id, subpath, entry_uuid, sequence,
+                         body_json, origin_device_id, hlc, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        entry_id,
+                        session_id,
+                        payload
+                            .get("subpath")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default(),
+                        payload.get("entryUuid").and_then(serde_json::Value::as_str),
+                        payload
+                            .get("sequence")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or_default(),
+                        body_json,
+                        device_id,
+                        event_hlc,
+                        payload
+                            .get("createdAt")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(event_hlc),
+                    ],
+                )
+                .map_err(|error| {
+                    format!("Az agent session entry sync mentÃ©se sikertelen: {error}")
+                })?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 pub fn initialize_local_store() -> Result<StoreHealth, String> {
     let store = open_local_store()?;
     health_for_connection(&store.path, &store.connection)
+}
+
+fn recover_orphaned_agent_turns_in_connection(
+    connection: &Connection,
+    now: &str,
+) -> Result<usize, String> {
+    connection
+        .execute(
+            "UPDATE turns SET
+                 status = 'failed',
+                 terminal_event_id = COALESCE(terminal_event_id, id || ':orphaned:failed'),
+                 updated_at = ?1
+             WHERE status = 'running' AND agent_runtime IS NOT NULL",
+            params![now],
+        )
+        .map_err(|error| format!("Az orphaned agent turnök helyreállítása sikertelen: {error}"))
+}
+
+pub(crate) fn recover_orphaned_agent_turns() -> Result<usize, String> {
+    let store = open_local_store()?;
+    let now = now_millis();
+    recover_orphaned_agent_turns_in_connection(&store.connection, &now)
 }
 
 fn health_for_connection(path: &Path, connection: &Connection) -> Result<StoreHealth, String> {
@@ -2369,7 +4148,7 @@ pub(crate) fn save_snapshot_in_connection(
                 return Err(format!("Ismeretlen lokális üzenetszerep: {}", message.role));
             }
             let sequence = message.sequence.unwrap_or(index as i64);
-            let message_id = message
+            let mut message_id = message
                 .id
                 .as_deref()
                 .filter(|value| Uuid::parse_str(value).is_ok())
@@ -2384,7 +4163,6 @@ pub(crate) fn save_snapshot_in_connection(
                         ),
                     )
                 });
-            message_ids.insert(message_id.clone());
             let message_time = if message.time.trim().is_empty() {
                 now.clone()
             } else {
@@ -2407,13 +4185,93 @@ pub(crate) fn save_snapshot_in_connection(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string);
+            // A stale device can publish the provisional empty assistant row
+            // after another device already stored the completed answer. Do
+            // not let the alias cleanup below delete that stronger row just
+            // because the stale copy has a different UUID.
+            let canonical_agent_id = identity_turn_id
+                .as_deref()
+                .and_then(|turn_id| turn_id.strip_prefix("request:"))
+                .map(|request_id| {
+                    stable_id("agent-answer", &format!("{conversation_id}:{request_id}"))
+                });
+            let existing_stronger_id = if let Some(identity) =
+                identity_turn_id.as_deref().or(identity_item_id.as_deref())
+            {
+                let canonical_existing_id = if identity_role == "assistant" {
+                    if let Some(canonical_id) = canonical_agent_id.as_deref() {
+                        transaction
+                            .query_row(
+                                "SELECT id FROM messages
+                                 WHERE conversation_id = ?1 AND role = 'assistant' AND id = ?2",
+                                params![conversation_id, canonical_id],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .optional()
+                            .map_err(|error| {
+                                format!("A kanonikus agent Ã¼zenet nem olvashatÃ³: {error}")
+                            })?
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if canonical_existing_id.is_some() {
+                    canonical_existing_id
+                } else {
+                    let identity_column = if identity_turn_id.is_some() {
+                        "turn_id"
+                    } else {
+                        "item_id"
+                    };
+                    transaction
+                        .query_row(
+                            &format!(
+                                "SELECT id, body, \"final\" FROM messages
+                             WHERE conversation_id = ?1 AND role = ?2
+                               AND {identity_column} = ?3 AND id <> ?4
+                             ORDER BY \"final\" DESC, length(body) DESC, sequence DESC, id
+                             LIMIT 1"
+                            ),
+                            params![conversation_id, identity_role, identity, message_id],
+                            |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, i64>(2)?,
+                                ))
+                            },
+                        )
+                        .optional()
+                        .map_err(|error| {
+                            format!("A lokális üzenet aliasának lekérdezése sikertelen: {error}")
+                        })?
+                        .and_then(|(existing_id, existing_body, existing_final)| {
+                            let incoming_final = message.final_message.unwrap_or(false);
+                            let existing_is_stronger = (existing_final != 0
+                                && (!incoming_final || existing_body.len() >= message.text.len()))
+                                || (!incoming_final && existing_body.len() > message.text.len());
+                            existing_is_stronger.then_some(existing_id)
+                        })
+                }
+            } else {
+                None
+            };
+            if let Some(existing_id) = existing_stronger_id {
+                message_id = existing_id;
+            }
+            message_ids.insert(message_id.clone());
             transaction
                 .execute(
                     "INSERT INTO messages (id, conversation_id, role, body, sequence, hlc, item_id, turn_id, code, live, \"final\", origin_device_id, attachments_json, quote_refs_json, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                      ON CONFLICT(id) DO UPDATE SET
-                         body = CASE
+                     body = CASE
                              WHEN messages.role = 'user' THEN messages.body
+                             WHEN messages.role = 'assistant'
+                                  AND messages.\"final\" = 1
+                                  AND messages.id = ?16 THEN messages.body
                              WHEN length(excluded.body) >= length(messages.body) THEN excluded.body
                              ELSE messages.body
                          END,
@@ -2454,6 +4312,7 @@ pub(crate) fn save_snapshot_in_connection(
                         attachments_json,
                         quote_refs_json,
                         message_time,
+                        canonical_agent_id,
                     ],
                 )
                 .map_err(|error| format!("A lokális üzenet mentése sikertelen: {error}"))?;
@@ -2666,6 +4525,352 @@ mod tests {
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
             .expect("foreign_keys pragma");
         assert_eq!(foreign_keys, 1);
+        for (table, expected_column) in [
+            ("conversations", "agent_runtime"),
+            ("conversations", "active_agent_session_id"),
+            ("turns", "provider_turn_id"),
+            ("turns", "terminal_event_id"),
+            ("agent_sessions", "provider_session_id"),
+            ("agent_session_entries", "body_json"),
+            ("agent_approvals", "request_id"),
+        ] {
+            let exists: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                    params![table, expected_column],
+                    |row| row.get(0),
+                )
+                .expect("agent schema column");
+            assert_eq!(exists, 1, "missing {table}.{expected_column}");
+        }
+    }
+
+    #[test]
+    fn agent_session_head_conflict_requires_two_distinct_heads() {
+        assert!(!agent_session_head_conflicts(None, None));
+        assert!(!agent_session_head_conflicts(Some("head"), None));
+        assert!(!agent_session_head_conflicts(None, Some("head")));
+        assert!(!agent_session_head_conflicts(Some("head"), Some("head")));
+        assert!(agent_session_head_conflicts(Some("old"), Some("new")));
+    }
+
+    /// One project must have exactly one session-lineage key.
+    #[test]
+    fn project_keys_collapse_to_one_spelling_per_project() {
+        // The SDK sanitizes an extended-length root into four leading dashes.
+        assert_eq!(
+            normalize_project_key("----C--Users-danis-projects-fixture"),
+            "C--Users-danis-projects-fixture"
+        );
+        // The plain form is already canonical and must not change.
+        assert_eq!(
+            normalize_project_key("C--Users-danis-projects-fixture"),
+            "C--Users-danis-projects-fixture"
+        );
+        // A literal prefix, should one ever arrive unsanitized.
+        assert_eq!(
+            normalize_project_key(concat!(r"\\?\", r"C:\", "work")),
+            concat!("C:", r"\", "work")
+        );
+        // Names that merely begin with dashes are left alone: only a drive
+        // letter behind the dashes marks the sanitized prefix.
+        assert_eq!(
+            normalize_project_key("----shared-notes"),
+            "----shared-notes"
+        );
+        assert_eq!(normalize_project_key("----"), "----");
+        assert_eq!(normalize_project_key("  spaced  "), "spaced");
+    }
+
+    /// A conversation that arrived from another device carries no
+    /// `active_agent_session_id` — that column is local bookkeeping and is not
+    /// part of the sync payload. The synced `agent_sessions` row has to supply
+    /// it, otherwise the second device starts a fresh provider session and
+    /// re-sends the whole transcript instead of resuming.
+    #[test]
+    fn a_synced_conversation_resumes_from_the_agent_sessions_table() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        connection
+            .execute(
+                "INSERT INTO projects (id, name, canonical_path, created_at, updated_at)
+                 VALUES ('project', 'Project', 'C:/Project', '1', '1')",
+                [],
+            )
+            .expect("insert project");
+        // Note the empty active_agent_session_id: this is what an imported
+        // conversation looks like on the receiving device.
+        connection
+            .execute(
+                "INSERT INTO conversations
+                     (id, project_id, title, created_at, updated_at,
+                      agent_provider, agent_runtime, active_agent_session_id)
+                 VALUES ('conversation', 'project', 'Thread', '1', '1',
+                         'anthropic', 'claude_agent_bridge', NULL)",
+                [],
+            )
+            .expect("insert conversation");
+        connection
+            .execute(
+                "INSERT INTO agent_sessions
+                     (id, conversation_id, project_key, provider, provider_session_id,
+                      head_turn_id, status, created_at, updated_at)
+                 VALUES ('internal-1', 'conversation', 'project', 'anthropic',
+                         'provider-session-synced', 'turn-1', 'active', '2', '2')",
+                [],
+            )
+            .expect("insert synced session");
+
+        let status = agent_conversation_status_from_connection(&connection, "conversation")
+            .expect("status")
+            .expect("conversation exists");
+        assert_eq!(
+            status.active_session_id.as_deref(),
+            Some("provider-session-synced"),
+            "the synced session must be resumable without the local column"
+        );
+
+        // A deleted session must not be resurrected as the active one.
+        connection
+            .execute(
+                "UPDATE agent_sessions SET status = 'deleted' WHERE id = 'internal-1'",
+                [],
+            )
+            .expect("tombstone the session");
+        let after_delete = agent_conversation_status_from_connection(&connection, "conversation")
+            .expect("status after delete")
+            .expect("conversation still exists");
+        assert_eq!(after_delete.active_session_id, None);
+
+        // The local column still wins when it is set, so a device that owns the
+        // conversation keeps its own bookkeeping.
+        connection
+            .execute(
+                "UPDATE conversations SET active_agent_session_id = 'local-choice'
+                 WHERE id = 'conversation'",
+                [],
+            )
+            .expect("set local column");
+        let local_first = agent_conversation_status_from_connection(&connection, "conversation")
+            .expect("status with local column")
+            .expect("conversation exists");
+        assert_eq!(
+            local_first.active_session_id.as_deref(),
+            Some("local-choice")
+        );
+        let _ = connection;
+    }
+
+    #[test]
+    fn two_device_merge_detects_a_divergent_claude_session_head() {
+        fn new_device() -> Connection {
+            let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+            configure_connection(&connection).expect("configure SQLite");
+            initialize_connection(&mut connection).expect("initialize schema");
+            connection
+        }
+
+        let device_a = new_device();
+        device_a
+            .execute(
+                "INSERT INTO projects (id, name, canonical_path, created_at, updated_at)
+                 VALUES ('project', 'Project', 'C:\\Project', '1', '1')",
+                [],
+            )
+            .expect("insert device A project");
+        device_a
+            .execute(
+                "INSERT INTO conversations (id, project_id, title, created_at, updated_at)
+                 VALUES ('conversation', 'project', 'Work', '1', '1')",
+                [],
+            )
+            .expect("insert device A conversation");
+        device_a
+            .execute(
+                "INSERT INTO turns (id, conversation_id, request_id, status, agent_runtime, created_at, updated_at)
+                 VALUES ('turn-a', 'conversation', 'request-a', 'completed', 'claude_agent_bridge', '2', '2')",
+                [],
+            )
+            .expect("insert device A turn");
+        device_a
+            .execute(
+                "INSERT INTO agent_sessions (
+                     id, conversation_id, project_key, provider, provider_session_id,
+                     head_turn_id, status, created_at, updated_at
+                 ) VALUES ('session', 'conversation', 'project', 'anthropic', 'provider', 'turn-a', 'active', '1', '2')",
+                [],
+            )
+            .expect("insert device A session");
+        let compacted = export_agent_session_compaction_state_from_connection(&device_a)
+            .expect("export device A session");
+
+        let mut device_b = new_device();
+        device_b
+            .execute(
+                "INSERT INTO projects (id, name, canonical_path, created_at, updated_at)
+                 VALUES ('project', 'Project', 'C:\\Project', '1', '1')",
+                [],
+            )
+            .expect("insert device B project");
+        device_b
+            .execute(
+                "INSERT INTO conversations (id, project_id, title, created_at, updated_at)
+                 VALUES ('conversation', 'project', 'Work', '1', '1')",
+                [],
+            )
+            .expect("insert device B conversation");
+        device_b
+            .execute(
+                "INSERT INTO turns (id, conversation_id, request_id, status, agent_runtime, created_at, updated_at)
+                 VALUES ('turn-a', 'conversation', 'request-a', 'completed', 'claude_agent_bridge', '2', '2'),
+                        ('turn-b', 'conversation', 'request-b', 'completed', 'claude_agent_bridge', '3', '3')",
+                [],
+            )
+            .expect("insert device B divergent turn");
+        let transaction = device_b.transaction().expect("start device B merge");
+        apply_agent_session_compaction_state(&transaction, &compacted)
+            .expect("apply device A session to device B");
+        transaction.commit().expect("commit device B merge");
+
+        let session_head: Option<String> = device_b
+            .query_row(
+                "SELECT head_turn_id FROM agent_sessions WHERE id = 'session'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read merged session head");
+        let conversation_head: String = device_b
+            .query_row(
+                "SELECT id FROM turns WHERE conversation_id = 'conversation'
+                 ORDER BY updated_at DESC, id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read divergent conversation head");
+        assert_eq!(session_head.as_deref(), Some("turn-a"));
+        assert_eq!(conversation_head, "turn-b");
+        assert!(agent_session_head_conflicts(
+            session_head.as_deref(),
+            Some(conversation_head.as_str())
+        ));
+    }
+
+    #[test]
+    fn deleted_agent_session_entries_are_not_restored_from_compaction() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+        connection
+            .execute(
+                "INSERT INTO agent_sessions (
+                     id, conversation_id, project_key, provider, provider_session_id,
+                     status, created_at, updated_at
+                 ) VALUES ('session', 'conversation', 'project', 'anthropic', 'provider', 'deleted', '1', '2')",
+                [],
+            )
+            .expect("insert deleted session");
+        connection
+            .execute(
+                "INSERT INTO agent_session_entries (
+                     id, agent_session_id, subpath, sequence, body_json, created_at
+                 ) VALUES ('entry', 'session', '', 1, '{\"old\":true}', '2')",
+                [],
+            )
+            .expect("insert deleted session entry");
+
+        let state = AgentSessionCompactionState {
+            sessions: vec![AgentSessionCompactionRow {
+                id: "session".to_string(),
+                conversation_id: "conversation".to_string(),
+                project_key: "project".to_string(),
+                provider: "anthropic".to_string(),
+                provider_session_id: "provider".to_string(),
+                head_turn_id: None,
+                status: "deleted".to_string(),
+                created_at: "1".to_string(),
+                updated_at: "3".to_string(),
+                origin_device_id: None,
+                hlc: Some("h2".to_string()),
+            }],
+            entries: vec![AgentSessionCompactionEntry {
+                id: "entry".to_string(),
+                agent_session_id: "session".to_string(),
+                subpath: String::new(),
+                entry_uuid: None,
+                sequence: 1,
+                body: serde_json::json!({"new": true}),
+                origin_device_id: None,
+                hlc: Some("h1".to_string()),
+                created_at: "2".to_string(),
+            }],
+        };
+        let transaction = connection.transaction().expect("start transaction");
+        apply_agent_session_compaction_state(&transaction, &state)
+            .expect("apply deleted compaction state");
+        transaction.commit().expect("commit compaction state");
+
+        let entry_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_session_entries WHERE agent_session_id = 'session'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count deleted entries");
+        assert_eq!(entry_count, 0);
+        assert!(
+            export_agent_session_compaction_state_from_connection(&connection)
+                .expect("export compaction state")
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn orphaned_agent_turns_are_marked_failed_on_restart_recovery() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+        connection
+            .execute(
+                "INSERT INTO projects (id, name, canonical_path, created_at, updated_at)
+                 VALUES ('project', 'Project', 'C:\\Project', '1', '1')",
+                [],
+            )
+            .expect("insert project");
+        connection
+            .execute(
+                "INSERT INTO conversations (id, project_id, title, created_at, updated_at)
+                 VALUES ('conversation', 'project', 'Work', '1', '1')",
+                [],
+            )
+            .expect("insert conversation");
+        connection
+            .execute(
+                "INSERT INTO turns (
+                     id, conversation_id, request_id, status, agent_runtime, created_at, updated_at
+                 ) VALUES ('turn', 'conversation', 'request', 'running', 'claude_agent_bridge', '1', '1')",
+                [],
+            )
+            .expect("insert orphaned turn");
+
+        assert_eq!(
+            recover_orphaned_agent_turns_in_connection(&connection, "2")
+                .expect("recover orphaned turn"),
+            1
+        );
+        let row: (String, String) = connection
+            .query_row(
+                "SELECT status, terminal_event_id FROM turns WHERE id = 'turn'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read recovered turn");
+        assert_eq!(
+            row,
+            ("failed".to_string(), "turn:orphaned:failed".to_string())
+        );
     }
 
     #[test]
@@ -3355,6 +5560,353 @@ mod tests {
     }
 
     #[test]
+    fn stale_empty_assistant_snapshot_cannot_replace_completed_answer() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        let mut completed_snapshot = test_snapshot();
+        let conversation = completed_snapshot
+            .conversations
+            .values_mut()
+            .next()
+            .expect("completed conversation");
+        conversation.messages.push(LocalMessage {
+            id: Some(Uuid::new_v4().to_string()),
+            role: "assistant".to_string(),
+            text: "final answer".to_string(),
+            time: "2026-07-24T07:00:00Z".to_string(),
+            code: Some(false),
+            live: Some(false),
+            final_message: Some(true),
+            item_id: None,
+            turn_id: Some("request:shared-turn".to_string()),
+            sequence: Some(11),
+            hlc: None,
+            origin_device_id: None,
+            images: Vec::new(),
+            quote_refs: Vec::new(),
+        });
+        save_snapshot_in_connection(&mut connection, completed_snapshot.clone())
+            .expect("save completed answer");
+
+        let mut stale_snapshot = completed_snapshot;
+        let stale_conversation = stale_snapshot
+            .conversations
+            .values_mut()
+            .next()
+            .expect("stale conversation");
+        let stale_user = stale_conversation.messages[0].clone();
+        stale_conversation.messages = vec![
+            stale_user,
+            LocalMessage {
+                id: Some(Uuid::new_v4().to_string()),
+                role: "assistant".to_string(),
+                text: String::new(),
+                time: "most".to_string(),
+                code: Some(false),
+                live: Some(true),
+                final_message: Some(false),
+                item_id: None,
+                turn_id: Some("request:shared-turn".to_string()),
+                sequence: Some(11),
+                hlc: None,
+                origin_device_id: None,
+                images: Vec::new(),
+                quote_refs: Vec::new(),
+            },
+        ];
+        save_snapshot_in_connection(&mut connection, stale_snapshot)
+            .expect("save stale provisional answer");
+
+        let loaded = load_snapshot_from_connection(&connection).expect("load merged answer");
+        let answer = loaded
+            .conversations
+            .values()
+            .next()
+            .expect("conversation")
+            .messages
+            .iter()
+            .find(|message| message.role == "assistant")
+            .expect("completed answer");
+        assert_eq!(answer.text, "final answer");
+        assert_eq!(answer.live, Some(false));
+        assert_eq!(answer.final_message, Some(true));
+    }
+
+    #[test]
+    fn native_agent_answer_checkpoint_settles_the_sqlite_placeholder() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        let mut snapshot = test_snapshot();
+        snapshot
+            .conversations
+            .values_mut()
+            .next()
+            .expect("conversation")
+            .messages
+            .push(LocalMessage {
+                id: Some(Uuid::new_v4().to_string()),
+                role: "assistant".to_string(),
+                text: String::new(),
+                time: "most".to_string(),
+                code: Some(false),
+                live: Some(true),
+                final_message: Some(false),
+                item_id: None,
+                turn_id: Some("request:native-answer".to_string()),
+                sequence: Some(11),
+                hlc: None,
+                origin_device_id: None,
+                images: Vec::new(),
+                quote_refs: Vec::new(),
+            });
+        save_snapshot_in_connection(&mut connection, snapshot).expect("save placeholder");
+        let conversation_id: String = connection
+            .query_row(
+                "SELECT id FROM conversations WHERE title = 'Thread'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("conversation id");
+
+        record_agent_answer_in_connection(
+            &mut connection,
+            &conversation_id,
+            "native-answer",
+            "Végleges natív válasz",
+        )
+        .expect("checkpoint answer");
+
+        let stored: (i64, String, i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*), MAX(body), MAX(live), MAX(\"final\")
+                 FROM messages
+                 WHERE conversation_id = ?1 AND role = 'assistant'
+                   AND turn_id = 'request:native-answer'",
+                params![conversation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read checkpoint answer");
+        assert_eq!(stored, (1, "Végleges natív válasz".to_string(), 0, 1));
+    }
+
+    #[test]
+    fn native_agent_answer_checkpoint_replaces_a_stale_same_turn_alias() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        let request_id = "canonical-answer";
+        let turn_id = format!("request:{request_id}");
+        let mut snapshot = test_snapshot();
+        snapshot
+            .conversations
+            .values_mut()
+            .next()
+            .expect("conversation")
+            .messages[0]
+            .turn_id = Some(turn_id.clone());
+        save_snapshot_in_connection(&mut connection, snapshot).expect("save user");
+        let conversation_id: String = connection
+            .query_row(
+                "SELECT id FROM conversations WHERE title = 'Thread'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("conversation id");
+        connection
+            .execute(
+                "INSERT INTO messages (
+                     id, conversation_id, role, body, sequence, hlc, item_id, turn_id,
+                     code, live, \"final\", origin_device_id, attachments_json,
+                     quote_refs_json, created_at
+                 ) VALUES (?1, ?2, 'assistant', ?3, 12, NULL, NULL, ?4, 0, 0, 1, NULL, '[]', '[]', '2')",
+                params![
+                    Uuid::new_v4().to_string(),
+                    conversation_id,
+                    "old answer that is longer",
+                    turn_id,
+                ],
+            )
+            .expect("insert stale alias");
+
+        record_agent_answer_in_connection(
+            &mut connection,
+            &conversation_id,
+            request_id,
+            "CURRENT_OK",
+        )
+        .expect("replace stale alias");
+
+        let rows: Vec<(String, String, i64)> = connection
+            .prepare(
+                "SELECT id, body, sequence FROM messages
+                 WHERE conversation_id = ?1 AND role = 'assistant' AND turn_id = ?2
+                 ORDER BY id",
+            )
+            .expect("prepare answer rows")
+            .query_map(params![conversation_id, turn_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .expect("query answer rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect answer rows");
+        assert_eq!(
+            rows,
+            vec![(
+                stable_id("agent-answer", &format!("{conversation_id}:{request_id}"),),
+                "CURRENT_OK".to_string(),
+                11,
+            )]
+        );
+    }
+
+    #[test]
+    fn snapshot_save_cannot_overwrite_canonical_agent_answer_with_stale_alias() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        let request_id = "snapshot-canonical";
+        let turn_id = format!("request:{request_id}");
+        let mut snapshot = test_snapshot();
+        snapshot
+            .conversations
+            .values_mut()
+            .next()
+            .expect("conversation")
+            .messages[0]
+            .turn_id = Some(turn_id.clone());
+        save_snapshot_in_connection(&mut connection, snapshot).expect("save user");
+        let conversation_id: String = connection
+            .query_row(
+                "SELECT id FROM conversations WHERE title = 'Thread'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("conversation id");
+        record_agent_answer_in_connection(
+            &mut connection,
+            &conversation_id,
+            request_id,
+            "CURRENT_CANONICAL_OK",
+        )
+        .expect("save canonical answer");
+
+        let mut stale = load_snapshot_from_connection(&connection).expect("load canonical");
+        let conversation = stale
+            .conversations
+            .values_mut()
+            .next()
+            .expect("stale conversation");
+        let user = conversation
+            .messages
+            .iter()
+            .find(|message| message.role == "user")
+            .cloned()
+            .expect("user message");
+        let mut stale_answer = conversation
+            .messages
+            .iter()
+            .find(|message| message.role == "assistant")
+            .cloned()
+            .expect("canonical answer");
+        stale_answer.id = Some(Uuid::new_v4().to_string());
+        stale_answer.text = "STALE_LONGER_ANSWER_THAT_MUST_NOT_WIN".to_string();
+        stale_answer.sequence = Some(12);
+        conversation.messages = vec![user, stale_answer];
+        save_snapshot_in_connection(&mut connection, stale).expect("save stale snapshot");
+
+        let rows: Vec<(String, String)> = connection
+            .prepare(
+                "SELECT id, body FROM messages
+                 WHERE conversation_id = ?1 AND role = 'assistant' AND turn_id = ?2",
+            )
+            .expect("prepare canonical rows")
+            .query_map(params![conversation_id, turn_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("query canonical rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect canonical rows");
+        assert_eq!(
+            rows,
+            vec![(
+                stable_id("agent-answer", &format!("{conversation_id}:{request_id}"),),
+                "CURRENT_CANONICAL_OK".to_string(),
+            )]
+        );
+    }
+
+    #[test]
+    fn native_agent_answer_checkpoint_reconstructs_empty_rpc_text_from_deltas() {
+        let response = crate::agent::AgentResponse {
+            provider: crate::agent::AgentProvider::Anthropic,
+            runtime: crate::agent::AgentRuntimeKind::ClaudeAgentBridge,
+            thread_id: Some("session".to_string()),
+            session_id: Some("session".to_string()),
+            text: String::new(),
+            events: vec![
+                crate::agent::AgentEventEnvelope {
+                    protocol_version: 1,
+                    message_id: "one".to_string(),
+                    request_id: "request".to_string(),
+                    conversation_id: Some("conversation".to_string()),
+                    session_id: Some("session".to_string()),
+                    model: Some("claude-sonnet-5".to_string()),
+                    provider_turn_id: Some("session".to_string()),
+                    terminal_event_id: None,
+                    sequence: 1,
+                    timestamp: "1".to_string(),
+                    provider: crate::agent::AgentProvider::Anthropic,
+                    runtime: crate::agent::AgentRuntimeKind::ClaudeAgentBridge,
+                    event_type: "assistant/text_delta".to_string(),
+                    payload: serde_json::json!({
+                        "delta": "PHASE",
+                        "phase": "final_answer"
+                    }),
+                },
+                crate::agent::AgentEventEnvelope {
+                    protocol_version: 1,
+                    message_id: "two".to_string(),
+                    request_id: "request".to_string(),
+                    conversation_id: Some("conversation".to_string()),
+                    session_id: Some("session".to_string()),
+                    model: Some("claude-sonnet-5".to_string()),
+                    provider_turn_id: Some("session".to_string()),
+                    terminal_event_id: Some("request:session:completed".to_string()),
+                    sequence: 2,
+                    timestamp: "2".to_string(),
+                    provider: crate::agent::AgentProvider::Anthropic,
+                    runtime: crate::agent::AgentRuntimeKind::ClaudeAgentBridge,
+                    event_type: "agent/turn_completed".to_string(),
+                    payload: serde_json::json!({ "finalText": "PHASE1012" }),
+                },
+            ],
+            guard: crate::codex::AgentGuardReport {
+                snapshot_id: String::new(),
+                snapshot_path: String::new(),
+                base_hash: String::new(),
+                post_hash: None,
+                changed_files: Vec::new(),
+                added_files: Vec::new(),
+                removed_files: Vec::new(),
+                rollback_available: false,
+                apply_available: false,
+                apply_base_hash: None,
+                rebased: false,
+                isolation_mode: "test".to_string(),
+            },
+            thread_rehydrated: true,
+        };
+
+        assert_eq!(agent_response_answer_text(&response), "PHASE1012");
+    }
+
+    #[test]
     fn partial_conversation_snapshot_preserves_existing_history() {
         let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
         configure_connection(&connection).expect("configure SQLite");
@@ -3582,9 +6134,10 @@ mod tests {
             .expect("save General tombstone");
 
         let after_delete = load_snapshot_from_connection(&connection).expect("load after delete");
-        assert!(!after_delete.conversations.values().any(|candidate| {
-            candidate.id.as_deref() == Some(conversation_id.as_str())
-        }));
+        assert!(!after_delete
+            .conversations
+            .values()
+            .any(|candidate| { candidate.id.as_deref() == Some(conversation_id.as_str()) }));
         let active_rows: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM conversations WHERE scope = 'general' AND archived_at IS NULL",
@@ -3598,10 +6151,12 @@ mod tests {
         // row, exactly like a later sync poll or restart-time hydration.
         save_snapshot_in_connection(&mut connection, stale_snapshot)
             .expect("repeat stale General snapshot");
-        let after_repeat = load_snapshot_from_connection(&connection).expect("load repeated snapshot");
-        assert!(!after_repeat.conversations.values().any(|candidate| {
-            candidate.id.as_deref() == Some(conversation_id.as_str())
-        }));
+        let after_repeat =
+            load_snapshot_from_connection(&connection).expect("load repeated snapshot");
+        assert!(!after_repeat
+            .conversations
+            .values()
+            .any(|candidate| { candidate.id.as_deref() == Some(conversation_id.as_str()) }));
 
         // Removing the tombstone is the explicit restore path.
         save_snapshot_in_connection(
@@ -3618,9 +6173,10 @@ mod tests {
         )
         .expect("restore General conversation");
         let restored = load_snapshot_from_connection(&connection).expect("load restored General");
-        assert!(restored.conversations.values().any(|candidate| {
-            candidate.id.as_deref() == Some(conversation_id.as_str())
-        }));
+        assert!(restored
+            .conversations
+            .values()
+            .any(|candidate| { candidate.id.as_deref() == Some(conversation_id.as_str()) }));
     }
 
     #[test]

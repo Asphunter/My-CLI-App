@@ -78,6 +78,39 @@ export const isSettledHistoricalAssistant = (
       (Boolean(message.text.trim()) || hasImages) &&
       (nextRole === undefined || nextRole === "user")));
 
+/**
+ * A previous client could persist a second, longer assistant alias under the
+ * same turn id. When the canonical answer arrives later, its timeline
+ * sequence is authoritative even if its text is shorter than the corrupted
+ * alias. This keeps restart/sync hydration from moving the real answer back
+ * into the old alias position.
+ */
+export const isNewerSettledAssistantVersion = (
+  existing: MessageIdentityLike,
+  incoming: MessageIdentityLike,
+) => {
+  if (
+    existing.role !== "assistant" ||
+    incoming.role !== "assistant" ||
+    !incoming.final ||
+    incoming.live ||
+    !incoming.text.trim() ||
+    !existing.final ||
+    existing.live ||
+    !existing.text.trim()
+  )
+    return false;
+  if (existing.text === incoming.text) return false;
+  if (
+    typeof existing.sequence !== "number" ||
+    !Number.isFinite(existing.sequence) ||
+    typeof incoming.sequence !== "number" ||
+    !Number.isFinite(incoming.sequence)
+  )
+    return false;
+  return incoming.sequence > existing.sequence;
+};
+
 const nonEmpty = (value: string | undefined) => value?.trim() || undefined;
 
 /** Ordered aliases for one logical chat row.

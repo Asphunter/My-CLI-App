@@ -23,12 +23,16 @@ const MESSAGE_UPSERT: &str = "message.upsert";
 const WORK_ITEM_UPSERT: &str = "work_item.upsert";
 const TOMBSTONE_UPSERT: &str = "entity.tombstone";
 const ENTITY_RESTORE: &str = "entity.restore";
+const AGENT_SESSION_UPSERT: &str = "agent_session.upsert";
+const AGENT_SESSION_ENTRY_APPEND: &str = "agent_session.entry_append";
+const AGENT_SESSION_TOMBSTONE: &str = "agent_session.tombstone";
 const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 const TRANSIENT_EVENT_READ_RETRIES: usize = 4;
 const TRANSIENT_EVENT_READ_DELAY_MS: u64 = 250;
 const TOMBSTONE_RETENTION_DAYS: i64 = 30;
 const MILLIS_PER_DAY: u64 = 86_400_000;
 const RETENTION_SCHEMA_VERSION: i64 = 1;
+const COMPACTION_SCHEMA_VERSION: i64 = 2;
 const MAX_RETENTION_METADATA_BYTES: u64 = 1024 * 1024;
 const MAX_RETENTION_BACKUP_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_COMPACTION_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
@@ -333,12 +337,27 @@ struct CompactionSnapshot {
     journal_digest: String,
     cursors: BTreeMap<String, RetentionCursor>,
     state: LocalStoreSnapshot,
+    #[serde(default)]
+    agent_sessions: store::AgentSessionCompactionState,
     snapshot_hash: String,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CompactionSnapshotHashInput<'a> {
+    schema_version: i64,
+    snapshot_id: &'a str,
+    created_at: &'a str,
+    event_count: u64,
+    journal_digest: &'a str,
+    cursors: &'a BTreeMap<String, RetentionCursor>,
+    state: &'a LocalStoreSnapshot,
+    agent_sessions: &'a store::AgentSessionCompactionState,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyCompactionSnapshotHashInput<'a> {
     schema_version: i64,
     snapshot_id: &'a str,
     created_at: &'a str,
@@ -580,29 +599,44 @@ fn journal_digest_for_scan(scan: &JournalScan) -> String {
 }
 
 fn compaction_snapshot_hash(snapshot: &CompactionSnapshot) -> Result<String, String> {
-    let input = CompactionSnapshotHashInput {
-        schema_version: snapshot.schema_version,
-        snapshot_id: &snapshot.snapshot_id,
-        created_at: &snapshot.created_at,
-        event_count: snapshot.event_count,
-        journal_digest: &snapshot.journal_digest,
-        cursors: &snapshot.cursors,
-        state: &snapshot.state,
-    };
-    let bytes = serde_json::to_vec(&input).map_err(|error| {
-        format!("A compaction snapshot hash-inputja nem szerializálható: {error}")
-    })?;
+    let bytes = if snapshot.schema_version == RETENTION_SCHEMA_VERSION {
+        serde_json::to_vec(&LegacyCompactionSnapshotHashInput {
+            schema_version: snapshot.schema_version,
+            snapshot_id: &snapshot.snapshot_id,
+            created_at: &snapshot.created_at,
+            event_count: snapshot.event_count,
+            journal_digest: &snapshot.journal_digest,
+            cursors: &snapshot.cursors,
+            state: &snapshot.state,
+        })
+    } else {
+        serde_json::to_vec(&CompactionSnapshotHashInput {
+            schema_version: snapshot.schema_version,
+            snapshot_id: &snapshot.snapshot_id,
+            created_at: &snapshot.created_at,
+            event_count: snapshot.event_count,
+            journal_digest: &snapshot.journal_digest,
+            cursors: &snapshot.cursors,
+            state: &snapshot.state,
+            agent_sessions: &snapshot.agent_sessions,
+        })
+    }
+    .map_err(|error| format!("A compaction snapshot hash-inputja nem szerializálható: {error}"))?;
     Ok(sha256_hex(&bytes))
 }
 
 fn validate_compaction_snapshot(snapshot: &CompactionSnapshot) -> Result<(), String> {
-    if snapshot.schema_version != RETENTION_SCHEMA_VERSION
-        || Uuid::parse_str(&snapshot.snapshot_id).is_err()
+    if !matches!(
+        snapshot.schema_version,
+        RETENTION_SCHEMA_VERSION | COMPACTION_SCHEMA_VERSION
+    ) || Uuid::parse_str(&snapshot.snapshot_id).is_err()
         || snapshot.created_at.parse::<u64>().is_err()
         || !is_sha256(&snapshot.journal_digest)
         || !is_sha256(&snapshot.snapshot_hash)
         || snapshot.state.schema_version > STORE_SCHEMA_VERSION
         || snapshot.cursors.len() > 100_000
+        || snapshot.agent_sessions.sessions.len() > 100_000
+        || snapshot.agent_sessions.entries.len() > 10_000_000
         || snapshot.event_count > 100_000_000
     {
         return Err("A compaction snapshot fejléce hibás.".to_string());
@@ -1731,6 +1765,44 @@ fn validate_payload(event_type: &str, entity_id: &str, payload: &Value) -> Resul
                 return Err("A tombstone event identityje vagy típusa hibás.".to_string());
             }
         }
+        AGENT_SESSION_UPSERT | AGENT_SESSION_TOMBSTONE => {
+            let id = payload
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Az agent session event ID-ja hiÃ¡nyzik.".to_string())?;
+            if format!("agent-session:{id}") != entity_id
+                || payload
+                    .get("conversationId")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .is_empty()
+                || payload
+                    .get("providerSessionId")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .is_empty()
+            {
+                return Err("Az agent session event identityje vagy tartalma hibÃ¡s.".to_string());
+            }
+        }
+        AGENT_SESSION_ENTRY_APPEND => {
+            let id = payload
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Az agent session entry event ID-ja hiÃ¡nyzik.".to_string())?;
+            if format!("agent-entry:{id}") != entity_id
+                || payload
+                    .get("session")
+                    .and_then(|value| value.get("id"))
+                    .and_then(Value::as_str)
+                    .is_none()
+                || payload.get("body").is_none()
+            {
+                return Err("Az agent session entry event tartalma hibÃ¡s.".to_string());
+            }
+        }
         _ => return Err(format!("Ismeretlen v2 event type: {event_type}")),
     }
     Ok(())
@@ -2311,6 +2383,7 @@ fn apply_events_with_cursor_floor(
             .map_err(|error| {
                 format!("A compaction snapshot lokális metaadata nem menthető: {error}")
             })?;
+        store::apply_agent_session_compaction_state(&transaction, &snapshot.agent_sessions)?;
         for (device_id, cursor) in &snapshot.cursors {
             transaction
                 .execute(
@@ -2436,6 +2509,19 @@ fn apply_events_with_cursor_floor(
                         ],
                     )
                     .map_err(|error| format!("A v2 event mentése sikertelen: {error}"))?;
+                if matches!(
+                    event.event_type.as_str(),
+                    AGENT_SESSION_UPSERT | AGENT_SESSION_ENTRY_APPEND | AGENT_SESSION_TOMBSTONE
+                ) {
+                    store::apply_agent_sync_event(
+                        &transaction,
+                        &event.event_type,
+                        &event.entity_id,
+                        &event.payload,
+                        &event.hlc,
+                        &event.device_id,
+                    )?;
+                }
                 imported += 1;
             }
             transaction
@@ -3279,6 +3365,15 @@ fn reduce_snapshot(connection: &Connection) -> Result<LocalStoreSnapshot, String
                     tombstones.insert(key, (rank, event.event_type == TOMBSTONE_UPSERT, tombstone));
                 }
             }
+            // Agent sessions live in their own tables, which `apply_events`
+            // has already written; they are not part of the UI snapshot. They
+            // still have to be named here, because the catch-all below is the
+            // journal's integrity guard and would otherwise fail every publish
+            // made after a Claude turn — taking Codex conversations down with
+            // it. A new event type must be added to all six dispatch sites:
+            // the validator, this reducer, the store apply, the store export,
+            // the event rank and the compaction selection.
+            AGENT_SESSION_UPSERT | AGENT_SESSION_ENTRY_APPEND | AGENT_SESSION_TOMBSTONE => {}
             _ => {
                 return Err(format!(
                     "Ismeretlen v2 event a reducerben: {}",
@@ -3896,6 +3991,7 @@ struct RetentionRuntime {
     report: SyncImportReport,
     health: SyncHealth,
     snapshot: LocalStoreSnapshot,
+    agent_sessions: store::AgentSessionCompactionState,
     scan: JournalScan,
 }
 
@@ -3906,6 +4002,8 @@ fn load_retention_runtime() -> Result<RetentionRuntime, String> {
     let report = import_into_store(&root, &device_id, &mut local_store)?;
     let health = build_sync_health(&root, &local_store.connection, &report)?;
     let snapshot = reduce_snapshot(&local_store.connection)?;
+    let agent_sessions =
+        store::export_agent_session_compaction_state_from_connection(&local_store.connection)?;
     let scan = scan_journal(&root, &device_id)?;
     Ok(RetentionRuntime {
         device_id,
@@ -3913,6 +4011,7 @@ fn load_retention_runtime() -> Result<RetentionRuntime, String> {
         report,
         health,
         snapshot,
+        agent_sessions,
         scan,
     })
 }
@@ -4149,6 +4248,70 @@ fn prune_snapshot_for_compaction_selected(
     }
 }
 
+fn prune_agent_session_state_for_compaction(
+    state: &store::AgentSessionCompactionState,
+    snapshot: &LocalStoreSnapshot,
+    candidates: &[SyncRetentionCandidate],
+    selected: Option<&HashSet<String>>,
+) -> store::AgentSessionCompactionState {
+    let candidate_is_selected = |candidate: &SyncRetentionCandidate| {
+        candidate.eligible
+            && selected
+                .map(|keys| keys.contains(&candidate.selection_key))
+                .unwrap_or(true)
+    };
+    let purged_projects = candidates
+        .iter()
+        .filter(|candidate| candidate_is_selected(candidate) && candidate.entity_type == "project")
+        .map(|candidate| candidate.entity_id.clone())
+        .collect::<HashSet<_>>();
+    let purged_conversations = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate_is_selected(candidate) && candidate.entity_type == "conversation"
+        })
+        .map(|candidate| candidate.entity_id.clone())
+        .collect::<HashSet<_>>();
+    let mut purged_conversations = purged_conversations;
+    for conversation in snapshot.conversations.values() {
+        if purged_projects.contains(&conversation.project_id)
+            || conversation
+                .id
+                .as_deref()
+                .is_some_and(|id| purged_conversations.contains(id))
+        {
+            if let Some(id) = conversation.id.clone() {
+                purged_conversations.insert(id);
+            }
+        }
+    }
+    let sessions = state
+        .sessions
+        .iter()
+        .map(|session| {
+            if purged_conversations.contains(&session.conversation_id) {
+                let mut tombstone = session.clone();
+                tombstone.status = "deleted".to_string();
+                tombstone
+            } else {
+                session.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    let retained_ids = sessions
+        .iter()
+        .filter(|session| session.status != "deleted")
+        .map(|session| session.id.as_str())
+        .collect::<HashSet<_>>();
+    let entries = state
+        .entries
+        .iter()
+        .filter(|entry| retained_ids.contains(entry.agent_session_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    store::AgentSessionCompactionState { sessions, entries }
+}
+
 fn compaction_snapshot_path(root: &Path, snapshot_id: &str, created_at: &str) -> PathBuf {
     retention_root(root)
         .join("snapshots")
@@ -4165,16 +4328,18 @@ fn write_compaction_snapshot(
     root: &Path,
     scan: &JournalScan,
     mut state: LocalStoreSnapshot,
+    agent_sessions: store::AgentSessionCompactionState,
 ) -> Result<(CompactionSnapshot, PathBuf), String> {
     strip_nonportable_thread_ids(&mut state);
     let mut snapshot = CompactionSnapshot {
-        schema_version: RETENTION_SCHEMA_VERSION,
+        schema_version: COMPACTION_SCHEMA_VERSION,
         snapshot_id: Uuid::new_v4().to_string(),
         created_at: now_text(),
         event_count: journal_event_count_for_scan(scan),
         journal_digest: journal_digest_for_scan(scan),
         cursors: journal_cursors_for_scan(scan),
         state,
+        agent_sessions,
         snapshot_hash: String::new(),
     };
     snapshot.snapshot_hash = compaction_snapshot_hash(&snapshot)?;
@@ -4346,23 +4511,33 @@ fn execute_retention_purge(
         ),
         None => prune_snapshot_for_compaction(&preview.snapshot, &preview.candidates),
     };
-    let (snapshot, snapshot_path) =
-        match write_compaction_snapshot(&runtime.root, &runtime.scan, pruned_state) {
-            Ok(value) => value,
-            Err(error) => {
-                let _ = write_retention_audit(
-                    &runtime.root,
-                    &runtime.device_id,
-                    &runtime.scan,
-                    "purge",
-                    "failed",
-                    selected_count,
-                    None,
-                    Some(error.clone()),
-                );
-                return Err(error);
-            }
-        };
+    let pruned_agent_sessions = prune_agent_session_state_for_compaction(
+        &runtime.agent_sessions,
+        &preview.snapshot,
+        &preview.candidates,
+        selected,
+    );
+    let (snapshot, snapshot_path) = match write_compaction_snapshot(
+        &runtime.root,
+        &runtime.scan,
+        pruned_state,
+        pruned_agent_sessions,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = write_retention_audit(
+                &runtime.root,
+                &runtime.device_id,
+                &runtime.scan,
+                "purge",
+                "failed",
+                selected_count,
+                None,
+                Some(error.clone()),
+            );
+            return Err(error);
+        }
+    };
     if let Err(error) = purge_compacted_events(&runtime.root, &snapshot) {
         let _ = fs::remove_file(&snapshot_path);
         let _ = write_retention_audit(
@@ -4457,6 +4632,15 @@ fn project_is_tombstoned_for_publish(
                     .map(|path| path == sync_path_key(&project.path_hint))
                     .unwrap_or(false))
     })
+}
+
+fn pending_event_priority(event_type: &str) -> u8 {
+    match event_type {
+        AGENT_SESSION_UPSERT => 0,
+        AGENT_SESSION_ENTRY_APPEND => 1,
+        AGENT_SESSION_TOMBSTONE => 2,
+        _ => 10,
+    }
 }
 
 fn pending_events(snapshot: &LocalStoreSnapshot) -> Result<Vec<PendingEvent>, String> {
@@ -4595,8 +4779,9 @@ fn pending_events(snapshot: &LocalStoreSnapshot) -> Result<Vec<PendingEvent>, St
         });
     }
     pending.sort_by(|left, right| {
-        left.event_type
-            .cmp(&right.event_type)
+        pending_event_priority(&left.event_type)
+            .cmp(&pending_event_priority(&right.event_type))
+            .then_with(|| left.event_type.cmp(&right.event_type))
             .then_with(|| left.entity_id.cmp(&right.entity_id))
     });
     Ok(pending)
@@ -4751,7 +4936,21 @@ fn append_snapshot(
     store: &LocalStore,
     snapshot: &LocalStoreSnapshot,
 ) -> Result<usize, String> {
-    append_pending_events(root, device_id, store, pending_events(snapshot)?)
+    let mut pending = pending_events(snapshot)?;
+    for (entity_id, event_type, payload) in store::export_agent_session_events()? {
+        pending.push(PendingEvent {
+            entity_id,
+            event_type,
+            payload,
+        });
+    }
+    pending.sort_by(|left, right| {
+        pending_event_priority(&left.event_type)
+            .cmp(&pending_event_priority(&right.event_type))
+            .then_with(|| left.event_type.cmp(&right.event_type))
+            .then_with(|| left.entity_id.cmp(&right.entity_id))
+    });
+    append_pending_events(root, device_id, store, pending)
 }
 
 pub(crate) fn sync_v2_pull() -> Result<SyncV2Result, String> {
@@ -4878,7 +5077,10 @@ pub(crate) fn sync_v2_rebuild_from_local() -> Result<SyncV2Result, String> {
         rows.collect::<Result<BTreeMap<_, _>, _>>()
             .map_err(|error| format!("A lokális sync cursoradat hibás: {error}"))?
     };
-    let (mut compaction, snapshot_path) = write_compaction_snapshot(&root, &scan, local_snapshot)?;
+    let agent_sessions =
+        store::export_agent_session_compaction_state_from_connection(&local_store.connection)?;
+    let (mut compaction, snapshot_path) =
+        write_compaction_snapshot(&root, &scan, local_snapshot, agent_sessions)?;
     // Keep prefixes for other devices that are still represented in the local
     // store even if their OneDrive event directory is temporarily offline.
     // Never carry the current device's stale cursor across the reset.
@@ -5198,7 +5400,9 @@ mod tests {
                  CREATE TABLE store_meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
                  CREATE TABLE devices (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, last_hlc TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
                  CREATE TABLE sync_events (event_id TEXT PRIMARY KEY NOT NULL, device_id TEXT NOT NULL, device_sequence INTEGER NOT NULL, hlc TEXT NOT NULL, entity_id TEXT NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, payload_hash TEXT NOT NULL, event_hash TEXT NOT NULL, previous_hash TEXT, imported_at TEXT, UNIQUE(device_id, device_sequence));
-                 CREATE TABLE sync_cursors (source_device_id TEXT PRIMARY KEY NOT NULL, last_sequence INTEGER NOT NULL, last_hash TEXT, updated_at TEXT NOT NULL);",
+                 CREATE TABLE sync_cursors (source_device_id TEXT PRIMARY KEY NOT NULL, last_sequence INTEGER NOT NULL, last_hash TEXT, updated_at TEXT NOT NULL);
+                 CREATE TABLE agent_sessions (id TEXT PRIMARY KEY NOT NULL, conversation_id TEXT NOT NULL, project_key TEXT NOT NULL, provider TEXT NOT NULL, provider_session_id TEXT NOT NULL, head_turn_id TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, origin_device_id TEXT, hlc TEXT);
+                 CREATE TABLE agent_session_entries (id TEXT PRIMARY KEY NOT NULL, agent_session_id TEXT NOT NULL, subpath TEXT NOT NULL, entry_uuid TEXT, sequence INTEGER NOT NULL, body_json TEXT NOT NULL, origin_device_id TEXT, hlc TEXT, created_at TEXT NOT NULL, UNIQUE(agent_session_id, subpath, sequence));",
             )
             .expect("schema");
         LocalStore {
@@ -5223,6 +5427,269 @@ mod tests {
             origin_device_id: None,
             images: Vec::new(),
             quote_refs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn duplicate_agent_session_entry_sync_is_idempotent() {
+        let mut local = test_store();
+        let session_payload = serde_json::json!({
+            "id": "session",
+            "conversationId": "conversation",
+            "projectKey": "project",
+            "provider": "anthropic",
+            "providerSessionId": "provider-session",
+            "headTurnId": "turn-a",
+            "status": "active",
+            "createdAt": "1",
+            "updatedAt": "1"
+        });
+        let entry_payload = serde_json::json!({
+            "id": "entry",
+            "session": session_payload,
+            "subpath": "",
+            "entryUuid": "provider-entry",
+            "sequence": 1,
+            "body": {"type": "assistant", "text": "once"},
+            "createdAt": "2"
+        });
+        let transaction = local
+            .connection
+            .transaction()
+            .expect("start sync transaction");
+        store::apply_agent_sync_event(
+            &transaction,
+            AGENT_SESSION_UPSERT,
+            "agent-session:session",
+            &session_payload,
+            "h1",
+            "device-a",
+        )
+        .expect("apply session event");
+        store::apply_agent_sync_event(
+            &transaction,
+            AGENT_SESSION_ENTRY_APPEND,
+            "agent-entry:entry",
+            &entry_payload,
+            "h2",
+            "device-a",
+        )
+        .expect("apply first entry event");
+        store::apply_agent_sync_event(
+            &transaction,
+            AGENT_SESSION_ENTRY_APPEND,
+            "agent-entry:entry",
+            &entry_payload,
+            "h2",
+            "device-a",
+        )
+        .expect("apply duplicate entry event");
+        transaction.commit().expect("commit sync transaction");
+
+        let count: i64 = local
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_session_entries WHERE agent_session_id = 'session'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count synced entries");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn two_device_claude_session_resume_fork_and_tombstone_converge() {
+        fn apply_agent_event(
+            local: &mut LocalStore,
+            event_type: &str,
+            entity_id: &str,
+            payload: &serde_json::Value,
+            hlc: &str,
+            device_id: &str,
+        ) {
+            let transaction = local
+                .connection
+                .transaction()
+                .expect("start agent sync transaction");
+            store::apply_agent_sync_event(
+                &transaction,
+                event_type,
+                entity_id,
+                payload,
+                hlc,
+                device_id,
+            )
+            .expect("apply agent sync event");
+            transaction.commit().expect("commit agent sync transaction");
+        }
+
+        let mut device_a = test_store();
+        let mut device_b = test_store();
+        let shared_session = serde_json::json!({
+            "id": "session-shared",
+            "conversationId": "conversation",
+            "projectKey": "project",
+            "provider": "anthropic",
+            "providerSessionId": "provider-shared",
+            "headTurnId": "turn-a",
+            "status": "active",
+            "createdAt": "1",
+            "updatedAt": "2"
+        });
+        let shared_entry = serde_json::json!({
+            "id": "entry-a",
+            "session": shared_session,
+            "subpath": "",
+            "entryUuid": "provider-entry-a",
+            "sequence": 1,
+            "body": {"type": "assistant", "text": "A gép válasza"},
+            "createdAt": "2"
+        });
+
+        // A completes the first turn; B hydrates the exact session and entry
+        // before continuing it. Applying the same immutable events twice is
+        // the normal cross-device replay path, not an exceptional case.
+        for device in [&mut device_a, &mut device_b] {
+            apply_agent_event(
+                device,
+                AGENT_SESSION_UPSERT,
+                "agent-session:session-shared",
+                shared_entry.get("session").expect("shared session payload"),
+                "h1",
+                "device-a",
+            );
+            apply_agent_event(
+                device,
+                AGENT_SESSION_ENTRY_APPEND,
+                "agent-entry:entry-a",
+                &shared_entry,
+                "h2",
+                "device-a",
+            );
+        }
+
+        // B continues from the hydrated context. The separate session models
+        // the safe fork path when the original provider head is no longer the
+        // same as the conversation head on the other device.
+        let fork_session = serde_json::json!({
+            "id": "session-fork-b",
+            "conversationId": "conversation",
+            "projectKey": "project",
+            "provider": "anthropic",
+            "providerSessionId": "provider-fork-b",
+            "headTurnId": "turn-b",
+            "status": "active",
+            "createdAt": "3",
+            "updatedAt": "4"
+        });
+        let fork_entry = serde_json::json!({
+            "id": "entry-b",
+            "session": fork_session,
+            "subpath": "",
+            "entryUuid": "provider-entry-b",
+            "sequence": 1,
+            "body": {"type": "assistant", "text": "B gép fork válasza"},
+            "createdAt": "4"
+        });
+        for device in [&mut device_a, &mut device_b] {
+            apply_agent_event(
+                device,
+                AGENT_SESSION_UPSERT,
+                "agent-session:session-fork-b",
+                fork_entry.get("session").expect("fork session payload"),
+                "h3",
+                "device-b",
+            );
+            apply_agent_event(
+                device,
+                AGENT_SESSION_ENTRY_APPEND,
+                "agent-entry:entry-b",
+                &fork_entry,
+                "h4",
+                "device-b",
+            );
+        }
+
+        // A delete tombstone wins over a stale entry that arrives later. The
+        // fork remains active on both devices and its entry is not duplicated
+        // when the same event is replayed.
+        let tombstone = shared_entry
+            .get("session")
+            .expect("shared session payload")
+            .clone();
+        apply_agent_event(
+            &mut device_a,
+            AGENT_SESSION_TOMBSTONE,
+            "agent-session:session-shared",
+            &tombstone,
+            "h5",
+            "device-a",
+        );
+        apply_agent_event(
+            &mut device_b,
+            AGENT_SESSION_TOMBSTONE,
+            "agent-session:session-shared",
+            &tombstone,
+            "h5",
+            "device-a",
+        );
+        let stale_entry = serde_json::json!({
+            "id": "entry-a-after-delete",
+            "session": shared_entry.get("session").expect("shared session payload"),
+            "subpath": "",
+            "entryUuid": "provider-entry-a-stale",
+            "sequence": 2,
+            "body": {"type": "assistant", "text": "stale"},
+            "createdAt": "2"
+        });
+        apply_agent_event(
+            &mut device_b,
+            AGENT_SESSION_ENTRY_APPEND,
+            "agent-entry:entry-a-after-delete",
+            &stale_entry,
+            "h2",
+            "device-a",
+        );
+        apply_agent_event(
+            &mut device_a,
+            AGENT_SESSION_ENTRY_APPEND,
+            "agent-entry:entry-b",
+            &fork_entry,
+            "h4",
+            "device-b",
+        );
+
+        for device in [&device_a, &device_b] {
+            let session_counts: (i64, i64) = device
+                .connection
+                .query_row(
+                    "SELECT
+                         SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END),
+                         SUM(CASE WHEN status = 'deleted' THEN 1 ELSE 0 END)
+                     FROM agent_sessions",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read merged agent session counts");
+            assert_eq!(session_counts, (1, 1));
+
+            let entry_count: i64 = device
+                .connection
+                .query_row("SELECT COUNT(*) FROM agent_session_entries", [], |row| {
+                    row.get(0)
+                })
+                .expect("read merged agent entries");
+            assert_eq!(entry_count, 2);
+
+            let stale_count: i64 = device
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_session_entries WHERE id = 'entry-a-after-delete'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read stale entry count");
+            assert_eq!(stale_count, 0);
         }
     }
 
@@ -5431,6 +5898,7 @@ mod tests {
                 },
             )]),
             state,
+            agent_sessions: store::AgentSessionCompactionState::default(),
             snapshot_hash: String::new(),
         };
         compaction.snapshot_hash = compaction_snapshot_hash(&compaction).expect("snapshot hash");
@@ -5572,6 +6040,134 @@ mod tests {
         assert_eq!(answer.text, "Tartós válasz");
         assert_eq!(answer.final_message, Some(true));
         assert_eq!(answer.live, Some(false));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The journal round trip a Claude coding turn actually takes.
+    ///
+    /// The existing two-device test calls `store::apply_agent_sync_event`
+    /// directly and therefore never reaches `reduce_snapshot`, which is why an
+    /// unhandled agent event could sit in the reducer unnoticed. One agent
+    /// session event in the journal must not stop the snapshot from being
+    /// rebuilt — otherwise every publish after a Claude turn fails and the
+    /// whole sync, Codex conversations included, drops into quarantine.
+    #[test]
+    fn agent_session_events_survive_the_journal_round_trip() {
+        let root = test_root();
+        let device_a = Uuid::new_v4().to_string();
+        let importer = Uuid::new_v4().to_string();
+        let project_id = stable_id("project", "agent-journal-project");
+        let conversation_id = stable_id("conversation", "agent-journal-conversation");
+
+        let project = make_event(
+            &device_a,
+            1,
+            format!("{:020}-{:08}", 1, 0),
+            None,
+            project_id.clone(),
+            PROJECT_UPSERT.to_string(),
+            serde_json::to_value(LocalProject {
+                id: project_id.clone(),
+                name: "Agent".to_string(),
+                relative_path: Some("agent".to_string()),
+                path_hint: "C:/agent".to_string(),
+                threads: vec!["Thread".to_string()],
+            })
+            .expect("project payload"),
+        )
+        .expect("project event");
+        let conversation = make_event(
+            &device_a,
+            2,
+            format!("{:020}-{:08}", 2, 0),
+            Some(project.event_hash.clone()),
+            conversation_id.clone(),
+            CONVERSATION_UPSERT.to_string(),
+            serde_json::to_value(ConversationEventPayload {
+                id: conversation_id.clone(),
+                scope: store::CODING_SCOPE.to_string(),
+                project_id: Some(project_id.clone()),
+                title: "Agent thread".to_string(),
+                thread_id: None,
+                updated_at: "2".to_string(),
+                plan_history: BTreeMap::new(),
+                commentary: Vec::new(),
+            })
+            .expect("conversation payload"),
+        )
+        .expect("conversation event");
+
+        let session_payload = serde_json::json!({
+            "id": "session-journal",
+            "conversationId": conversation_id,
+            "projectKey": "agent-project",
+            "provider": "anthropic",
+            "providerSessionId": "provider-session-journal",
+            "headTurnId": "turn-1",
+            "status": "active",
+            "createdAt": "3",
+            "updatedAt": "3",
+            "originDeviceId": device_a,
+            "hlc": format!("{:020}-{:08}", 3, 0),
+        });
+        let session = make_event(
+            &device_a,
+            3,
+            format!("{:020}-{:08}", 3, 0),
+            Some(conversation.event_hash.clone()),
+            "agent-session:session-journal".to_string(),
+            AGENT_SESSION_UPSERT.to_string(),
+            session_payload.clone(),
+        )
+        .expect("agent session event");
+        let entry = make_event(
+            &device_a,
+            4,
+            format!("{:020}-{:08}", 4, 0),
+            Some(session.event_hash.clone()),
+            "agent-entry:entry-journal".to_string(),
+            AGENT_SESSION_ENTRY_APPEND.to_string(),
+            serde_json::json!({
+                "id": "entry-journal",
+                "session": session_payload,
+                "subpath": "",
+                "entryUuid": "entry-uuid-1",
+                "sequence": 1,
+                "body": { "type": "user", "text": "szia" },
+                "createdAt": "4",
+                "originDeviceId": device_a,
+                "hlc": format!("{:020}-{:08}", 4, 0),
+            }),
+        )
+        .expect("agent entry event");
+
+        for event in [&project, &conversation, &session, &entry] {
+            write_event(&root, event).expect("write event");
+        }
+        let scan = scan_journal(&root, &importer).expect("scan journal");
+        let mut store = test_store();
+        apply_events(&mut store, &scan).expect("apply events");
+
+        // The reducer must tolerate the agent events; they belong to their own
+        // tables, not to the UI snapshot.
+        let snapshot = reduce_snapshot(&store.connection).expect("reduce snapshot");
+        assert_eq!(snapshot.conversations.len(), 1);
+        assert!(snapshot
+            .projects
+            .iter()
+            .any(|project| project.id == project_id));
+
+        // And the agent tables must actually hold the imported session.
+        let sessions: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_sessions WHERE provider_session_id = ?1",
+                params!["provider-session-journal"],
+                |row| row.get(0),
+            )
+            .expect("session count");
+        assert_eq!(sessions, 1, "the agent session must survive the round trip");
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6729,6 +7325,7 @@ mod tests {
             report: report.clone(),
             health: health.clone(),
             snapshot: snapshot.clone(),
+            agent_sessions: store::AgentSessionCompactionState::default(),
             scan: JournalScan {
                 accepted: events.clone(),
                 scanned_events: scan.scanned_events,
@@ -6774,6 +7371,7 @@ mod tests {
             report,
             health,
             snapshot,
+            agent_sessions: store::AgentSessionCompactionState::default(),
             scan,
         })
         .expect("build gate preview after ack");
@@ -6906,8 +7504,13 @@ mod tests {
         let pruned = prune_snapshot_for_compaction(&current, &candidates);
         assert!(pruned.tombstones.is_empty());
 
-        let (snapshot, snapshot_path) = write_compaction_snapshot(&root, &scan, pruned.clone())
-            .expect("write compaction snapshot");
+        let (snapshot, snapshot_path) = write_compaction_snapshot(
+            &root,
+            &scan,
+            pruned.clone(),
+            store::AgentSessionCompactionState::default(),
+        )
+        .expect("write compaction snapshot");
         purge_compacted_events(&root, &snapshot).expect("purge compacted events");
         assert!(snapshot_path.is_file());
         let compacted_scan =

@@ -7,6 +7,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "test:timeline": "node --test tests/*.test.ts",
+    "test:claude-bridge": "node --test agent-bridge/*.test.mjs",
+    "claude:bridge": "node agent-bridge/main.mjs",
     "smoke:app-server": "node scripts/app_server_smoke.cjs",
     "release:check": "node scripts/release_check.cjs",
     "release:test": "npm.cmd run test:timeline && npm.cmd run build && set \"CARGO_TARGET_DIR=%LOCALAPPDATA%\\min\\cargo-target\"&& cargo test --manifest-path src-tauri/Cargo.toml --no-default-features && node scripts/app_server_smoke.cjs",
@@ -19,6 +21,7 @@
     "tauri:build:local": "set \"CARGO_TARGET_DIR=%LOCALAPPDATA%\\min\\cargo-target\"&& tauri build"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.218",
     "@openai/codex": "^0.144.1",
     "@tauri-apps/api": "^2.0.0",
     "react": "^19.0.0",

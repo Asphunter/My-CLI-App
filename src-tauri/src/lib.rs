@@ -1,3 +1,5 @@
+mod agent;
+mod claude;
 mod codex;
 mod migration;
 mod store;
@@ -26,6 +28,214 @@ async fn codex_send(
             .map_err(|error| format!("A Codex-háttérfeladat leállt: {error}"))?;
     codex::end_request(&request_id);
     result
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn agent_send(
+    app: tauri::AppHandle,
+    mut request: agent::AgentTurnRequest,
+) -> Result<agent::AgentResponse, String> {
+    let request_id = request.request_id.clone().unwrap_or_else(|| {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        format!("agent-request-{stamp}")
+    });
+    request.request_id = Some(request_id.clone());
+    store::record_agent_turn_start(&mut request)?;
+    if request.provider == agent::AgentProvider::Codex
+        && request.runtime == agent::AgentRuntimeKind::CodexAppServer
+    {
+        let codex_request = request.to_codex_request()?;
+        let request_for_worker = request.clone();
+        let cancellation = codex::begin_request(&request_id)?;
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            codex::send(app, codex_request, cancellation)
+        })
+        .await
+        .map_err(|error| format!("Az agent hÃ¡ttÃ©rfeladat leÃ¡llt: {error}"))?;
+        codex::end_request(&request_id);
+        result
+            .map(|response| {
+                let response = agent::from_codex_response(&request_for_worker, response);
+                let _ = store::record_agent_turn_terminal(&request, &response, "completed");
+                let _ = store::record_agent_answer(&request, &response);
+                response
+            })
+            .map_err(|error| {
+                let _ = store::record_agent_turn_failure(&request, "failed");
+                error
+            })
+    } else if request.provider == agent::AgentProvider::Anthropic
+        && request.runtime == agent::AgentRuntimeKind::ClaudeAgentBridge
+    {
+        let request_for_worker = request.clone();
+        let cancellation = claude::begin_request(&request_id)?;
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            claude::send(app, request_for_worker, cancellation)
+        })
+        .await
+        .map_err(|error| format!("A Claude agent háttérfeladata leállt: {error}"))?;
+        claude::end_request(&request_id);
+        result
+            .map(|response| {
+                let _ = store::record_agent_turn_terminal(&request, &response, "completed");
+                let _ = store::record_agent_answer(&request, &response);
+                response
+            })
+            .map_err(|error| {
+                let _ = store::record_agent_turn_failure(&request, "failed");
+                error
+            })
+    } else {
+        Err("Ismeretlen vagy nem támogatott provider/runtime páros.".to_string())
+    }
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn agent_conversation_status(
+    conversation_id: String,
+) -> Result<Option<store::AgentConversationStatus>, String> {
+    store::agent_conversation_status(&conversation_id)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn agent_answer_checkpoint(
+    conversation_id: String,
+    request_id: String,
+    text: String,
+) -> Result<(), String> {
+    store::record_agent_answer_text(&conversation_id, &request_id, &text)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn agent_cancel(provider: Option<agent::AgentProvider>, request_id: String) -> Result<(), String> {
+    match provider.unwrap_or(agent::AgentProvider::Codex) {
+        agent::AgentProvider::Codex => codex::cancel_request(&request_id),
+        agent::AgentProvider::Anthropic => Err(
+            "A Claude bridge megszakítása a live coding runtime bekötésével aktiválódik."
+                .to_string(),
+        ),
+    }
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn agent_approval_response(
+    provider: Option<agent::AgentProvider>,
+    approval_id: String,
+    decision: String,
+) -> Result<(), String> {
+    match provider.unwrap_or(agent::AgentProvider::Codex) {
+        agent::AgentProvider::Codex => codex::respond_approval(&approval_id, &decision),
+        agent::AgentProvider::Anthropic => {
+            Err("A Claude approval UI a live coding runtime bekötésével aktiválódik.".to_string())
+        }
+    }
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn agent_question_response(
+    provider: Option<agent::AgentProvider>,
+    question_id: String,
+    answer: serde_json::Value,
+) -> Result<(), String> {
+    let _ = (provider, question_id, answer);
+    Err(
+        "A provider question-kezelés a live Claude coding runtime fázisában aktiválódik."
+            .to_string(),
+    )
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn claude_cancel(request_id: String) -> Result<(), String> {
+    claude::cancel_request(&request_id)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn claude_approval_response(
+    approval_id: String,
+    decision: String,
+    reason: Option<String>,
+) -> Result<(), String> {
+    claude::respond_approval(&approval_id, &decision, reason)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn claude_question_response(question_id: String, answer: serde_json::Value) -> Result<(), String> {
+    claude::respond_question(&question_id, answer)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn agent_models(
+    app: tauri::AppHandle,
+    provider: Option<agent::AgentProvider>,
+) -> Result<Vec<agent::AgentModelDescriptor>, String> {
+    match provider.unwrap_or(agent::AgentProvider::Codex) {
+        agent::AgentProvider::Codex => tauri::async_runtime::spawn_blocking(move || {
+            codex::list_models(app).map(agent::codex_model_descriptors)
+        })
+        .await
+        .map_err(|error| {
+            format!("A provider modellkatalÃ³gus hÃ¡ttÃ©rfeladata leÃ¡llt: {error}")
+        })?,
+        agent::AgentProvider::Anthropic => Ok(agent::runtime_catalog()
+            .into_iter()
+            .find(|runtime| runtime.provider == agent::AgentProvider::Anthropic)
+            .map(|runtime| runtime.models)
+            .unwrap_or_default()),
+    }
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn agent_auth_status(
+    provider: Option<agent::AgentProvider>,
+) -> Result<agent::AgentAuthStatus, String> {
+    match provider.unwrap_or(agent::AgentProvider::Anthropic) {
+        agent::AgentProvider::Codex => Ok(agent::AgentAuthStatus {
+            provider: agent::AgentProvider::Codex,
+            configured: true,
+            source: "codexAppServer".to_string(),
+            preview: None,
+        }),
+        agent::AgentProvider::Anthropic => {
+            let status = claude::auth_status()?;
+            Ok(agent::AgentAuthStatus {
+                provider: agent::AgentProvider::Anthropic,
+                configured: status.configured,
+                source: status.source,
+                preview: status.preview,
+            })
+        }
+    }
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn agent_test_connection(
+    provider: Option<agent::AgentProvider>,
+    model: Option<String>,
+    effort: Option<String>,
+    max_budget_usd: Option<f64>,
+    max_turns: Option<u32>,
+    cwd: Option<String>,
+) -> Result<agent::AgentConnectionResult, String> {
+    match provider.unwrap_or(agent::AgentProvider::Anthropic) {
+        agent::AgentProvider::Anthropic => tauri::async_runtime::spawn_blocking(move || {
+            claude::test_connection(model, effort, max_budget_usd, max_turns, cwd)
+                .map(agent::from_claude_connection)
+        })
+        .await
+        .map_err(|error| format!("A provider kapcsolat-teszt hÃ¡ttÃ©rfeladata leÃ¡llt: {error}"))?,
+        agent::AgentProvider::Codex => {
+            Err("A Codex kapcsolatát a meglévő app-server transport kezeli.".to_string())
+        }
+    }
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn agent_shutdown(provider: Option<agent::AgentProvider>) -> Result<(), String> {
+    let _ = provider;
+    Ok(())
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -63,6 +273,43 @@ async fn codex_rebase_snapshot(snapshot_id: String) -> Result<codex::AgentRebase
     tauri::async_runtime::spawn_blocking(move || codex::rebase_agent_snapshot(&snapshot_id))
         .await
         .map_err(|error| format!("A Codex 3-way merge háttérfeladata leállt: {error}"))?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn agent_rollback_snapshot(
+    snapshot_id: String,
+) -> Result<codex::AgentRollbackResult, String> {
+    tauri::async_runtime::spawn_blocking(move || codex::rollback_agent_snapshot(&snapshot_id))
+        .await
+        .map_err(|error| format!("Az agent rollback háttérfeladata leállt: {error}"))?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn agent_apply_snapshot(snapshot_id: String) -> Result<codex::AgentApplyResult, String> {
+    tauri::async_runtime::spawn_blocking(move || codex::apply_agent_snapshot(&snapshot_id))
+        .await
+        .map_err(|error| format!("Az agent apply háttérfeladata leállt: {error}"))?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn agent_discard_snapshot(snapshot_id: String) -> Result<codex::AgentDiscardResult, String> {
+    tauri::async_runtime::spawn_blocking(move || codex::discard_agent_snapshot(&snapshot_id))
+        .await
+        .map_err(|error| format!("Az agent snapshot elvetése leállt: {error}"))?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn agent_preview_snapshot(snapshot_id: String) -> Result<codex::AgentDiffPreview, String> {
+    tauri::async_runtime::spawn_blocking(move || codex::preview_agent_snapshot(&snapshot_id))
+        .await
+        .map_err(|error| format!("Az agent diff preview háttérfeladata leállt: {error}"))?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn agent_rebase_snapshot(snapshot_id: String) -> Result<codex::AgentRebaseResult, String> {
+    tauri::async_runtime::spawn_blocking(move || codex::rebase_agent_snapshot(&snapshot_id))
+        .await
+        .map_err(|error| format!("Az agent rebase háttérfeladata leállt: {error}"))?
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -118,6 +365,45 @@ async fn codex_models(app: tauri::AppHandle) -> Result<Vec<codex::CodexModel>, S
     tauri::async_runtime::spawn_blocking(move || codex::list_models(app))
         .await
         .map_err(|error| format!("A modellkatalógus-háttérfeladat leállt: {error}"))?
+}
+
+#[tauri::command]
+fn agent_runtime_catalog() -> Vec<agent::AgentRuntimeDescriptor> {
+    agent::runtime_catalog()
+}
+
+#[tauri::command]
+fn claude_auth_status() -> Result<claude::ClaudeAuthStatus, String> {
+    claude::auth_status()
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn claude_save_api_key(api_key: String) -> Result<claude::ClaudeAuthStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || claude::save_api_key(&api_key))
+        .await
+        .map_err(|error| format!("A Claude API-kulcs mentési hÃ¡ttÃ©rfeladata leÃ¡llt: {error}"))?
+}
+
+#[tauri::command]
+async fn claude_delete_api_key() -> Result<claude::ClaudeAuthStatus, String> {
+    tauri::async_runtime::spawn_blocking(claude::delete_api_key)
+        .await
+        .map_err(|error| format!("A Claude API-kulcs tÃ¶rlési hÃ¡ttÃ©rfeladata leÃ¡llt: {error}"))?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn claude_test_connection(
+    model: Option<String>,
+    effort: Option<String>,
+    max_budget_usd: Option<f64>,
+    max_turns: Option<u32>,
+    cwd: Option<String>,
+) -> Result<claude::ClaudeConnectionResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        claude::test_connection(model, effort, max_budget_usd, max_turns, cwd)
+    })
+    .await
+    .map_err(|error| format!("A Claude kapcsolat-teszt hÃ¡ttÃ©rfeladata leÃ¡llt: {error}"))?
 }
 
 #[tauri::command]
@@ -210,6 +496,7 @@ async fn local_store_import_v1() -> Result<Vec<migration::ImportReport>, String>
 #[tauri::command]
 async fn local_store_load() -> Result<store::LocalStoreSnapshot, String> {
     tauri::async_runtime::spawn_blocking(|| {
+        let _ = store::recover_orphaned_agent_turns();
         let snapshot = store::load_snapshot()?;
         let (snapshot, recovered) = codex::recover_local_store_snapshot(snapshot)?;
         if recovered {
@@ -333,11 +620,29 @@ pub fn run() {
     builder
         .invoke_handler(tauri::generate_handler![
             codex_send,
+            agent_send,
+            agent_conversation_status,
+            agent_answer_checkpoint,
+            agent_cancel,
+            agent_approval_response,
+            agent_question_response,
+            claude_cancel,
+            claude_approval_response,
+            claude_question_response,
+            agent_models,
+            agent_auth_status,
+            agent_test_connection,
+            agent_shutdown,
             codex_rollback_snapshot,
             codex_apply_snapshot,
             codex_discard_snapshot,
             codex_preview_snapshot,
             codex_rebase_snapshot,
+            agent_rollback_snapshot,
+            agent_apply_snapshot,
+            agent_discard_snapshot,
+            agent_preview_snapshot,
+            agent_rebase_snapshot,
             codex_respond_approval,
             codex_cancel,
             read_code_file,
@@ -346,6 +651,11 @@ pub fn run() {
             save_image_attachments,
             read_project_image,
             codex_models,
+            agent_runtime_catalog,
+            claude_auth_status,
+            claude_save_api_key,
+            claude_delete_api_key,
+            claude_test_connection,
             codex_workspace,
             codex_set_projects_root,
             pick_project_directory,

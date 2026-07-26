@@ -1455,3 +1455,17 @@ textarea::placeholder { color: var(--faint); }
   background: #151b1e;
   color: #eeeeE4;
 }
+
+/* Pipeline: the stage badge and the composer switch. A run triples how much
+   there is to read, so the verdict is one word here and the sentence behind it
+   lives in the tooltip. */
+.stage-badge { padding: 1px 6px; border: 1px solid #4a5c52; border-radius: 4px; background: rgba(28, 40, 33, .7); color: var(--muted); font-size: 8px; font-weight: 600; letter-spacing: .04em; white-space: nowrap; }
+.stage-verdict { padding: 1px 6px; border-radius: 4px; font-size: 8px; font-weight: 700; letter-spacing: .04em; white-space: nowrap; }
+.stage-verdict.is-accepted { border: 1px solid #4d8060; background: rgba(30, 60, 40, .75); color: #8fd6a6; }
+.stage-verdict.is-changes { border: 1px solid #8a7a45; background: rgba(60, 52, 26, .75); color: #ddc776; }
+.composer-pipeline-switch { display: inline-flex; align-items: center; gap: 4px; margin-left: 8px; }
+.composer-pipeline-switch button { min-height: 20px; padding: 2px 8px; border: 1px solid #40515a; border-radius: 4px; background: rgba(25, 32, 36, .72); color: var(--faint); font-size: 8px; font-weight: 600; letter-spacing: .04em; }
+.composer-pipeline-switch button.is-active { border-color: #5e9877; background: #1d3528; color: var(--text); }
+.composer-pipeline-switch select { min-height: 20px; border: 1px solid #40515a; border-radius: 4px; background: rgba(25, 32, 36, .72); color: var(--muted); font-size: 8px; }
+.composer-pipeline-progress { margin-left: 8px; color: var(--accent); font-size: 8px; font-weight: 600; letter-spacing: .04em; }
+.message-stage-badges { display: flex; align-items: center; gap: 5px; margin-bottom: 5px; }

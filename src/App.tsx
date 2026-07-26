@@ -78,6 +78,8 @@ type Message = {
   detailed?: boolean;
   /** File changes produced by this response, when the native guard exposed them. */
   changeSummary?: ChangeSummaryFile[];
+  /** Which pipeline stage produced this message, when it belongs to a run. */
+  pipeline?: MessagePipeline;
 };
 
 type MessageImageAttachment = {
@@ -184,6 +186,92 @@ type AgentDiffPreview = {
   lastActionAt?: string | null;
   files: AgentDiffFile[];
 };
+type PipelineRecipeStage = {
+  role: "plan" | "code" | "review";
+  provider: "codex" | "anthropic";
+  runtime: string;
+  model?: string;
+  effort?: string;
+  maxTurns?: number;
+};
+
+type PipelineRecipe = {
+  id: string;
+  label: string;
+  stages: PipelineRecipeStage[];
+};
+
+type PipelineProgressEvent = {
+  runId: string;
+  conversationId: string;
+  stageIndex: number;
+  stageCount: number;
+  role: "plan" | "code" | "review";
+  agentLabel: string;
+  requestId: string;
+  phase: "started" | "finished" | "failed";
+  status: "running" | "completed" | "failed" | "cancelled";
+};
+
+type PipelineStageResult = {
+  index: number;
+  role: "plan" | "code" | "review";
+  agentLabel: string;
+  requestId: string;
+  succeeded: boolean;
+  text: string;
+  error?: string;
+  review?: { verdict: "accepted" | "changes_requested"; summary: string };
+  sessionId?: string;
+};
+
+type PipelineRunResult = {
+  runId: string;
+  recipe: PipelineRecipe;
+  status: "running" | "completed" | "failed" | "cancelled";
+  stages: PipelineStageResult[];
+  error?: string;
+};
+
+/** The stage badge a message carries so a run groups on any device. */
+type MessagePipeline = {
+  runId: string;
+  stageIndex: number;
+  stageCount: number;
+  stageRole: string;
+  stageAgent: string;
+  verdict?: string;
+  verdictSummary?: string;
+};
+
+const STAGE_ROLE_LABELS: Record<string, string> = {
+  plan: "TERV",
+  code: "KÓD",
+  review: "REVIEW",
+};
+
+/** The badge that tells a stage apart from an ordinary answer at a glance. */
+const stageBadge = (pipeline?: MessagePipeline) => {
+  if (!pipeline) return null;
+  const role = STAGE_ROLE_LABELS[pipeline.stageRole] ?? pipeline.stageRole;
+  const accepted = pipeline.verdict === "accepted";
+  return (
+    <>
+      <span className="stage-badge" title={`${pipeline.stageAgent}`}>
+        {`${pipeline.stageIndex + 1}/${pipeline.stageCount} ${role} · ${pipeline.stageAgent}`}
+      </span>
+      {pipeline.verdict && (
+        <span
+          className={`stage-verdict${accepted ? " is-accepted" : " is-changes"}`}
+          title={pipeline.verdictSummary ?? ""}
+        >
+          {accepted ? "ELFOGAD" : "JAVÍTANDÓ"}
+        </span>
+      )}
+    </>
+  );
+};
+
 type ChangeSummaryFile = {
   path: string;
   status: "modified" | "added" | "removed";
@@ -4199,6 +4287,11 @@ function MessageRow({
         )}
       </div>
       <div className="message-content">
+        {message.pipeline && (
+          // A stage answer often has no trace card of its own, so without this
+          // the run's structure would be invisible on the plain row.
+          <div className="message-stage-badges">{stageBadge(message.pipeline)}</div>
+        )}
         <div
           className={`message-body${isPending ? " is-pending" : ""}`}
           data-quote-selectable="true"
@@ -5546,6 +5639,7 @@ function TurnProgressCard({
       >
         <div className="compact-answer-header">
           <strong>VÁLASZ</strong>
+          {stageBadge(answer?.pipeline)}
           <span>{streaming ? "készül" : "kész"}</span>
           {answerActions}
         </div>
@@ -5632,6 +5726,7 @@ function TurnProgressCard({
                     LÉPÉSEK
                   </button>
                 </div>
+                {stageBadge(answer?.pipeline)}
                 <span>{streaming ? "készül" : "kész"}</span>
                 {overallElapsed && <time>{overallElapsed}</time>}
                 {answerActions}
@@ -6408,6 +6503,17 @@ function App() {
   );
   const [composerQuotes, setComposerQuotes] = useState<QuoteReference[]>([]);
   const [showDetailedTrace, setShowDetailedTrace] = useState(false);
+  // The detailed tick opens a second choice: keep today's single-agent trace,
+  // or run the prompt as a chain of roles. Off by default, because a chain
+  // costs three times the wall clock and three times the reading.
+  const [pipelineMode, setPipelineMode] = useState(false);
+  const [pipelineRecipes, setPipelineRecipes] = useState<PipelineRecipe[]>([]);
+  const [pipelineRecipeId, setPipelineRecipeId] = useState("plan_code_review");
+  const [pipelineProgress, setPipelineProgress] =
+    useState<PipelineProgressEvent | null>(null);
+  const activePipelineRecipe =
+    pipelineRecipes.find((recipe) => recipe.id === pipelineRecipeId) ??
+    pipelineRecipes[0];
   const [pendingImages, setPendingImages] = useState<PendingImageAttachment[]>(
     [],
   );
@@ -7729,6 +7835,32 @@ function App() {
         compareTimelineOrder(left, right) || (left.kind === "message" ? -1 : 1),
     );
   }, [messages, workLogGroups]);
+
+  useEffect(() => {
+    if (!isTauri) return;
+    void invoke<PipelineRecipe[]>("pipeline_recipes")
+      .then(setPipelineRecipes)
+      .catch((error) => console.warn("Pipeline recipes unavailable", error));
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri) return;
+    // A chain takes minutes, so the UI has to follow it stage by stage instead
+    // of showing nothing until the whole run finishes. The stage's request id
+    // arrives here before its first event does, which is what lets the live
+    // trace attribute those events to the turn that is actually running.
+    const unlisten = listen<PipelineProgressEvent>("pipeline-progress", (event) => {
+      const progress = event.payload;
+      setPipelineProgress(progress);
+      if (progress.phase === "started") {
+        activeRequestIdRef.current = progress.requestId;
+        activeTurnIdRef.current = undefined;
+      }
+    });
+    return () => {
+      void unlisten.then((dispose) => dispose());
+    };
+  }, []);
 
   const latestWorkLogKeyRef = useRef<string | null>(null);
   latestWorkLogKeyRef.current =
@@ -11450,6 +11582,9 @@ function App() {
         )
       : undefined;
     const clientTurnId = regeneration?.turnId ?? fallbackTurnId;
+    // Regeneration replays one turn, so it stays on the single-turn path even
+    // when the chain is selected; re-running a chain is a whole-run action.
+    const runPipeline = showDetailedTrace && pipelineMode && !regeneration;
     const userSequence = regeneration?.source.sequence ?? nextTimelineSequence();
     const liveSequence =
       regeneration?.originalAnswer.sequence ?? nextTimelineSequence();
@@ -11753,6 +11888,64 @@ function App() {
       const resumeClaudeSessionId = regeneration
         ? null
         : (durableClaudeSessionId ?? claudeSessionIds[requestThreadKey] ?? null);
+      // A chain is its own call: the runner drives the stages, records each
+      // answer, and returns them together. The ordinary single-turn path below
+      // is untouched, which is what keeps the default behaviour identical.
+      if (runPipeline && activePipelineRecipe && isTauri && !regeneration) {
+        const stageRequestIds = activePipelineRecipe.stages.map(
+          (_, index) => `${requestId}-stage-${index}`,
+        );
+        try {
+          const run = await invoke<PipelineRunResult>("pipeline_send", {
+            request: {
+              recipeId: activePipelineRecipe.id,
+              prompt: codexPrompt,
+              conversationId: requestConversationId,
+              requestIds: stageRequestIds,
+              images: storedImages,
+              cwd: isGeneralMode ? null : activeProjectData.path,
+              sessionId: resumeClaudeSessionId,
+              conversationContext: rehydrationContext || null,
+              maxBudgetUsd: Number(claudeBudgetUsd),
+            },
+          });
+          if (cancelledRequestIdsRef.current.delete(requestId)) return;
+          const stageMessages: Message[] = run.stages.map((stage) => ({
+            id: crypto.randomUUID(),
+            role: "assistant",
+            text: stage.succeeded
+              ? stage.text
+              : `A(z) ${STAGE_ROLE_LABELS[stage.role] ?? stage.role} szakasz megszakadt: ${stage.error ?? "ismeretlen hiba"}`,
+            time: "most",
+            live: false,
+            final: true,
+            turnId: `request:${stage.requestId}`,
+            itemId: "assistant-0",
+            pipeline: {
+              runId: run.runId,
+              stageIndex: stage.index,
+              stageCount: run.recipe.stages.length,
+              stageRole: stage.role,
+              stageAgent: stage.agentLabel,
+              verdict: stage.review?.verdict,
+              verdictSummary: stage.review?.summary,
+            },
+          }));
+          setMessages((current) => [...current, ...stageMessages]);
+          const lastSession = [...run.stages]
+            .reverse()
+            .find((stage) => stage.sessionId)?.sessionId;
+          if (lastSession)
+            setClaudeSessionIds((current) => ({
+              ...current,
+              [requestThreadKey]: lastSession,
+            }));
+          if (run.status === "failed" && run.error) notify(run.error);
+        } finally {
+          setPipelineProgress(null);
+        }
+        return;
+      }
       const response = useClaude
         ? await invoke<CodexResponse>("agent_send", {
             request: {
@@ -13439,6 +13632,51 @@ function App() {
               />
               <span>Részletes</span>
             </label>
+            {showDetailedTrace && pipelineRecipes.length > 0 && (
+              <div
+                className="composer-pipeline-switch"
+                role="group"
+                aria-label="Részletes mód"
+              >
+                <button
+                  type="button"
+                  className={!pipelineMode ? "is-active" : ""}
+                  aria-pressed={!pipelineMode}
+                  onClick={() => setPipelineMode(false)}
+                >
+                  Egy AI
+                </button>
+                <button
+                  type="button"
+                  className={pipelineMode ? "is-active" : ""}
+                  aria-pressed={pipelineMode}
+                  onClick={() => setPipelineMode(true)}
+                  title={activePipelineRecipe?.stages
+                    .map((stage) => `${STAGE_ROLE_LABELS[stage.role] ?? stage.role}`)
+                    .join(" → ")}
+                >
+                  Multi-AI
+                </button>
+                {pipelineMode && (
+                  <select
+                    value={pipelineRecipeId}
+                    onChange={(event) => setPipelineRecipeId(event.currentTarget.value)}
+                    aria-label="Lánc kiválasztása"
+                  >
+                    {pipelineRecipes.map((recipe) => (
+                      <option key={recipe.id} value={recipe.id}>
+                        {recipe.label}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </div>
+            )}
+            {pipelineProgress && (
+              <div className="composer-pipeline-progress" role="status">
+                {`${STAGE_ROLE_LABELS[pipelineProgress.role] ?? pipelineProgress.role} · ${pipelineProgress.agentLabel} · ${pipelineProgress.stageIndex + 1}/${pipelineProgress.stageCount}`}
+              </div>
+            )}
             <div className="composer">
               {composerQuotes.length > 0 && (
                 <div className="composer-quotes" aria-label="Kijelölt idézetek">

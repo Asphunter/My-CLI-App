@@ -3456,6 +3456,42 @@ fn reduce_snapshot(connection: &Connection) -> Result<LocalStoreSnapshot, String
             // using the stable conversation ID history.
             .extend(project.threads.iter().cloned());
     }
+    // Resolve display titles before anything keys a map by them. Group per
+    // project, and keep GENERAL as the single flat bucket it is in the UI.
+    let mut title_buckets = BTreeMap::<String, Vec<(String, String)>>::new();
+    for conversation in conversations.values() {
+        let archived = tombstones
+            .get(&("conversation".to_string(), conversation.value.id.clone()))
+            .map(|(_, archived, _)| *archived)
+            .unwrap_or(false);
+        if archived {
+            continue;
+        }
+        let bucket = if conversation.value.scope == store::GENERAL_SCOPE {
+            store::GENERAL_PROJECT_ID.to_string()
+        } else {
+            match conversation.value.project_id.as_ref() {
+                Some(project_id) => project_id.clone(),
+                None => continue,
+            }
+        };
+        title_buckets.entry(bucket).or_default().push((
+            conversation.value.id.clone(),
+            conversation.value.title.clone(),
+        ));
+    }
+    let mut display_titles = HashMap::<String, String>::new();
+    for entries in title_buckets.values_mut() {
+        entries.sort();
+        display_titles.extend(disambiguated_conversation_titles(entries));
+    }
+    let display_title = |conversation: &ConversationAccumulator| -> String {
+        display_titles
+            .get(&conversation.value.id)
+            .cloned()
+            .unwrap_or_else(|| conversation.value.title.clone())
+    };
+
     let mut current_conversation_titles = BTreeMap::<String, BTreeSet<String>>::new();
     let mut retired_conversation_titles = BTreeMap::<String, BTreeSet<String>>::new();
     for conversation in conversations.values() {
@@ -3479,7 +3515,7 @@ fn reduce_snapshot(connection: &Connection) -> Result<LocalStoreSnapshot, String
         current_conversation_titles
             .entry(project_id.clone())
             .or_default()
-            .insert(conversation.value.title.clone());
+            .insert(display_title(conversation));
         retired_conversation_titles
             .entry(project_id.clone())
             .or_default()
@@ -3571,13 +3607,14 @@ fn reduce_snapshot(connection: &Connection) -> Result<LocalStoreSnapshot, String
                 .collect::<Vec<_>>();
             work_items.sort_by(|left, right| left.id.cmp(&right.id));
             let value = &conversation.value;
+            let title = display_title(conversation);
             output_conversations.insert(
-                format!("{}::{}", project_id, value.title),
+                format!("{}::{}", project_id, title),
                 LocalConversation {
                     id: Some(value.id.clone()),
                     scope: value.scope.clone(),
                     project_id: storage_project_id(&value.scope, Some(project_id.as_str())),
-                    title: value.title.clone(),
+                    title,
                     messages,
                     work_items,
                     thread_id: value.thread_id.clone(),
@@ -3618,13 +3655,14 @@ fn reduce_snapshot(connection: &Connection) -> Result<LocalStoreSnapshot, String
             .collect::<Vec<_>>();
         work_items.sort_by(|left, right| left.id.cmp(&right.id));
         let value = &conversation.value;
+        let title = display_title(conversation);
         output_conversations.insert(
-            format!("{}::{}", store::GENERAL_PROJECT_ID, value.title),
+            format!("{}::{}", store::GENERAL_PROJECT_ID, title),
             LocalConversation {
                 id: Some(value.id.clone()),
                 scope: store::GENERAL_SCOPE.to_string(),
                 project_id: storage_project_id(&value.scope, value.project_id.as_deref()),
-                title: value.title.clone(),
+                title,
                 messages,
                 work_items,
                 thread_id: value.thread_id.clone(),
@@ -3757,6 +3795,36 @@ fn normalized_message_id(conversation_id: &str, message: &LocalMessage, index: u
             index
         ),
     )
+}
+
+/// Two devices that were offline can each create a conversation with the same
+/// title, and the snapshot maps are keyed by `project::title`. Without this the
+/// second one silently overwrote the first and simply vanished.
+///
+/// The suffix matches what `uniqueConversationTitle` already produces when one
+/// device creates a duplicate name, so the result looks the way the app always
+/// looked: `test1` and `test1 2`.
+///
+/// This label can become the stored title on the next save and publish as an
+/// ordinary rename, which is safe only because it is a pure function of the
+/// conversation ids and their titles. Both devices compute the same answer and
+/// converge; re-running it finds no collision and changes nothing. That is also
+/// why the caller must order by conversation id and never by a local clock:
+/// `created_at` is the import time on the second device, so ordering by it
+/// would let the two disagree and flap the title back and forth forever.
+fn disambiguated_conversation_titles(ordered: &[(String, String)]) -> HashMap<String, String> {
+    let mut taken = HashSet::<String>::new();
+    let mut resolved = HashMap::<String, String>::new();
+    for (conversation_id, title) in ordered {
+        let mut candidate = title.clone();
+        let mut suffix = 2_usize;
+        while !taken.insert(candidate.to_lowercase()) {
+            candidate = format!("{title} {suffix}");
+            suffix += 1;
+        }
+        resolved.insert(conversation_id.clone(), candidate);
+    }
+    resolved
 }
 
 /// A single message can be removed permanently, not just a whole conversation.
@@ -3963,12 +4031,16 @@ fn canonicalize_snapshot_for_compaction(
                 ));
             }
         }
-        conversation.id = Some(conversation_id);
+        // Key by the conversation id, which the guard above has just made
+        // unique. A title-based key silently dropped one of two conversations
+        // that shared a name, and nothing downstream reads this key as meaning:
+        // the reducer seed and the pruner both go through the values.
+        conversation.id = Some(conversation_id.clone());
         conversations.insert(
             if is_general {
-                format!("general::{}", conversation.title)
+                format!("general::{conversation_id}")
             } else {
-                format!("{}::{}", conversation.project_id, conversation.title)
+                format!("{}::{conversation_id}", conversation.project_id)
             },
             conversation,
         );
@@ -5827,6 +5899,179 @@ mod tests {
         assert_eq!(merged.final_message, Some(true));
         assert_eq!(merged.live, Some(false));
         assert_eq!(merged.time, "2026-07-20T17:12:00Z");
+    }
+
+    #[test]
+    fn two_offline_devices_naming_a_conversation_the_same_keep_both() {
+        let root = test_root();
+        let device_a = Uuid::new_v4().to_string();
+        let device_b = Uuid::new_v4().to_string();
+        let importer = Uuid::new_v4().to_string();
+        let project_id = stable_id("project", "same-title-project");
+        let older_id = stable_id("conversation", "same-title-older");
+        let newer_id = stable_id("conversation", "same-title-newer");
+
+        let project = make_event(
+            &device_a,
+            1,
+            format!("{:020}-{:08}", 1, 0),
+            None,
+            project_id.clone(),
+            PROJECT_UPSERT.to_string(),
+            serde_json::to_value(LocalProject {
+                id: project_id.clone(),
+                name: "Shared".to_string(),
+                relative_path: Some("shared".to_string()),
+                path_hint: "C:/shared".to_string(),
+                threads: Vec::new(),
+            })
+            .expect("project payload"),
+        )
+        .expect("project event");
+        let conversation_event =
+            |device: &str, sequence: u64, hlc_millis: u64, previous: Option<String>, id: &str| {
+                make_event(
+                    device,
+                    sequence,
+                    format!("{:020}-{:08}", hlc_millis, 0),
+                    previous,
+                    id.to_string(),
+                    CONVERSATION_UPSERT.to_string(),
+                    serde_json::to_value(ConversationEventPayload {
+                        id: id.to_string(),
+                        scope: store::CODING_SCOPE.to_string(),
+                        project_id: Some(project_id.clone()),
+                        // Both devices were offline and picked the same name.
+                        title: "test1".to_string(),
+                        thread_id: None,
+                        updated_at: hlc_millis.to_string(),
+                        plan_history: BTreeMap::new(),
+                        commentary: Vec::new(),
+                    })
+                    .expect("conversation payload"),
+                )
+                .expect("conversation event")
+            };
+        // The older conversation is created first in journal order.
+        let older =
+            conversation_event(&device_a, 2, 2, Some(project.event_hash.clone()), &older_id);
+        let newer = conversation_event(&device_b, 1, 3, None, &newer_id);
+
+        for event in [&project, &older, &newer] {
+            write_event(&root, event).expect("write event");
+        }
+        let scan = scan_journal(&root, &importer).expect("scan journal");
+        let mut store = test_store();
+        apply_events(&mut store, &scan).expect("apply events");
+        let snapshot = reduce_snapshot(&store.connection).expect("reduce snapshot");
+
+        assert_eq!(
+            snapshot.conversations.len(),
+            2,
+            "neither conversation may disappear because they share a title"
+        );
+        let mut titles = snapshot
+            .conversations
+            .values()
+            .map(|conversation| {
+                (
+                    conversation.id.clone().unwrap_or_default(),
+                    conversation.title.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        titles.sort();
+        let older_title = titles
+            .iter()
+            .find(|(id, _)| id == &older_id)
+            .map(|(_, title)| title.clone())
+            .expect("older conversation");
+        let newer_title = titles
+            .iter()
+            .find(|(id, _)| id == &newer_id)
+            .map(|(_, title)| title.clone())
+            .expect("newer conversation");
+        // Which one keeps the plain name is decided by conversation id, so it is
+        // arbitrary but identical on both devices -- that is what matters, since
+        // the label may become the stored title.
+        let mut labels = vec![older_title.clone(), newer_title.clone()];
+        labels.sort();
+        assert_eq!(
+            labels,
+            vec!["test1".to_string(), "test1 2".to_string()],
+            "one keeps the plain name and the other gets the numeric suffix"
+        );
+
+        // Convergence: a device that imports the same journal in the opposite
+        // order must derive exactly the same labels, or the two would flap the
+        // title back and forth forever once it is stored.
+        let mut mirrored = test_store();
+        let mut mirrored_scan = scan.clone();
+        mirrored_scan.accepted.reverse();
+        mirrored_scan
+            .accepted
+            .sort_by_key(|event| (event.device_id.clone(), event.device_sequence));
+        apply_events(&mut mirrored, &mirrored_scan).expect("apply mirrored");
+        let mirrored_snapshot = reduce_snapshot(&mirrored.connection).expect("reduce mirrored");
+        let label_of = |snapshot: &store::LocalStoreSnapshot, id: &str| {
+            snapshot
+                .conversations
+                .values()
+                .find(|conversation| conversation.id.as_deref() == Some(id))
+                .map(|conversation| conversation.title.clone())
+        };
+        assert_eq!(
+            label_of(&mirrored_snapshot, &older_id),
+            Some(older_title.clone()),
+            "both devices must land on the same label for the same conversation"
+        );
+        assert_eq!(
+            label_of(&mirrored_snapshot, &newer_id),
+            Some(newer_title.clone())
+        );
+
+        // Idempotent: once the labels are the stored titles there is no
+        // collision left, so a second pass must change nothing.
+        let settled = reduce_snapshot(&store.connection).expect("reduce again");
+        assert_eq!(label_of(&settled, &older_id), Some(older_title));
+        assert_eq!(label_of(&settled, &newer_id), Some(newer_title));
+
+        // The Tree must offer both names, otherwise one is unreachable.
+        let threads = &snapshot
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .expect("project")
+            .threads;
+        assert!(
+            threads.contains(&"test1".to_string()) && threads.contains(&"test1 2".to_string()),
+            "both titles must be listed in the Tree, got {threads:?}"
+        );
+
+        // Publishing the resolved label is fine precisely because it is
+        // deterministic: both devices emit the same rename, so the journal
+        // converges instead of flapping. What must never happen is two
+        // conversation events claiming the same title again.
+        let published = pending_events(&snapshot).expect("pending events");
+        let published_titles = published
+            .iter()
+            .filter(|event| event.event_type == CONVERSATION_UPSERT)
+            .filter_map(|event| {
+                event
+                    .payload
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        let unique_titles = published_titles.iter().cloned().collect::<HashSet<_>>();
+        assert_eq!(
+            published_titles.len(),
+            unique_titles.len(),
+            "two published conversations must not claim the same title again: {published_titles:?}"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -3822,6 +3822,39 @@ pub(crate) fn load_snapshot_from_connection(
         rows
     };
 
+    // Resolve duplicate titles before the coding key below is built from one.
+    // Order by conversation id, never by `created_at`: that column holds the
+    // import time on the second device, so ordering by it would make the two
+    // devices pick different labels and flap the title between them.
+    let mut resolved_titles = HashMap::<String, String>::new();
+    {
+        let mut by_bucket = BTreeMap::<String, Vec<(String, String)>>::new();
+        for (conversation_id, project_id, row_scope, title, ..) in &conversation_rows {
+            let bucket = if row_scope == GENERAL_SCOPE {
+                GENERAL_PROJECT_ID.to_string()
+            } else {
+                project_id.clone()
+            };
+            by_bucket
+                .entry(bucket)
+                .or_default()
+                .push((conversation_id.clone(), title.clone()));
+        }
+        for entries in by_bucket.values_mut() {
+            entries.sort();
+            let mut taken = HashSet::<String>::new();
+            for (conversation_id, title) in entries.iter() {
+                let mut candidate = title.clone();
+                let mut suffix = 2_usize;
+                while !taken.insert(candidate.to_lowercase()) {
+                    candidate = format!("{title} {suffix}");
+                    suffix += 1;
+                }
+                resolved_titles.insert(conversation_id.clone(), candidate);
+            }
+        }
+    }
+
     let mut conversations = BTreeMap::new();
     for (
         conversation_id,
@@ -3929,6 +3962,10 @@ pub(crate) fn load_snapshot_from_connection(
         } else {
             CODING_SCOPE.to_string()
         };
+        let title = resolved_titles
+            .get(&conversation_id)
+            .cloned()
+            .unwrap_or(title);
         let key = if row_scope == GENERAL_SCOPE {
             format!("general::{conversation_id}")
         } else {

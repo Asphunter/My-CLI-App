@@ -2,6 +2,7 @@ mod agent;
 mod claude;
 mod codex;
 mod migration;
+mod pipeline;
 mod store;
 mod sync;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,6 +33,17 @@ async fn codex_send(
 
 #[tauri::command(rename_all = "camelCase")]
 async fn agent_send(
+    app: tauri::AppHandle,
+    request: agent::AgentTurnRequest,
+) -> Result<agent::AgentResponse, String> {
+    run_agent_turn(app, request).await
+}
+
+/// The single place a turn is actually executed. `agent_send` is the frontend's
+/// door into it; the pipeline runner walks in through the same door so a stage
+/// is an ordinary turn in every respect — same store rows, same events, same
+/// rollback guard.
+async fn run_agent_turn(
     app: tauri::AppHandle,
     mut request: agent::AgentTurnRequest,
 ) -> Result<agent::AgentResponse, String> {
@@ -91,6 +103,188 @@ async fn agent_send(
     } else {
         Err("Ismeretlen vagy nem támogatott provider/runtime páros.".to_string())
     }
+}
+
+#[tauri::command]
+fn pipeline_recipes() -> Vec<pipeline::Recipe> {
+    pipeline::recipes_for_frontend()
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn pipeline_send(
+    app: tauri::AppHandle,
+    request: pipeline::PipelineRunRequest,
+) -> Result<pipeline::PipelineRunResult, String> {
+    let recipe = pipeline::recipe_by_id(&request.recipe_id)
+        .ok_or_else(|| format!("Ismeretlen recept: {}.", request.recipe_id))?;
+    recipe.validate()?;
+    if request.request_ids.len() != recipe.stages.len() {
+        return Err(format!(
+            "A recept {} szakaszához {} request id kell, {} érkezett.",
+            recipe.label,
+            recipe.stages.len(),
+            request.request_ids.len()
+        ));
+    }
+
+    let run_id = store::begin_pipeline_run(&request.conversation_id, &recipe)?;
+    let stage_count = recipe.stages.len() as i64;
+    let mut artifacts = Vec::<pipeline::StageArtifact>::new();
+    let mut stages = Vec::<pipeline::PipelineStageResult>::new();
+    // A stage of the same runtime continues the same session, so a model switch
+    // inside one vendor keeps the context. Crossing runtimes starts fresh and
+    // the artifact block in the prompt is what carries the work over.
+    let mut session_by_runtime: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    if let Some(session_id) = request.session_id.clone() {
+        session_by_runtime.insert(
+            format!("{:?}", agent::AgentRuntimeKind::ClaudeAgentBridge),
+            session_id,
+        );
+    }
+    let mut status = pipeline::RunStatus::Running;
+    let mut run_error = None;
+
+    for (index, stage) in recipe.stages.iter().enumerate() {
+        let agent_label = pipeline::stage_agent_label(stage);
+        let request_id = request.request_ids[index].clone();
+        let runtime_key = format!("{:?}", stage.runtime);
+        let progress =
+            |phase: &'static str, status: pipeline::RunStatus| pipeline::PipelineProgress {
+                run_id: run_id.clone(),
+                conversation_id: request.conversation_id.clone(),
+                stage_index: index as i64,
+                stage_count,
+                role: stage.role,
+                agent_label: agent_label.clone(),
+                request_id: request_id.clone(),
+                phase,
+                status,
+            };
+        let _ = codex::emit_main_window(&app, "pipeline-progress", &progress("started", status));
+
+        store::update_pipeline_run_stage(&run_id, index as i64)?;
+        let turn = agent::AgentTurnRequest {
+            prompt: pipeline::stage_prompt(stage.role, &request.prompt, &artifacts),
+            // Only the first stage carries the user's attachments; a later stage
+            // reasons about the work, not about the original images again.
+            images: if index == 0 {
+                request.images.clone()
+            } else {
+                Vec::new()
+            },
+            provider: stage.provider,
+            runtime: stage.runtime,
+            conversation_id: Some(request.conversation_id.clone()),
+            session_id: session_by_runtime.get(&runtime_key).cloned(),
+            conversation_context: if index == 0 {
+                request.conversation_context.clone()
+            } else {
+                None
+            },
+            model: stage.model.clone(),
+            effort: stage.effort.clone(),
+            cwd: request.cwd.clone(),
+            request_id: Some(request_id.clone()),
+            max_budget_usd: request.max_budget_usd,
+            max_turns: stage.max_turns,
+            tool_profile: Some(stage.role.tool_profile()),
+        };
+
+        let outcome = run_agent_turn(app.clone(), turn).await;
+        let is_last = index + 1 == recipe.stages.len();
+        let stage_result = match outcome {
+            Ok(response) => {
+                if let Some(session_id) = response.session_id.clone() {
+                    session_by_runtime.insert(runtime_key, session_id);
+                }
+                let review = if stage.role == pipeline::StageRole::Review {
+                    pipeline::parse_review_verdict(&response.text)
+                } else {
+                    None
+                };
+                artifacts.push(pipeline::artifact_from_response(
+                    stage.role,
+                    &response.text,
+                    &response.guard,
+                ));
+                status = pipeline::status_after_stage(true, is_last);
+                pipeline::PipelineStageResult {
+                    index: index as i64,
+                    role: stage.role,
+                    agent_label: agent_label.clone(),
+                    request_id: request_id.clone(),
+                    succeeded: true,
+                    text: response.text,
+                    error: None,
+                    review,
+                    session_id: response.session_id,
+                }
+            }
+            Err(error) => {
+                status = pipeline::status_after_stage(false, is_last);
+                run_error = Some(error.clone());
+                pipeline::PipelineStageResult {
+                    index: index as i64,
+                    role: stage.role,
+                    agent_label: agent_label.clone(),
+                    request_id: request_id.clone(),
+                    succeeded: false,
+                    text: String::new(),
+                    error: Some(error),
+                    review: None,
+                    session_id: None,
+                }
+            }
+        };
+        let failed = !stage_result.succeeded;
+        // Label the answer this stage just stored, so the badge survives a
+        // restart and reaches the other device on the message itself.
+        if stage_result.succeeded {
+            let _ = store::label_pipeline_stage_answer(
+                &request.conversation_id,
+                &request_id,
+                &store::LocalMessagePipeline {
+                    run_id: run_id.clone(),
+                    stage_index: index as i64,
+                    stage_count,
+                    stage_role: format!("{:?}", stage.role).to_lowercase(),
+                    stage_agent: agent_label.clone(),
+                    verdict: stage_result
+                        .review
+                        .as_ref()
+                        .map(|review| match review.verdict {
+                            pipeline::ReviewVerdict::Accepted => "accepted".to_string(),
+                            pipeline::ReviewVerdict::ChangesRequested => {
+                                "changes_requested".to_string()
+                            }
+                        }),
+                    verdict_summary: stage_result
+                        .review
+                        .as_ref()
+                        .map(|review| review.summary.clone()),
+                },
+            );
+        }
+        let _ = codex::emit_main_window(
+            &app,
+            "pipeline-progress",
+            &progress(if failed { "failed" } else { "finished" }, status),
+        );
+        stages.push(stage_result);
+        if failed {
+            break;
+        }
+    }
+
+    store::finish_pipeline_run(&run_id, status.as_wire(), run_error.as_deref())?;
+    Ok(pipeline::PipelineRunResult {
+        run_id,
+        recipe,
+        status,
+        stages,
+        error: run_error,
+    })
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -621,6 +815,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             codex_send,
             agent_send,
+            pipeline_recipes,
+            pipeline_send,
             agent_conversation_status,
             agent_answer_checkpoint,
             agent_cancel,

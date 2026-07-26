@@ -5621,6 +5621,7 @@ mod tests {
             quote_refs: Vec::new(),
             detailed: None,
             change_summary: Vec::new(),
+            pipeline: None,
         }
     }
 
@@ -7195,6 +7196,7 @@ mod tests {
                 quote_refs: Vec::new(),
                 detailed: None,
                 change_summary: Vec::new(),
+                pipeline: None,
             }],
             work_items: Vec::new(),
             thread_id: Some("foreign-machine-rollout".to_string()),
@@ -7274,6 +7276,7 @@ mod tests {
                 quote_refs: Vec::new(),
                 detailed: None,
                 change_summary: Vec::new(),
+                pipeline: None,
             }],
             work_items: Vec::new(),
             thread_id: None,
@@ -7341,6 +7344,7 @@ mod tests {
                 quote_refs: Vec::new(),
                 detailed: None,
                 change_summary: Vec::new(),
+                pipeline: None,
             }],
             work_items: Vec::new(),
             thread_id: None,
@@ -7679,6 +7683,7 @@ mod tests {
                     quote_refs: Vec::new(),
                     detailed: None,
                     change_summary: Vec::new(),
+                    pipeline: None,
                 },
             })
             .expect("message payload"),

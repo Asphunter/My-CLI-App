@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
-pub const STORE_SCHEMA_VERSION: i64 = 21;
+pub const STORE_SCHEMA_VERSION: i64 = 22;
 // The public snapshot and sync contracts represent GENERAL with
 // projectId = null. SQLite keeps this hidden FK target only because the
 // existing conversations.project_id column is intentionally NOT NULL and
@@ -80,6 +80,10 @@ CREATE TABLE IF NOT EXISTS messages (
     -- NULL keeps meaning "the sender never expressed a choice".
     detailed INTEGER,
     change_summary_json TEXT NOT NULL DEFAULT '[]',
+    -- Which pipeline stage produced this message, so the run can be grouped and
+    -- badged on any device. Travels on the message for the same reason the
+    -- detailed flag does: it needs no new journal event type.
+    pipeline_json TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -141,6 +145,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_session_entry_uuid
 
 CREATE INDEX IF NOT EXISTS idx_agent_session_entries_load
     ON agent_session_entries(agent_session_id, subpath, sequence);
+
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+    id TEXT PRIMARY KEY NOT NULL,
+    conversation_id TEXT NOT NULL,
+    recipe_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    current_stage INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_conversation
+    ON pipeline_runs(conversation_id, created_at);
 
 CREATE TABLE IF NOT EXISTS agent_approvals (
     id TEXT PRIMARY KEY NOT NULL,
@@ -387,6 +405,27 @@ pub struct LocalMessage {
     /// the panel is no longer missing on every other device.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub change_summary: Vec<LocalChangeSummaryFile>,
+    /// Which pipeline stage produced this message. Present only for messages
+    /// that belong to a run, so an ordinary turn carries nothing extra.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<LocalMessagePipeline>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalMessagePipeline {
+    pub run_id: String,
+    pub stage_index: i64,
+    pub stage_count: i64,
+    /// `plan` / `code` / `review` — the wire form of the stage role.
+    pub stage_role: String,
+    /// Human-facing agent label for the badge, e.g. "Claude · Opus 5".
+    pub stage_agent: String,
+    /// Only a review stage has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1096,9 +1135,10 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
                                 .unwrap_or_default(),
                             quote_refs: serde_json::from_str(&row.get::<_, String>(14)?)
                                 .unwrap_or_default(),
-                            // This v14 migration predates both columns.
+                            // This v14 migration predates all three columns.
                             detailed: None,
                             change_summary: Vec::new(),
+                            pipeline: None,
                         },
                     ))
                 })
@@ -1573,9 +1613,56 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
             format!("A lokális SQLite v21 migráció commitja sikertelen: {error}")
         })?;
     }
+    let migrated_version = read_schema_version(connection)?;
+    if migrated_version == 21 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("A lokális SQLite v22 migráció nem indítható el: {error}"))?;
+        let has_pipeline_column: bool = {
+            let mut statement = transaction
+                .prepare("PRAGMA table_info(messages)")
+                .map_err(|error| format!("A v22 messages schema nem olvasható: {error}"))?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|error| format!("A v22 messages oszloplista nem olvasható: {error}"))?
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(|error| format!("A v22 messages schema hibás: {error}"))?;
+            columns.contains("pipeline_json")
+        };
+        if !has_pipeline_column {
+            transaction
+                .execute_batch("ALTER TABLE messages ADD COLUMN pipeline_json TEXT;")
+                .map_err(|error| {
+                    format!("A v22 messages.pipeline_json oszlop nem hozható létre: {error}")
+                })?;
+        }
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS pipeline_runs (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     conversation_id TEXT NOT NULL,
+                     recipe_json TEXT NOT NULL,
+                     status TEXT NOT NULL,
+                     current_stage INTEGER NOT NULL DEFAULT 0,
+                     error TEXT,
+                     created_at TEXT NOT NULL,
+                     updated_at TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_pipeline_runs_conversation
+                     ON pipeline_runs(conversation_id, created_at);
+                 PRAGMA user_version = 22;",
+            )
+            .map_err(|error| format!("A v22 pipeline táblák létrehozása sikertelen: {error}"))?;
+        transaction.commit().map_err(|error| {
+            format!("A lokális SQLite v22 migráció commitja sikertelen: {error}")
+        })?;
+    }
     // Cheap invariant check rather than a one-shot migration: the fossils can
     // also arrive later from another device that has not been updated yet.
     repair_answers_before_their_question(connection)?;
+    // A run cannot survive a restart: its stages were driven by a process that
+    // is gone. Close them honestly instead of leaving a spinner forever.
+    fail_interrupted_pipeline_runs(connection)?;
     Ok(())
 }
 
@@ -3367,6 +3454,106 @@ pub(crate) fn repair_answers_before_their_question(
     Ok(fossils.len())
 }
 
+pub(crate) fn begin_pipeline_run(
+    conversation_id: &str,
+    recipe: &crate::pipeline::Recipe,
+) -> Result<String, String> {
+    let store = open_local_store()?;
+    let now = now_millis();
+    let run_id = Uuid::new_v4().to_string();
+    let recipe_json = serde_json::to_string(recipe)
+        .map_err(|error| format!("A recept nem szerializálható: {error}"))?;
+    store
+        .connection
+        .execute(
+            "INSERT INTO pipeline_runs
+                 (id, conversation_id, recipe_json, status, current_stage, error, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'running', 0, NULL, ?4, ?4)",
+            params![run_id, conversation_id, recipe_json, now],
+        )
+        .map_err(|error| format!("A lánc futamának indítása nem menthető: {error}"))?;
+    Ok(run_id)
+}
+
+pub(crate) fn update_pipeline_run_stage(run_id: &str, stage_index: i64) -> Result<(), String> {
+    let store = open_local_store()?;
+    store
+        .connection
+        .execute(
+            "UPDATE pipeline_runs SET current_stage = ?1, updated_at = ?2 WHERE id = ?3",
+            params![stage_index, now_millis(), run_id],
+        )
+        .map_err(|error| format!("A lánc szakaszának mentése sikertelen: {error}"))?;
+    Ok(())
+}
+
+pub(crate) fn finish_pipeline_run(
+    run_id: &str,
+    status: &str,
+    error: Option<&str>,
+) -> Result<(), String> {
+    let store = open_local_store()?;
+    store
+        .connection
+        .execute(
+            "UPDATE pipeline_runs SET status = ?1, error = ?2, updated_at = ?3 WHERE id = ?4",
+            params![status, error, now_millis(), run_id],
+        )
+        .map_err(|error| format!("A lánc futamának lezárása sikertelen: {error}"))?;
+    Ok(())
+}
+
+/// Stamps the stage metadata onto the answer the canonical writer has just
+/// stored for this request, keyed the same way that writer keys it.
+pub(crate) fn label_pipeline_stage_answer(
+    conversation_id: &str,
+    request_id: &str,
+    pipeline: &LocalMessagePipeline,
+) -> Result<(), String> {
+    let store = open_local_store()?;
+    let pipeline_json = serde_json::to_string(pipeline)
+        .map_err(|error| format!("A pipeline-metaadat nem szerializálható: {error}"))?;
+    store
+        .connection
+        .execute(
+            "UPDATE messages SET pipeline_json = ?1
+             WHERE conversation_id = ?2 AND role = 'assistant' AND turn_id = ?3",
+            params![
+                pipeline_json,
+                conversation_id,
+                format!("request:{request_id}")
+            ],
+        )
+        .map_err(|error| format!("A szakasz-válasz megjelölése sikertelen: {error}"))?;
+    Ok(())
+}
+
+/// A run is driven by a live process, so it cannot survive that process going
+/// away. Leaving it `running` would show a stage spinner that never resolves;
+/// the finished stages keep their answers either way.
+fn fail_interrupted_pipeline_runs(connection: &Connection) -> Result<usize, String> {
+    let has_table: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_runs')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("A pipeline_runs tábla nem ellenőrizhető: {error}"))?;
+    if !has_table {
+        return Ok(0);
+    }
+    connection
+        .execute(
+            "UPDATE pipeline_runs SET
+                 status = 'failed',
+                 error = COALESCE(error, 'A lánc újraindítás miatt megszakadt.'),
+                 updated_at = ?1
+             WHERE status = 'running'",
+            params![now_millis()],
+        )
+        .map_err(|error| format!("A megszakadt láncok lezárása sikertelen: {error}"))
+}
+
 fn now_millis() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3876,7 +4063,7 @@ pub(crate) fn load_snapshot_from_connection(
                 .prepare(
                     "SELECT id, role, body, created_at, code, live, \"final\", item_id, turn_id,
                             sequence, hlc, origin_device_id, attachments_json, quote_refs_json,
-                            detailed, change_summary_json
+                            detailed, change_summary_json, pipeline_json
                      FROM messages
                      WHERE conversation_id = ?1
                      ORDER BY sequence, COALESCE(origin_device_id, ''), id",
@@ -3904,6 +4091,9 @@ pub(crate) fn load_snapshot_from_connection(
                         detailed: row.get::<_, Option<i64>>(14)?.map(|value| value != 0),
                         change_summary: serde_json::from_str(&row.get::<_, String>(15)?)
                             .unwrap_or_default(),
+                        pipeline: row
+                            .get::<_, Option<String>>(16)?
+                            .and_then(|value| serde_json::from_str(&value).ok()),
                     };
                     message.text = collapse_repeated_assistant_text(&message.role, &message.text);
                     Ok(message)
@@ -4457,6 +4647,12 @@ pub(crate) fn save_snapshot_in_connection(
                 .map_err(|error| format!("Az idézet-hivatkozások nem szerializálhatók: {error}"))?;
             let change_summary_json = serde_json::to_string(&message.change_summary)
                 .map_err(|error| format!("A változás-összefoglaló nem szerializálható: {error}"))?;
+            let pipeline_json = message
+                .pipeline
+                .as_ref()
+                .map(|pipeline| serde_json::to_string(pipeline))
+                .transpose()
+                .map_err(|error| format!("A pipeline-metaadat nem szerializálható: {error}"))?;
             let identity_role = message.role.clone();
             let identity_turn_id = message
                 .turn_id
@@ -4549,8 +4745,8 @@ pub(crate) fn save_snapshot_in_connection(
             message_ids.insert(message_id.clone());
             transaction
                 .execute(
-                    "INSERT INTO messages (id, conversation_id, role, body, sequence, hlc, item_id, turn_id, code, live, \"final\", origin_device_id, attachments_json, quote_refs_json, created_at, detailed, change_summary_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?17, ?18)
+                    "INSERT INTO messages (id, conversation_id, role, body, sequence, hlc, item_id, turn_id, code, live, \"final\", origin_device_id, attachments_json, quote_refs_json, created_at, detailed, change_summary_json, pipeline_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?17, ?18, ?19)
                      ON CONFLICT(id) DO UPDATE SET
                      body = CASE
                              WHEN messages.role = 'user' THEN messages.body
@@ -4605,7 +4801,8 @@ pub(crate) fn save_snapshot_in_connection(
                              WHEN excluded.change_summary_json <> '[]'
                                  THEN excluded.change_summary_json
                              ELSE messages.change_summary_json
-                         END",
+                         END,
+                         pipeline_json = COALESCE(excluded.pipeline_json, messages.pipeline_json)",
                     params![
                         message_id,
                         conversation_id,
@@ -4625,6 +4822,7 @@ pub(crate) fn save_snapshot_in_connection(
                         canonical_agent_id,
                         message.detailed.map(|value| if value { 1 } else { 0 }),
                         change_summary_json,
+                        pipeline_json,
                     ],
                 )
                 .map_err(|error| format!("A lokális üzenet mentése sikertelen: {error}"))?;
@@ -5601,6 +5799,7 @@ mod tests {
                 quote_refs: Vec::new(),
                 detailed: None,
                 change_summary: Vec::new(),
+                pipeline: None,
             }],
             work_items: vec![LocalWorkItem {
                 id: 11,
@@ -5704,6 +5903,7 @@ mod tests {
                     quote_refs: Vec::new(),
                     detailed: None,
                     change_summary: Vec::new(),
+                    pipeline: None,
                 });
                 conversation.messages.push(LocalMessage {
                     id: Some(format!("answer-{index}")),
@@ -5723,6 +5923,7 @@ mod tests {
                     quote_refs: Vec::new(),
                     detailed: None,
                     change_summary: Vec::new(),
+                    pipeline: None,
                 });
             }
         }
@@ -5749,6 +5950,102 @@ mod tests {
             answers, 2,
             "both answers must survive; a shared item id must not delete a previous turn's answer"
         );
+    }
+
+    #[test]
+    fn a_stage_badge_survives_the_store_round_trip() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        let answer_id = Uuid::new_v4().to_string();
+        let mut snapshot = test_snapshot();
+        {
+            let conversation = snapshot
+                .conversations
+                .values_mut()
+                .next()
+                .expect("conversation");
+            conversation.messages.clear();
+            conversation.messages.push(LocalMessage {
+                id: Some(Uuid::new_v4().to_string()),
+                role: "user".to_string(),
+                text: "Javitsd a hibat".to_string(),
+                time: "100".to_string(),
+                code: None,
+                live: Some(false),
+                final_message: Some(false),
+                item_id: None,
+                turn_id: Some("request:stage-0".to_string()),
+                sequence: Some(100),
+                hlc: None,
+                origin_device_id: None,
+                images: Vec::new(),
+                quote_refs: Vec::new(),
+                detailed: None,
+                change_summary: Vec::new(),
+                pipeline: None,
+            });
+            conversation.messages.push(LocalMessage {
+                id: Some(answer_id.clone()),
+                role: "assistant".to_string(),
+                text: "VERDIKT: JAVÍTANDÓ — a teszt nem futott le.".to_string(),
+                time: "101".to_string(),
+                code: None,
+                live: Some(false),
+                final_message: Some(true),
+                item_id: Some("assistant-0".to_string()),
+                turn_id: Some("request:stage-0".to_string()),
+                sequence: Some(101),
+                hlc: None,
+                origin_device_id: None,
+                images: Vec::new(),
+                quote_refs: Vec::new(),
+                detailed: None,
+                change_summary: Vec::new(),
+                pipeline: Some(LocalMessagePipeline {
+                    run_id: "run-1".to_string(),
+                    stage_index: 2,
+                    stage_count: 3,
+                    stage_role: "review".to_string(),
+                    stage_agent: "Codex".to_string(),
+                    verdict: Some("changes_requested".to_string()),
+                    verdict_summary: Some("a teszt nem futott le.".to_string()),
+                }),
+            });
+        }
+        save_snapshot_in_connection(&mut connection, snapshot).expect("save conversation");
+
+        let loaded = load_snapshot_from_connection(&connection).expect("load snapshot");
+        let answer = loaded
+            .conversations
+            .values()
+            .next()
+            .expect("conversation")
+            .messages
+            .iter()
+            .find(|message| message.id.as_deref() == Some(answer_id.as_str()))
+            .expect("answer")
+            .clone();
+        let pipeline = answer
+            .pipeline
+            .expect("the stage badge must survive, or the run cannot be grouped on any device");
+        assert_eq!(pipeline.stage_index, 2);
+        assert_eq!(pipeline.stage_count, 3);
+        assert_eq!(pipeline.stage_role, "review");
+        assert_eq!(pipeline.verdict.as_deref(), Some("changes_requested"));
+
+        // An ordinary turn must stay free of the extra metadata.
+        let question = loaded
+            .conversations
+            .values()
+            .next()
+            .expect("conversation")
+            .messages
+            .iter()
+            .find(|message| message.role == "user")
+            .expect("question");
+        assert!(question.pipeline.is_none());
     }
 
     #[test]
@@ -5785,6 +6082,7 @@ mod tests {
                 // The sender chose the compact layout for this turn.
                 detailed: Some(false),
                 change_summary: Vec::new(),
+                pipeline: None,
             });
             conversation.messages.push(LocalMessage {
                 id: Some(answer_id.clone()),
@@ -5809,6 +6107,7 @@ mod tests {
                     removed: 0,
                     binary_or_truncated: None,
                 }],
+                pipeline: None,
             });
         }
         save_snapshot_in_connection(&mut connection, snapshot).expect("save conversation");
@@ -5951,6 +6250,7 @@ mod tests {
                 quote_refs: Vec::new(),
                 detailed: None,
                 change_summary: Vec::new(),
+                pipeline: None,
             });
             conversation.messages.push(LocalMessage {
                 id: Some(message_id.clone()),
@@ -5969,6 +6269,7 @@ mod tests {
                 quote_refs: Vec::new(),
                 detailed: None,
                 change_summary: Vec::new(),
+                pipeline: None,
             });
             snapshot
         };
@@ -6029,6 +6330,7 @@ mod tests {
                 quote_refs: Vec::new(),
                 detailed: None,
                 change_summary: Vec::new(),
+                pipeline: None,
             });
             conversation.messages.push(LocalMessage {
                 id: Some(Uuid::new_v4().to_string()),
@@ -6047,6 +6349,7 @@ mod tests {
                 quote_refs: Vec::new(),
                 detailed: None,
                 change_summary: Vec::new(),
+                pipeline: None,
             });
         }
         save_snapshot_in_connection(&mut connection, snapshot).expect("save conversation");
@@ -6304,6 +6607,7 @@ mod tests {
             quote_refs: Vec::new(),
             detailed: None,
             change_summary: Vec::new(),
+            pipeline: None,
         };
         let mut completed = placeholder.clone();
         completed.id = Some(Uuid::new_v4().to_string());
@@ -6360,6 +6664,7 @@ mod tests {
             quote_refs: Vec::new(),
             detailed: None,
             change_summary: Vec::new(),
+            pipeline: None,
         });
         save_snapshot_in_connection(&mut connection, completed_snapshot.clone())
             .expect("save completed answer");
@@ -6390,6 +6695,7 @@ mod tests {
                 quote_refs: Vec::new(),
                 detailed: None,
                 change_summary: Vec::new(),
+                pipeline: None,
             },
         ];
         save_snapshot_in_connection(&mut connection, stale_snapshot)
@@ -6440,6 +6746,7 @@ mod tests {
                 quote_refs: Vec::new(),
                 detailed: None,
                 change_summary: Vec::new(),
+                pipeline: None,
             });
         save_snapshot_in_connection(&mut connection, snapshot).expect("save placeholder");
         let conversation_id: String = connection

@@ -2404,7 +2404,7 @@ fn send_json(stdin: &mut ChildStdin, value: Value) -> Result<(), String> {
     stdin.flush().map_err(|error| error.to_string())
 }
 
-fn emit_main_window<T: Serialize>(
+pub(crate) fn emit_main_window<T: Serialize>(
     app: &tauri::AppHandle,
     event: &str,
     payload: &T,
@@ -4432,6 +4432,7 @@ mod sync_tests {
             quote_refs: Vec::new(),
             detailed: None,
             change_summary: Vec::new(),
+            pipeline: None,
         }
     }
 

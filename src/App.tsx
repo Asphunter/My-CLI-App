@@ -28,6 +28,7 @@ import {
   beginAssistantRegeneration,
   collapseAbandonedRegenerationRetries,
   collapseRepeatedAssistantText,
+  bothAssistantVersionsAreSettled,
   coalesceMessageIdentities,
   isNewerSettledAssistantVersion,
   isSettledHistoricalAssistant,
@@ -1803,9 +1804,11 @@ const mergeMessages = (
             ? message.text
             : !existingUnavailable && messageUnavailable
               ? existing.text
-              : message.text.trim().length > existing.text.trim().length
-                ? message.text
-                : existing.text;
+              : bothAssistantVersionsAreSettled(existing, message)
+                ? existing.text
+                : message.text.trim().length > existing.text.trim().length
+                  ? message.text
+                  : existing.text;
       return {
         ...existing,
         time:

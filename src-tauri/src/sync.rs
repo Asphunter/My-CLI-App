@@ -1758,8 +1758,14 @@ fn validate_payload(event_type: &str, entity_id: &str, payload: &Value) -> Resul
         TOMBSTONE_UPSERT | ENTITY_RESTORE => {
             let tombstone: TombstoneEventPayload = serde_json::from_value(payload.clone())
                 .map_err(|error| format!("A tombstone/restore event payloadja hibás: {error}"))?;
+            // "message" removes a single row rather than a whole conversation.
+            // The repair pass needs it for answers that were merged into a
+            // foreign turn: only a tombstone makes such a deletion stick.
             if tombstone.entity_id != entity_id
-                || !matches!(tombstone.entity_type.as_str(), "project" | "conversation")
+                || !matches!(
+                    tombstone.entity_type.as_str(),
+                    "project" | "conversation" | "message"
+                )
                 || tombstone.archived_at.trim().is_empty()
             {
                 return Err("A tombstone event identityje vagy típusa hibás.".to_string());
@@ -3013,7 +3019,16 @@ fn merge_answer_checkpoints(
                 tombstone.entity_type == "conversation"
                     && tombstone.entity_id == entry.conversation_id
             });
-            if project_archived || conversation_archived {
+            // The checkpoint is a redundant copy of an answer, so it also
+            // resurrects one that was deliberately removed. Without this the
+            // repaired fossil came back on every single pull, even though it
+            // was gone from SQLite and suppressed in the journal.
+            let answer_archived = entry.answer.id.as_deref().is_some_and(|answer_id| {
+                snapshot.tombstones.iter().any(|tombstone| {
+                    tombstone.entity_type == "message" && tombstone.entity_id == answer_id
+                })
+            });
+            if project_archived || conversation_archived || answer_archived {
                 continue;
             }
 
@@ -3492,8 +3507,9 @@ fn reduce_snapshot(connection: &Connection) -> Result<LocalStoreSnapshot, String
         }) {
             let mut messages = conversation
                 .messages
-                .values()
-                .map(|(_, message)| message.clone())
+                .iter()
+                .filter(|(message_id, _)| !message_is_tombstoned(&tombstones, message_id))
+                .map(|(_, (_, message))| message.clone())
                 .collect::<Vec<_>>();
             messages.sort_by(|left, right| {
                 left.sequence
@@ -3538,8 +3554,9 @@ fn reduce_snapshot(connection: &Connection) -> Result<LocalStoreSnapshot, String
     {
         let mut messages = conversation
             .messages
-            .values()
-            .map(|(_, message)| message.clone())
+            .iter()
+            .filter(|(message_id, _)| !message_is_tombstoned(&tombstones, message_id))
+            .map(|(_, (_, message))| message.clone())
             .collect::<Vec<_>>();
         messages.sort_by(|left, right| {
             left.sequence
@@ -3695,6 +3712,19 @@ fn normalized_message_id(conversation_id: &str, message: &LocalMessage, index: u
     )
 }
 
+/// A single message can be removed permanently, not just a whole conversation.
+/// The repair pass uses this for answers that were merged into a foreign turn:
+/// without it every import would hand the fossil straight back.
+fn message_is_tombstoned(
+    tombstones: &BTreeMap<(String, String), (EventRank, bool, TombstoneEventPayload)>,
+    message_id: &str,
+) -> bool {
+    tombstones
+        .get(&("message".to_string(), message_id.to_string()))
+        .map(|(_, archived, _)| *archived)
+        .unwrap_or(false)
+}
+
 fn normalized_work_item_id(conversation_id: &str, item: &LocalWorkItem, index: usize) -> String {
     let identity = item
         .item_id
@@ -3727,10 +3757,34 @@ fn normalized_tombstone(
     tombstone: &LocalTombstone,
     project_ids: &HashMap<String, String>,
 ) -> Result<(String, TombstoneEventPayload), String> {
-    if !matches!(tombstone.entity_type.as_str(), "project" | "conversation") {
+    if !matches!(
+        tombstone.entity_type.as_str(),
+        "project" | "conversation" | "message"
+    ) {
         return Err(format!(
             "Ismeretlen tombstone entitástípus: {}.",
             tombstone.entity_type
+        ));
+    }
+    // A message id is already the durable identity everything else keys on, so
+    // it needs none of the project/title normalization below.
+    if tombstone.entity_type == "message" {
+        return Ok((
+            tombstone.entity_id.clone(),
+            TombstoneEventPayload {
+                entity_type: tombstone.entity_type.clone(),
+                entity_id: tombstone.entity_id.clone(),
+                archived_at: if tombstone.archived_at.trim().is_empty() {
+                    now_text()
+                } else {
+                    tombstone.archived_at.clone()
+                },
+                project_id: None,
+                title: None,
+                relative_path: None,
+                path_hint: None,
+                reason: tombstone.reason.clone(),
+            },
         ));
     }
     let normalized_project_id = tombstone.project_id.as_deref().map(|project_id| {
@@ -6167,6 +6221,242 @@ mod tests {
             )
             .expect("session count");
         assert_eq!(sessions, 1, "the agent session must survive the round trip");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_answer_checkpoint_does_not_resurrect_a_tombstoned_answer() {
+        let fossil_id = Uuid::new_v4().to_string();
+        let conversation_id = Uuid::new_v4().to_string();
+        let project = LocalProject {
+            id: Uuid::new_v4().to_string(),
+            name: "Shared".to_string(),
+            relative_path: Some("shared".to_string()),
+            path_hint: "C:/shared".to_string(),
+            threads: vec!["Thread".to_string()],
+        };
+        let mut answer = test_message(&fossil_id, "assistant", "fossziliia", true);
+        answer.sequence = Some(1);
+        answer.turn_id = Some("request:fossil-turn".to_string());
+
+        let snapshot = store::LocalStoreSnapshot {
+            schema_version: STORE_SCHEMA_VERSION,
+            projects: Vec::new(),
+            conversations: BTreeMap::new(),
+            tombstones: vec![LocalTombstone {
+                entity_type: "message".to_string(),
+                entity_id: fossil_id.clone(),
+                archived_at: "9".to_string(),
+                project_id: None,
+                title: None,
+                relative_path: None,
+                path_hint: None,
+                reason: Some("answer-before-question".to_string()),
+            }],
+        };
+
+        let merged = merge_answer_checkpoints(
+            snapshot,
+            vec![AnswerCheckpointFile {
+                schema_version: 2,
+                device_id: Uuid::new_v4().to_string(),
+                updated_at: "9".to_string(),
+                answers: vec![AnswerCheckpointEntry {
+                    project,
+                    conversation_id,
+                    conversation_title: "Thread".to_string(),
+                    updated_at: "9".to_string(),
+                    user_message: None,
+                    answer,
+                }],
+                checkpoint_hash: String::new(),
+            }],
+        );
+
+        let resurrected = merged
+            .conversations
+            .values()
+            .flat_map(|conversation| conversation.messages.iter())
+            .filter(|message| message.id.as_deref() == Some(fossil_id.as_str()))
+            .count();
+        assert_eq!(
+            resurrected, 0,
+            "the redundant checkpoint must not hand back a deliberately removed answer"
+        );
+    }
+
+    #[test]
+    fn a_message_tombstone_can_be_dispatched_to_the_journal() {
+        // The repair pass is useless if the deletion never leaves this device,
+        // and an unknown entity type here fails the whole export, not just one
+        // tombstone.
+        let message_id = Uuid::new_v4().to_string();
+        let (entity_id, payload) = normalized_tombstone(
+            &LocalTombstone {
+                entity_type: "message".to_string(),
+                entity_id: message_id.clone(),
+                archived_at: "42".to_string(),
+                project_id: None,
+                title: None,
+                relative_path: None,
+                path_hint: None,
+                reason: Some("answer-before-question".to_string()),
+            },
+            &HashMap::new(),
+        )
+        .expect("a message tombstone must be dispatchable");
+
+        assert_eq!(entity_id, message_id);
+        assert_eq!(payload.entity_type, "message");
+        assert_eq!(payload.entity_id, message_id);
+
+        let event = make_event(
+            &Uuid::new_v4().to_string(),
+            1,
+            format!("{:020}-{:08}", 1, 0),
+            None,
+            entity_id,
+            TOMBSTONE_UPSERT.to_string(),
+            serde_json::to_value(&payload).expect("payload"),
+        )
+        .expect("event");
+        validate_event(&event).expect("the validator must accept a message tombstone");
+    }
+
+    #[test]
+    fn a_tombstoned_message_is_not_resurrected_by_the_journal() {
+        let root = test_root();
+        let device_a = Uuid::new_v4().to_string();
+        let importer = Uuid::new_v4().to_string();
+        let project_id = stable_id("project", "message-tombstone-project");
+        let conversation_id = stable_id("conversation", "message-tombstone-conversation");
+
+        let project = make_event(
+            &device_a,
+            1,
+            format!("{:020}-{:08}", 1, 0),
+            None,
+            project_id.clone(),
+            PROJECT_UPSERT.to_string(),
+            serde_json::to_value(LocalProject {
+                id: project_id.clone(),
+                name: "Shared".to_string(),
+                relative_path: Some("shared".to_string()),
+                path_hint: "C:/shared".to_string(),
+                threads: vec!["Thread".to_string()],
+            })
+            .expect("project payload"),
+        )
+        .expect("project event");
+        let conversation = make_event(
+            &device_a,
+            2,
+            format!("{:020}-{:08}", 2, 0),
+            Some(project.event_hash.clone()),
+            conversation_id.clone(),
+            CONVERSATION_UPSERT.to_string(),
+            serde_json::to_value(ConversationEventPayload {
+                id: conversation_id.clone(),
+                scope: store::CODING_SCOPE.to_string(),
+                project_id: Some(project_id.clone()),
+                title: "Thread".to_string(),
+                thread_id: None,
+                updated_at: "2".to_string(),
+                plan_history: BTreeMap::new(),
+                commentary: Vec::new(),
+            })
+            .expect("conversation payload"),
+        )
+        .expect("conversation event");
+
+        let mut kept = test_message(&Uuid::new_v4().to_string(), "assistant", "igazi", true);
+        kept.sequence = Some(3);
+        kept.turn_id = Some("request:kept-turn".to_string());
+        let kept_event = make_event(
+            &device_a,
+            3,
+            format!("{:020}-{:08}", 3, 0),
+            Some(conversation.event_hash.clone()),
+            kept.id.clone().expect("kept id"),
+            MESSAGE_UPSERT.to_string(),
+            serde_json::to_value(MessageEventPayload {
+                project_id: Some(project_id.clone()),
+                conversation_id: conversation_id.clone(),
+                message: kept,
+            })
+            .expect("kept payload"),
+        )
+        .expect("kept event");
+
+        // The fossil owns its own turn, exactly like the real one: the merge
+        // wrote a foreign answer under a much older, already answered turn.
+        let mut fossil = test_message(&Uuid::new_v4().to_string(), "assistant", "fossziliia", true);
+        fossil.sequence = Some(1);
+        fossil.turn_id = Some("request:fossil-turn".to_string());
+        let fossil_id = fossil.id.clone().expect("fossil id");
+        let fossil_event = make_event(
+            &device_a,
+            4,
+            format!("{:020}-{:08}", 4, 0),
+            Some(kept_event.event_hash.clone()),
+            fossil_id.clone(),
+            MESSAGE_UPSERT.to_string(),
+            serde_json::to_value(MessageEventPayload {
+                project_id: Some(project_id),
+                conversation_id: conversation_id.clone(),
+                message: fossil,
+            })
+            .expect("fossil payload"),
+        )
+        .expect("fossil event");
+        let tombstone = make_event(
+            &device_a,
+            5,
+            format!("{:020}-{:08}", 5, 0),
+            Some(fossil_event.event_hash.clone()),
+            fossil_id.clone(),
+            TOMBSTONE_UPSERT.to_string(),
+            serde_json::to_value(TombstoneEventPayload {
+                entity_type: "message".to_string(),
+                entity_id: fossil_id.clone(),
+                archived_at: "5".to_string(),
+                project_id: None,
+                title: None,
+                relative_path: None,
+                path_hint: None,
+                reason: Some("answer-before-question".to_string()),
+            })
+            .expect("tombstone payload"),
+        )
+        .expect("tombstone event");
+
+        for event in [
+            &project,
+            &conversation,
+            &kept_event,
+            &fossil_event,
+            &tombstone,
+        ] {
+            write_event(&root, event).expect("write event");
+        }
+        let scan = scan_journal(&root, &importer).expect("scan journal");
+        let mut store = test_store();
+        apply_events(&mut store, &scan).expect("apply events");
+        let snapshot = reduce_snapshot(&store.connection).expect("reduce snapshot");
+        let messages = &snapshot
+            .conversations
+            .values()
+            .next()
+            .expect("conversation")
+            .messages;
+
+        assert_eq!(
+            messages.len(),
+            1,
+            "the tombstoned answer must not come back from the journal"
+        );
+        assert_eq!(messages[0].text, "igazi");
 
         let _ = fs::remove_dir_all(root);
     }

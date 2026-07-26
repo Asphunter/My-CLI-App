@@ -1506,6 +1506,9 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
             format!("A lokÃ¡lis SQLite v20 migrÃ¡ciÃ³ commitja sikertelen: {error}")
         })?;
     }
+    // Cheap invariant check rather than a one-shot migration: the fossils can
+    // also arrive later from another device that has not been updated yet.
+    repair_answers_before_their_question(connection)?;
     Ok(())
 }
 
@@ -3155,6 +3158,86 @@ pub fn local_store_health() -> Result<StoreHealth, String> {
     }
 }
 
+/// An answer can never precede its own question: the canonical writer always
+/// places it directly after the user row. Rows that do sit earlier are fossils
+/// of the old shared-`assistant-0` merge, which folded every answer of a
+/// conversation into the first one and saved that text back under a foreign,
+/// much older turn. Drop them and tombstone the id, otherwise the next journal
+/// import resurrects the fossil on every device.
+pub(crate) fn repair_answers_before_their_question(
+    connection: &mut Connection,
+) -> Result<usize, String> {
+    // Legacy databases are migrated column by column, so the invariant can only
+    // be checked once the timeline columns it needs are actually present.
+    let columns = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(messages)")
+            .map_err(|error| format!("A messages tábla sémája nem olvasható: {error}"))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| format!("A messages oszlopai nem olvashatók: {error}"))?;
+        rows.collect::<Result<HashSet<_>, _>>()
+            .map_err(|error| format!("A messages oszlopai nem olvashatók: {error}"))?
+    };
+    if !["role", "turn_id", "sequence", "conversation_id"]
+        .iter()
+        .all(|column| columns.contains(*column))
+    {
+        return Ok(0);
+    }
+
+    let fossils = {
+        let mut statement = connection
+            .prepare(
+                "SELECT answer.id
+                 FROM messages AS answer
+                 JOIN messages AS question
+                   ON question.conversation_id = answer.conversation_id
+                  AND question.turn_id = answer.turn_id
+                  AND question.role = 'user'
+                 WHERE answer.role = 'assistant'
+                   AND answer.turn_id IS NOT NULL
+                   AND answer.sequence < question.sequence",
+            )
+            .map_err(|error| {
+                format!("A hibás pozíciójú válaszok lekérdezése sikertelen: {error}")
+            })?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("A hibás pozíciójú válaszok olvasása sikertelen: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("A hibás pozíciójú válaszok olvasása sikertelen: {error}"))?
+    };
+    if fossils.is_empty() {
+        return Ok(0);
+    }
+
+    let now = now_millis();
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("A válaszjavítás tranzakciója nem indítható: {error}"))?;
+    for id in &fossils {
+        transaction
+            .execute("DELETE FROM messages WHERE id = ?1", params![id])
+            .map_err(|error| format!("A hibás pozíciójú válasz nem törölhető: {error}"))?;
+        transaction
+            .execute(
+                "INSERT INTO sync_tombstones
+                     (entity_type, entity_id, archived_at, project_id, title, relative_path, path_hint, reason)
+                 VALUES ('message', ?1, ?2, NULL, NULL, NULL, NULL, 'answer-before-question')
+                 ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+                     archived_at = excluded.archived_at,
+                     reason = excluded.reason",
+                params![id, now],
+            )
+            .map_err(|error| format!("A hibás válasz tombstone-ja nem menthető: {error}"))?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("A válaszjavítás commitja sikertelen: {error}"))?;
+    Ok(fossils.len())
+}
+
 fn now_millis() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3193,7 +3276,14 @@ fn message_identity_keys(message: &LocalMessage) -> Vec<String> {
         keys.push(format!("turn:{turn_id}:{}", message.role));
     }
     if let Some(item_id) = item_id {
-        keys.push(format!("item:{item_id}:{}", message.role));
+        // An item id only identifies a message inside its own turn. Providers
+        // label content blocks positionally, so every first answer block is
+        // `assistant-0`; treating that as a global identity merged every answer
+        // in a conversation into one and dropped the rest.
+        match turn_id {
+            Some(turn_id) => keys.push(format!("turn:{turn_id}:item:{item_id}:{}", message.role)),
+            None => keys.push(format!("item:{item_id}:{}", message.role)),
+        }
     }
     if let Some(id) = id {
         keys.push(format!("id:{id}"));
@@ -3913,6 +4003,19 @@ pub(crate) fn save_snapshot_in_connection(
             )
             .map_err(|error| format!("A tombstoned conversation archive failed: {error}"))?;
     }
+    // A conversation is archived, but a single bad message is really gone: it
+    // has no place to hide and every import would otherwise hand it back.
+    for tombstone in &snapshot.tombstones {
+        if tombstone.entity_type != "message" {
+            continue;
+        }
+        transaction
+            .execute(
+                "DELETE FROM messages WHERE id = ?1",
+                params![tombstone.entity_id],
+            )
+            .map_err(|error| format!("A tombstoned üzenet törlése sikertelen: {error}"))?;
+    }
     let incoming_tombstones = snapshot
         .tombstones
         .iter()
@@ -4272,6 +4375,23 @@ pub(crate) fn save_snapshot_in_connection(
                              WHEN messages.role = 'assistant'
                                   AND messages.\"final\" = 1
                                   AND messages.id = ?16 THEN messages.body
+                             -- A settled answer is already complete, so growing
+                             -- it by length only made corruption permanent: the
+                             -- correct, shorter text could never win back and a
+                             -- glued body outlived every restart and re-import.
+                             -- The newer clock decides; without one the journal
+                             -- wins, because that is the shared truth and the
+                             -- local row may be a private corruption.
+                             WHEN messages.role = 'assistant' AND messages.\"final\" = 1 THEN
+                                 CASE
+                                     WHEN excluded.\"final\" = 1
+                                          AND trim(excluded.body) <> ''
+                                          AND (excluded.hlc IS NULL
+                                               OR messages.hlc IS NULL
+                                               OR excluded.hlc >= messages.hlc)
+                                         THEN excluded.body
+                                     ELSE messages.body
+                                 END
                              WHEN length(excluded.body) >= length(messages.body) THEN excluded.body
                              ELSE messages.body
                          END,
@@ -4326,11 +4446,23 @@ pub(crate) fn save_snapshot_in_connection(
                     .map_err(|error| format!("A turn message-alias törlése sikertelen: {error}"))?;
             }
             if let Some(item_id) = identity_item_id.as_deref() {
+                // An item id is only unique inside its own turn: a provider may
+                // reuse a positional label such as `assistant-0` for the first
+                // content block of every answer. Without the turn restriction
+                // this cleanup deleted every earlier answer in the
+                // conversation, leaving the questions behind with no replies.
                 transaction
                     .execute(
                         "DELETE FROM messages
-                         WHERE conversation_id = ?1 AND role = ?2 AND item_id = ?3 AND id <> ?4",
-                        params![conversation_id, identity_role, item_id, message_id],
+                         WHERE conversation_id = ?1 AND role = ?2 AND item_id = ?3 AND id <> ?4
+                           AND (?5 IS NULL OR turn_id IS NULL OR turn_id = ?5)",
+                        params![
+                            conversation_id,
+                            identity_role,
+                            item_id,
+                            message_id,
+                            identity_turn_id,
+                        ],
                     )
                     .map_err(|error| {
                         format!("Az item message-alias törlése sikertelen: {error}")
@@ -5328,6 +5460,270 @@ mod tests {
                 reason: Some("test".to_string()),
             }],
         }
+    }
+
+    /// Two Claude answers in one conversation must both survive a save.
+    ///
+    /// The bridge labels every answer block by its index inside the model
+    /// response, which is almost always 0, so every answer arrived as
+    /// `assistant-0`. The alias cleanup in the save path deletes rows sharing
+    /// an item id, and with a constant id that meant each new answer wiped
+    /// every earlier answer in the same conversation — the questions stayed,
+    /// the answers vanished.
+    #[test]
+    fn a_new_answer_does_not_delete_earlier_answers_in_the_conversation() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        let mut snapshot = test_snapshot();
+        {
+            let conversation = snapshot
+                .conversations
+                .values_mut()
+                .next()
+                .expect("conversation");
+            conversation.messages.clear();
+            for (index, (question, answer)) in [
+                ("Elso kerdes", "Elso valasz"),
+                ("Masodik kerdes", "Masodik valasz"),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let turn = format!("request:turn-{index}");
+                let base = 100 + (index as i64) * 2;
+                conversation.messages.push(LocalMessage {
+                    id: Some(format!("user-{index}")),
+                    role: "user".to_string(),
+                    text: (*question).to_string(),
+                    time: base.to_string(),
+                    code: None,
+                    live: Some(false),
+                    final_message: Some(false),
+                    item_id: None,
+                    turn_id: Some(turn.clone()),
+                    sequence: Some(base),
+                    hlc: None,
+                    origin_device_id: None,
+                    images: Vec::new(),
+                    quote_refs: Vec::new(),
+                });
+                conversation.messages.push(LocalMessage {
+                    id: Some(format!("answer-{index}")),
+                    role: "assistant".to_string(),
+                    text: (*answer).to_string(),
+                    time: (base + 1).to_string(),
+                    code: None,
+                    live: Some(false),
+                    final_message: Some(true),
+                    // The constant the bridge used to send for every answer.
+                    item_id: Some("assistant-0".to_string()),
+                    turn_id: Some(turn),
+                    sequence: Some(base + 1),
+                    hlc: None,
+                    origin_device_id: None,
+                    images: Vec::new(),
+                    quote_refs: Vec::new(),
+                });
+            }
+        }
+
+        save_snapshot_in_connection(&mut connection, snapshot).expect("save conversation");
+
+        let answers: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE role = 'assistant'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count answers");
+        let questions: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE role = 'user'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count questions");
+
+        assert_eq!(questions, 2, "both questions must survive");
+        assert_eq!(
+            answers, 2,
+            "both answers must survive; a shared item id must not delete a previous turn's answer"
+        );
+    }
+
+    #[test]
+    fn a_glued_answer_is_healed_by_the_correct_one_from_the_journal() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        let message_id = Uuid::new_v4().to_string();
+        let build = |text: &str| {
+            let mut snapshot = test_snapshot();
+            let conversation = snapshot
+                .conversations
+                .values_mut()
+                .next()
+                .expect("conversation");
+            conversation.messages.clear();
+            conversation.messages.push(LocalMessage {
+                id: Some(Uuid::new_v4().to_string()),
+                role: "user".to_string(),
+                text: "Rajzolj egy SVG-t".to_string(),
+                time: "100".to_string(),
+                code: None,
+                live: Some(false),
+                final_message: Some(false),
+                item_id: None,
+                turn_id: Some("request:svg-turn".to_string()),
+                sequence: Some(100),
+                hlc: None,
+                origin_device_id: None,
+                images: Vec::new(),
+                quote_refs: Vec::new(),
+            });
+            conversation.messages.push(LocalMessage {
+                id: Some(message_id.clone()),
+                role: "assistant".to_string(),
+                text: text.to_string(),
+                time: "101".to_string(),
+                code: None,
+                live: Some(false),
+                final_message: Some(true),
+                item_id: Some("assistant-0".to_string()),
+                turn_id: Some("request:svg-turn".to_string()),
+                sequence: Some(101),
+                hlc: None,
+                origin_device_id: None,
+                images: Vec::new(),
+                quote_refs: Vec::new(),
+            });
+            snapshot
+        };
+
+        // The device stored the glued body while the old merge was still live.
+        save_snapshot_in_connection(
+            &mut connection,
+            build("Elkeszult a superhet.svg.Yes. Two files: AGENTS.md es AGENTS.md"),
+        )
+        .expect("save glued answer");
+        // The journal still holds the correct, shorter text.
+        save_snapshot_in_connection(&mut connection, build("Elkeszult a superhet.svg."))
+            .expect("apply journal answer");
+
+        let body: String = connection
+            .query_row(
+                "SELECT body FROM messages WHERE id = ?1",
+                params![message_id],
+                |row| row.get(0),
+            )
+            .expect("read answer");
+        assert_eq!(
+            body, "Elkeszult a superhet.svg.",
+            "a settled answer must be healed by the journal instead of keeping the longer glued text"
+        );
+    }
+
+    #[test]
+    fn an_answer_stored_before_its_own_question_is_repaired_and_stays_deleted() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        let conversation_id = Uuid::new_v4().to_string();
+        let mut snapshot = test_snapshot();
+        {
+            let conversation = snapshot
+                .conversations
+                .values_mut()
+                .next()
+                .expect("conversation");
+            conversation.id = Some(conversation_id.clone());
+            conversation.messages.clear();
+            conversation.messages.push(LocalMessage {
+                id: Some(Uuid::new_v4().to_string()),
+                role: "user".to_string(),
+                text: "Elso kerdes".to_string(),
+                time: "100".to_string(),
+                code: None,
+                live: Some(false),
+                final_message: Some(false),
+                item_id: None,
+                turn_id: Some("request:turn-0".to_string()),
+                sequence: Some(100),
+                hlc: None,
+                origin_device_id: None,
+                images: Vec::new(),
+                quote_refs: Vec::new(),
+            });
+            conversation.messages.push(LocalMessage {
+                id: Some(Uuid::new_v4().to_string()),
+                role: "assistant".to_string(),
+                text: "Elso valasz".to_string(),
+                time: "101".to_string(),
+                code: None,
+                live: Some(false),
+                final_message: Some(true),
+                item_id: Some("assistant-0".to_string()),
+                turn_id: Some("request:turn-0".to_string()),
+                sequence: Some(101),
+                hlc: None,
+                origin_device_id: None,
+                images: Vec::new(),
+                quote_refs: Vec::new(),
+            });
+        }
+        save_snapshot_in_connection(&mut connection, snapshot).expect("save conversation");
+
+        // The fossil the old merge produced: another turn's answer text written
+        // under this turn, ahead of the question it supposedly answers.
+        let fossil_id = Uuid::new_v4().to_string();
+        connection
+            .execute(
+                "INSERT INTO messages
+                     (id, conversation_id, role, body, sequence, hlc, item_id, turn_id,
+                      code, live, \"final\", origin_device_id, attachments_json,
+                      quote_refs_json, created_at)
+                 VALUES (?1, ?2, 'assistant', 'Egy masik turn valasza', 1, NULL,
+                         'assistant-0', 'request:turn-0', 0, 0, 1, NULL, '[]', '[]', '1')",
+                params![fossil_id, conversation_id],
+            )
+            .expect("insert fossil");
+
+        let repaired =
+            repair_answers_before_their_question(&mut connection).expect("repair fossils");
+        assert_eq!(repaired, 1, "the misplaced answer must be repaired");
+
+        let remaining: Vec<String> = {
+            let mut statement = connection
+                .prepare("SELECT body FROM messages WHERE role = 'assistant' ORDER BY sequence")
+                .expect("prepare");
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect")
+        };
+        assert_eq!(
+            remaining,
+            vec!["Elso valasz".to_string()],
+            "the real answer must survive and only the fossil may go"
+        );
+
+        let tombstoned: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_tombstones
+                 WHERE entity_type = 'message' AND entity_id = ?1",
+                params![fossil_id],
+                |row| row.get(0),
+            )
+            .expect("count tombstones");
+        assert_eq!(
+            tombstoned, 1,
+            "without a tombstone the next journal import resurrects the fossil"
+        );
     }
 
     #[test]

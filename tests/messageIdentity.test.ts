@@ -3,9 +3,11 @@ import test from "node:test";
 
 import {
   beginAssistantRegeneration,
+  bothAssistantVersionsAreSettled,
   collapseRepeatedAssistantText,
   collapseAbandonedRegenerationRetries,
   coalesceMessageIdentities,
+  messageIdentityKeys,
   isNewerSettledAssistantVersion,
   isSettledHistoricalAssistant,
   messagesShareIdentity,
@@ -25,9 +27,11 @@ const mergeVersions = (existing: TestMessage, incoming: TestMessage) => {
     id: preferIncoming ? incoming.id ?? existing.id : existing.id ?? incoming.id,
     text: preferIncoming
       ? incoming.text
-      : incoming.text.trim().length > existing.text.trim().length
-        ? incoming.text
-        : existing.text,
+      : bothAssistantVersionsAreSettled(existing, incoming)
+        ? existing.text
+        : incoming.text.trim().length > existing.text.trim().length
+          ? incoming.text
+          : existing.text,
     live: final ? false : Boolean(existing.live || incoming.live),
     final,
     itemId: preferIncoming
@@ -332,5 +336,106 @@ test("trace suppression applies only to the exact logical answer", () => {
   assert.equal(
     messagesShareIdentity(selected, { ...selected, id: "cache-copy" }),
     true,
+  );
+});
+
+test("answers from different turns stay separate even with a shared item id", () => {
+  // The bridge labels the first content block of every answer `assistant-0`,
+  // so a conversation-wide item identity merged all answers into one and the
+  // earlier replies disappeared while the questions stayed.
+  const first = messageIdentityKeys({
+    role: "assistant",
+    id: "answer-1",
+    turnId: "request:turn-1",
+    itemId: "assistant-0",
+  });
+  const second = messageIdentityKeys({
+    role: "assistant",
+    id: "answer-2",
+    turnId: "request:turn-2",
+    itemId: "assistant-0",
+  });
+
+  assert.equal(
+    first.some((key) => second.includes(key)),
+    false,
+    "two answers from different turns must not share an identity key",
+  );
+
+  // Within one turn the item id still collapses the streaming placeholder onto
+  // the final answer, which is what the cleanup was for.
+  const streaming = messageIdentityKeys({
+    role: "assistant",
+    id: "live-row",
+    turnId: "request:turn-1",
+    itemId: "assistant-0",
+  });
+  assert.equal(
+    streaming.some((key) => first.includes(key)),
+    true,
+    "the same turn must still coalesce onto one answer",
+  );
+});
+
+test("a glued cached answer must not beat the authoritative one", () => {
+  const authoritative: TestMessage = {
+    id: "answer-1",
+    role: "assistant",
+    text: "Elkeszult a superhet.svg.",
+    turnId: "request:svg-turn",
+    itemId: "assistant-0",
+    sequence: 101,
+    live: false,
+    final: true,
+  };
+  // What the old merge left behind in a device's cache: this answer with a
+  // second, unrelated answer appended. It is longer, so the length heuristic
+  // used to hand it the win on every single reload.
+  const glued: TestMessage = {
+    ...authoritative,
+    text: "Elkeszult a superhet.svg.Yes. Two files: AGENTS.md es AGENTS.md",
+  };
+
+  assert.equal(bothAssistantVersionsAreSettled(authoritative, glued), true);
+  assert.equal(
+    isNewerSettledAssistantVersion(authoritative, glued),
+    false,
+    "the glued copy has no newer sequence, so it must not be preferred",
+  );
+
+  // The synced copy is the primary source, the cached one comes second.
+  const result = coalesceMessageIdentities<TestMessage>(
+    [authoritative, glued],
+    mergeVersions,
+  );
+  assert.equal(result.length, 1);
+  assert.equal(
+    result[0].text,
+    "Elkeszult a superhet.svg.",
+    "the authoritative answer must survive a longer, glued cache entry",
+  );
+});
+
+test("an unfinished answer may still grow to the longer version", () => {
+  const streaming: TestMessage = {
+    id: "answer-2",
+    role: "assistant",
+    text: "Elkesz",
+    turnId: "request:svg-turn",
+    sequence: 101,
+    live: true,
+    final: false,
+  };
+  const complete: TestMessage = {
+    ...streaming,
+    text: "Elkeszult a superhet.svg.",
+    live: false,
+    final: true,
+  };
+
+  assert.equal(
+    bothAssistantVersionsAreSettled(streaming, complete),
+    false,
+    "a live row is not settled, so the length heuristic must still apply",
   );
 });

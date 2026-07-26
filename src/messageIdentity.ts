@@ -111,6 +111,25 @@ export const isNewerSettledAssistantVersion = (
   return incoming.sequence > existing.sequence;
 };
 
+/**
+ * Two settled versions of the same answer. The "longer text wins" heuristic
+ * must not decide here: a corrupted copy that glued two answers together is
+ * always longer, so it outlived every reload and the correct, shorter text
+ * could never win back. Only the authoritative side may decide, and the
+ * heuristic stays for genuinely incomplete rows (a live or truncated stream).
+ */
+export const bothAssistantVersionsAreSettled = (
+  existing: MessageIdentityLike,
+  incoming: MessageIdentityLike,
+) =>
+  existing.role === "assistant" &&
+  incoming.role === "assistant" &&
+  Boolean(existing.final) &&
+  !existing.live &&
+  Boolean(existing.text.trim()) &&
+  Boolean(incoming.final) &&
+  !incoming.live;
+
 const nonEmpty = (value: string | undefined) => value?.trim() || undefined;
 
 /** Ordered aliases for one logical chat row.
@@ -127,7 +146,16 @@ export const messageIdentityKeys = (message: MessageIdentityLike) => {
   const id = nonEmpty(message.id);
 
   if (turnId) keys.push(`turn:${turnId}:${message.role}`);
-  if (itemId) keys.push(`item:${itemId}:${message.role}`);
+  // An item id only identifies a message inside its own turn. Providers label
+  // content blocks positionally, so every first answer block is `assistant-0`;
+  // treating that as a global identity merged every answer in a conversation
+  // into one and the earlier ones were lost.
+  if (itemId)
+    keys.push(
+      turnId
+        ? `turn:${turnId}:item:${itemId}:${message.role}`
+        : `item:${itemId}:${message.role}`,
+    );
   if (id) keys.push(`id:${id}`);
   if (
     message.role === "assistant" &&

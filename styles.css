@@ -627,8 +627,11 @@ textarea::placeholder { color: var(--faint); }
 .settings-retention .retention-audit-item em { grid-column: 2; max-width: none; text-align: left; white-space: normal; line-height: 1.25; }
 .settings-retention-blockers { display: grid; gap: 3px; margin: 0 0 0 15px; padding: 0; color: #d8b47b; font-size: 8px; line-height: 1.35; }
 
-.composer-wrap { display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: end; gap: 8px; width: min(760px, calc(100% - 44px)); margin-right: auto; margin-bottom: 16px; margin-left: auto; }
-.composer-wrap > .composer-controls { align-self: start; margin-top: 2px; }
+/* The composer is one centred column and nothing else lives in its flow: the
+   detailed controls float beside it, so switching them on cannot move, narrow
+   or lift the input box. */
+.composer-wrap { display: block; width: min(760px, calc(100% - 44px)); margin-right: auto; margin-bottom: 16px; margin-left: auto; }
+.composer-wrap > .composer-controls { position: absolute; top: 0; right: calc(100% + 10px); z-index: 2; }
 /* One grid child, so the two-column composer layout stays two columns however
    many controls the detailed mode adds. */
 .composer-controls { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; }
@@ -653,7 +656,10 @@ textarea::placeholder { color: var(--faint); }
 .code-drawer { top: 0; }
 
 @media (max-width: 1080px) { .composer-wrap { width: calc(100% - 36px); margin-right: auto; margin-left: auto; } .user-message .message-content { max-width: 60%; } }
-@media (max-width: 700px) { .composer-wrap { width: calc(100% - 28px); margin-right: 14px; margin-left: 14px; gap: 5px; } .composer-wrap > .composer-controls { margin-top: 2px; } .user-message .message-content { max-width: 100%; } }
+/* Too narrow for a side column: the controls return to the flow above the
+   composer, which still never changes its width. */
+@media (max-width: 1320px) { .composer-wrap > .composer-controls { position: static; margin-bottom: 4px; } }
+@media (max-width: 700px) { .composer-wrap { width: calc(100% - 28px); margin-right: 14px; margin-left: 14px; } .user-message .message-content { max-width: 100%; } }
 
 /* A selected work item is a real popover, never a layer over the controls. */
 .compact-work-flow.is-expanded { overflow: visible; }

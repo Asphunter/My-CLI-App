@@ -13723,7 +13723,7 @@ function App() {
           <form ref={composerFormRef} className="composer-wrap" onSubmit={submitMessage}>
             <div className="composer-controls">
               <div className="composer-controls-top">
-                {pipelineRecipes.length > 0 && (
+                {showDetailedTrace && pipelineRecipes.length > 0 && (
                   <div
                     className="composer-pipeline-switch mode-switch"
                     role="tablist"

@@ -1,6 +1,35 @@
 # Multi-agent (Codex + Claude) pipeline — megvalósítási terv
 
-Állapot: **terv, kód még nincs.** Dátum: 2026-07-26.
+Állapot: **terv, kód még nincs.** Dátum: 2026-07-26. **V2 — a megbeszélt döntésekkel frissítve.**
+
+## V2 döntések (felülírják a lenti részleteket, ahol ütköznek)
+
+1. **Per-szakasz modell és effort is választható**, nem csak agent. Pl. Terv =
+   Claude **Fable**, Kód = Claude **Opus 5**, Review = **Codex**. Kulcs-belátás:
+   azonos runtime-on belüli modellváltás **nem veszít kontextust** — a Claude
+   session turnönként más modellel folytatható, a session emlékszik. A "lossy
+   átadás" kockázat csak runtime-váltásnál él (ott az artefaktum-blokk visz).
+   Ebből következik az ajánlott fő preset: **Terv(Claude/Fable) →
+   Kód(Claude/Opus 5, ugyanaz a session) → Review(Codex, független)** — a
+   szerző-oldal folytonos, a bíráló-oldal idegen szem.
+2. **GUI: a Részletes pipa bővül.** Pipa nélkül = mai kompakt egy-agent mód.
+   Pipa bepipálva megjelenik egy kétállású csúszka:
+   `Részletes ◄──► Multi-AI`. Bal = mai részletes egy-agent; jobb = pipeline a
+   beállításokban konfigurált recepttel. A választás üzenetenként tárolódik és
+   syncel (a meglévő `detailed` + új `pipeline` mezőkön). A recept részletei
+   (szakaszok, agent/modell/effort) a Beállításokban élnek, a composer tiszta
+   marad.
+3. **A review tömör:** alapból egyetlen sor (verdikt-jelvény + egymondatos
+   indok), kattintásra nyílik ki. Háromszoros szövegmennyiséget senki nem olvas
+   végig naponta.
+4. **Reviewer és tesztfuttatás:** Claude-reviewer kaphat Bash-t Edit/Write
+   nélkül (a tool-lista granuláris → kikényszeríthető "futtass, de ne írj").
+   A Codex-sandbox durvább (read-only VAGY workspace-write), ezért a
+   Codex-reviewer read-only marad, és a teszteredményt a Kód-szakasz
+   artefaktuma hozza (a kódoló amúgy is lefuttatja a teszteket).
+5. **F2-be bekerül a párhuzamos OLVASÁS** (több lencsés review, több szakaszos
+   audit) — írás nélkül kockázatmentes, és ez az erős modellek valódi terepe.
+   Párhuzamos ÍRÁS továbbra sem terv része (worktree-alapú külön projekt lenne).
 
 ---
 

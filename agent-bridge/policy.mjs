@@ -42,6 +42,35 @@ export const ENABLED_TOOLS = [
   "AskUserQuestion",
 ];
 
+/** Tools that can change the workspace. */
+const WRITE_TOOLS = new Set(["Edit", "Write"]);
+
+/**
+ * Role profiles for a pipeline stage.
+ *
+ * A planning or reviewing stage must not edit files, and a prompt asking it not
+ * to is a hope, not a guarantee. Withholding the tools is the guarantee -- the
+ * SDK cannot call what it was never given, and a subagent inherits the same
+ * gate, so delegation cannot widen it either.
+ *
+ * `reviewer` keeps Bash so the review can run the tests instead of speculating
+ * about them, which is the difference between evidence and an opinion. It is
+ * also why the reviewer profile is not simply "read-only".
+ */
+export const STAGE_TOOL_PROFILES = {
+  full: ENABLED_TOOLS,
+  read_only: ENABLED_TOOLS.filter(
+    (tool) => !WRITE_TOOLS.has(tool) && tool !== "Bash",
+  ),
+  reviewer: ENABLED_TOOLS.filter((tool) => !WRITE_TOOLS.has(tool)),
+};
+
+/** Falls back to the full set for an unknown profile rather than failing a turn. */
+export function toolsForProfile(profile) {
+  if (typeof profile !== "string") return ENABLED_TOOLS;
+  return STAGE_TOOL_PROFILES[profile] ?? ENABLED_TOOLS;
+}
+
 /**
  * Converts a TodoWrite payload into the plan shape the GUI already renders.
  * Claude's statuses (`pending` / `in_progress` / `completed`) are passed through

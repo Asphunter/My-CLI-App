@@ -9,7 +9,12 @@ import {
 } from "./auth.mjs";
 import { hasAnswer, normalizeQuestionAnswers } from "./questions.mjs";
 import { normalizeGuardPath, stripExtendedLengthPrefix } from "./paths.mjs";
-import { classifyTool, ENABLED_TOOLS, planFromTodos } from "./policy.mjs";
+import {
+  classifyTool,
+  ENABLED_TOOLS,
+  planFromTodos,
+  toolsForProfile,
+} from "./policy.mjs";
 import { collectProjectInstructions } from "./instructions.mjs";
 import fs from "node:fs";
 import os from "node:os";
@@ -319,4 +324,31 @@ test("a missing remote Claude session retries once without resume", () => {
   );
   assert.equal(shouldStartFreshSession(null, "No conversation found with session ID"), false);
   assert.equal(shouldStartFreshSession("old-session", "Invalid API key"), false);
+});
+
+test("a planning stage cannot be handed a tool that edits files", () => {
+  const tools = toolsForProfile("read_only");
+  assert.ok(!tools.includes("Edit"));
+  assert.ok(!tools.includes("Write"));
+  assert.ok(
+    !tools.includes("Bash"),
+    "a planning stage reads and thinks; running commands is not part of it",
+  );
+  assert.ok(tools.includes("Read") && tools.includes("Grep"));
+});
+
+test("a reviewer may run the tests but still cannot edit files", () => {
+  const tools = toolsForProfile("reviewer");
+  assert.ok(
+    tools.includes("Bash"),
+    "without Bash a review can only speculate about the tests",
+  );
+  assert.ok(!tools.includes("Edit"));
+  assert.ok(!tools.includes("Write"));
+});
+
+test("an unknown or missing profile keeps the full set instead of failing a turn", () => {
+  assert.deepEqual(toolsForProfile(undefined), ENABLED_TOOLS);
+  assert.deepEqual(toolsForProfile("nonsense"), ENABLED_TOOLS);
+  assert.deepEqual(toolsForProfile("full"), ENABLED_TOOLS);
 });

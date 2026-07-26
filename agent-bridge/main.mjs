@@ -7,7 +7,7 @@ import { classifyConnectionError } from "./errors.mjs";
 import { budgetOption, hasCredentials, MISSING_CREDENTIALS_MESSAGE } from "./auth.mjs";
 import { hasAnswer, normalizeQuestionAnswers } from "./questions.mjs";
 import { normalizeGuardPath } from "./paths.mjs";
-import { classifyTool, ENABLED_TOOLS, planFromTodos } from "./policy.mjs";
+import { classifyTool, ENABLED_TOOLS, planFromTodos, toolsForProfile } from "./policy.mjs";
 import { collectProjectInstructions } from "./instructions.mjs";
 import {
   makeEnvelope,
@@ -564,10 +564,15 @@ async function runLiveTurn(request) {
       files: projectInstructions.files,
     });
   }
+  // A pipeline stage narrows what the turn may do. Withholding the tools is
+  // what makes a "do not edit files" role an actual constraint.
+  const stageTools = toolsForProfile(payload.toolProfile);
   diagnostic("live turn starting", {
     requestId: request.requestId,
     resumeSessionId: initialResume,
     projectKey: turn.projectKey,
+    toolProfile: payload.toolProfile ?? "full",
+    toolCount: stageTools.length,
     cwd,
   });
   emitAgentEvent(request, turn.sessionId, "turn/started", { turnId: turn.sessionId ?? request.requestId, item: { type: "turn", status: "started" } });
@@ -591,7 +596,7 @@ async function runLiveTurn(request) {
               preset: "claude_code",
               ...(projectInstructions.text ? { append: projectInstructions.text } : {}),
             },
-            tools: ENABLED_TOOLS,
+            tools: stageTools,
             allowedTools: [],
             permissionMode: "default",
             persistSession: true,

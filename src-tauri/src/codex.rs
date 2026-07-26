@@ -26,6 +26,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const CODEX_APPROVAL_POLICY: &str = "never";
 const CODEX_SANDBOX_POLICY: &str = "workspace-write";
+const CODEX_READ_ONLY_SANDBOX_POLICY: &str = "read-only";
 const CODEX_REASONING_SUMMARY: &str = "detailed";
 // The Min window owns completion audio. Inheriting the user's global Codex
 // `notify` hook would play a second, slightly delayed copy of the same sound.
@@ -50,6 +51,10 @@ pub struct CodexRequest {
     pub effort: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// When false the app-server runs with a read-only sandbox, which is how a
+    /// planning or reviewing stage is prevented from touching the workspace.
+    #[serde(default)]
+    pub allow_workspace_writes: Option<bool>,
     #[serde(default)]
     pub request_id: Option<String>,
 }
@@ -2821,10 +2826,17 @@ pub fn send(
             },
         )?;
 
+        // A stage that must not edit files gets the read-only sandbox: the
+        // app-server refuses the write rather than trusting the prompt.
+        let sandbox_policy = if request.allow_workspace_writes.unwrap_or(true) {
+            CODEX_SANDBOX_POLICY
+        } else {
+            CODEX_READ_ONLY_SANDBOX_POLICY
+        };
         let start_params = json!({
             "cwd": execution_cwd_string,
             "approvalPolicy": CODEX_APPROVAL_POLICY,
-            "sandbox": CODEX_SANDBOX_POLICY,
+            "sandbox": sandbox_policy,
             "serviceName": "min",
             "developerInstructions": UI_DEVELOPER_INSTRUCTIONS
         });
@@ -2835,7 +2847,7 @@ pub fn send(
                 "threadId": thread_id,
                 "cwd": execution_cwd_string,
                 "approvalPolicy": CODEX_APPROVAL_POLICY,
-                "sandbox": CODEX_SANDBOX_POLICY,
+                "sandbox": sandbox_policy,
                 "developerInstructions": UI_DEVELOPER_INSTRUCTIONS
             });
             send_json(

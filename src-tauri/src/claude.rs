@@ -829,6 +829,9 @@ pub fn send(
                         "cwd": cwd.to_string_lossy(),
                         "projectKey": session_project_key(&cwd),
                         "images": request.images,
+                        "toolProfile": request
+                            .tool_profile
+                            .map(crate::agent::StageToolProfile::as_wire),
                     }),
                 ),
             )?;

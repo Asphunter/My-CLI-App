@@ -80,6 +80,41 @@ pub struct AgentTurnRequest {
     pub request_id: Option<String>,
     pub max_budget_usd: Option<f64>,
     pub max_turns: Option<u32>,
+    /// Which tools this turn may use. A planning or reviewing stage must be
+    /// unable to edit files, and asking it not to in the prompt is a hope, not
+    /// a guarantee -- the guarantee is not handing it the tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_profile: Option<StageToolProfile>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageToolProfile {
+    /// Everything, which is what an ordinary turn and a coding stage get.
+    Full,
+    /// No writes and no commands: a planning stage reads and thinks.
+    ReadOnly,
+    /// No writes, but commands are allowed so a review can run the tests
+    /// instead of speculating about them.
+    Reviewer,
+}
+
+impl StageToolProfile {
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::ReadOnly => "read_only",
+            Self::Reviewer => "reviewer",
+        }
+    }
+
+    /// Codex exposes a whole-sandbox switch rather than a tool list, so both
+    /// non-writing profiles collapse onto its read-only sandbox. A Codex
+    /// reviewer therefore cannot run the tests itself; the coding stage's own
+    /// test output travels in the artifact instead.
+    pub fn allows_workspace_writes(self) -> bool {
+        matches!(self, Self::Full)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -167,6 +202,11 @@ impl AgentTurnRequest {
             effort: self.effort.clone(),
             cwd: self.cwd.clone(),
             request_id: self.request_id.clone(),
+            allow_workspace_writes: Some(
+                self.tool_profile
+                    .map(StageToolProfile::allows_workspace_writes)
+                    .unwrap_or(true),
+            ),
         })
     }
 }
@@ -407,5 +447,58 @@ mod tests {
             provider_turn_id_from_payload(&serde_json::json!({"turnId": "t-1"})),
             Some("t-1".to_string())
         );
+    }
+
+    fn codex_request_with(profile: Option<StageToolProfile>) -> crate::codex::CodexRequest {
+        AgentTurnRequest {
+            prompt: "feladat".to_string(),
+            images: Vec::new(),
+            provider: AgentProvider::Codex,
+            runtime: AgentRuntimeKind::CodexAppServer,
+            conversation_id: Some("conversation".to_string()),
+            session_id: None,
+            conversation_context: None,
+            model: None,
+            effort: None,
+            cwd: None,
+            request_id: Some("request".to_string()),
+            max_budget_usd: None,
+            max_turns: None,
+            tool_profile: profile,
+        }
+        .to_codex_request()
+        .expect("codex request")
+    }
+
+    #[test]
+    fn a_non_writing_stage_reaches_codex_as_a_read_only_sandbox() {
+        // Codex has no per-tool switch, so both non-writing roles collapse onto
+        // its read-only sandbox -- the app-server refuses the write instead of
+        // the prompt asking it not to.
+        assert_eq!(
+            codex_request_with(Some(StageToolProfile::ReadOnly)).allow_workspace_writes,
+            Some(false)
+        );
+        assert_eq!(
+            codex_request_with(Some(StageToolProfile::Reviewer)).allow_workspace_writes,
+            Some(false)
+        );
+        assert_eq!(
+            codex_request_with(Some(StageToolProfile::Full)).allow_workspace_writes,
+            Some(true)
+        );
+        // An ordinary turn carries no profile and must keep writing.
+        assert_eq!(
+            codex_request_with(None).allow_workspace_writes,
+            Some(true),
+            "a turn without a stage role is a normal turn and must stay writable"
+        );
+    }
+
+    #[test]
+    fn the_profile_wire_names_match_what_the_bridge_understands() {
+        assert_eq!(StageToolProfile::Full.as_wire(), "full");
+        assert_eq!(StageToolProfile::ReadOnly.as_wire(), "read_only");
+        assert_eq!(StageToolProfile::Reviewer.as_wire(), "reviewer");
     }
 }

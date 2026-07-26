@@ -544,15 +544,17 @@ pub struct PipelineOutcome {
 /// emitting progress -- happens inside `execute`, so what remains here is the
 /// part worth testing on its own: which prompt each stage is handed, which
 /// session it continues, what a failure does to the rest of the chain.
-pub async fn run_stages<F, Fut>(
+pub async fn run_stages<F, Fut, S>(
     recipe: &Recipe,
     original_prompt: &str,
     initial_session: Option<String>,
+    should_stop: S,
     mut execute: F,
 ) -> PipelineOutcome
 where
     F: FnMut(StageExecution) -> Fut,
     Fut: std::future::Future<Output = Result<StageOutcome, String>>,
+    S: Fn() -> bool,
 {
     let mut artifacts = Vec::<StageArtifact>::new();
     let mut stages = Vec::<StageRunResult>::new();
@@ -570,6 +572,13 @@ where
     let mut error = None;
 
     for (index, stage) in recipe.stages.iter().enumerate() {
+        // Checked between stages rather than inside one: a stage cannot be torn
+        // out of the provider mid-turn today, so the honest promise is that no
+        // further stage starts. Whatever already ran keeps its answer.
+        if should_stop() {
+            status = RunStatus::Cancelled;
+            break;
+        }
         let runtime_key = format!("{:?}", stage.runtime);
         let execution = StageExecution {
             index,
@@ -752,6 +761,9 @@ mod tests {
     struct Recorder {
         seen: std::cell::RefCell<Vec<StageExecution>>,
         outcomes: std::cell::RefCell<Vec<Result<StageOutcome, String>>>,
+        /// Stop the chain once this many stages have run, standing in for the
+        /// user pressing the stop button mid-run.
+        stop_after: std::cell::Cell<Option<usize>>,
     }
 
     impl Recorder {
@@ -759,19 +771,31 @@ mod tests {
             Self {
                 seen: std::cell::RefCell::new(Vec::new()),
                 outcomes: std::cell::RefCell::new(outcomes),
+                stop_after: std::cell::Cell::new(None),
             }
         }
 
         fn run(&self, recipe: &Recipe, prompt: &str, session: Option<String>) -> PipelineOutcome {
-            tauri::async_runtime::block_on(run_stages(recipe, prompt, session, |execution| {
-                self.seen.borrow_mut().push(execution);
-                let next = if self.outcomes.borrow().is_empty() {
-                    Ok(StageOutcome::default())
-                } else {
-                    self.outcomes.borrow_mut().remove(0)
-                };
-                async move { next }
-            }))
+            let stop = std::cell::Cell::new(false);
+            tauri::async_runtime::block_on(run_stages(
+                recipe,
+                prompt,
+                session,
+                || {
+                    self.stop_after
+                        .get()
+                        .is_some_and(|at| self.seen.borrow().len() >= at)
+                },
+                |execution| {
+                    self.seen.borrow_mut().push(execution);
+                    let next = if self.outcomes.borrow().is_empty() {
+                        Ok(StageOutcome::default())
+                    } else {
+                        self.outcomes.borrow_mut().remove(0)
+                    };
+                    async move { next }
+                },
+            ))
         }
     }
 
@@ -900,6 +924,25 @@ mod tests {
         assert!(
             outcome.stages[0].review.is_none() && outcome.stages[1].review.is_none(),
             "only a review stage carries a verdict"
+        );
+    }
+
+    #[test]
+    fn l7_stopping_a_chain_starts_no_further_stage() {
+        let recipe = recipe_by_id("plan_code_review").expect("preset");
+        let recorder = Recorder::with(vec![ok("terv", None), ok("kod", None)]);
+        // A provider turn cannot be torn out mid-flight today, so the promise
+        // is that nothing further starts once the user has said stop.
+        recorder.stop_after.set(Some(2));
+        let outcome = recorder.run(&recipe, "Feladat.", None);
+
+        assert_eq!(recorder.seen.borrow().len(), 2, "the review must not start");
+        assert_eq!(outcome.status, RunStatus::Cancelled);
+        assert_eq!(outcome.stages.len(), 2, "what already ran keeps its answer");
+        assert!(outcome.stages.iter().all(|stage| stage.succeeded));
+        assert!(
+            outcome.error.is_none(),
+            "stopping on purpose is not an error"
         );
     }
 

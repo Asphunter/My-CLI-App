@@ -105,6 +105,30 @@ async fn run_agent_turn(
     }
 }
 
+/// Runs the user asked to stop. A chain is cancelled between stages, so this is
+/// a small set that empties itself when the run finishes.
+fn cancelled_pipeline_runs() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static RUNS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    RUNS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn pipeline_run_is_cancelled(run_id: &str) -> bool {
+    cancelled_pipeline_runs()
+        .lock()
+        .map(|runs| runs.contains(run_id))
+        .unwrap_or(false)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn pipeline_cancel(run_id: String) -> Result<(), String> {
+    cancelled_pipeline_runs()
+        .lock()
+        .map_err(|_| "A lánc megszakítási állapota zárolva maradt.".to_string())?
+        .insert(run_id);
+    Ok(())
+}
+
 #[tauri::command]
 fn pipeline_recipes() -> Vec<pipeline::Recipe> {
     pipeline::recipes_for_frontend()
@@ -136,10 +160,12 @@ async fn pipeline_send(
         let app = app.clone();
         let request = &request;
         let run_id = run_id.clone();
+        let cancel_run_id = run_id.clone();
         pipeline::run_stages(
             &recipe,
             &request.prompt,
             request.session_id.clone(),
+            move || pipeline_run_is_cancelled(&cancel_run_id),
             move |execution| {
                 let app = app.clone();
                 let run_id = run_id.clone();
@@ -274,6 +300,9 @@ async fn pipeline_send(
     let status = outcome.status;
     let run_error = outcome.error;
 
+    if let Ok(mut runs) = cancelled_pipeline_runs().lock() {
+        runs.remove(&run_id);
+    }
     store::finish_pipeline_run(&run_id, status.as_wire(), run_error.as_deref())?;
     Ok(pipeline::PipelineRunResult {
         run_id,
@@ -815,6 +844,7 @@ pub fn run() {
             agent_send,
             pipeline_recipes,
             pipeline_send,
+            pipeline_cancel,
             agent_conversation_status,
             agent_answer_checkpoint,
             agent_cancel,

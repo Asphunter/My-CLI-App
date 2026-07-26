@@ -11465,6 +11465,15 @@ function App() {
     }
     setIsCancelling(true);
     try {
+      // A chain has to be told as well: cancelling the running stage would
+      // otherwise just let the next one start.
+      if (pipelineProgress) {
+        try {
+          await invoke("pipeline_cancel", { runId: pipelineProgress.runId });
+        } catch (error) {
+          console.warn("Pipeline cancel failed", error);
+        }
+      }
       await invoke(
         activeProviderRef.current === "anthropic"
           ? "claude_cancel"

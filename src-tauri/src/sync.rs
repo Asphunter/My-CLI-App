@@ -6126,6 +6126,115 @@ mod tests {
     }
 
     #[test]
+    fn i1_the_stage_badge_survives_the_journal_round_trip() {
+        let root = test_root();
+        let device = Uuid::new_v4().to_string();
+        let importer = Uuid::new_v4().to_string();
+        let project_id = stable_id("project", "badge-journal-project");
+        let conversation_id = stable_id("conversation", "badge-journal-conversation");
+
+        let project = make_event(
+            &device,
+            1,
+            format!("{:020}-{:08}", 1, 0),
+            None,
+            project_id.clone(),
+            PROJECT_UPSERT.to_string(),
+            serde_json::to_value(LocalProject {
+                id: project_id.clone(),
+                name: "Shared".to_string(),
+                relative_path: Some("shared".to_string()),
+                path_hint: "C:/shared".to_string(),
+                threads: vec!["Thread".to_string()],
+            })
+            .expect("project payload"),
+        )
+        .expect("project event");
+        let conversation = make_event(
+            &device,
+            2,
+            format!("{:020}-{:08}", 2, 0),
+            Some(project.event_hash.clone()),
+            conversation_id.clone(),
+            CONVERSATION_UPSERT.to_string(),
+            serde_json::to_value(ConversationEventPayload {
+                id: conversation_id.clone(),
+                scope: store::CODING_SCOPE.to_string(),
+                project_id: Some(project_id.clone()),
+                title: "Thread".to_string(),
+                thread_id: None,
+                updated_at: "2".to_string(),
+                plan_history: BTreeMap::new(),
+                commentary: Vec::new(),
+            })
+            .expect("conversation payload"),
+        )
+        .expect("conversation event");
+
+        let mut answer = test_message(
+            &Uuid::new_v4().to_string(),
+            "assistant",
+            "VERDIKT: JAVÍTANDÓ - a teszt nem futott le.",
+            true,
+        );
+        answer.sequence = Some(3);
+        answer.turn_id = Some("request:stage-2".to_string());
+        answer.pipeline = Some(store::LocalMessagePipeline {
+            run_id: "run-7".to_string(),
+            stage_index: 2,
+            stage_count: 3,
+            stage_role: "review".to_string(),
+            stage_agent: "Codex".to_string(),
+            verdict: Some("changes_requested".to_string()),
+            verdict_summary: Some("a teszt nem futott le.".to_string()),
+        });
+        let answer_event = make_event(
+            &device,
+            3,
+            format!("{:020}-{:08}", 3, 0),
+            Some(conversation.event_hash.clone()),
+            answer.id.clone().expect("answer id"),
+            MESSAGE_UPSERT.to_string(),
+            serde_json::to_value(MessageEventPayload {
+                project_id: Some(project_id),
+                conversation_id,
+                message: answer,
+            })
+            .expect("answer payload"),
+        )
+        .expect("answer event");
+
+        for event in [&project, &conversation, &answer_event] {
+            write_event(&root, event).expect("write event");
+        }
+        let scan = scan_journal(&root, &importer).expect("scan journal");
+        let mut store = test_store();
+        apply_events(&mut store, &scan).expect("apply events");
+        let snapshot = reduce_snapshot(&store.connection).expect("reduce snapshot");
+
+        let badge = snapshot
+            .conversations
+            .values()
+            .next()
+            .expect("conversation")
+            .messages
+            .iter()
+            .find(|message| message.role == "assistant")
+            .and_then(|message| message.pipeline.clone())
+            .expect("the badge must cross the journal, or the other device cannot group the run");
+        assert_eq!(badge.stage_index, 2);
+        assert_eq!(badge.stage_count, 3);
+        assert_eq!(badge.stage_role, "review");
+        assert_eq!(badge.verdict.as_deref(), Some("changes_requested"));
+        assert_eq!(
+            badge.verdict_summary.as_deref(),
+            Some("a teszt nem futott le.")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn i2_a_later_copy_without_the_badge_must_not_erase_it() {
         // The badge is written by the device that ran the chain. Another device
         // republishing the same settled answer has no badge to send, and the

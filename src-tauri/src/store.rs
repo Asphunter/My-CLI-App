@@ -5967,6 +5967,143 @@ mod tests {
     }
 
     #[test]
+    fn u8_a_run_interrupted_by_a_restart_is_closed_honestly() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        connection
+            .execute(
+                "INSERT INTO pipeline_runs
+                     (id, conversation_id, recipe_json, status, current_stage, error, created_at, updated_at)
+                 VALUES ('run-live', 'conversation-1', '{}', 'running', 1, NULL, '100', '100'),
+                        ('run-done', 'conversation-1', '{}', 'completed', 2, NULL, '100', '100')",
+                [],
+            )
+            .expect("insert runs");
+
+        // A run is driven by a process that is now gone; leaving it running
+        // would spin a stage forever.
+        fail_interrupted_pipeline_runs(&connection).expect("recover runs");
+
+        let live: (String, Option<String>) = connection
+            .query_row(
+                "SELECT status, error FROM pipeline_runs WHERE id = 'run-live'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read run");
+        assert_eq!(live.0, "failed");
+        assert!(
+            live.1.unwrap_or_default().contains("újraindítás"),
+            "the reason must say what happened, not just that it failed"
+        );
+
+        let done: String = connection
+            .query_row(
+                "SELECT status FROM pipeline_runs WHERE id = 'run-done'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read run");
+        assert_eq!(done, "completed", "a finished run must be left alone");
+    }
+
+    #[test]
+    fn i3_the_stages_of_one_run_stay_three_separate_answers() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        let roles = ["plan", "code", "review"];
+        let mut snapshot = test_snapshot();
+        {
+            let conversation = snapshot
+                .conversations
+                .values_mut()
+                .next()
+                .expect("conversation");
+            conversation.messages.clear();
+            conversation.messages.push(LocalMessage {
+                id: Some(Uuid::new_v4().to_string()),
+                role: "user".to_string(),
+                text: "Javitsd a hibat".to_string(),
+                time: "100".to_string(),
+                code: None,
+                live: Some(false),
+                final_message: Some(false),
+                item_id: None,
+                turn_id: Some("request:run-stage-0".to_string()),
+                sequence: Some(100),
+                hlc: None,
+                origin_device_id: None,
+                images: Vec::new(),
+                quote_refs: Vec::new(),
+                detailed: None,
+                change_summary: Vec::new(),
+                pipeline: None,
+            });
+            for (index, role) in roles.iter().enumerate() {
+                conversation.messages.push(LocalMessage {
+                    id: Some(Uuid::new_v4().to_string()),
+                    role: "assistant".to_string(),
+                    text: format!("A(z) {role} szakasz valasza"),
+                    time: (101 + index).to_string(),
+                    code: None,
+                    live: Some(false),
+                    final_message: Some(true),
+                    // What the bridge labels every first content block.
+                    item_id: Some("assistant-0".to_string()),
+                    turn_id: Some(format!("request:run-stage-{index}")),
+                    sequence: Some(101 + index as i64),
+                    hlc: None,
+                    origin_device_id: None,
+                    images: Vec::new(),
+                    quote_refs: Vec::new(),
+                    detailed: None,
+                    change_summary: Vec::new(),
+                    pipeline: Some(LocalMessagePipeline {
+                        run_id: "run-1".to_string(),
+                        stage_index: index as i64,
+                        stage_count: 3,
+                        stage_role: role.to_string(),
+                        stage_agent: "Claude".to_string(),
+                        verdict: None,
+                        verdict_summary: None,
+                    }),
+                });
+            }
+        }
+        save_snapshot_in_connection(&mut connection, snapshot).expect("save run");
+
+        let loaded = load_snapshot_from_connection(&connection).expect("load snapshot");
+        let answers = loaded
+            .conversations
+            .values()
+            .next()
+            .expect("conversation")
+            .messages
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            answers.len(),
+            3,
+            "three stages are three answers; the shared item id must not fold them into one"
+        );
+        assert_eq!(
+            answers
+                .iter()
+                .filter_map(|message| message.pipeline.as_ref())
+                .map(|pipeline| pipeline.stage_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "each answer keeps its own badge, in order"
+        );
+    }
+
+    #[test]
     fn a_stage_badge_survives_the_store_round_trip() {
         let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
         configure_connection(&connection).expect("configure SQLite");

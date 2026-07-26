@@ -1494,7 +1494,7 @@ textarea::placeholder { color: var(--faint); }
    container is only as wide as the stage columns, so it must stay a single
    unwrapped row of its own width instead. */
 .composer-pipeline-switch.mode-switch { display: flex; flex-wrap: nowrap; margin: 0; padding: 2px; }
-.composer-pipeline-switch.mode-switch button { min-height: 19px; padding: 0 8px; font-size: 9px; letter-spacing: .06em; }
+.composer-pipeline-switch.mode-switch button { min-height: 19px; padding: 0 8px; font-size: 9px; letter-spacing: .06em; white-space: nowrap; }
 /* One fixed column width for every stage, sized for the longest label
    ('5.6 Terra'), so a cell does not resize as its value steps. */
 .composer-stage-grid { display: grid; grid-auto-flow: column; grid-auto-columns: 48px; gap: 11px; margin-top: 2px; }

@@ -220,6 +220,7 @@ async fn pipeline_send(
                     error: None,
                     review,
                     session_id: response.session_id,
+                    answer_message_id: None,
                 }
             }
             Err(error) => {
@@ -235,14 +236,16 @@ async fn pipeline_send(
                     error: Some(error),
                     review: None,
                     session_id: None,
+                    answer_message_id: None,
                 }
             }
         };
+        let mut stage_result = stage_result;
         let failed = !stage_result.succeeded;
         // Label the answer this stage just stored, so the badge survives a
         // restart and reaches the other device on the message itself.
         if stage_result.succeeded {
-            let _ = store::label_pipeline_stage_answer(
+            stage_result.answer_message_id = store::label_pipeline_stage_answer(
                 &request.conversation_id,
                 &request_id,
                 &store::LocalMessagePipeline {
@@ -265,7 +268,9 @@ async fn pipeline_send(
                         .as_ref()
                         .map(|review| review.summary.clone()),
                 },
-            );
+            )
+            .ok()
+            .unwrap_or_default();
         }
         let _ = codex::emit_main_window(
             &app,

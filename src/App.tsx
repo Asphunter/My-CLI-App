@@ -223,6 +223,8 @@ type PipelineStageResult = {
   error?: string;
   review?: { verdict: "accepted" | "changes_requested"; summary: string };
   sessionId?: string;
+  /** Id of the row the runner stored for this stage's answer. */
+  answerMessageId?: string;
 };
 
 type PipelineRunResult = {
@@ -12016,7 +12018,10 @@ function App() {
           });
           if (cancelledRequestIdsRef.current.delete(requestId)) return;
           const stageMessages: Message[] = run.stages.map((stage) => ({
-            id: crypto.randomUUID(),
+            // The runner already stored this answer; reuse its id so the row it
+            // wrote and the row shown here are the same row. Inventing an id
+            // here produced a second copy of every stage answer.
+            id: stage.answerMessageId ?? crypto.randomUUID(),
             role: "assistant",
             text: stage.succeeded
               ? stage.text

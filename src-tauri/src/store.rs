@@ -3509,23 +3509,32 @@ pub(crate) fn label_pipeline_stage_answer(
     conversation_id: &str,
     request_id: &str,
     pipeline: &LocalMessagePipeline,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let store = open_local_store()?;
     let pipeline_json = serde_json::to_string(pipeline)
         .map_err(|error| format!("A pipeline-metaadat nem szerializálható: {error}"))?;
+    let turn_id = format!("request:{request_id}");
     store
         .connection
         .execute(
             "UPDATE messages SET pipeline_json = ?1
              WHERE conversation_id = ?2 AND role = 'assistant' AND turn_id = ?3",
-            params![
-                pipeline_json,
-                conversation_id,
-                format!("request:{request_id}")
-            ],
+            params![pipeline_json, conversation_id, turn_id],
         )
         .map_err(|error| format!("A szakasz-válasz megjelölése sikertelen: {error}"))?;
-    Ok(())
+    // Handed back to the UI so it renders the row that was just stored instead
+    // of inventing a second one under an id of its own for the same answer.
+    store
+        .connection
+        .query_row(
+            "SELECT id FROM messages
+             WHERE conversation_id = ?1 AND role = 'assistant' AND turn_id = ?2
+             ORDER BY sequence DESC LIMIT 1",
+            params![conversation_id, turn_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("A szakasz-válasz azonosítója nem olvasható: {error}"))
 }
 
 /// A run is driven by a live process, so it cannot survive that process going

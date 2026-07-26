@@ -244,11 +244,25 @@ type MessagePipeline = {
   verdictSummary?: string;
 };
 
-/** Readable names for models a preset may name before the catalog knows them. */
+/**
+ * What a chain stage may run, per vendor.
+ *
+ * Deliberately a fixed list rather than the model catalog: deriving it from the
+ * catalog gave every stage a different set - one offered only Sonnet, another
+ * only the model its preset happened to name - and a chain is unusable if the
+ * same click means something different in each column.
+ */
+const PIPELINE_MODELS: Record<"anthropic" | "codex", string[]> = {
+  anthropic: ["claude-opus-5", "claude-fable-5"],
+  codex: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+};
+
 const PIPELINE_MODEL_LABELS: Record<string, string> = {
   "claude-opus-5": "Claude Opus 5",
   "claude-fable-5": "Claude Fable 5",
-  "claude-sonnet-5": "Claude Sonnet 5",
+  "gpt-5.6-sol": "GPT-5.6-Sol",
+  "gpt-5.6-terra": "GPT-5.6-Terra",
+  "gpt-5.6-luna": "GPT-5.6-Luna",
 };
 
 /** The chain is read at a glance, so the vendor prefix is dropped. */
@@ -6540,9 +6554,16 @@ function App() {
     const stage = activePipelineRecipe?.stages[index];
     const override = pipelineStageOverrides[stageOverrideKey(index)];
     // A vendor switch invalidates the model that belonged to the old one.
-    if (field === "model" && override?.provider && override.provider !== stage?.provider)
-      return override.model ?? "";
-    return override?.[field] ?? stage?.[field] ?? "";
+    if (field === "effort") return override?.effort ?? stage?.effort ?? "";
+    const vendor = stageProvider(index) === "anthropic" ? "anthropic" : "codex";
+    const allowed = PIPELINE_MODELS[vendor];
+    const switched = override?.provider && override.provider !== stage?.provider;
+    const candidate = switched
+      ? override?.model
+      : (override?.model ?? stage?.model);
+    // Show what will actually run: a preset naming a model outside the list
+    // would otherwise display something the click cycle can never return to.
+    return candidate && allowed.includes(candidate) ? candidate : allowed[0];
   };
   const stageProvider = (index: number) =>
     pipelineStageOverrides[stageOverrideKey(index)]?.provider ??
@@ -6553,15 +6574,9 @@ function App() {
     const stage = activePipelineRecipe?.stages[index];
     if (!stage) return [] as string[];
     if (field === "effort") return FALLBACK_EFFORTS;
-    const isClaude = stageProvider(index) === "anthropic";
-    // The runtime is fixed by the chain, so only that vendor's models are
-    // offered; a preset may also name one the catalog has not learned yet.
-    const ids = modelCatalog
-      .filter((model) =>
-        isClaude ? model.id.startsWith("claude-") : !model.id.startsWith("claude-"),
-      )
-      .map((model) => model.id);
-    return stage.model && !ids.includes(stage.model) ? [stage.model, ...ids] : ids;
+    return PIPELINE_MODELS[
+      stageProvider(index) === "anthropic" ? "anthropic" : "codex"
+    ];
   };
   /** Stepping instead of a dropdown: the chain stays two lines tall. */
   const cycleStageValue = (

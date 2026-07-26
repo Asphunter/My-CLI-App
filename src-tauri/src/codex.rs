@@ -4418,6 +4418,8 @@ mod sync_tests {
             origin_device_id: None,
             images: Vec::new(),
             quote_refs: Vec::new(),
+            detailed: None,
+            change_summary: Vec::new(),
         }
     }
 

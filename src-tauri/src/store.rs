@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
-pub const STORE_SCHEMA_VERSION: i64 = 20;
+pub const STORE_SCHEMA_VERSION: i64 = 21;
 // The public snapshot and sync contracts represent GENERAL with
 // projectId = null. SQLite keeps this hidden FK target only because the
 // existing conversations.project_id column is intentionally NOT NULL and
@@ -74,6 +74,12 @@ CREATE TABLE IF NOT EXISTS messages (
     origin_device_id TEXT REFERENCES devices(id),
     attachments_json TEXT NOT NULL DEFAULT '[]',
     quote_refs_json TEXT NOT NULL DEFAULT '[]',
+    -- Which trace layout the sender chose, and the file-change summary of the
+    -- turn. Both used to live only in the browser profile, so a second device
+    -- fell back to the historical layout and showed no changed-files panel.
+    -- NULL keeps meaning "the sender never expressed a choice".
+    detailed INTEGER,
+    change_summary_json TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL
 );
 
@@ -373,6 +379,25 @@ pub struct LocalMessage {
     pub images: Vec<LocalImageAttachment>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quote_refs: Vec<LocalQuoteReference>,
+    /// Which trace layout the sender picked. `None` means the sender never
+    /// expressed a choice, which keeps the historical detailed layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detailed: Option<bool>,
+    /// The turn's changed files. Small enough to travel with the message, so
+    /// the panel is no longer missing on every other device.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub change_summary: Vec<LocalChangeSummaryFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalChangeSummaryFile {
+    pub path: String,
+    pub status: String,
+    pub added: i64,
+    pub removed: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_or_truncated: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1071,6 +1096,9 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
                                 .unwrap_or_default(),
                             quote_refs: serde_json::from_str(&row.get::<_, String>(14)?)
                                 .unwrap_or_default(),
+                            // This v14 migration predates both columns.
+                            detailed: None,
+                            change_summary: Vec::new(),
                         },
                     ))
                 })
@@ -1504,6 +1532,45 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
             })?;
         transaction.commit().map_err(|error| {
             format!("A lokÃ¡lis SQLite v20 migrÃ¡ciÃ³ commitja sikertelen: {error}")
+        })?;
+    }
+    let migrated_version = read_schema_version(connection)?;
+    if migrated_version == 20 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("A lokális SQLite v21 migráció nem indítható el: {error}"))?;
+        let existing_columns: HashSet<String> = {
+            let mut statement = transaction
+                .prepare("PRAGMA table_info(messages)")
+                .map_err(|error| format!("A v21 messages schema nem olvasható: {error}"))?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|error| format!("A v21 messages oszloplista nem olvasható: {error}"))?
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(|error| format!("A v21 messages schema hibás: {error}"))?;
+            rows
+        };
+        if !existing_columns.contains("detailed") {
+            transaction
+                .execute_batch("ALTER TABLE messages ADD COLUMN detailed INTEGER;")
+                .map_err(|error| {
+                    format!("A v21 messages.detailed oszlop nem hozható létre: {error}")
+                })?;
+        }
+        if !existing_columns.contains("change_summary_json") {
+            transaction
+                .execute_batch(
+                    "ALTER TABLE messages ADD COLUMN change_summary_json TEXT NOT NULL DEFAULT '[]';",
+                )
+                .map_err(|error| {
+                    format!("A v21 messages.change_summary_json oszlop nem hozható létre: {error}")
+                })?;
+        }
+        transaction
+            .execute_batch("PRAGMA user_version = 21;")
+            .map_err(|error| format!("A v21 schema-verzió nem menthető: {error}"))?;
+        transaction.commit().map_err(|error| {
+            format!("A lokális SQLite v21 migráció commitja sikertelen: {error}")
         })?;
     }
     // Cheap invariant check rather than a one-shot migration: the fossils can
@@ -3775,7 +3842,8 @@ pub(crate) fn load_snapshot_from_connection(
             let mut statement = connection
                 .prepare(
                     "SELECT id, role, body, created_at, code, live, \"final\", item_id, turn_id,
-                            sequence, hlc, origin_device_id, attachments_json, quote_refs_json
+                            sequence, hlc, origin_device_id, attachments_json, quote_refs_json,
+                            detailed, change_summary_json
                      FROM messages
                      WHERE conversation_id = ?1
                      ORDER BY sequence, COALESCE(origin_device_id, ''), id",
@@ -3799,6 +3867,9 @@ pub(crate) fn load_snapshot_from_connection(
                         images: serde_json::from_str(&row.get::<_, String>(12)?)
                             .unwrap_or_default(),
                         quote_refs: serde_json::from_str(&row.get::<_, String>(13)?)
+                            .unwrap_or_default(),
+                        detailed: row.get::<_, Option<i64>>(14)?.map(|value| value != 0),
+                        change_summary: serde_json::from_str(&row.get::<_, String>(15)?)
                             .unwrap_or_default(),
                     };
                     message.text = collapse_repeated_assistant_text(&message.role, &message.text);
@@ -4347,6 +4418,8 @@ pub(crate) fn save_snapshot_in_connection(
                 .map_err(|error| format!("A képcsatolmányok nem szerializálhatók: {error}"))?;
             let quote_refs_json = serde_json::to_string(&message.quote_refs)
                 .map_err(|error| format!("Az idézet-hivatkozások nem szerializálhatók: {error}"))?;
+            let change_summary_json = serde_json::to_string(&message.change_summary)
+                .map_err(|error| format!("A változás-összefoglaló nem szerializálható: {error}"))?;
             let identity_role = message.role.clone();
             let identity_turn_id = message
                 .turn_id
@@ -4439,8 +4512,8 @@ pub(crate) fn save_snapshot_in_connection(
             message_ids.insert(message_id.clone());
             transaction
                 .execute(
-                    "INSERT INTO messages (id, conversation_id, role, body, sequence, hlc, item_id, turn_id, code, live, \"final\", origin_device_id, attachments_json, quote_refs_json, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                    "INSERT INTO messages (id, conversation_id, role, body, sequence, hlc, item_id, turn_id, code, live, \"final\", origin_device_id, attachments_json, quote_refs_json, created_at, detailed, change_summary_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?17, ?18)
                      ON CONFLICT(id) DO UPDATE SET
                      body = CASE
                              WHEN messages.role = 'user' THEN messages.body
@@ -4487,6 +4560,14 @@ pub(crate) fn save_snapshot_in_connection(
                              WHEN messages.role = 'user' THEN messages.quote_refs_json
                              WHEN excluded.quote_refs_json <> '[]' THEN excluded.quote_refs_json
                              ELSE messages.quote_refs_json
+                         END,
+                         -- The sender's layout choice is written once; a later
+                         -- copy that never learned it must not erase it.
+                         detailed = COALESCE(messages.detailed, excluded.detailed),
+                         change_summary_json = CASE
+                             WHEN excluded.change_summary_json <> '[]'
+                                 THEN excluded.change_summary_json
+                             ELSE messages.change_summary_json
                          END",
                     params![
                         message_id,
@@ -4505,6 +4586,8 @@ pub(crate) fn save_snapshot_in_connection(
                         quote_refs_json,
                         message_time,
                         canonical_agent_id,
+                        message.detailed.map(|value| if value { 1 } else { 0 }),
+                        change_summary_json,
                     ],
                 )
                 .map_err(|error| format!("A lokális üzenet mentése sikertelen: {error}"))?;
@@ -5479,6 +5562,8 @@ mod tests {
                     mime_type: "image/png".to_string(),
                 }],
                 quote_refs: Vec::new(),
+                detailed: None,
+                change_summary: Vec::new(),
             }],
             work_items: vec![LocalWorkItem {
                 id: 11,
@@ -5580,6 +5665,8 @@ mod tests {
                     origin_device_id: None,
                     images: Vec::new(),
                     quote_refs: Vec::new(),
+                    detailed: None,
+                    change_summary: Vec::new(),
                 });
                 conversation.messages.push(LocalMessage {
                     id: Some(format!("answer-{index}")),
@@ -5597,6 +5684,8 @@ mod tests {
                     origin_device_id: None,
                     images: Vec::new(),
                     quote_refs: Vec::new(),
+                    detailed: None,
+                    change_summary: Vec::new(),
                 });
             }
         }
@@ -5623,6 +5712,98 @@ mod tests {
             answers, 2,
             "both answers must survive; a shared item id must not delete a previous turn's answer"
         );
+    }
+
+    #[test]
+    fn the_trace_layout_and_changed_files_survive_a_store_round_trip() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        let question_id = Uuid::new_v4().to_string();
+        let answer_id = Uuid::new_v4().to_string();
+        let mut snapshot = test_snapshot();
+        {
+            let conversation = snapshot
+                .conversations
+                .values_mut()
+                .next()
+                .expect("conversation");
+            conversation.messages.clear();
+            conversation.messages.push(LocalMessage {
+                id: Some(question_id.clone()),
+                role: "user".to_string(),
+                text: "Javitsd a math.js-t".to_string(),
+                time: "100".to_string(),
+                code: None,
+                live: Some(false),
+                final_message: Some(false),
+                item_id: None,
+                turn_id: Some("request:turn-0".to_string()),
+                sequence: Some(100),
+                hlc: None,
+                origin_device_id: None,
+                images: Vec::new(),
+                quote_refs: Vec::new(),
+                // The sender chose the compact layout for this turn.
+                detailed: Some(false),
+                change_summary: Vec::new(),
+            });
+            conversation.messages.push(LocalMessage {
+                id: Some(answer_id.clone()),
+                role: "assistant".to_string(),
+                text: "PHASE18_ROLLBACK_OK".to_string(),
+                time: "101".to_string(),
+                code: None,
+                live: Some(false),
+                final_message: Some(true),
+                item_id: Some("assistant-0".to_string()),
+                turn_id: Some("request:turn-0".to_string()),
+                sequence: Some(101),
+                hlc: None,
+                origin_device_id: None,
+                images: Vec::new(),
+                quote_refs: Vec::new(),
+                detailed: None,
+                change_summary: vec![LocalChangeSummaryFile {
+                    path: "math.js".to_string(),
+                    status: "modified".to_string(),
+                    added: 4,
+                    removed: 0,
+                    binary_or_truncated: None,
+                }],
+            });
+        }
+        save_snapshot_in_connection(&mut connection, snapshot).expect("save conversation");
+
+        let loaded = load_snapshot_from_connection(&connection).expect("load snapshot");
+        let messages = &loaded
+            .conversations
+            .values()
+            .next()
+            .expect("conversation")
+            .messages;
+        let question = messages
+            .iter()
+            .find(|message| message.id.as_deref() == Some(question_id.as_str()))
+            .expect("question");
+        let answer = messages
+            .iter()
+            .find(|message| message.id.as_deref() == Some(answer_id.as_str()))
+            .expect("answer");
+
+        assert_eq!(
+            question.detailed,
+            Some(false),
+            "the sender's trace layout must survive, otherwise another device falls back to the detailed one"
+        );
+        assert_eq!(
+            answer.change_summary.len(),
+            1,
+            "the changed-files summary must survive, otherwise the panel is missing on every other device"
+        );
+        assert_eq!(answer.change_summary[0].path, "math.js");
+        assert_eq!(answer.change_summary[0].added, 4);
     }
 
     #[test]
@@ -5731,6 +5912,8 @@ mod tests {
                 origin_device_id: None,
                 images: Vec::new(),
                 quote_refs: Vec::new(),
+                detailed: None,
+                change_summary: Vec::new(),
             });
             conversation.messages.push(LocalMessage {
                 id: Some(message_id.clone()),
@@ -5747,6 +5930,8 @@ mod tests {
                 origin_device_id: None,
                 images: Vec::new(),
                 quote_refs: Vec::new(),
+                detailed: None,
+                change_summary: Vec::new(),
             });
             snapshot
         };
@@ -5805,6 +5990,8 @@ mod tests {
                 origin_device_id: None,
                 images: Vec::new(),
                 quote_refs: Vec::new(),
+                detailed: None,
+                change_summary: Vec::new(),
             });
             conversation.messages.push(LocalMessage {
                 id: Some(Uuid::new_v4().to_string()),
@@ -5821,6 +6008,8 @@ mod tests {
                 origin_device_id: None,
                 images: Vec::new(),
                 quote_refs: Vec::new(),
+                detailed: None,
+                change_summary: Vec::new(),
             });
         }
         save_snapshot_in_connection(&mut connection, snapshot).expect("save conversation");
@@ -6076,6 +6265,8 @@ mod tests {
             origin_device_id: None,
             images: Vec::new(),
             quote_refs: Vec::new(),
+            detailed: None,
+            change_summary: Vec::new(),
         };
         let mut completed = placeholder.clone();
         completed.id = Some(Uuid::new_v4().to_string());
@@ -6130,6 +6321,8 @@ mod tests {
             origin_device_id: None,
             images: Vec::new(),
             quote_refs: Vec::new(),
+            detailed: None,
+            change_summary: Vec::new(),
         });
         save_snapshot_in_connection(&mut connection, completed_snapshot.clone())
             .expect("save completed answer");
@@ -6158,6 +6351,8 @@ mod tests {
                 origin_device_id: None,
                 images: Vec::new(),
                 quote_refs: Vec::new(),
+                detailed: None,
+                change_summary: Vec::new(),
             },
         ];
         save_snapshot_in_connection(&mut connection, stale_snapshot)
@@ -6206,6 +6401,8 @@ mod tests {
                 origin_device_id: None,
                 images: Vec::new(),
                 quote_refs: Vec::new(),
+                detailed: None,
+                change_summary: Vec::new(),
             });
         save_snapshot_in_connection(&mut connection, snapshot).expect("save placeholder");
         let conversation_id: String = connection

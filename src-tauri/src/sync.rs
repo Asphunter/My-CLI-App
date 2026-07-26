@@ -2891,6 +2891,11 @@ fn merge_message_versions(existing: &LocalMessage, mut incoming: LocalMessage) -
         if merged.turn_id.is_none() {
             merged.turn_id = incoming.turn_id;
         }
+        // The layout choice belongs to the prompt and is written once, so a
+        // later copy may only supply it when the first one never carried it.
+        if merged.detailed.is_none() {
+            merged.detailed = incoming.detailed;
+        }
         merged.live = Some(false);
         return merged;
     }
@@ -2951,6 +2956,14 @@ fn merge_message_versions(existing: &LocalMessage, mut incoming: LocalMessage) -
     }
     if incoming.origin_device_id.is_none() {
         incoming.origin_device_id = existing.origin_device_id.clone();
+    }
+    if incoming.detailed.is_none() {
+        incoming.detailed = existing.detailed;
+    }
+    // A device that computed the changed files keeps them: the other side only
+    // ever has an empty list, and losing it is what hid the panel remotely.
+    if incoming.change_summary.is_empty() {
+        incoming.change_summary = existing.change_summary.clone();
     }
     incoming
 }
@@ -3774,12 +3787,31 @@ fn normalized_work_item_id(conversation_id: &str, item: &LocalWorkItem, index: u
     stable_id("work-item", &identity)
 }
 
+/// Raw tool output stays local, but the edit itself is what the LÉPÉSEK and
+/// FÁJLOK/VÁLTOZÁSOK panels are made of. Dropping it wholesale is why the other
+/// device showed "Ehhez a lépéshez nem érkezett..." for a turn that had changed
+/// a file. Share the code sides under a cap and say so when one is too big.
+const MAX_SHARED_CODE_CHARS: usize = 64 * 1024;
+
+fn shared_code_side(value: Option<&String>) -> Option<String> {
+    let value = value?;
+    if value.chars().count() <= MAX_SHARED_CODE_CHARS {
+        return Some(value.clone());
+    }
+    Some(format!(
+        "{}\n\n… A diff túl nagy a szinkronhoz; a teljes tartalom azon a gépen érhető el, ahol a módosítás készült.",
+        value.chars().take(MAX_SHARED_CODE_CHARS).collect::<String>()
+    ))
+}
+
 fn sanitized_work_item(item: &LocalWorkItem) -> LocalWorkItem {
     let mut sanitized = item.clone();
+    // The unstructured tool transcript can be megabytes and has no reader on
+    // the receiving side; the structured code sides do.
     sanitized.body = None;
-    sanitized.code = None;
-    sanitized.before_code = None;
-    sanitized.after_code = None;
+    sanitized.code = shared_code_side(item.code.as_ref());
+    sanitized.before_code = shared_code_side(item.before_code.as_ref());
+    sanitized.after_code = shared_code_side(item.after_code.as_ref());
     if sanitized.detail.chars().count() > 2000 {
         sanitized.detail = sanitized.detail.chars().take(2000).collect();
         sanitized.detail.push('…');
@@ -5515,6 +5547,8 @@ mod tests {
             origin_device_id: None,
             images: Vec::new(),
             quote_refs: Vec::new(),
+            detailed: None,
+            change_summary: Vec::new(),
         }
     }
 
@@ -5793,6 +5827,51 @@ mod tests {
         assert_eq!(merged.final_message, Some(true));
         assert_eq!(merged.live, Some(false));
         assert_eq!(merged.time, "2026-07-20T17:12:00Z");
+    }
+
+    #[test]
+    fn a_published_work_item_keeps_the_edit_but_drops_the_raw_transcript() {
+        let mut item = LocalWorkItem {
+            id: 1,
+            item_id: Some("toolu_edit".to_string()),
+            turn_id: None,
+            plan_step_id: None,
+            kind: "tool".to_string(),
+            status: "done".to_string(),
+            label: "Eszköz fut".to_string(),
+            detail: "Edit".to_string(),
+            event_type: "item/tool/started".to_string(),
+            time: "100".to_string(),
+            body: Some("megabytes of raw tool output".to_string()),
+            code: None,
+            before_code: Some("const multiply = (a, b) => a + b;".to_string()),
+            after_code: Some("const multiply = (a, b) => a * b;".to_string()),
+            language: Some("javascript".to_string()),
+            hlc: None,
+            origin_device_id: None,
+        };
+
+        let shared = sanitized_work_item(&item);
+        assert!(
+            shared.body.is_none(),
+            "the unstructured transcript has no reader on the other device"
+        );
+        assert_eq!(
+            shared.before_code.as_deref(),
+            Some("const multiply = (a, b) => a + b;"),
+            "the edit itself is what the LÉPÉSEK and FÁJLOK/VÁLTOZÁSOK panels are built from"
+        );
+        assert_eq!(
+            shared.after_code.as_deref(),
+            Some("const multiply = (a, b) => a * b;")
+        );
+
+        // An oversized side is truncated and says so instead of vanishing.
+        item.after_code = Some("x".repeat(MAX_SHARED_CODE_CHARS + 10));
+        let capped = sanitized_work_item(&item);
+        let capped_after = capped.after_code.expect("capped after code");
+        assert!(capped_after.chars().count() > MAX_SHARED_CODE_CHARS);
+        assert!(capped_after.contains("túl nagy a szinkronhoz"));
     }
 
     #[test]
@@ -6869,6 +6948,8 @@ mod tests {
                 origin_device_id: None,
                 images: Vec::new(),
                 quote_refs: Vec::new(),
+                detailed: None,
+                change_summary: Vec::new(),
             }],
             work_items: Vec::new(),
             thread_id: Some("foreign-machine-rollout".to_string()),
@@ -6946,6 +7027,8 @@ mod tests {
                 origin_device_id: None,
                 images: Vec::new(),
                 quote_refs: Vec::new(),
+                detailed: None,
+                change_summary: Vec::new(),
             }],
             work_items: Vec::new(),
             thread_id: None,
@@ -7011,6 +7094,8 @@ mod tests {
                 origin_device_id: None,
                 images: Vec::new(),
                 quote_refs: Vec::new(),
+                detailed: None,
+                change_summary: Vec::new(),
             }],
             work_items: Vec::new(),
             thread_id: None,
@@ -7347,6 +7432,8 @@ mod tests {
                     origin_device_id: None,
                     images: Vec::new(),
                     quote_refs: Vec::new(),
+                    detailed: None,
+                    change_summary: Vec::new(),
                 },
             })
             .expect("message payload"),

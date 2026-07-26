@@ -1515,7 +1515,16 @@ const compactMessages = (messages: Message[]) => {
 
 const repairHistoricalAssistantText = (message: Message): Message => {
   const text = collapseRepeatedAssistantText(message.role, message.text);
-  return text === message.text ? message : { ...message, text };
+  const repaired = text === message.text ? message : { ...message, text };
+  // The layout choice used to live only in this browser profile, so every other
+  // device fell back to the detailed trace and rendered the same turn
+  // differently. Lift the remembered value onto the message once, so the next
+  // save carries it to SQLite and from there to the journal.
+  if (repaired.detailed !== undefined) return repaired;
+  const remembered = rememberedDetailMode(repaired.id);
+  return remembered === undefined
+    ? repaired
+    : { ...repaired, detailed: remembered };
 };
 
 // A Codex request cannot remain live across an app reload. Every persisted
@@ -1983,19 +1992,23 @@ const rememberDetailMode = (messageId: string | undefined, detailed: boolean) =>
   }
 };
 
+const rememberedDetailMode = (messageId: string | undefined) => {
+  if (typeof window === "undefined" || !messageId) return undefined;
+  try {
+    const saved = JSON.parse(
+      localStorage.getItem(DETAIL_MODE_STORAGE_KEY) ?? "{}",
+    ) as Record<string, unknown>;
+    const savedMode = saved[messageId];
+    return typeof savedMode === "boolean" ? savedMode : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
 const messageUsesDetailedTrace = (message: Message) => {
   if (typeof message.detailed === "boolean") return message.detailed;
-  if (typeof window !== "undefined" && message.id) {
-    try {
-      const saved = JSON.parse(
-        localStorage.getItem(DETAIL_MODE_STORAGE_KEY) ?? "{}",
-      ) as Record<string, unknown>;
-      const savedMode = saved[message.id];
-      if (typeof savedMode === "boolean") return savedMode;
-    } catch {
-      // Fall back to the historical detailed layout.
-    }
-  }
+  const remembered = rememberedDetailMode(message.id);
+  if (remembered !== undefined) return remembered;
   // Messages created before the toggle existed retain their established UI.
   return true;
 };

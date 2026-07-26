@@ -383,6 +383,40 @@ pub struct PipelineRunRequest {
     pub conversation_context: Option<String>,
     #[serde(default)]
     pub max_budget_usd: Option<f64>,
+    /// Per-stage model and reasoning chosen in the GUI. Indexed by stage, and
+    /// only the fields the user actually set override the preset -- a stage
+    /// left alone keeps what the recipe recommends.
+    #[serde(default)]
+    pub stage_overrides: Vec<StageOverride>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StageOverride {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+/// Applies the GUI's per-stage choices onto the preset.
+pub fn apply_stage_overrides(recipe: &mut Recipe, overrides: &[StageOverride]) {
+    for (stage, over) in recipe.stages.iter_mut().zip(overrides.iter()) {
+        if let Some(model) = over
+            .model
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            stage.model = Some(model.to_string());
+        }
+        if let Some(effort) = over
+            .effort
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            stage.effort = Some(effort.to_string());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

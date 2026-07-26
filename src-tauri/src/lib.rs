@@ -115,8 +115,9 @@ async fn pipeline_send(
     app: tauri::AppHandle,
     request: pipeline::PipelineRunRequest,
 ) -> Result<pipeline::PipelineRunResult, String> {
-    let recipe = pipeline::recipe_by_id(&request.recipe_id)
+    let mut recipe = pipeline::recipe_by_id(&request.recipe_id)
         .ok_or_else(|| format!("Ismeretlen recept: {}.", request.recipe_id))?;
+    pipeline::apply_stage_overrides(&mut recipe, &request.stage_overrides);
     recipe.validate()?;
     if request.request_ids.len() != recipe.stages.len() {
         return Err(format!(

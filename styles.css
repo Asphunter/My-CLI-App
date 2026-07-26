@@ -628,7 +628,10 @@ textarea::placeholder { color: var(--faint); }
 .settings-retention-blockers { display: grid; gap: 3px; margin: 0 0 0 15px; padding: 0; color: #d8b47b; font-size: 8px; line-height: 1.35; }
 
 .composer-wrap { display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: end; gap: 8px; width: min(760px, calc(100% - 44px)); margin-right: auto; margin-bottom: 16px; margin-left: auto; }
-.composer-wrap > .composer-detail-toggle { align-self: end; margin-bottom: 42px; }
+.composer-wrap > .composer-controls { align-self: end; margin-bottom: 42px; }
+/* One grid child, so the two-column composer layout stays two columns however
+   many controls the detailed mode adds. */
+.composer-controls { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; }
 .user-message .message-content { width: fit-content; max-width: min(720px, 60%); }
 .user-message .message-body { width: fit-content; max-width: 100%; box-sizing: border-box; }
 .user-message .message-body p .quote-backlinks { display: inline-flex; margin: 0 0 0 4px; vertical-align: middle; }
@@ -650,7 +653,7 @@ textarea::placeholder { color: var(--faint); }
 .code-drawer { top: 0; }
 
 @media (max-width: 1080px) { .composer-wrap { width: calc(100% - 36px); margin-right: auto; margin-left: auto; } .user-message .message-content { max-width: 60%; } }
-@media (max-width: 700px) { .composer-wrap { width: calc(100% - 28px); margin-right: 14px; margin-left: 14px; gap: 5px; } .composer-wrap > .composer-detail-toggle { margin-bottom: 42px; } .user-message .message-content { max-width: 100%; } }
+@media (max-width: 700px) { .composer-wrap { width: calc(100% - 28px); margin-right: 14px; margin-left: 14px; gap: 5px; } .composer-wrap > .composer-controls { margin-bottom: 42px; } .user-message .message-content { max-width: 100%; } }
 
 /* A selected work item is a real popover, never a layer over the controls. */
 .compact-work-flow.is-expanded { overflow: visible; }
@@ -1463,9 +1466,13 @@ textarea::placeholder { color: var(--faint); }
 .stage-verdict { padding: 1px 6px; border-radius: 4px; font-size: 8px; font-weight: 700; letter-spacing: .04em; white-space: nowrap; }
 .stage-verdict.is-accepted { border: 1px solid #4d8060; background: rgba(30, 60, 40, .75); color: #8fd6a6; }
 .stage-verdict.is-changes { border: 1px solid #8a7a45; background: rgba(60, 52, 26, .75); color: #ddc776; }
-.composer-pipeline-switch { display: inline-flex; align-items: center; gap: 4px; margin-left: 8px; }
+.composer-pipeline-switch { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
 .composer-pipeline-switch button { min-height: 20px; padding: 2px 8px; border: 1px solid #40515a; border-radius: 4px; background: rgba(25, 32, 36, .72); color: var(--faint); font-size: 8px; font-weight: 600; letter-spacing: .04em; }
 .composer-pipeline-switch button.is-active { border-color: #5e9877; background: #1d3528; color: var(--text); }
 .composer-pipeline-switch select { min-height: 20px; border: 1px solid #40515a; border-radius: 4px; background: rgba(25, 32, 36, .72); color: var(--muted); font-size: 8px; }
-.composer-pipeline-progress { margin-left: 8px; color: var(--accent); font-size: 8px; font-weight: 600; letter-spacing: .04em; }
+.composer-pipeline-progress { color: var(--accent); font-size: 8px; font-weight: 600; letter-spacing: .04em; }
 .message-stage-badges { display: flex; align-items: center; gap: 5px; margin-bottom: 5px; }
+.composer-stage-config { display: flex; flex-direction: column; gap: 3px; }
+.composer-stage-row { display: flex; align-items: center; gap: 4px; }
+.composer-stage-role { min-width: 42px; color: var(--faint); font-size: 8px; font-weight: 700; letter-spacing: .04em; }
+.composer-stage-row select { min-height: 19px; max-width: 130px; border: 1px solid #40515a; border-radius: 4px; background: rgba(25, 32, 36, .72); color: var(--muted); font-size: 8px; }

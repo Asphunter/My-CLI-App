@@ -244,6 +244,13 @@ type MessagePipeline = {
   verdictSummary?: string;
 };
 
+/** Readable names for models a preset may name before the catalog knows them. */
+const PIPELINE_MODEL_LABELS: Record<string, string> = {
+  "claude-opus-5": "Claude Opus 5",
+  "claude-fable-5": "Claude Fable 5",
+  "claude-sonnet-5": "Claude Sonnet 5",
+};
+
 const STAGE_ROLE_LABELS: Record<string, string> = {
   plan: "TERV",
   code: "KÓD",
@@ -6511,6 +6518,12 @@ function App() {
   const [pipelineRecipeId, setPipelineRecipeId] = useState("plan_code_review");
   const [pipelineProgress, setPipelineProgress] =
     useState<PipelineProgressEvent | null>(null);
+  // Per-stage model and reasoning, keyed by `${recipeId}:${stageIndex}`. Empty
+  // means "keep what the preset recommends", so the picker never has to
+  // pre-fill values the user did not choose.
+  const [pipelineStageOverrides, setPipelineStageOverrides] = useState<
+    Record<string, { model?: string; effort?: string }>
+  >({});
   const activePipelineRecipe =
     pipelineRecipes.find((recipe) => recipe.id === pipelineRecipeId) ??
     pipelineRecipes[0];
@@ -11907,6 +11920,10 @@ function App() {
               sessionId: resumeClaudeSessionId,
               conversationContext: rehydrationContext || null,
               maxBudgetUsd: Number(claudeBudgetUsd),
+              stageOverrides: activePipelineRecipe.stages.map(
+                (_, index) =>
+                  pipelineStageOverrides[`${activePipelineRecipe.id}:${index}`] ?? {},
+              ),
             },
           });
           if (cancelledRequestIdsRef.current.delete(requestId)) return;
@@ -13618,6 +13635,7 @@ function App() {
             )}
           </div>
           <form ref={composerFormRef} className="composer-wrap" onSubmit={submitMessage}>
+            <div className="composer-controls">
             <label
               className="composer-detail-toggle"
               title="Részletes terv, lépések és gondolkodás megjelenítése"
@@ -13672,11 +13690,92 @@ function App() {
                 )}
               </div>
             )}
+            {showDetailedTrace && pipelineMode && activePipelineRecipe && (
+              <div className="composer-stage-config" aria-label="Szakaszok beállítása">
+                {activePipelineRecipe.stages.map((stage, index) => {
+                  const key = `${activePipelineRecipe.id}:${index}`;
+                  const override = pipelineStageOverrides[key] ?? {};
+                  const isClaude = stage.provider === "anthropic";
+                  // Only the vendor's own models may be offered for a stage:
+                  // the runtime is fixed by the recipe, so a Codex model on a
+                  // Claude stage would simply fail at send time.
+                  const catalogModels = modelCatalog.filter((model) =>
+                    isClaude
+                      ? model.id.startsWith("claude-")
+                      : !model.id.startsWith("claude-"),
+                  );
+                  // The preset can recommend a model the catalog has not
+                  // learned about yet. Showing "default" while a different one
+                  // actually runs would be a lie, so it is offered explicitly.
+                  const models =
+                    stage.model &&
+                    !catalogModels.some((model) => model.id === stage.model)
+                      ? [
+                          {
+                            id: stage.model,
+                            displayName: PIPELINE_MODEL_LABELS[stage.model] ?? stage.model,
+                            description: "",
+                            supportedReasoningEfforts: FALLBACK_EFFORTS,
+                            defaultReasoningEffort: null,
+                          } as CodexModel,
+                          ...catalogModels,
+                        ]
+                      : catalogModels;
+                  const efforts =
+                    models.find(
+                      (model) => model.id === (override.model ?? stage.model),
+                    )?.supportedReasoningEfforts ?? FALLBACK_EFFORTS;
+                  const setOverride = (patch: { model?: string; effort?: string }) =>
+                    setPipelineStageOverrides((current) => ({
+                      ...current,
+                      [key]: { ...current[key], ...patch },
+                    }));
+                  return (
+                    <div className="composer-stage-row" key={key}>
+                      <span className="composer-stage-role">
+                        {STAGE_ROLE_LABELS[stage.role] ?? stage.role}
+                      </span>
+                      <select
+                        value={override.model ?? stage.model ?? ""}
+                        onChange={(event) =>
+                          setOverride({ model: event.currentTarget.value })
+                        }
+                        aria-label={`${STAGE_ROLE_LABELS[stage.role]} modell`}
+                      >
+                        <option value="">
+                          {isClaude ? "Claude · alapértelmezett" : "Codex · alapértelmezett"}
+                        </option>
+                        {models.map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.displayName}
+                          </option>
+                        ))}
+                      </select>
+                      <select
+                        value={override.effort ?? stage.effort ?? ""}
+                        onChange={(event) =>
+                          setOverride({ effort: event.currentTarget.value })
+                        }
+                        aria-label={`${STAGE_ROLE_LABELS[stage.role]} reasoning`}
+                      >
+                        <option value="">reasoning</option>
+                        {efforts.map((effort) => (
+                          <option key={effort} value={effort}>
+                            {effort}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
             {pipelineProgress && (
               <div className="composer-pipeline-progress" role="status">
                 {`${STAGE_ROLE_LABELS[pipelineProgress.role] ?? pipelineProgress.role} · ${pipelineProgress.agentLabel} · ${pipelineProgress.stageIndex + 1}/${pipelineProgress.stageCount}`}
               </div>
             )}
+            </div>
             <div className="composer">
               {composerQuotes.length > 0 && (
                 <div className="composer-quotes" aria-label="Kijelölt idézetek">

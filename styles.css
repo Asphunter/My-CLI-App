@@ -631,7 +631,14 @@ textarea::placeholder { color: var(--faint); }
    detailed controls float beside it, so switching them on cannot move, narrow
    or lift the input box. */
 .composer-wrap { display: block; width: min(760px, calc(100% - 44px)); margin-right: auto; margin-bottom: 16px; margin-left: auto; }
-.composer-wrap > .composer-controls { position: absolute; top: 0; right: calc(100% + 10px); z-index: 2; }
+/* Anchored to the composer's bottom, not its top: the block is taller than the
+   composer, and growing downward pushed its last row off the bottom of the
+   window. Growing upward keeps every row on screen. */
+/* Anchored to the composer's bottom, not its top: the block is taller than the
+   composer, and growing downward pushed its last row off the bottom of the
+   window. Growing upward keeps every row on screen, and the panel surface is
+   what stops it reading as a collision with the message it rises in front of. */
+.composer-wrap > .composer-controls { position: absolute; right: calc(100% + 10px); bottom: 0; z-index: 2; padding: 6px 8px 8px; border: 1px solid var(--border-soft); border-radius: 9px; background: var(--panel); box-shadow: 0 8px 26px rgba(0, 0, 0, .28); }
 /* One grid child, so the two-column composer layout stays two columns however
    many controls the detailed mode adds. */
 .composer-controls { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; }

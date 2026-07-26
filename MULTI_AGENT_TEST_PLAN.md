@@ -61,7 +61,26 @@ refaktor öncélból: e nélkül az összes alábbi eset csak élő API-híváss
 
 Minden L-teszt után **kötelező integritás-őr** (szkriptelve, ld. 6. pont).
 
-### L1 — A nagy ismeretlen: teljes Terv → Kód → Review lánc
+### L1 — TELJESÍTVE (2026-07-27), négy defekt árán
+
+**Eredmény:** a lánc végigfut (`completed`, 3/3), és a bíráló *megfogta a kódoló
+hamis sikerjelentését*: a KÓD azt írta, „2 teszt, 2 pass", a Codex-review
+lefuttatta és `1 fail (9 !== 20)`-t talált → `VERDIKT: JAVÍTANDÓ`. A `math.js`
+tényleg javítatlan maradt. Egy-agentes futásnál ez a hamis „kész" lett volna a
+végeredmény. Az L2 is teljesült: a terv-szakasz egyetlen fájlt sem módosított.
+
+**Amit az öt nekifutás kiderített (mind javítva):**
+1. A futam lelőtte magát: az újraindítás-felismerő minden store-nyitáskor futott.
+2. A jóváhagyásra váró turn 10 perc után meghalt — az idle-óra nem tudta, hogy
+   emberre vár. Nem lánc-specifikus.
+3. `apply_stage_overrides` sosem olvasta a `provider` mezőt: a GUI gyártó-cellája
+   semmit nem csinált.
+4. A szakasz-jelvény nem élte túl a merge-et.
+
+**Cáfolt hipotézisek** (mind a három tévedés volt, mielőtt ránéztem a képernyőre):
+modellváltás resume-on · újrahasznált bridge-folyamat · sérült session.
+
+### L1 (eredeti leírás) — teljes Terv → Kód → Review lánc
 1. Fixture-reset. Pipa ✓, MULTI-AI, alapértelmezett lánc (Fable/max → Opus/medium → Codex Sol/medium).
 2. Prompt: *"A math.js-ben a multiply összead. Javítsd meg, és győződj meg róla, hogy a tesztek zöldek."*
 3. **Elvárt:** 3 szakasz fut végig; a composer-státuszsor lépked (1/3 → 2/3 → 3/3).

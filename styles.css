@@ -1510,3 +1510,4 @@ textarea::placeholder { color: var(--faint); }
 /* The chain owns the model choice, so the composer's own picker must not look
    available while a chain is selected. */
 .model-picker.is-disabled { pointer-events: none; opacity: .4; }
+.composer-pipeline-waiting { color: var(--accent); font-weight: 700; }

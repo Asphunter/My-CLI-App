@@ -13817,6 +13817,12 @@ function App() {
             {pipelineProgress && (
               <div className="composer-pipeline-progress" role="status">
                 {`${STAGE_ROLE_LABELS[pipelineProgress.role] ?? pipelineProgress.role} · ${pipelineProgress.agentLabel} · ${pipelineProgress.stageIndex + 1}/${pipelineProgress.stageCount}`}
+                {/* A chain that is waiting on the user looks identical to one
+                    that is thinking, and that cost a whole run: the stage sat
+                    on an approval nobody knew about until it timed out. */}
+                {(pendingClaudeApproval || pendingClaudeQuestion) && (
+                  <strong className="composer-pipeline-waiting"> · rád vár</strong>
+                )}
               </div>
             )}
             </div>

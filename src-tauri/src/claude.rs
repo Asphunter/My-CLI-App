@@ -162,6 +162,19 @@ fn pending_approvals() -> &'static Mutex<HashMap<String, String>> {
     PENDING_APPROVALS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// True while this turn has an approval or a question the user has not answered.
+fn waiting_for_user(request_id: &str) -> bool {
+    let approval = pending_approvals()
+        .lock()
+        .map(|pending| pending.values().any(|value| value == request_id))
+        .unwrap_or(false);
+    let question = pending_questions()
+        .lock()
+        .map(|pending| pending.values().any(|value| value == request_id))
+        .unwrap_or(false);
+    approval || question
+}
+
 fn pending_questions() -> &'static Mutex<HashMap<String, String>> {
     PENDING_QUESTIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -844,7 +857,7 @@ pub fn send(
         let total_cost_usd: Option<f64>;
         loop {
             let line = reader
-                .next(&cancellation)?
+                .next_waiting_for_user(&cancellation, &request_id)?
                 .ok_or_else(|| "A Claude bridge lezárta a kapcsolatot.".to_string())?;
             let message = parse_bridge_message(line.trim_end())?;
             if message.request_id.as_deref() != Some(request_id.as_str()) {
@@ -1278,6 +1291,31 @@ impl CancellableLineReader {
         self.next_with_idle_timeout(cancellation, BRIDGE_IDLE_TIMEOUT)
     }
 
+    /// The idle timeout exists to catch a bridge that has died quietly. A turn
+    /// waiting on a person is not that: it is silent because the answer has not
+    /// been given yet, and killing it after ten minutes lost a chain's coding
+    /// stage that had already done its work and was asking to run the tests.
+    fn next_waiting_for_user(
+        &self,
+        cancellation: &AtomicBool,
+        request_id: &str,
+    ) -> Result<Option<String>, String> {
+        loop {
+            let blocked_on_user = waiting_for_user(request_id);
+            match self.next_with_idle_timeout(cancellation, BRIDGE_IDLE_TIMEOUT) {
+                Err(error) if blocked_on_user && error.contains("időtúllépés") => {
+                    // Still the user's move, so the clock starts over rather
+                    // than the turn being declared dead.
+                    if !waiting_for_user(request_id) {
+                        return Err(error);
+                    }
+                    continue;
+                }
+                other => return other,
+            }
+        }
+    }
+
     fn next_with_idle_timeout(
         &self,
         cancellation: &AtomicBool,
@@ -1468,5 +1506,45 @@ mod tests {
             .next_with_idle_timeout(&cancellation, Duration::from_millis(2))
             .expect_err("an idle bridge must time out");
         assert!(error.contains("időtúllépés"));
+    }
+
+    #[test]
+    fn a_turn_waiting_on_the_user_is_not_treated_as_a_dead_bridge() {
+        let request_id = format!("request-{}", uuid::Uuid::new_v4());
+        let approval_id = format!("approval-{}", uuid::Uuid::new_v4());
+
+        assert!(
+            !waiting_for_user(&request_id),
+            "a turn nobody was asked about is not waiting"
+        );
+
+        pending_approvals()
+            .lock()
+            .expect("approval registry")
+            .insert(approval_id.clone(), request_id.clone());
+        assert!(
+            waiting_for_user(&request_id),
+            "an unanswered approval means the silence is the user's, not the bridge's"
+        );
+
+        // Answering it hands the turn back to the bridge, and the idle clock
+        // becomes meaningful again.
+        pending_approvals()
+            .lock()
+            .expect("approval registry")
+            .remove(&approval_id);
+        assert!(!waiting_for_user(&request_id));
+
+        // A question blocks the turn the same way an approval does.
+        let question_id = format!("question-{}", uuid::Uuid::new_v4());
+        pending_questions()
+            .lock()
+            .expect("question registry")
+            .insert(question_id.clone(), request_id.clone());
+        assert!(waiting_for_user(&request_id));
+        pending_questions()
+            .lock()
+            .expect("question registry")
+            .remove(&question_id);
     }
 }

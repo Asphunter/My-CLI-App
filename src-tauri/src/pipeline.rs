@@ -128,10 +128,12 @@ impl Recipe {
     }
 }
 
-/// The presets the GUI offers. `plan_code_review` is the recommended one: the
-/// authoring side stays inside one Claude session (a model switch there keeps
-/// the context), and only the reviewer is a different vendor, which is where
-/// independence is worth the lossy hand-off.
+/// The chain the GUI runs. There is deliberately one: the detailed mode already
+/// means "show me the plan", so a variant without a planning stage would
+/// contradict the tick that turned it on. The authoring side stays inside one
+/// Claude session, where a model switch keeps the context, and only the
+/// reviewer is a different vendor -- that is where independence is worth the
+/// lossy hand-off.
 pub fn builtin_recipes() -> Vec<Recipe> {
     let claude = |role: StageRole, model: &str, max_turns: u32| RecipeStage {
         role,
@@ -149,25 +151,15 @@ pub fn builtin_recipes() -> Vec<Recipe> {
         effort: None,
         max_turns: Some(max_turns),
     };
-    vec![
-        Recipe {
-            id: "plan_code_review".to_string(),
-            label: "Terv → Kód → Review".to_string(),
-            stages: vec![
-                claude(StageRole::Plan, "claude-fable-5", 15),
-                claude(StageRole::Code, "claude-opus-5", 40),
-                codex(StageRole::Review, 15),
-            ],
-        },
-        Recipe {
-            id: "code_review".to_string(),
-            label: "Kód → Review".to_string(),
-            stages: vec![
-                claude(StageRole::Code, "claude-opus-5", 40),
-                codex(StageRole::Review, 15),
-            ],
-        },
-    ]
+    vec![Recipe {
+        id: "plan_code_review".to_string(),
+        label: "Terv → Kód → Review".to_string(),
+        stages: vec![
+            claude(StageRole::Plan, "claude-fable-5", 15),
+            claude(StageRole::Code, "claude-opus-5", 40),
+            codex(StageRole::Review, 15),
+        ],
+    }]
 }
 
 pub fn recipe_by_id(id: &str) -> Option<Recipe> {

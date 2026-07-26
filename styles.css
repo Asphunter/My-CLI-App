@@ -1472,7 +1472,12 @@ textarea::placeholder { color: var(--faint); }
 .composer-pipeline-switch select { min-height: 20px; border: 1px solid #40515a; border-radius: 4px; background: rgba(25, 32, 36, .72); color: var(--muted); font-size: 8px; }
 .composer-pipeline-progress { color: var(--accent); font-size: 8px; font-weight: 600; letter-spacing: .04em; }
 .message-stage-badges { display: flex; align-items: center; gap: 5px; margin-bottom: 5px; }
-.composer-stage-config { display: flex; flex-direction: column; gap: 3px; }
-.composer-stage-row { display: flex; align-items: center; gap: 4px; }
-.composer-stage-role { min-width: 42px; color: var(--faint); font-size: 8px; font-weight: 700; letter-spacing: .04em; }
-.composer-stage-row select { min-height: 19px; max-width: 130px; border: 1px solid #40515a; border-radius: 4px; background: rgba(25, 32, 36, .72); color: var(--muted); font-size: 8px; }
+/* The chain reads as one line per dimension: models on top, reasoning below.
+   Clicking a cell steps to the next value, right click steps back, so three
+   stages stay two lines tall instead of nine controls. */
+.composer-stage-chain { display: flex; flex-direction: column; gap: 2px; }
+.composer-chain-line { display: flex; align-items: center; gap: 2px; }
+.composer-chain-cell { display: inline-flex; align-items: center; gap: 2px; }
+.composer-chain-arrow { color: var(--faint); font-size: 8px; font-style: normal; }
+.composer-chain-line button { min-height: 18px; padding: 1px 6px; border: 1px solid #40515a; border-radius: 4px; background: rgba(25, 32, 36, .72); color: var(--muted); font-size: 8px; font-weight: 600; letter-spacing: .02em; white-space: nowrap; cursor: pointer; }
+.composer-chain-line button:hover { border-color: #5e9877; color: var(--text); }

@@ -251,6 +251,13 @@ const PIPELINE_MODEL_LABELS: Record<string, string> = {
   "claude-sonnet-5": "Claude Sonnet 5",
 };
 
+/** The chain is read at a glance, so the vendor prefix is dropped. */
+const shortModelLabel = (modelId: string) => {
+  if (!modelId) return "alap";
+  const pretty = PIPELINE_MODEL_LABELS[modelId] ?? modelId;
+  return pretty.replace(/^Claude\s+/i, "").replace(/^GPT-/i, "GPT-");
+};
+
 const STAGE_ROLE_LABELS: Record<string, string> = {
   plan: "TERV",
   code: "KÓD",
@@ -6524,6 +6531,48 @@ function App() {
   const [pipelineStageOverrides, setPipelineStageOverrides] = useState<
     Record<string, { model?: string; effort?: string }>
   >({});
+  const stageOverrideKey = (index: number) =>
+    `${activePipelineRecipe?.id ?? ""}:${index}`;
+  const stageValue = (index: number, field: "model" | "effort") => {
+    const stage = activePipelineRecipe?.stages[index];
+    const override = pipelineStageOverrides[stageOverrideKey(index)];
+    return override?.[field] ?? stage?.[field] ?? "";
+  };
+  /** The values a stage may cycle through, in a stable order. */
+  const stageChoices = (index: number, field: "model" | "effort") => {
+    const stage = activePipelineRecipe?.stages[index];
+    if (!stage) return [] as string[];
+    if (field === "effort") return FALLBACK_EFFORTS;
+    const isClaude = stage.provider === "anthropic";
+    // The runtime is fixed by the chain, so only that vendor's models are
+    // offered; a preset may also name one the catalog has not learned yet.
+    const ids = modelCatalog
+      .filter((model) =>
+        isClaude ? model.id.startsWith("claude-") : !model.id.startsWith("claude-"),
+      )
+      .map((model) => model.id);
+    return stage.model && !ids.includes(stage.model) ? [stage.model, ...ids] : ids;
+  };
+  /** Stepping instead of a dropdown: the chain stays two lines tall. */
+  const cycleStageValue = (
+    index: number,
+    field: "model" | "effort",
+    direction: 1 | -1,
+  ) => {
+    const choices = stageChoices(index, field);
+    if (choices.length === 0) return;
+    const current = stageValue(index, field);
+    const at = choices.indexOf(current);
+    const next =
+      choices[(at + direction + choices.length) % choices.length] ?? choices[0];
+    setPipelineStageOverrides((state) => ({
+      ...state,
+      [stageOverrideKey(index)]: {
+        ...state[stageOverrideKey(index)],
+        [field]: next,
+      },
+    }));
+  };
   const activePipelineRecipe =
     pipelineRecipes.find((recipe) => recipe.id === pipelineRecipeId) ??
     pipelineRecipes[0];
@@ -13675,99 +13724,46 @@ function App() {
                 >
                   Multi-AI
                 </button>
-                {pipelineMode && (
-                  <select
-                    value={pipelineRecipeId}
-                    onChange={(event) => setPipelineRecipeId(event.currentTarget.value)}
-                    aria-label="Lánc kiválasztása"
-                  >
-                    {pipelineRecipes.map((recipe) => (
-                      <option key={recipe.id} value={recipe.id}>
-                        {recipe.label}
-                      </option>
-                    ))}
-                  </select>
-                )}
               </div>
             )}
             {showDetailedTrace && pipelineMode && activePipelineRecipe && (
-              <div className="composer-stage-config" aria-label="Szakaszok beállítása">
-                {activePipelineRecipe.stages.map((stage, index) => {
-                  const key = `${activePipelineRecipe.id}:${index}`;
-                  const override = pipelineStageOverrides[key] ?? {};
-                  const isClaude = stage.provider === "anthropic";
-                  // Only the vendor's own models may be offered for a stage:
-                  // the runtime is fixed by the recipe, so a Codex model on a
-                  // Claude stage would simply fail at send time.
-                  const catalogModels = modelCatalog.filter((model) =>
-                    isClaude
-                      ? model.id.startsWith("claude-")
-                      : !model.id.startsWith("claude-"),
-                  );
-                  // The preset can recommend a model the catalog has not
-                  // learned about yet. Showing "default" while a different one
-                  // actually runs would be a lie, so it is offered explicitly.
-                  const models =
-                    stage.model &&
-                    !catalogModels.some((model) => model.id === stage.model)
-                      ? [
-                          {
-                            id: stage.model,
-                            displayName: PIPELINE_MODEL_LABELS[stage.model] ?? stage.model,
-                            description: "",
-                            supportedReasoningEfforts: FALLBACK_EFFORTS,
-                            defaultReasoningEffort: null,
-                          } as CodexModel,
-                          ...catalogModels,
-                        ]
-                      : catalogModels;
-                  const efforts =
-                    models.find(
-                      (model) => model.id === (override.model ?? stage.model),
-                    )?.supportedReasoningEfforts ?? FALLBACK_EFFORTS;
-                  const setOverride = (patch: { model?: string; effort?: string }) =>
-                    setPipelineStageOverrides((current) => ({
-                      ...current,
-                      [key]: { ...current[key], ...patch },
-                    }));
-                  return (
-                    <div className="composer-stage-row" key={key}>
-                      <span className="composer-stage-role">
-                        {STAGE_ROLE_LABELS[stage.role] ?? stage.role}
-                      </span>
-                      <select
-                        value={override.model ?? stage.model ?? ""}
-                        onChange={(event) =>
-                          setOverride({ model: event.currentTarget.value })
-                        }
-                        aria-label={`${STAGE_ROLE_LABELS[stage.role]} modell`}
+              <div className="composer-stage-chain" aria-label="Lánc beállítása">
+                <div className="composer-chain-line">
+                  {activePipelineRecipe.stages.map((stage, index) => (
+                    <span className="composer-chain-cell" key={`model-${index}`}>
+                      {index > 0 && <i className="composer-chain-arrow">→</i>}
+                      <button
+                        type="button"
+                        onClick={() => cycleStageValue(index, "model", 1)}
+                        onContextMenu={(event) => {
+                          event.preventDefault();
+                          cycleStageValue(index, "model", -1);
+                        }}
+                        title={`${STAGE_ROLE_LABELS[stage.role] ?? stage.role} modellje — kattints a következőért, jobb klikk visszafelé`}
                       >
-                        <option value="">
-                          {isClaude ? "Claude · alapértelmezett" : "Codex · alapértelmezett"}
-                        </option>
-                        {models.map((model) => (
-                          <option key={model.id} value={model.id}>
-                            {model.displayName}
-                          </option>
-                        ))}
-                      </select>
-                      <select
-                        value={override.effort ?? stage.effort ?? ""}
-                        onChange={(event) =>
-                          setOverride({ effort: event.currentTarget.value })
-                        }
-                        aria-label={`${STAGE_ROLE_LABELS[stage.role]} reasoning`}
+                        {shortModelLabel(stageValue(index, "model") ?? "")}
+                      </button>
+                    </span>
+                  ))}
+                </div>
+                <div className="composer-chain-line">
+                  {activePipelineRecipe.stages.map((stage, index) => (
+                    <span className="composer-chain-cell" key={`effort-${index}`}>
+                      {index > 0 && <i className="composer-chain-arrow">→</i>}
+                      <button
+                        type="button"
+                        onClick={() => cycleStageValue(index, "effort", 1)}
+                        onContextMenu={(event) => {
+                          event.preventDefault();
+                          cycleStageValue(index, "effort", -1);
+                        }}
+                        title={`${STAGE_ROLE_LABELS[stage.role] ?? stage.role} reasoning — kattints a következőért, jobb klikk visszafelé`}
                       >
-                        <option value="">reasoning</option>
-                        {efforts.map((effort) => (
-                          <option key={effort} value={effort}>
-                            {effort}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  );
-                })}
+                        {stageValue(index, "effort") || "alap"}
+                      </button>
+                    </span>
+                  ))}
+                </div>
               </div>
             )}
             {pipelineProgress && (

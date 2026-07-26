@@ -135,29 +135,32 @@ impl Recipe {
 /// reviewer is a different vendor -- that is where independence is worth the
 /// lossy hand-off.
 pub fn builtin_recipes() -> Vec<Recipe> {
-    let claude = |role: StageRole, model: &str, max_turns: u32| RecipeStage {
+    // Every stage names a real reasoning level. Leaving it empty made the GUI
+    // show an "alap" cell that was not one of the values it could cycle to, so
+    // clicking once dropped an option that could never be reached again.
+    let claude = |role: StageRole, model: &str, effort: &str, max_turns: u32| RecipeStage {
         role,
         provider: AgentProvider::Anthropic,
         runtime: AgentRuntimeKind::ClaudeAgentBridge,
         model: Some(model.to_string()),
-        effort: None,
+        effort: Some(effort.to_string()),
         max_turns: Some(max_turns),
     };
-    let codex = |role: StageRole, max_turns: u32| RecipeStage {
+    let codex = |role: StageRole, model: &str, effort: &str, max_turns: u32| RecipeStage {
         role,
         provider: AgentProvider::Codex,
         runtime: AgentRuntimeKind::CodexAppServer,
-        model: None,
-        effort: None,
+        model: Some(model.to_string()),
+        effort: Some(effort.to_string()),
         max_turns: Some(max_turns),
     };
     vec![Recipe {
         id: "plan_code_review".to_string(),
         label: "Terv → Kód → Review".to_string(),
         stages: vec![
-            claude(StageRole::Plan, "claude-fable-5", 15),
-            claude(StageRole::Code, "claude-opus-5", 40),
-            codex(StageRole::Review, 15),
+            claude(StageRole::Plan, "claude-fable-5", "max", 15),
+            claude(StageRole::Code, "claude-opus-5", "medium", 40),
+            codex(StageRole::Review, "gpt-5.6-sol", "medium", 15),
         ],
     }]
 }

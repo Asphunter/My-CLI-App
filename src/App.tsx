@@ -257,20 +257,18 @@ const PIPELINE_MODELS: Record<"anthropic" | "codex", string[]> = {
   codex: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
 };
 
+/** Short enough that every cell fits one fixed width. */
 const PIPELINE_MODEL_LABELS: Record<string, string> = {
-  "claude-opus-5": "Claude Opus 5",
-  "claude-fable-5": "Claude Fable 5",
-  "gpt-5.6-sol": "GPT-5.6-Sol",
-  "gpt-5.6-terra": "GPT-5.6-Terra",
-  "gpt-5.6-luna": "GPT-5.6-Luna",
+  "claude-opus-5": "Opus 5",
+  "claude-fable-5": "Fable 5",
+  "gpt-5.6-sol": "5.6 Sol",
+  "gpt-5.6-terra": "5.6 Terra",
+  "gpt-5.6-luna": "5.6 Luna",
 };
 
 /** The chain is read at a glance, so the vendor prefix is dropped. */
-const shortModelLabel = (modelId: string) => {
-  if (!modelId) return "alap";
-  const pretty = PIPELINE_MODEL_LABELS[modelId] ?? modelId;
-  return pretty.replace(/^Claude\s+/i, "").replace(/^GPT-/i, "GPT-");
-};
+const shortModelLabel = (modelId: string) =>
+  PIPELINE_MODEL_LABELS[modelId] ?? modelId;
 
 const STAGE_ROLE_LABELS: Record<string, string> = {
   plan: "TERV",
@@ -13803,7 +13801,7 @@ function App() {
                         }}
                         title="Reasoning — kattints a következőért, jobb klikk visszafelé"
                       >
-                        {stageValue(index, "effort") || "alap"}
+                        {stageValue(index, "effort") || FALLBACK_EFFORTS[0]}
                       </button>
                     </div>
                   ))}

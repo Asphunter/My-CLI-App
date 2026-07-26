@@ -1479,10 +1479,12 @@ textarea::placeholder { color: var(--faint); }
 .composer-controls-top .composer-detail-toggle { min-height: 24px; }
 .composer-pipeline-switch.mode-switch { margin: 0; padding: 2px; }
 .composer-pipeline-switch.mode-switch button { min-height: 20px; padding: 0 8px; font-size: 8px; letter-spacing: .06em; }
-.composer-stage-grid { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 4px; margin-top: 3px; }
+/* One fixed column width for every stage, sized for the longest label
+   ('5.6 Terra'), so a cell does not resize as its value steps. */
+.composer-stage-grid { display: grid; grid-auto-flow: column; grid-auto-columns: 74px; gap: 4px; margin-top: 3px; }
 .composer-stage-col { display: flex; flex-direction: column; align-items: stretch; gap: 2px; }
 .composer-stage-role { color: var(--faint); font-size: 8px; font-weight: 700; letter-spacing: .06em; text-align: center; }
-.composer-stage-col button { min-height: 18px; padding: 1px 6px; border: 1px solid #40515a; border-radius: 4px; background: rgba(25, 32, 36, .72); color: var(--muted); font-size: 8px; font-weight: 600; white-space: nowrap; cursor: pointer; }
+.composer-stage-col button { width: 100%; min-height: 18px; padding: 1px 4px; border: 1px solid #40515a; border-radius: 4px; background: rgba(25, 32, 36, .72); color: var(--muted); font-size: 8px; font-weight: 600; white-space: nowrap; cursor: pointer; }
 .composer-stage-col button:hover { border-color: #5e9877; color: var(--text); }
 .composer-stage-col .composer-stage-vendor { color: var(--text); font-weight: 700; }
 /* The chain owns the model choice, so the composer's own picker must not look

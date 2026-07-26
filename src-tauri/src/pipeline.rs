@@ -614,8 +614,16 @@ where
                 });
             }
             Err(message) => {
-                status = status_after_stage(false, is_last);
-                error = Some(message.clone());
+                // Stopping on purpose reaches the provider as a cancelled
+                // request, so the stage reports an error. Calling that a
+                // failure would blame the user for pressing stop.
+                let stopped = should_stop();
+                status = if stopped {
+                    RunStatus::Cancelled
+                } else {
+                    status_after_stage(false, is_last)
+                };
+                error = (!stopped).then(|| message.clone());
                 stages.push(StageRunResult {
                     index,
                     role: stage.role,
@@ -924,6 +932,30 @@ mod tests {
         assert!(
             outcome.stages[0].review.is_none() && outcome.stages[1].review.is_none(),
             "only a review stage carries a verdict"
+        );
+    }
+
+    #[test]
+    fn l7b_a_stage_cut_short_by_the_stop_button_is_not_a_failure() {
+        let recipe = recipe_by_id("plan_code_review").expect("preset");
+        // Pressing stop cancels the provider request, so the stage comes back
+        // with an error. That is the user's doing, not a broken run.
+        let recorder = Recorder::with(vec![
+            ok("terv", None),
+            Err("A Claude-kérés megszakítva.".to_string()),
+        ]);
+        recorder.stop_after.set(Some(2));
+        let outcome = recorder.run(&recipe, "Feladat.", None);
+
+        assert_eq!(outcome.status, RunStatus::Cancelled);
+        assert!(
+            outcome.error.is_none(),
+            "a stopped run must not report a failure reason to the user"
+        );
+        assert_eq!(outcome.stages.len(), 2);
+        assert!(
+            !outcome.stages[1].succeeded,
+            "the stage itself did not finish"
         );
     }
 

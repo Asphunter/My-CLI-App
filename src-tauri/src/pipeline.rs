@@ -389,6 +389,10 @@ pub struct StageOverride {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
+    /// `anthropic` or `codex`. Switching the vendor switches the runtime with
+    /// it, since a Claude model cannot run on the Codex app-server.
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 /// Applies the GUI's per-stage choices onto the preset.

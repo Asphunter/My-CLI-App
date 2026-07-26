@@ -628,7 +628,7 @@ textarea::placeholder { color: var(--faint); }
 .settings-retention-blockers { display: grid; gap: 3px; margin: 0 0 0 15px; padding: 0; color: #d8b47b; font-size: 8px; line-height: 1.35; }
 
 .composer-wrap { display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: end; gap: 8px; width: min(760px, calc(100% - 44px)); margin-right: auto; margin-bottom: 16px; margin-left: auto; }
-.composer-wrap > .composer-controls { align-self: end; margin-bottom: 42px; }
+.composer-wrap > .composer-controls { align-self: start; margin-top: 2px; }
 /* One grid child, so the two-column composer layout stays two columns however
    many controls the detailed mode adds. */
 .composer-controls { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; }
@@ -653,7 +653,7 @@ textarea::placeholder { color: var(--faint); }
 .code-drawer { top: 0; }
 
 @media (max-width: 1080px) { .composer-wrap { width: calc(100% - 36px); margin-right: auto; margin-left: auto; } .user-message .message-content { max-width: 60%; } }
-@media (max-width: 700px) { .composer-wrap { width: calc(100% - 28px); margin-right: 14px; margin-left: 14px; gap: 5px; } .composer-wrap > .composer-controls { margin-bottom: 42px; } .user-message .message-content { max-width: 100%; } }
+@media (max-width: 700px) { .composer-wrap { width: calc(100% - 28px); margin-right: 14px; margin-left: 14px; gap: 5px; } .composer-wrap > .composer-controls { margin-top: 2px; } .user-message .message-content { max-width: 100%; } }
 
 /* A selected work item is a real popover, never a layer over the controls. */
 .compact-work-flow.is-expanded { overflow: visible; }
@@ -1472,12 +1472,19 @@ textarea::placeholder { color: var(--faint); }
 .composer-pipeline-switch select { min-height: 20px; border: 1px solid #40515a; border-radius: 4px; background: rgba(25, 32, 36, .72); color: var(--muted); font-size: 8px; }
 .composer-pipeline-progress { color: var(--accent); font-size: 8px; font-weight: 600; letter-spacing: .04em; }
 .message-stage-badges { display: flex; align-items: center; gap: 5px; margin-bottom: 5px; }
-/* The chain reads as one line per dimension: models on top, reasoning below.
-   Clicking a cell steps to the next value, right click steps back, so three
-   stages stay two lines tall instead of nine controls. */
-.composer-stage-chain { display: flex; flex-direction: column; gap: 2px; }
-.composer-chain-line { display: flex; align-items: center; gap: 2px; }
-.composer-chain-cell { display: inline-flex; align-items: center; gap: 2px; }
-.composer-chain-arrow { color: var(--faint); font-size: 8px; font-style: normal; }
-.composer-chain-line button { min-height: 18px; padding: 1px 6px; border: 1px solid #40515a; border-radius: 4px; background: rgba(25, 32, 36, .72); color: var(--muted); font-size: 8px; font-weight: 600; letter-spacing: .02em; white-space: nowrap; cursor: pointer; }
-.composer-chain-line button:hover { border-color: #5e9877; color: var(--text); }
+/* The chain is read column by column: one column per stage, each stacking the
+   role, its vendor, its model and its reasoning. Clicking a cell steps to the
+   next value and right click steps back, so nine choices need no dropdowns. */
+.composer-controls-top { display: flex; align-items: center; gap: 6px; }
+.composer-controls-top .composer-detail-toggle { min-height: 24px; }
+.composer-pipeline-switch.mode-switch { margin: 0; padding: 2px; }
+.composer-pipeline-switch.mode-switch button { min-height: 20px; padding: 0 8px; font-size: 8px; letter-spacing: .06em; }
+.composer-stage-grid { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 4px; margin-top: 3px; }
+.composer-stage-col { display: flex; flex-direction: column; align-items: stretch; gap: 2px; }
+.composer-stage-role { color: var(--faint); font-size: 8px; font-weight: 700; letter-spacing: .06em; text-align: center; }
+.composer-stage-col button { min-height: 18px; padding: 1px 6px; border: 1px solid #40515a; border-radius: 4px; background: rgba(25, 32, 36, .72); color: var(--muted); font-size: 8px; font-weight: 600; white-space: nowrap; cursor: pointer; }
+.composer-stage-col button:hover { border-color: #5e9877; color: var(--text); }
+.composer-stage-col .composer-stage-vendor { color: var(--text); font-weight: 700; }
+/* The chain owns the model choice, so the composer's own picker must not look
+   available while a chain is selected. */
+.model-picker.is-disabled { pointer-events: none; opacity: .4; }

@@ -4036,6 +4036,8 @@ const familyVariantLabel = (family: ModelFamily, model: CodexModel) => {
 };
 
 type ModelPickerProps = {
+  /** A chain picks its own model per stage, so this one is not in charge. */
+  disabled?: boolean;
   open: boolean;
   loading: boolean;
   activeLabel: string;
@@ -4065,9 +4067,10 @@ function ModelPicker({
   onFamilyHover,
   onSelectModel,
   onSelectEffort,
+  disabled = false,
 }: ModelPickerProps) {
   return (
-    <div className="model-picker">
+    <div className={`model-picker${disabled ? " is-disabled" : ""}`} aria-disabled={disabled}>
       <button
         type="button"
         className="model-chip"
@@ -6529,21 +6532,28 @@ function App() {
   // means "keep what the preset recommends", so the picker never has to
   // pre-fill values the user did not choose.
   const [pipelineStageOverrides, setPipelineStageOverrides] = useState<
-    Record<string, { model?: string; effort?: string }>
+    Record<string, { model?: string; effort?: string; provider?: string }>
   >({});
   const stageOverrideKey = (index: number) =>
     `${activePipelineRecipe?.id ?? ""}:${index}`;
   const stageValue = (index: number, field: "model" | "effort") => {
     const stage = activePipelineRecipe?.stages[index];
     const override = pipelineStageOverrides[stageOverrideKey(index)];
+    // A vendor switch invalidates the model that belonged to the old one.
+    if (field === "model" && override?.provider && override.provider !== stage?.provider)
+      return override.model ?? "";
     return override?.[field] ?? stage?.[field] ?? "";
   };
+  const stageProvider = (index: number) =>
+    pipelineStageOverrides[stageOverrideKey(index)]?.provider ??
+    activePipelineRecipe?.stages[index]?.provider ??
+    "anthropic";
   /** The values a stage may cycle through, in a stable order. */
   const stageChoices = (index: number, field: "model" | "effort") => {
     const stage = activePipelineRecipe?.stages[index];
     if (!stage) return [] as string[];
     if (field === "effort") return FALLBACK_EFFORTS;
-    const isClaude = stage.provider === "anthropic";
+    const isClaude = stageProvider(index) === "anthropic";
     // The runtime is fixed by the chain, so only that vendor's models are
     // offered; a preset may also name one the catalog has not learned yet.
     const ids = modelCatalog
@@ -6556,9 +6566,22 @@ function App() {
   /** Stepping instead of a dropdown: the chain stays two lines tall. */
   const cycleStageValue = (
     index: number,
-    field: "model" | "effort",
+    field: "model" | "effort" | "vendor",
     direction: 1 | -1,
   ) => {
+    if (field === "vendor") {
+      const next = stageProvider(index) === "anthropic" ? "codex" : "anthropic";
+      setPipelineStageOverrides((state) => ({
+        ...state,
+        [stageOverrideKey(index)]: {
+          ...state[stageOverrideKey(index)],
+          provider: next,
+          // The old vendor's model cannot run on the new one.
+          model: undefined,
+        },
+      }));
+      return;
+    }
     const choices = stageChoices(index, field);
     if (choices.length === 0) return;
     const current = stageValue(index, field);
@@ -11969,10 +11992,11 @@ function App() {
               sessionId: resumeClaudeSessionId,
               conversationContext: rehydrationContext || null,
               maxBudgetUsd: Number(claudeBudgetUsd),
-              stageOverrides: activePipelineRecipe.stages.map(
-                (_, index) =>
-                  pipelineStageOverrides[`${activePipelineRecipe.id}:${index}`] ?? {},
-              ),
+              stageOverrides: activePipelineRecipe.stages.map((_, index) => ({
+                model: stageValue(index, "model") || undefined,
+                effort: stageValue(index, "effort") || undefined,
+                provider: stageProvider(index),
+              })),
             },
           });
           if (cancelledRequestIdsRef.current.delete(requestId)) return;
@@ -13685,53 +13709,65 @@ function App() {
           </div>
           <form ref={composerFormRef} className="composer-wrap" onSubmit={submitMessage}>
             <div className="composer-controls">
-            <label
-              className="composer-detail-toggle"
-              title="Részletes terv, lépések és gondolkodás megjelenítése"
-            >
-              <input
-                type="checkbox"
-                checked={showDetailedTrace}
-                onChange={(event) =>
-                  setShowDetailedTrace(event.currentTarget.checked)
-                }
-                aria-label="Részletes terv, lépések és gondolkodás"
-              />
-              <span>Részletes</span>
-            </label>
-            {showDetailedTrace && pipelineRecipes.length > 0 && (
-              <div
-                className="composer-pipeline-switch"
-                role="group"
-                aria-label="Részletes mód"
-              >
-                <button
-                  type="button"
-                  className={!pipelineMode ? "is-active" : ""}
-                  aria-pressed={!pipelineMode}
-                  onClick={() => setPipelineMode(false)}
+              <div className="composer-controls-top">
+                {pipelineRecipes.length > 0 && (
+                  <div
+                    className="composer-pipeline-switch mode-switch"
+                    role="tablist"
+                    aria-label="Részletes mód"
+                  >
+                    <button
+                      type="button"
+                      className={!pipelineMode ? "is-active" : ""}
+                      aria-pressed={!pipelineMode}
+                      onClick={() => setPipelineMode(false)}
+                    >
+                      EGY AI
+                    </button>
+                    <button
+                      type="button"
+                      className={pipelineMode ? "is-active" : ""}
+                      aria-pressed={pipelineMode}
+                      onClick={() => setPipelineMode(true)}
+                    >
+                      MULTI-AI
+                    </button>
+                  </div>
+                )}
+                <label
+                  className="composer-detail-toggle"
+                  title="Részletes terv, lépések és gondolkodás megjelenítése"
                 >
-                  Egy AI
-                </button>
-                <button
-                  type="button"
-                  className={pipelineMode ? "is-active" : ""}
-                  aria-pressed={pipelineMode}
-                  onClick={() => setPipelineMode(true)}
-                  title={activePipelineRecipe?.stages
-                    .map((stage) => `${STAGE_ROLE_LABELS[stage.role] ?? stage.role}`)
-                    .join(" → ")}
-                >
-                  Multi-AI
-                </button>
+                  <input
+                    type="checkbox"
+                    checked={showDetailedTrace}
+                    onChange={(event) =>
+                      setShowDetailedTrace(event.currentTarget.checked)
+                    }
+                    aria-label="Részletes terv, lépések és gondolkodás"
+                  />
+                  <span>Részletes</span>
+                </label>
               </div>
-            )}
-            {showDetailedTrace && pipelineMode && activePipelineRecipe && (
-              <div className="composer-stage-chain" aria-label="Lánc beállítása">
-                <div className="composer-chain-line">
+              {showDetailedTrace && pipelineMode && activePipelineRecipe && (
+                <div className="composer-stage-grid" aria-label="Lánc beállítása">
                   {activePipelineRecipe.stages.map((stage, index) => (
-                    <span className="composer-chain-cell" key={`model-${index}`}>
-                      {index > 0 && <i className="composer-chain-arrow">→</i>}
+                    <div className="composer-stage-col" key={`stage-${index}`}>
+                      <span className="composer-stage-role">
+                        {STAGE_ROLE_LABELS[stage.role] ?? stage.role}
+                      </span>
+                      <button
+                        type="button"
+                        className="composer-stage-vendor"
+                        onClick={() => cycleStageValue(index, "vendor", 1)}
+                        onContextMenu={(event) => {
+                          event.preventDefault();
+                          cycleStageValue(index, "vendor", -1);
+                        }}
+                        title="Gyártó — kattints a másikra"
+                      >
+                        {stageProvider(index) === "anthropic" ? "Claude" : "ChatGPT"}
+                      </button>
                       <button
                         type="button"
                         onClick={() => cycleStageValue(index, "model", 1)}
@@ -13739,17 +13775,10 @@ function App() {
                           event.preventDefault();
                           cycleStageValue(index, "model", -1);
                         }}
-                        title={`${STAGE_ROLE_LABELS[stage.role] ?? stage.role} modellje — kattints a következőért, jobb klikk visszafelé`}
+                        title="Modell — kattints a következőért, jobb klikk visszafelé"
                       >
                         {shortModelLabel(stageValue(index, "model") ?? "")}
                       </button>
-                    </span>
-                  ))}
-                </div>
-                <div className="composer-chain-line">
-                  {activePipelineRecipe.stages.map((stage, index) => (
-                    <span className="composer-chain-cell" key={`effort-${index}`}>
-                      {index > 0 && <i className="composer-chain-arrow">→</i>}
                       <button
                         type="button"
                         onClick={() => cycleStageValue(index, "effort", 1)}
@@ -13757,15 +13786,14 @@ function App() {
                           event.preventDefault();
                           cycleStageValue(index, "effort", -1);
                         }}
-                        title={`${STAGE_ROLE_LABELS[stage.role] ?? stage.role} reasoning — kattints a következőért, jobb klikk visszafelé`}
+                        title="Reasoning — kattints a következőért, jobb klikk visszafelé"
                       >
                         {stageValue(index, "effort") || "alap"}
                       </button>
-                    </span>
+                    </div>
                   ))}
                 </div>
-              </div>
-            )}
+              )}
             {pipelineProgress && (
               <div className="composer-pipeline-progress" role="status">
                 {`${STAGE_ROLE_LABELS[pipelineProgress.role] ?? pipelineProgress.role} · ${pipelineProgress.agentLabel} · ${pipelineProgress.stageIndex + 1}/${pipelineProgress.stageCount}`}
@@ -13878,6 +13906,7 @@ function App() {
                     </button>
                   )}
                   <ModelPicker
+                    disabled={showDetailedTrace && pipelineMode}
                     open={modelMenuOpen}
                     loading={modelsLoading}
                     activeLabel={activeLabel}

@@ -5,6 +5,40 @@ Elv: minden állításhoz bizonyíték (SQL-lekérdezés, journal-számlálás, 
 teszt-kimenet). Ami nem ellenőrizhető, az nincs kész — ezt a leckét ma kétszer
 tanultuk meg (mérőszám ≠ ránézés; "lefordul" ≠ "működik").
 
+
+## Állapot (2026-07-27)
+
+| Teszt | Állapot | Megjegyzés |
+|---|---|---|
+| U0 kiemelés | ✅ | `pipeline::run_stages`, injektált executorral |
+| U1, U1b session-öröklés | ✅ | |
+| U2 artefaktum-lánc | ✅ | |
+| U3 hiba megállítja a láncot | ✅ | |
+| U4, U4b felülbírálások | ✅ | **hibát talált:** a gyártó-csere sosem működött |
+| U5 request_ids ellenőrzés | ⬜ | |
+| U6 képek csak az elsőnek | ✅ | |
+| U7 JAVÍTANDÓ = completed | ✅ | |
+| U8, U8b futam-helyreállítás | ✅ | **hibát talált:** a futam lelőtte magát |
+| U9 kanonikus id | ⬜ | a függvény globális store-t nyit, előbb ki kell emelni |
+| U10 verdikt-fixture-ök | 🔄 | az L1 review-szövege felhasználható |
+| I1 jelvény a journalon | ✅ | |
+| I2 jelvény-öröklés merge-en | ✅ | **hibát talált:** a jelvény eltűnt |
+| I3 három szakasz = három válasz | ✅ | |
+| **L1 teljes lánc** | ✅ | lent részletezve; a bíráló megfogta a kódoló hamis sikerjelentését |
+| L2 terv nem ír | ✅ | az L1 mellékesen igazolta |
+| L3 Claude-bíráló tesztet futtat | ⬜ | |
+| L4 JAVÍTANDÓ-ág szándékosan | ⬜ | az L1 véletlenül produkálta, de nem célzottan |
+| L5 hibás szakasz | ⬜ | |
+| L6 újraindítás lánc közben | ⬜ | |
+| L7 megszakítás | ⚠️ | **defekt, nem teszteset** — nincs lánc-megszakítás |
+| L8 budget subscription alatt | ⬜ | |
+| L9 interaktivitás | 🔄 | a jóváhagyás-ág élesben lefutott; kérdés-ág nem |
+| L10 újragenerálás | ⬜ | |
+| X1–X3 másik gép | ⬜ | |
+
+Menet közben javított defektek, mind teszttel rögzítve: futam öngyilkosság ·
+jóváhagyásra váró turn halála · néma gyártó-csere · elvesző jelvény.
+
 ## 0. Kiindulási állapot — mi van már lefedve és mi nincs
 
 | Réteg | Van | Nincs |

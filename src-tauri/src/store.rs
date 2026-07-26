@@ -3785,6 +3785,11 @@ fn merge_snapshot_message_versions(
     if incoming.origin_device_id.is_none() {
         incoming.origin_device_id = existing.origin_device_id.clone();
     }
+    // Same reason as the sync merge: a copy without the badge must not strip
+    // the badge off the row that has one.
+    if incoming.pipeline.is_none() {
+        incoming.pipeline = existing.pipeline.clone();
+    }
     incoming
 }
 

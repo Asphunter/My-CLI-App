@@ -130,127 +130,111 @@ async fn pipeline_send(
 
     let run_id = store::begin_pipeline_run(&request.conversation_id, &recipe)?;
     let stage_count = recipe.stages.len() as i64;
-    let mut artifacts = Vec::<pipeline::StageArtifact>::new();
+    // Everything with a side effect lives in this closure; `run_stages` owns the
+    // chain logic itself and is tested without any of this.
+    let outcome = {
+        let app = app.clone();
+        let request = &request;
+        let run_id = run_id.clone();
+        pipeline::run_stages(
+            &recipe,
+            &request.prompt,
+            request.session_id.clone(),
+            move |execution| {
+                let app = app.clone();
+                let run_id = run_id.clone();
+                let request_id = request.request_ids[execution.index].clone();
+                let agent_label = pipeline::stage_agent_label(&execution.stage);
+                async move {
+                    let progress = |phase: &'static str, status: pipeline::RunStatus| {
+                        pipeline::PipelineProgress {
+                            run_id: run_id.clone(),
+                            conversation_id: request.conversation_id.clone(),
+                            stage_index: execution.index as i64,
+                            stage_count,
+                            role: execution.stage.role,
+                            agent_label: agent_label.clone(),
+                            request_id: request_id.clone(),
+                            phase,
+                            status,
+                        }
+                    };
+                    let _ = codex::emit_main_window(
+                        &app,
+                        "pipeline-progress",
+                        &progress("started", pipeline::RunStatus::Running),
+                    );
+                    store::update_pipeline_run_stage(&run_id, execution.index as i64)?;
+                    let turn = agent::AgentTurnRequest {
+                        prompt: execution.prompt,
+                        images: if execution.is_first {
+                            request.images.clone()
+                        } else {
+                            Vec::new()
+                        },
+                        provider: execution.stage.provider,
+                        runtime: execution.stage.runtime,
+                        conversation_id: Some(request.conversation_id.clone()),
+                        session_id: execution.session_id,
+                        conversation_context: if execution.is_first {
+                            request.conversation_context.clone()
+                        } else {
+                            None
+                        },
+                        model: execution.stage.model.clone(),
+                        effort: execution.stage.effort.clone(),
+                        cwd: request.cwd.clone(),
+                        request_id: Some(request_id.clone()),
+                        max_budget_usd: request.max_budget_usd,
+                        max_turns: execution.stage.max_turns,
+                        tool_profile: Some(execution.stage.role.tool_profile()),
+                    };
+                    let result = run_agent_turn(app.clone(), turn).await;
+                    let phase = if result.is_ok() { "finished" } else { "failed" };
+                    let _ = codex::emit_main_window(
+                        &app,
+                        "pipeline-progress",
+                        &progress(
+                            phase,
+                            if result.is_ok() {
+                                pipeline::RunStatus::Running
+                            } else {
+                                pipeline::RunStatus::Failed
+                            },
+                        ),
+                    );
+                    let response = result?;
+                    let mut changed_files = response.guard.changed_files.clone();
+                    changed_files.extend(response.guard.added_files.iter().cloned());
+                    changed_files.extend(response.guard.removed_files.iter().cloned());
+                    changed_files.sort();
+                    changed_files.dedup();
+                    Ok(pipeline::StageOutcome {
+                        text: response.text,
+                        session_id: response.session_id,
+                        changed_files,
+                    })
+                }
+            },
+        )
+        .await
+    };
+
+    // The badge is stamped once the chain is done, so a stage's verdict is
+    // already known when its answer is labelled.
     let mut stages = Vec::<pipeline::PipelineStageResult>::new();
-    // A stage of the same runtime continues the same session, so a model switch
-    // inside one vendor keeps the context. Crossing runtimes starts fresh and
-    // the artifact block in the prompt is what carries the work over.
-    let mut session_by_runtime: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    if let Some(session_id) = request.session_id.clone() {
-        session_by_runtime.insert(
-            format!("{:?}", agent::AgentRuntimeKind::ClaudeAgentBridge),
-            session_id,
-        );
-    }
-    let mut status = pipeline::RunStatus::Running;
-    let mut run_error = None;
-
-    for (index, stage) in recipe.stages.iter().enumerate() {
+    for stage_result in &outcome.stages {
+        let stage = &recipe.stages[stage_result.index];
         let agent_label = pipeline::stage_agent_label(stage);
-        let request_id = request.request_ids[index].clone();
-        let runtime_key = format!("{:?}", stage.runtime);
-        let progress =
-            |phase: &'static str, status: pipeline::RunStatus| pipeline::PipelineProgress {
-                run_id: run_id.clone(),
-                conversation_id: request.conversation_id.clone(),
-                stage_index: index as i64,
-                stage_count,
-                role: stage.role,
-                agent_label: agent_label.clone(),
-                request_id: request_id.clone(),
-                phase,
-                status,
-            };
-        let _ = codex::emit_main_window(&app, "pipeline-progress", &progress("started", status));
-
-        store::update_pipeline_run_stage(&run_id, index as i64)?;
-        let turn = agent::AgentTurnRequest {
-            prompt: pipeline::stage_prompt(stage.role, &request.prompt, &artifacts),
-            // Only the first stage carries the user's attachments; a later stage
-            // reasons about the work, not about the original images again.
-            images: if index == 0 {
-                request.images.clone()
-            } else {
-                Vec::new()
-            },
-            provider: stage.provider,
-            runtime: stage.runtime,
-            conversation_id: Some(request.conversation_id.clone()),
-            session_id: session_by_runtime.get(&runtime_key).cloned(),
-            conversation_context: if index == 0 {
-                request.conversation_context.clone()
-            } else {
-                None
-            },
-            model: stage.model.clone(),
-            effort: stage.effort.clone(),
-            cwd: request.cwd.clone(),
-            request_id: Some(request_id.clone()),
-            max_budget_usd: request.max_budget_usd,
-            max_turns: stage.max_turns,
-            tool_profile: Some(stage.role.tool_profile()),
-        };
-
-        let outcome = run_agent_turn(app.clone(), turn).await;
-        let is_last = index + 1 == recipe.stages.len();
-        let stage_result = match outcome {
-            Ok(response) => {
-                if let Some(session_id) = response.session_id.clone() {
-                    session_by_runtime.insert(runtime_key, session_id);
-                }
-                let review = if stage.role == pipeline::StageRole::Review {
-                    pipeline::parse_review_verdict(&response.text)
-                } else {
-                    None
-                };
-                artifacts.push(pipeline::artifact_from_response(
-                    stage.role,
-                    &response.text,
-                    &response.guard,
-                ));
-                status = pipeline::status_after_stage(true, is_last);
-                pipeline::PipelineStageResult {
-                    index: index as i64,
-                    role: stage.role,
-                    agent_label: agent_label.clone(),
-                    request_id: request_id.clone(),
-                    succeeded: true,
-                    text: response.text,
-                    error: None,
-                    review,
-                    session_id: response.session_id,
-                    answer_message_id: None,
-                }
-            }
-            Err(error) => {
-                status = pipeline::status_after_stage(false, is_last);
-                run_error = Some(error.clone());
-                pipeline::PipelineStageResult {
-                    index: index as i64,
-                    role: stage.role,
-                    agent_label: agent_label.clone(),
-                    request_id: request_id.clone(),
-                    succeeded: false,
-                    text: String::new(),
-                    error: Some(error),
-                    review: None,
-                    session_id: None,
-                    answer_message_id: None,
-                }
-            }
-        };
-        let mut stage_result = stage_result;
-        let failed = !stage_result.succeeded;
-        // Label the answer this stage just stored, so the badge survives a
-        // restart and reaches the other device on the message itself.
-        if stage_result.succeeded {
-            stage_result.answer_message_id = store::label_pipeline_stage_answer(
+        // Deterministic: the frontend allocated one id per stage in order.
+        let request_id = request.request_ids[stage_result.index].clone();
+        let answer_message_id = if stage_result.succeeded {
+            store::label_pipeline_stage_answer(
                 &request.conversation_id,
                 &request_id,
                 &store::LocalMessagePipeline {
                     run_id: run_id.clone(),
-                    stage_index: index as i64,
+                    stage_index: stage_result.index as i64,
                     stage_count,
                     stage_role: format!("{:?}", stage.role).to_lowercase(),
                     stage_agent: agent_label.clone(),
@@ -270,18 +254,25 @@ async fn pipeline_send(
                 },
             )
             .ok()
-            .unwrap_or_default();
-        }
-        let _ = codex::emit_main_window(
-            &app,
-            "pipeline-progress",
-            &progress(if failed { "failed" } else { "finished" }, status),
-        );
-        stages.push(stage_result);
-        if failed {
-            break;
-        }
+            .flatten()
+        } else {
+            None
+        };
+        stages.push(pipeline::PipelineStageResult {
+            index: stage_result.index as i64,
+            role: stage_result.role,
+            agent_label,
+            request_id,
+            succeeded: stage_result.succeeded,
+            text: stage_result.text.clone(),
+            error: stage_result.error.clone(),
+            review: stage_result.review.clone(),
+            session_id: stage_result.session_id.clone(),
+            answer_message_id,
+        });
     }
+    let status = outcome.status;
+    let run_error = outcome.error;
 
     store::finish_pipeline_run(&run_id, status.as_wire(), run_error.as_deref())?;
     Ok(pipeline::PipelineRunResult {

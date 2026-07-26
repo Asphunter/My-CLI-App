@@ -2960,6 +2960,11 @@ fn merge_message_versions(existing: &LocalMessage, mut incoming: LocalMessage) -
     if incoming.detailed.is_none() {
         incoming.detailed = existing.detailed;
     }
+    // Only the device that ran the chain has the badge; a copy republished by
+    // another device carries none, and dropping it here would ungroup the run.
+    if incoming.pipeline.is_none() {
+        incoming.pipeline = existing.pipeline.clone();
+    }
     // A device that computed the changed files keeps them: the other side only
     // ever has an empty list, and losing it is what hid the panel remotely.
     if incoming.change_summary.is_empty() {
@@ -6118,6 +6123,36 @@ mod tests {
         let capped_after = capped.after_code.expect("capped after code");
         assert!(capped_after.chars().count() > MAX_SHARED_CODE_CHARS);
         assert!(capped_after.contains("túl nagy a szinkronhoz"));
+    }
+
+    #[test]
+    fn i2_a_later_copy_without_the_badge_must_not_erase_it() {
+        // The badge is written by the device that ran the chain. Another device
+        // republishing the same settled answer has no badge to send, and the
+        // merge decides what survives -- the same shape of hole that lost the
+        // detailed flag, so it is pinned here rather than assumed.
+        let mut badged = test_message("answer", "assistant", "A szakasz valasza", true);
+        badged.pipeline = Some(store::LocalMessagePipeline {
+            run_id: "run-1".to_string(),
+            stage_index: 1,
+            stage_count: 3,
+            stage_role: "code".to_string(),
+            stage_agent: "Claude · Opus 5".to_string(),
+            verdict: None,
+            verdict_summary: None,
+        });
+        let unbadged = test_message("answer", "assistant", "A szakasz valasza", true);
+
+        let merged = merge_message_versions(&badged, unbadged.clone());
+        assert!(
+            merged.pipeline.is_some(),
+            "a copy that never learned the badge must not strip it"
+        );
+        assert_eq!(merged.pipeline.as_ref().unwrap().stage_index, 1);
+
+        // And the other direction: an incoming badge fills a row that has none.
+        let filled = merge_message_versions(&unbadged, badged);
+        assert!(filled.pipeline.is_some());
     }
 
     #[test]

@@ -401,6 +401,34 @@ pub struct StageOverride {
 /// Applies the GUI's per-stage choices onto the preset.
 pub fn apply_stage_overrides(recipe: &mut Recipe, overrides: &[StageOverride]) {
     for (stage, over) in recipe.stages.iter_mut().zip(overrides.iter()) {
+        // The vendor decides the runtime with it: a Claude model cannot run on
+        // the Codex app-server, so a stale id from the previous vendor has to go
+        // rather than fail at send time.
+        match over.provider.as_deref() {
+            Some("anthropic") => {
+                stage.provider = AgentProvider::Anthropic;
+                stage.runtime = AgentRuntimeKind::ClaudeAgentBridge;
+                if stage
+                    .model
+                    .as_deref()
+                    .is_some_and(|model| !model.starts_with("claude-"))
+                {
+                    stage.model = None;
+                }
+            }
+            Some("codex") => {
+                stage.provider = AgentProvider::Codex;
+                stage.runtime = AgentRuntimeKind::CodexAppServer;
+                if stage
+                    .model
+                    .as_deref()
+                    .is_some_and(|model| model.starts_with("claude-"))
+                {
+                    stage.model = None;
+                }
+            }
+            _ => {}
+        }
         if let Some(model) = over
             .model
             .as_deref()
@@ -468,6 +496,138 @@ pub struct PipelineProgress {
 
 pub fn recipes_for_frontend() -> Vec<Recipe> {
     builtin_recipes()
+}
+
+/// What the runner hands to whoever actually executes a stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageExecution {
+    pub index: usize,
+    pub stage: RecipeStage,
+    pub prompt: String,
+    /// The session this stage should continue, if one of its runtime is open.
+    pub session_id: Option<String>,
+    /// Only the first stage carries the user's attachments and context.
+    pub is_first: bool,
+}
+
+/// What executing a stage produced, reduced to what the chain reasons about.
+/// Deliberately not `AgentResponse`: the chain does not care how the answer was
+/// obtained, and a test should not have to build a whole transport response.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StageOutcome {
+    pub text: String,
+    pub session_id: Option<String>,
+    pub changed_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageRunResult {
+    pub index: usize,
+    pub role: StageRole,
+    pub succeeded: bool,
+    pub text: String,
+    pub error: Option<String>,
+    pub review: Option<ReviewOutcome>,
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipelineOutcome {
+    pub status: RunStatus,
+    pub stages: Vec<StageRunResult>,
+    pub error: Option<String>,
+}
+
+/// Walks the chain.
+///
+/// Everything with a side effect -- running the turn, writing to the store,
+/// emitting progress -- happens inside `execute`, so what remains here is the
+/// part worth testing on its own: which prompt each stage is handed, which
+/// session it continues, what a failure does to the rest of the chain.
+pub async fn run_stages<F, Fut>(
+    recipe: &Recipe,
+    original_prompt: &str,
+    initial_session: Option<String>,
+    mut execute: F,
+) -> PipelineOutcome
+where
+    F: FnMut(StageExecution) -> Fut,
+    Fut: std::future::Future<Output = Result<StageOutcome, String>>,
+{
+    let mut artifacts = Vec::<StageArtifact>::new();
+    let mut stages = Vec::<StageRunResult>::new();
+    // Keyed by runtime: a stage continues the session of its own runtime, which
+    // is what lets a model switch inside one vendor keep the context while a
+    // vendor switch starts fresh and relies on the artifact block instead.
+    let mut session_by_runtime = std::collections::HashMap::<String, String>::new();
+    if let Some(session) = initial_session {
+        session_by_runtime.insert(
+            format!("{:?}", AgentRuntimeKind::ClaudeAgentBridge),
+            session,
+        );
+    }
+    let mut status = RunStatus::Running;
+    let mut error = None;
+
+    for (index, stage) in recipe.stages.iter().enumerate() {
+        let runtime_key = format!("{:?}", stage.runtime);
+        let execution = StageExecution {
+            index,
+            stage: stage.clone(),
+            prompt: stage_prompt(stage.role, original_prompt, &artifacts),
+            session_id: session_by_runtime.get(&runtime_key).cloned(),
+            is_first: index == 0,
+        };
+        let is_last = index + 1 == recipe.stages.len();
+        match execute(execution).await {
+            Ok(outcome) => {
+                if let Some(session) = outcome.session_id.clone() {
+                    session_by_runtime.insert(runtime_key, session);
+                }
+                let review = (stage.role == StageRole::Review)
+                    .then(|| parse_review_verdict(&outcome.text))
+                    .flatten();
+                artifacts.push(StageArtifact {
+                    role: stage.role,
+                    text: outcome.text.clone(),
+                    changed_files: outcome.changed_files,
+                    diff: None,
+                });
+                status = status_after_stage(true, is_last);
+                stages.push(StageRunResult {
+                    index,
+                    role: stage.role,
+                    succeeded: true,
+                    text: outcome.text,
+                    error: None,
+                    review,
+                    session_id: outcome.session_id,
+                });
+            }
+            Err(message) => {
+                status = status_after_stage(false, is_last);
+                error = Some(message.clone());
+                stages.push(StageRunResult {
+                    index,
+                    role: stage.role,
+                    succeeded: false,
+                    text: String::new(),
+                    error: Some(message),
+                    review: None,
+                    session_id: None,
+                });
+                // The remaining roles would reason about an artifact that does
+                // not exist, so the chain stops here.
+                break;
+            }
+        }
+    }
+
+    PipelineOutcome {
+        status,
+        stages,
+        error,
+    }
 }
 
 #[cfg(test)]
@@ -584,6 +744,215 @@ mod tests {
             status_after_stage(false, false),
             RunStatus::Failed,
             "the later roles would reason about an artifact that does not exist"
+        );
+    }
+
+    /// Records what each stage was handed, so a test asserts on the chain
+    /// itself rather than on whatever the executor happened to return.
+    struct Recorder {
+        seen: std::cell::RefCell<Vec<StageExecution>>,
+        outcomes: std::cell::RefCell<Vec<Result<StageOutcome, String>>>,
+    }
+
+    impl Recorder {
+        fn with(outcomes: Vec<Result<StageOutcome, String>>) -> Self {
+            Self {
+                seen: std::cell::RefCell::new(Vec::new()),
+                outcomes: std::cell::RefCell::new(outcomes),
+            }
+        }
+
+        fn run(&self, recipe: &Recipe, prompt: &str, session: Option<String>) -> PipelineOutcome {
+            tauri::async_runtime::block_on(run_stages(recipe, prompt, session, |execution| {
+                self.seen.borrow_mut().push(execution);
+                let next = if self.outcomes.borrow().is_empty() {
+                    Ok(StageOutcome::default())
+                } else {
+                    self.outcomes.borrow_mut().remove(0)
+                };
+                async move { next }
+            }))
+        }
+    }
+
+    fn ok(text: &str, session: Option<&str>) -> Result<StageOutcome, String> {
+        Ok(StageOutcome {
+            text: text.to_string(),
+            session_id: session.map(str::to_string),
+            changed_files: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn u1_a_model_switch_inside_one_vendor_continues_the_same_session() {
+        let recipe = recipe_by_id("plan_code_review").expect("preset");
+        let recorder = Recorder::with(vec![
+            ok("terv", Some("claude-session-1")),
+            ok("kod", Some("claude-session-1")),
+            ok("VERDIKT: ELFOGAD - rendben.", Some("codex-session-9")),
+        ]);
+        recorder.run(&recipe, "Feladat.", None);
+        let seen = recorder.seen.borrow();
+
+        assert_eq!(
+            seen[0].session_id, None,
+            "the first stage opens the session"
+        );
+        assert_eq!(
+            seen[1].session_id.as_deref(),
+            Some("claude-session-1"),
+            "planning on one model and coding on another must continue one session"
+        );
+        assert_eq!(
+            seen[2].session_id, None,
+            "the reviewer is another runtime and must never inherit the Claude session"
+        );
+        assert_ne!(seen[0].stage.model, seen[1].stage.model);
+    }
+
+    #[test]
+    fn u1b_an_existing_conversation_session_reaches_the_first_claude_stage() {
+        let recipe = recipe_by_id("plan_code_review").expect("preset");
+        let recorder = Recorder::with(Vec::new());
+        recorder.run(&recipe, "Feladat.", Some("resumed-session".to_string()));
+        assert_eq!(
+            recorder.seen.borrow()[0].session_id.as_deref(),
+            Some("resumed-session")
+        );
+    }
+
+    #[test]
+    fn u2_each_stage_sees_the_task_and_everything_produced_before_it() {
+        let recipe = recipe_by_id("plan_code_review").expect("preset");
+        let recorder = Recorder::with(vec![
+            ok("A TERVEM: olvasd a math.js-t", None),
+            ok("A KODOM: kijavitottam", None),
+            ok("VERDIKT: ELFOGAD - jo.", None),
+        ]);
+        recorder.run(&recipe, "EREDETI KERES", None);
+        let seen = recorder.seen.borrow();
+
+        assert!(
+            !seen[0].prompt.contains("A TERVEM"),
+            "nothing precedes the first stage"
+        );
+        assert!(seen[1].prompt.contains("A TERVEM"));
+        assert!(seen[2].prompt.contains("A TERVEM") && seen[2].prompt.contains("A KODOM"));
+        for execution in seen.iter() {
+            assert!(
+                execution.prompt.starts_with("[EREDETI FELADAT]"),
+                "a stage that reads the previous output first drifts from the request"
+            );
+            assert!(execution.prompt.contains("EREDETI KERES"));
+        }
+    }
+
+    #[test]
+    fn u3_a_failed_stage_stops_the_chain_and_keeps_what_came_before() {
+        let recipe = recipe_by_id("plan_code_review").expect("preset");
+        let recorder = Recorder::with(vec![
+            ok("terv", None),
+            Err("A kodolo elhasalt.".to_string()),
+            ok("ez sosem fut", None),
+        ]);
+        let outcome = recorder.run(&recipe, "Feladat.", None);
+
+        assert_eq!(
+            recorder.seen.borrow().len(),
+            2,
+            "the reviewer would reason about an artifact that does not exist"
+        );
+        assert_eq!(outcome.status, RunStatus::Failed);
+        assert_eq!(outcome.error.as_deref(), Some("A kodolo elhasalt."));
+        assert_eq!(outcome.stages.len(), 2);
+        assert!(outcome.stages[0].succeeded && outcome.stages[0].text == "terv");
+        assert!(!outcome.stages[1].succeeded);
+    }
+
+    #[test]
+    fn u6_only_the_first_stage_carries_the_original_attachments() {
+        let recipe = recipe_by_id("plan_code_review").expect("preset");
+        let recorder = Recorder::with(Vec::new());
+        recorder.run(&recipe, "Feladat.", None);
+        let seen = recorder.seen.borrow();
+        assert!(seen[0].is_first);
+        assert!(!seen[1].is_first && !seen[2].is_first);
+    }
+
+    #[test]
+    fn u7_a_review_asking_for_changes_still_completes_the_run() {
+        let recipe = recipe_by_id("plan_code_review").expect("preset");
+        let recorder = Recorder::with(vec![
+            ok("terv", None),
+            ok("kod", None),
+            ok("VERDIKT: JAVÍTANDÓ - a teszt nem futott le.", None),
+        ]);
+        let outcome = recorder.run(&recipe, "Feladat.", None);
+
+        assert_eq!(
+            outcome.status,
+            RunStatus::Completed,
+            "the verdict is the result of the chain, not a failure of it"
+        );
+        let review = outcome.stages[2].review.as_ref().expect("verdict");
+        assert_eq!(review.verdict, ReviewVerdict::ChangesRequested);
+        assert_eq!(review.summary, "a teszt nem futott le.");
+        assert!(
+            outcome.stages[0].review.is_none() && outcome.stages[1].review.is_none(),
+            "only a review stage carries a verdict"
+        );
+    }
+
+    #[test]
+    fn u4_the_gui_choices_override_the_preset() {
+        let mut recipe = recipe_by_id("plan_code_review").expect("preset");
+        apply_stage_overrides(
+            &mut recipe,
+            &[
+                StageOverride {
+                    model: Some("claude-opus-5".to_string()),
+                    effort: Some("high".to_string()),
+                    provider: None,
+                },
+                StageOverride::default(),
+                StageOverride {
+                    model: None,
+                    effort: None,
+                    provider: Some("anthropic".to_string()),
+                },
+            ],
+        );
+
+        assert_eq!(recipe.stages[0].model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(recipe.stages[0].effort.as_deref(), Some("high"));
+        assert_eq!(
+            recipe.stages[1].model.as_deref(),
+            Some("claude-opus-5"),
+            "a stage left alone keeps what the preset recommends"
+        );
+        assert_eq!(recipe.stages[2].provider, AgentProvider::Anthropic);
+        assert_eq!(
+            recipe.stages[2].runtime,
+            AgentRuntimeKind::ClaudeAgentBridge,
+            "switching the vendor must switch the runtime with it"
+        );
+    }
+
+    #[test]
+    fn u4b_switching_a_stage_to_codex_drops_the_claude_model() {
+        let mut recipe = recipe_by_id("plan_code_review").expect("preset");
+        apply_stage_overrides(
+            &mut recipe,
+            &[StageOverride {
+                model: None,
+                effort: None,
+                provider: Some("codex".to_string()),
+            }],
+        );
+        assert_eq!(recipe.stages[0].provider, AgentProvider::Codex);
+        assert_eq!(
+            recipe.stages[0].model, None,
+            "a Claude model id would fail on the Codex app-server at send time"
         );
     }
 

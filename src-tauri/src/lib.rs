@@ -688,6 +688,7 @@ async fn local_store_import_v1() -> Result<Vec<migration::ImportReport>, String>
 async fn local_store_load() -> Result<store::LocalStoreSnapshot, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let _ = store::recover_orphaned_agent_turns();
+        let _ = store::recover_interrupted_pipeline_runs();
         let snapshot = store::load_snapshot()?;
         let (snapshot, recovered) = codex::recover_local_store_snapshot(snapshot)?;
         if recovered {

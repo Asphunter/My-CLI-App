@@ -1660,9 +1660,6 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
     // Cheap invariant check rather than a one-shot migration: the fossils can
     // also arrive later from another device that has not been updated yet.
     repair_answers_before_their_question(connection)?;
-    // A run cannot survive a restart: its stages were driven by a process that
-    // is gone. Close them honestly instead of leaving a spinner forever.
-    fail_interrupted_pipeline_runs(connection)?;
     Ok(())
 }
 
@@ -3302,6 +3299,15 @@ fn recover_orphaned_agent_turns_in_connection(
             params![now],
         )
         .map_err(|error| format!("Az orphaned agent turnök helyreállítása sikertelen: {error}"))
+}
+
+/// Startup-only, exactly like the orphaned-turn recovery beside it. It must not
+/// run on every store open: the runner opens the store several times while a
+/// chain is in flight, and closing "interrupted" runs there killed the very run
+/// that was still going.
+pub(crate) fn recover_interrupted_pipeline_runs() -> Result<usize, String> {
+    let store = open_local_store()?;
+    fail_interrupted_pipeline_runs(&store.connection)
 }
 
 pub(crate) fn recover_orphaned_agent_turns() -> Result<usize, String> {
@@ -6007,6 +6013,40 @@ mod tests {
             )
             .expect("read run");
         assert_eq!(done, "completed", "a finished run must be left alone");
+    }
+
+    #[test]
+    fn u8b_opening_the_store_does_not_kill_a_run_that_is_still_going() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        connection
+            .execute(
+                "INSERT INTO pipeline_runs
+                     (id, conversation_id, recipe_json, status, current_stage, error, created_at, updated_at)
+                 VALUES ('run-in-flight', 'conversation-1', '{}', 'running', 0, NULL, '100', '100')",
+                [],
+            )
+            .expect("insert run");
+
+        // The runner opens the store repeatedly while a chain is in flight -- to
+        // advance the stage, to record a turn, to store an answer. Recovery that
+        // rides along with initialization would close the run it is still in the
+        // middle of, which is exactly what happened on the first live chain.
+        initialize_connection(&mut connection).expect("re-initialize");
+
+        let status: String = connection
+            .query_row(
+                "SELECT status FROM pipeline_runs WHERE id = 'run-in-flight'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read run");
+        assert_eq!(
+            status, "running",
+            "a running chain must survive the store being opened again"
+        );
     }
 
     #[test]

@@ -261,9 +261,11 @@ const PIPELINE_MODELS: Record<"anthropic" | "codex", string[]> = {
 const PIPELINE_MODEL_LABELS: Record<string, string> = {
   "claude-opus-5": "Opus 5",
   "claude-fable-5": "Fable 5",
-  "gpt-5.6-sol": "5.6 Sol",
-  "gpt-5.6-terra": "5.6 Terra",
-  "gpt-5.6-luna": "5.6 Luna",
+  // The generation is already implied by the vendor cell above, and carrying
+  // it here forced every cell to the width of "5.6 Terra".
+  "gpt-5.6-sol": "Sol",
+  "gpt-5.6-terra": "Terra",
+  "gpt-5.6-luna": "Luna",
 };
 
 /** The chain is read at a glance, so the vendor prefix is dropped. */

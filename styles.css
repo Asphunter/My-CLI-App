@@ -1475,7 +1475,7 @@ textarea::placeholder { color: var(--faint); }
 .stage-verdict { padding: 1px 6px; border-radius: 4px; font-size: 8px; font-weight: 700; letter-spacing: .04em; white-space: nowrap; }
 .stage-verdict.is-accepted { border: 1px solid #4d8060; background: rgba(30, 60, 40, .75); color: #8fd6a6; }
 .stage-verdict.is-changes { border: 1px solid #8a7a45; background: rgba(60, 52, 26, .75); color: #ddc776; }
-.composer-pipeline-switch { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.composer-pipeline-switch { display: flex; flex-wrap: nowrap; align-items: center; gap: 4px; }
 .composer-pipeline-switch button { min-height: 20px; padding: 2px 8px; border: 1px solid #40515a; border-radius: 4px; background: rgba(25, 32, 36, .72); color: var(--faint); font-size: 8px; font-weight: 600; letter-spacing: .04em; }
 .composer-pipeline-switch button.is-active { border-color: #5e9877; background: #1d3528; color: var(--text); }
 .composer-pipeline-switch select { min-height: 20px; border: 1px solid #40515a; border-radius: 4px; background: rgba(25, 32, 36, .72); color: var(--muted); font-size: 8px; }
@@ -1484,18 +1484,29 @@ textarea::placeholder { color: var(--faint); }
 /* The chain is read column by column: one column per stage, each stacking the
    role, its vendor, its model and its reasoning. Clicking a cell steps to the
    next value and right click steps back, so nine choices need no dropdowns. */
-.composer-controls-top { display: flex; align-items: center; gap: 6px; }
+/* Right aligned so the tick keeps its place when the chain switch appears or
+   disappears beside it; a left aligned row slid it sideways on every toggle. */
+.composer-controls-top { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
 .composer-controls-top .composer-detail-toggle { min-height: 22px; font-size: 9px; }
-.composer-pipeline-switch.mode-switch { margin: 0; padding: 2px; }
+/* The sidebar's switch fills its column; here it must stay two cells wide in a
+   block only as wide as the stage columns, or it stacks into two rows. */
+/* The sidebar's switch is a two-column grid that fills its container; here the
+   container is only as wide as the stage columns, so it must stay a single
+   unwrapped row of its own width instead. */
+.composer-pipeline-switch.mode-switch { display: flex; flex-wrap: nowrap; margin: 0; padding: 2px; }
 .composer-pipeline-switch.mode-switch button { min-height: 19px; padding: 0 8px; font-size: 9px; letter-spacing: .06em; }
 /* One fixed column width for every stage, sized for the longest label
    ('5.6 Terra'), so a cell does not resize as its value steps. */
-.composer-stage-grid { display: grid; grid-auto-flow: column; grid-auto-columns: 76px; gap: 4px; margin-top: 2px; }
+.composer-stage-grid { display: grid; grid-auto-flow: column; grid-auto-columns: 48px; gap: 11px; margin-top: 2px; }
 .composer-stage-col { display: flex; flex-direction: column; align-items: stretch; gap: 2px; }
 .composer-stage-role { color: var(--faint); font-size: 9px; font-weight: 700; letter-spacing: .06em; text-align: center; }
-.composer-stage-col button { width: 100%; min-height: 17px; padding: 1px 5px; border: 1px solid #40515a; border-radius: 4px; background: rgba(25, 32, 36, .72); color: var(--muted); font-size: 9px; font-weight: 600; white-space: nowrap; cursor: pointer; }
+.composer-stage-col button { position: relative; width: 100%; min-height: 17px; padding: 1px 3px; border: 1px solid #40515a; border-radius: 4px; background: rgba(25, 32, 36, .72); color: var(--muted); font-size: 9px; font-weight: 600; white-space: nowrap; cursor: pointer; }
 .composer-stage-col button:hover { border-color: #5e9877; color: var(--text); }
-.composer-stage-col .composer-stage-vendor { color: var(--text); font-weight: 700; }
+".composer-stage-col .composer-stage-vendor { color: var(--text); font-weight: 700; }
+/* The model and reasoning rows read as a chain, so the hand-off is drawn
+   between them; the vendor row is a per-stage fact, not a sequence. */
+.composer-stage-col:not(:last-child) button:nth-of-type(2)::after,
+.composer-stage-col:not(:last-child) button:nth-of-type(3)::after { content: "→"; position: absolute; top: 50%; right: -9px; color: var(--faint); font-size: 8px; transform: translateY(-50%); }
 /* The chain owns the model choice, so the composer's own picker must not look
    available while a chain is selected. */
 .model-picker.is-disabled { pointer-events: none; opacity: .4; }

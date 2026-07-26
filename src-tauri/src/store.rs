@@ -2777,8 +2777,13 @@ pub(crate) fn apply_agent_session_compaction_state(
 pub(crate) fn export_agent_session_events(
 ) -> Result<Vec<(String, String, serde_json::Value)>, String> {
     let store = open_local_store()?;
-    let mut session_statement = store
-        .connection
+    export_agent_session_events_from_connection(&store.connection)
+}
+
+pub(crate) fn export_agent_session_events_from_connection(
+    connection: &Connection,
+) -> Result<Vec<(String, String, serde_json::Value)>, String> {
+    let mut session_statement = connection
         .prepare(
             "SELECT id, conversation_id, project_key, provider, provider_session_id,
                     head_turn_id, status, created_at, updated_at, origin_device_id, hlc
@@ -2819,6 +2824,12 @@ pub(crate) fn export_agent_session_events(
         hlc,
     ) in sessions
     {
+        // `hlc` and `originDeviceId` describe the event that carried this row,
+        // not the session, and the importer takes both from the event envelope
+        // instead of the payload. Publishing them made our own import rewrite
+        // them, which changed the next payload and produced an endless stream
+        // of identical session events. Only real session state travels here.
+        let _ = (&origin_device_id, &hlc);
         let base = serde_json::json!({
             "id": id.clone(),
             "conversationId": conversation_id.clone(),
@@ -2829,8 +2840,21 @@ pub(crate) fn export_agent_session_events(
             "status": status.clone(),
             "createdAt": created_at.clone(),
             "updatedAt": updated_at.clone(),
-            "originDeviceId": origin_device_id.clone(),
-            "hlc": hlc.clone(),
+        });
+        // An entry is immutable once written, so its event payload must be
+        // immutable too. Embedding the live session here made every publish
+        // rewrite every entry: publishing re-imported our own event, the import
+        // stamped a fresh `hlc`/`updatedAt` on the session row, and the next
+        // export produced a different payload hash for entries that had not
+        // changed at all. One unchanged entry reached 122 copies in the journal.
+        // Mutable session state travels in `agent_session.upsert` instead.
+        let session_stub = serde_json::json!({
+            "id": id.clone(),
+            "conversationId": conversation_id.clone(),
+            "projectKey": project_key.clone(),
+            "provider": provider.clone(),
+            "providerSessionId": provider_session_id.clone(),
+            "createdAt": created_at.clone(),
         });
         if status == "deleted" {
             events.push((
@@ -2845,8 +2869,7 @@ pub(crate) fn export_agent_session_events(
             "agent_session.upsert".to_string(),
             base.clone(),
         ));
-        let mut entry_statement = store
-            .connection
+        let mut entry_statement = connection
             .prepare(
                 "SELECT id, subpath, entry_uuid, sequence, body_json, created_at
                  FROM agent_session_entries
@@ -2873,7 +2896,7 @@ pub(crate) fn export_agent_session_events(
             })?;
             let payload = serde_json::json!({
                 "id": entry_id,
-                "session": base.clone(),
+                "session": session_stub.clone(),
                 "subpath": subpath,
                 "entryUuid": entry_uuid,
                 "sequence": sequence,
@@ -3006,25 +3029,64 @@ pub(crate) fn apply_agent_sync_event(
             }) {
                 return Ok(());
             }
-            let session_payload = serde_json::json!({
-                "id": session_id,
-                "conversationId": session.get("conversationId").and_then(serde_json::Value::as_str).unwrap_or_default(),
-                "projectKey": session.get("projectKey").and_then(serde_json::Value::as_str).unwrap_or_default(),
-                "provider": session.get("provider").and_then(serde_json::Value::as_str).unwrap_or("anthropic"),
-                "providerSessionId": session.get("providerSessionId").and_then(serde_json::Value::as_str).unwrap_or_default(),
-                "headTurnId": session.get("headTurnId").and_then(serde_json::Value::as_str),
-                "status": "active",
-                "createdAt": session.get("createdAt").and_then(serde_json::Value::as_str).unwrap_or(event_hlc),
-                "updatedAt": session.get("updatedAt").and_then(serde_json::Value::as_str).unwrap_or(event_hlc),
-            });
-            apply_agent_sync_event(
-                transaction,
-                "agent_session.upsert",
-                &format!("agent-session:{session_id}"),
-                &session_payload,
-                event_hlc,
-                device_id,
-            )?;
+            // Only make sure the parent row exists. An entry carries no
+            // authority over the session's mutable state -- writing it here
+            // stamped a new `hlc`/`updatedAt` on every import, which changed
+            // the next export's payloads and re-published every entry again.
+            // `agent_session.upsert` is the single carrier of that state.
+            let created_at = session
+                .get("createdAt")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(event_hlc);
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO agent_sessions (
+                         id, conversation_id, project_key, provider, provider_session_id,
+                         head_turn_id, status, created_at, updated_at, origin_device_id, hlc
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'active', ?6, ?6, ?7, ?8)",
+                    params![
+                        session_id,
+                        session
+                            .get("conversationId")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default(),
+                        session
+                            .get("projectKey")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default(),
+                        session
+                            .get("provider")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("anthropic"),
+                        session
+                            .get("providerSessionId")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default(),
+                        created_at,
+                        device_id,
+                        event_hlc,
+                    ],
+                )
+                .map_err(|error| {
+                    format!("Az agent session entry gazdasora nem hozhatÃ³ lÃ©tre: {error}")
+                })?;
+            // A newer entry still outranks a stale tombstone, exactly as before:
+            // the guard above already returned for a tombstone that is newer.
+            // This is a real state change, so re-publishing it is correct.
+            if existing_session
+                .as_ref()
+                .is_some_and(|(status, _)| status == "deleted")
+            {
+                transaction
+                    .execute(
+                        "UPDATE agent_sessions SET status = 'active', hlc = ?1, updated_at = ?2
+                         WHERE id = ?3",
+                        params![event_hlc, created_at, session_id],
+                    )
+                    .map_err(|error| {
+                        format!("Az agent session ÃºjraaktivÃ¡lÃ¡sa sikertelen: {error}")
+                    })?;
+            }
             let entry_body = payload
                 .get("body")
                 .ok_or_else(|| "Az agent session entry body-ja hiÃ¡nyzik.".to_string())?;
@@ -3406,7 +3468,17 @@ fn merge_snapshot_message_versions(
     incoming.id = existing.id.clone().or(incoming.id);
     let existing_unavailable = unavailable_assistant_message(existing);
     let incoming_unavailable = unavailable_assistant_message(&incoming);
+    // Two settled answers are two complete texts, so the longer one is not the
+    // better one: a body with another answer glued onto it always won and the
+    // correct, shorter text could never return. The first-seen row comes from
+    // the authoritative list here, which is the same rule the UI applies when
+    // it folds a cached copy into the synced one.
+    let both_settled = existing.final_message.unwrap_or(false)
+        && incoming.final_message.unwrap_or(false)
+        && !existing_unavailable
+        && !incoming_unavailable;
     if (incoming_unavailable && !existing_unavailable)
+        || both_settled
         || (incoming_unavailable == existing_unavailable
             && existing.text.trim().len() > incoming.text.trim().len())
     {
@@ -5550,6 +5622,82 @@ mod tests {
         assert_eq!(
             answers, 2,
             "both answers must survive; a shared item id must not delete a previous turn's answer"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_session_entry_keeps_its_payload_across_publishes() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        connection
+            .execute(
+                "INSERT INTO agent_sessions (
+                     id, conversation_id, project_key, provider, provider_session_id,
+                     head_turn_id, status, created_at, updated_at, origin_device_id, hlc
+                 ) VALUES ('session-1', 'conversation-1', 'C:/project', 'anthropic',
+                           'provider-session-1', NULL, 'active', '100', '100', NULL, NULL)",
+                [],
+            )
+            .expect("insert session");
+        connection
+            .execute(
+                "INSERT INTO agent_session_entries (
+                     id, agent_session_id, subpath, entry_uuid, sequence,
+                     body_json, origin_device_id, hlc, created_at
+                 ) VALUES ('entry-1', 'session-1', '', 'uuid-1', 1, '{\"type\":\"user\"}', NULL, NULL, '101')",
+                [],
+            )
+            .expect("insert entry");
+
+        let entry_payload = |connection: &Connection| {
+            export_agent_session_events_from_connection(connection)
+                .expect("export")
+                .into_iter()
+                .find(|(_, event_type, _)| event_type == "agent_session.entry_append")
+                .map(|(_, _, payload)| payload)
+                .expect("entry event")
+        };
+        let session_payload = |connection: &Connection| {
+            export_agent_session_events_from_connection(connection)
+                .expect("export")
+                .into_iter()
+                .find(|(_, event_type, _)| event_type == "agent_session.upsert")
+                .map(|(_, _, payload)| payload)
+                .expect("session event")
+        };
+        let before = entry_payload(&connection);
+        let before_session = session_payload(&connection);
+
+        // Exactly what publishing does to us: our own event comes back through
+        // the import and stamps fresh mutable state on the session row.
+        connection
+            .execute(
+                "UPDATE agent_sessions SET
+                     hlc = '00000001784847342378-00000000',
+                     origin_device_id = 'device-1'
+                 WHERE id = 'session-1'",
+                [],
+            )
+            .expect("simulate self-import");
+        let after = entry_payload(&connection);
+
+        assert_eq!(
+            before, after,
+            "an untouched entry must keep an identical payload, otherwise every publish re-writes every entry"
+        );
+        assert_eq!(
+            before_session,
+            session_payload(&connection),
+            "importing our own session event must not change what the next publish would write"
+        );
+        assert!(
+            before["session"].get("hlc").is_none()
+                && before["session"].get("updatedAt").is_none()
+                && before["session"].get("headTurnId").is_none()
+                && before["session"].get("status").is_none(),
+            "the entry payload must not carry mutable session state"
         );
     }
 

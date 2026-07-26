@@ -19,7 +19,12 @@ Napi növekedés: júl. 24: 4 756 · **júl. 25: 25 792** · júl. 26 (fél nap)
 
 ## P0 — Aktív vagy azonnal ható hibák
 
-### 1. Az agent-session entry echo-vihar (a journal-hízás fő oka)
+> **Státusz: mind a három javítva** (2026-07-26). Mérés a javítás után, éles adaton:
+> egymás utáni publish-ek `45 → 0 → 0` eventet írnak (előtte `45 → 45 → 45`, a
+> bejegyzéseknél ezrek); két valódi turn összesen 27 eventet szül, mind új adat.
+> A reducer-teszt javítás nélkül `["VALASZ_2"]`-t ad három válasz helyett.
+
+### 1. Az agent-session entry echo-vihar (a journal-hízás fő oka) — JAVÍTVA
 
 **Tünet:** egyetlen változatlan session-bejegyzés **122-szer** szerepel a journalban, 122 különböző payload-hash-sel (`agent-entry:31cf7404…`). Emiatt volt a másik gépen az „1,5 órája tölt le kb-os fájlokat".
 
@@ -32,7 +37,7 @@ Napi növekedés: júl. 24: 4 756 · **júl. 25: 25 792** · júl. 26 (fél nap)
 
 **Javítás-vázlat:** az entry payloadba csak stabil session-stub kerüljön (`id`, `conversationId`, `projectKey`, `provider`, `providerSessionId`, `createdAt` — mutálódó mező semmi); a validátor ([sync.rs:1796-1811](src-tauri/src/sync.rs#L1796-L1811)) csak `session.id`-t követel, tehát visszafelé kompatibilis. Teszt: két publish egymás után → a második 0 entry-eventet ír.
 
-### 2. A reducer ma is összeolvasztja a különböző turnök válaszait (a ma javított bug ikre)
+### 2. A reducer ma is összeolvasztja a különböző turnök válaszait — JAVÍTVA
 
 **Tünet-osztály:** pontosan az, amit ma javítottunk — csak a lánc **harmadik** rétegében még él.
 
@@ -49,7 +54,7 @@ Amikor a reducer fut (azaz amikor **új remote event érkezik** — pont a cross
 
 **Javítás-vázlat:** a `same_item` ág csak `same_turn`-nel együtt érvényes (ugyanaz a szabály, mint ma a store/frontend oldalon); teszt: két turn, mindkettő `assistant-0`, reducer után 2 üzenet marad.
 
-### 3. „A hosszabb szöveg nyer" még két rétegben él — a gyógyulást felülírja
+### 3. „A hosszabb szöveg nyer" még két rétegben él — JAVÍTVA
 
 Ma az SQLite upsertben lecseréltük (újabb óra nyer). De:
 - **Reducer + checkpoint-merge:** `merge_message_versions` settled válasznál is a hosszabbat tartja: [sync.rs:2898-2907](src-tauri/src/sync.rs#L2898-L2907) — ez fut a reducer üzenet-ágán ([sync.rs:3289-3291](src-tauri/src/sync.rs#L3289-L3291)) és a checkpoint-írásnál is ([sync.rs:916](src-tauri/src/sync.rs#L916)), tehát egy romlott hosszú törzs a **snapshot-rétegben** örökre nyer, hiába gyógyult az SQLite.
@@ -124,11 +129,11 @@ Az append csak a **saját** utolsó HLC-jéből lép tovább ([sync.rs:4928-4947
 5. **Blokkolás-granularitás:** idegen eszköz hibája ne tiltsa a saját appendet (per-device karantén, saját lánc írható marad).
 6. **Óradrift-őr:** ha a helyi óra és a journal legnagyobb HLC-je között nagy az eltérés, figyelmeztetés a UI-n (a P1/6 fúzióval együtt).
 
-## Javasolt holnapi sorrend
+## Sorrend
 
-1. **Echo-vihar leállítása** (P0/1) — enélkül minden más alatt tovább hízik a journal.
-2. **Reducer item-alias turn-scope** + **longest-wins csere** a 3 maradék helyen (P0/2, P0/3) — ez zárja le végleg a ma látott adatvesztés-osztályt.
-3. **Compaction/prune** mindkét gépen (Fejlesztés/3) — a 46k fájl eltüntetése.
+1. ~~**Echo-vihar leállítása** (P0/1)~~ — kész.
+2. ~~**Reducer item-alias turn-scope** + **longest-wins csere** (P0/2, P0/3)~~ — kész.
+3. **Compaction/prune** mindkét gépen (Fejlesztés/3) — a ~39k fájl eltüntetése. Most már biztonságos: az echo-forrás elapadt, nem hízik vissza.
 4. conversation.upsert karcsúsítás (P1/4).
 5. Cím-kulcs → id-kulcs rendezés + szellem-beszélgetés fix (P1/5).
 6. HLC-fúzió (P1/6), majd a P2/P3 lista.

@@ -2899,8 +2899,19 @@ fn merge_message_versions(existing: &LocalMessage, mut incoming: LocalMessage) -
     incoming.text = store::collapse_repeated_assistant_text(&incoming.role, &incoming.text);
     let existing_unavailable = unavailable_assistant_text(existing);
     let incoming_unavailable = unavailable_assistant_text(&incoming);
+    // Two settled answers are two complete texts, so length says nothing about
+    // which one is right. Letting the longer win made corruption permanent: a
+    // body with a second answer glued onto it beat the correct, shorter one on
+    // every merge and the truth could never come back. Every caller passes the
+    // authoritative version as `incoming` (the reducer only merges a strictly
+    // newer rank), so the caller's ordering decides instead.
+    let both_settled = existing.final_message.unwrap_or(false)
+        && incoming.final_message.unwrap_or(false)
+        && !existing_unavailable
+        && !incoming_unavailable;
     if (incoming_unavailable && !existing_unavailable)
-        || (incoming_unavailable == existing_unavailable
+        || (!both_settled
+            && incoming_unavailable == existing_unavailable
             && existing_text.trim().len() > incoming.text.trim().len())
     {
         incoming.text = existing_text;
@@ -2962,10 +2973,23 @@ fn existing_message_alias_id(
         if existing.role != incoming.role {
             return None;
         }
+        let existing_turn_id = existing
+            .turn_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
         let same_turn = turn_id
             .is_some_and(|turn_id| existing.turn_id.as_deref().map(str::trim) == Some(turn_id));
-        let same_item = item_id
-            .is_some_and(|item_id| existing.item_id.as_deref().map(str::trim) == Some(item_id));
+        // An item id only identifies a message inside its own turn: providers
+        // label content blocks positionally, so every first answer block is
+        // `assistant-0`. Two turns that disagree are two answers, never an
+        // alias of one -- accepting the item id alone folded every answer of a
+        // conversation into the first one during a remote import.
+        let different_turns =
+            matches!((turn_id, existing_turn_id), (Some(left), Some(right)) if left != right);
+        let same_item = !different_turns
+            && item_id
+                .is_some_and(|item_id| existing.item_id.as_deref().map(str::trim) == Some(item_id));
         let same_legacy_assistant = incoming.role == "assistant"
             && turn_id.is_none()
             && item_id.is_none()
@@ -2994,6 +3018,16 @@ fn merge_checkpoint_message(messages: &mut Vec<LocalMessage>, incoming: LocalMes
             .iter_mut()
             .find(|message| message.id.as_deref() == Some(incoming_id))
         {
+            // A checkpoint is a redundant recovery copy, never a correction.
+            // Once the reduced snapshot already holds a settled answer, that
+            // one is authoritative; merging here let an older checkpoint body
+            // overwrite it and reintroduced text the journal had moved past.
+            if existing.role == "assistant"
+                && existing.final_message.unwrap_or(false)
+                && !unavailable_assistant_text(existing)
+            {
+                return;
+            }
             *existing = merge_message_versions(existing, incoming);
             return;
         }
@@ -5762,6 +5796,62 @@ mod tests {
     }
 
     #[test]
+    fn a_longer_glued_answer_does_not_beat_the_authoritative_one() {
+        let correct = test_message("answer", "assistant", "Elkeszult a superhet.svg.", true);
+        let glued = test_message(
+            "answer",
+            "assistant",
+            "Elkeszult a superhet.svg.Yes. Two files: AGENTS.md es AGENTS.md",
+            true,
+        );
+
+        // The reducer only merges a strictly newer rank, so `incoming` wins.
+        assert_eq!(
+            merge_message_versions(&glued, correct.clone()).text,
+            "Elkeszult a superhet.svg.",
+            "a newer settled answer must replace a longer corrupted one"
+        );
+        // An empty/interrupted copy still cannot erase a real answer.
+        let stale = test_message("answer", "assistant", "", true);
+        assert_eq!(
+            merge_message_versions(&correct, stale).text,
+            "Elkeszult a superhet.svg."
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_cannot_overwrite_a_settled_answer_in_the_snapshot() {
+        let mut messages = vec![test_message(
+            "answer",
+            "assistant",
+            "Elkeszult a superhet.svg.",
+            true,
+        )];
+        let checkpoint_copy = test_message(
+            "answer",
+            "assistant",
+            "Elkeszult a superhet.svg.Yes. Two files: AGENTS.md es AGENTS.md",
+            true,
+        );
+
+        merge_checkpoint_message(&mut messages, checkpoint_copy);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].text, "Elkeszult a superhet.svg.",
+            "the redundant checkpoint must not correct an answer the snapshot already settled"
+        );
+
+        // It must still repair an answer the snapshot is missing.
+        let mut empty = vec![test_message("answer", "assistant", "", false)];
+        merge_checkpoint_message(
+            &mut empty,
+            test_message("answer", "assistant", "Helyreallitott valasz", true),
+        );
+        assert_eq!(empty[0].text, "Helyreallitott valasz");
+    }
+
+    #[test]
     fn later_sync_event_cannot_rewrite_a_user_payload() {
         let mut original = test_message("user", "user", "Eredeti kérdés", true);
         original.time = "first".to_string();
@@ -6221,6 +6311,115 @@ mod tests {
             )
             .expect("session count");
         assert_eq!(sessions, 1, "the agent session must survive the round trip");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_reducer_keeps_answers_of_different_turns_apart() {
+        let root = test_root();
+        let device_a = Uuid::new_v4().to_string();
+        let importer = Uuid::new_v4().to_string();
+        let project_id = stable_id("project", "reducer-turn-scope-project");
+        let conversation_id = stable_id("conversation", "reducer-turn-scope-conversation");
+
+        let project = make_event(
+            &device_a,
+            1,
+            format!("{:020}-{:08}", 1, 0),
+            None,
+            project_id.clone(),
+            PROJECT_UPSERT.to_string(),
+            serde_json::to_value(LocalProject {
+                id: project_id.clone(),
+                name: "Shared".to_string(),
+                relative_path: Some("shared".to_string()),
+                path_hint: "C:/shared".to_string(),
+                threads: vec!["Thread".to_string()],
+            })
+            .expect("project payload"),
+        )
+        .expect("project event");
+        let conversation = make_event(
+            &device_a,
+            2,
+            format!("{:020}-{:08}", 2, 0),
+            Some(project.event_hash.clone()),
+            conversation_id.clone(),
+            CONVERSATION_UPSERT.to_string(),
+            serde_json::to_value(ConversationEventPayload {
+                id: conversation_id.clone(),
+                scope: store::CODING_SCOPE.to_string(),
+                project_id: Some(project_id.clone()),
+                title: "Thread".to_string(),
+                thread_id: None,
+                updated_at: "2".to_string(),
+                plan_history: BTreeMap::new(),
+                commentary: Vec::new(),
+            })
+            .expect("conversation payload"),
+        )
+        .expect("conversation event");
+
+        // Three separate turns, each labelled `assistant-0` by the bridge.
+        // The real journal holds exactly this: 23 turns of one conversation
+        // all carrying that same positional item id.
+        let mut events = vec![project, conversation];
+        for index in 0..3_u64 {
+            let mut answer = test_message(
+                &Uuid::new_v4().to_string(),
+                "assistant",
+                &format!("VALASZ_{index}"),
+                true,
+            );
+            answer.sequence = Some(10 + index as i64);
+            answer.turn_id = Some(format!("request:turn-{index}"));
+            answer.item_id = Some("assistant-0".to_string());
+            let sequence = 3 + index;
+            let event = make_event(
+                &device_a,
+                sequence,
+                format!("{:020}-{:08}", sequence, 0),
+                Some(events.last().expect("previous").event_hash.clone()),
+                answer.id.clone().expect("answer id"),
+                MESSAGE_UPSERT.to_string(),
+                serde_json::to_value(MessageEventPayload {
+                    project_id: Some(project_id.clone()),
+                    conversation_id: conversation_id.clone(),
+                    message: answer,
+                })
+                .expect("answer payload"),
+            )
+            .expect("answer event");
+            events.push(event);
+        }
+
+        for event in &events {
+            write_event(&root, event).expect("write event");
+        }
+        let scan = scan_journal(&root, &importer).expect("scan journal");
+        let mut store = test_store();
+        apply_events(&mut store, &scan).expect("apply events");
+        let snapshot = reduce_snapshot(&store.connection).expect("reduce snapshot");
+        let messages = &snapshot
+            .conversations
+            .values()
+            .next()
+            .expect("conversation")
+            .messages;
+
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.text.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "VALASZ_0".to_string(),
+                "VALASZ_1".to_string(),
+                "VALASZ_2".to_string()
+            ],
+            "a shared positional item id must not merge answers of different turns"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

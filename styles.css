@@ -631,14 +631,10 @@ textarea::placeholder { color: var(--faint); }
    detailed controls float beside it, so switching them on cannot move, narrow
    or lift the input box. */
 .composer-wrap { display: block; width: min(760px, calc(100% - 44px)); margin-right: auto; margin-bottom: 16px; margin-left: auto; }
-/* Anchored to the composer's bottom, not its top: the block is taller than the
-   composer, and growing downward pushed its last row off the bottom of the
-   window. Growing upward keeps every row on screen. */
-/* Anchored to the composer's bottom, not its top: the block is taller than the
-   composer, and growing downward pushed its last row off the bottom of the
-   window. Growing upward keeps every row on screen, and the panel surface is
-   what stops it reading as a collision with the message it rises in front of. */
-.composer-wrap > .composer-controls { position: absolute; right: calc(100% + 10px); bottom: 0; z-index: 2; padding: 6px 8px 8px; border: 1px solid var(--border-soft); border-radius: 9px; background: var(--panel); box-shadow: 0 8px 26px rgba(0, 0, 0, .28); }
+/* Flush with the composer's top edge and no surface of its own: the block is
+   sized to the composer's own height, so it needs neither a panel to sit on
+   nor room below to grow into. */
+.composer-wrap > .composer-controls { position: absolute; top: 0; right: calc(100% + 10px); z-index: 2; }
 /* One grid child, so the two-column composer layout stays two columns however
    many controls the detailed mode adds. */
 .composer-controls { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; }
@@ -1489,15 +1485,15 @@ textarea::placeholder { color: var(--faint); }
    role, its vendor, its model and its reasoning. Clicking a cell steps to the
    next value and right click steps back, so nine choices need no dropdowns. */
 .composer-controls-top { display: flex; align-items: center; gap: 6px; }
-.composer-controls-top .composer-detail-toggle { min-height: 28px; font-size: 11px; }
+.composer-controls-top .composer-detail-toggle { min-height: 22px; font-size: 9px; }
 .composer-pipeline-switch.mode-switch { margin: 0; padding: 2px; }
-.composer-pipeline-switch.mode-switch button { min-height: 24px; padding: 0 10px; font-size: 10px; letter-spacing: .06em; }
+.composer-pipeline-switch.mode-switch button { min-height: 19px; padding: 0 8px; font-size: 9px; letter-spacing: .06em; }
 /* One fixed column width for every stage, sized for the longest label
    ('5.6 Terra'), so a cell does not resize as its value steps. */
-.composer-stage-grid { display: grid; grid-auto-flow: column; grid-auto-columns: 80px; gap: 6px; margin-top: 5px; }
-.composer-stage-col { display: flex; flex-direction: column; align-items: stretch; gap: 4px; }
-.composer-stage-role { color: var(--faint); font-size: 10px; font-weight: 700; letter-spacing: .06em; text-align: center; }
-.composer-stage-col button { width: 100%; min-height: 26px; padding: 2px 6px; border: 1px solid #40515a; border-radius: 5px; background: rgba(25, 32, 36, .72); color: var(--muted); font-size: 11px; font-weight: 600; white-space: nowrap; cursor: pointer; }
+.composer-stage-grid { display: grid; grid-auto-flow: column; grid-auto-columns: 76px; gap: 4px; margin-top: 2px; }
+.composer-stage-col { display: flex; flex-direction: column; align-items: stretch; gap: 2px; }
+.composer-stage-role { color: var(--faint); font-size: 9px; font-weight: 700; letter-spacing: .06em; text-align: center; }
+.composer-stage-col button { width: 100%; min-height: 17px; padding: 1px 5px; border: 1px solid #40515a; border-radius: 4px; background: rgba(25, 32, 36, .72); color: var(--muted); font-size: 9px; font-weight: 600; white-space: nowrap; cursor: pointer; }
 .composer-stage-col button:hover { border-color: #5e9877; color: var(--text); }
 .composer-stage-col .composer-stage-vendor { color: var(--text); font-weight: 700; }
 /* The chain owns the model choice, so the composer's own picker must not look

@@ -7,6 +7,7 @@ import {
   useRef,
   useState,
   type ChangeEvent,
+  type CSSProperties,
   type ClipboardEvent as ReactClipboardEvent,
   type FormEvent,
   type KeyboardEvent,
@@ -274,6 +275,28 @@ const PIPELINE_MODEL_LABELS: Record<string, string> = {
 const shortModelLabel = (modelId: string) =>
   PIPELINE_MODEL_LABELS[modelId] ?? modelId;
 
+/** Scrolls so the end of a freshly opened phase is visible, composer and all. */
+const revealPanelBottom = (panel: Element | null) => {
+  if (!(panel instanceof HTMLElement)) return;
+  // Measured in viewport coordinates on purpose: offsetTop is relative to the
+  // nearest positioned ancestor, which is not the element that scrolls.
+  const floor =
+    document.querySelector(".composer-wrap")?.getBoundingClientRect().top ??
+    window.innerHeight;
+  const delta = panel.getBoundingClientRect().bottom - (floor - 12);
+  if (delta <= 0) return;
+  let scroller: HTMLElement | null = panel.parentElement;
+  while (
+    scroller &&
+    scroller.scrollHeight <= scroller.clientHeight + 1 &&
+    scroller !== document.body
+  )
+    scroller = scroller.parentElement;
+  if (scroller && scroller !== document.body)
+    scroller.scrollBy({ top: delta, behavior: "smooth" });
+  else window.scrollBy({ top: delta, behavior: "smooth" });
+};
+
 /** The composed answer tab, which is not one of the chain's stages. */
 const PIPELINE_ANSWER_TAB = -1;
 
@@ -290,17 +313,12 @@ const stageBadge = (pipeline?: MessagePipeline) => {
   const accepted = pipeline.verdict === "accepted";
   return (
     <>
-      <span className="stage-badge" title={`${pipeline.stageAgent}`}>
-        {`${pipeline.stageIndex + 1}/${pipeline.stageCount} ${role} · ${pipeline.stageAgent}`}
+      <span
+        className="stage-badge"
+        title={`${pipeline.stageIndex + 1}/${pipeline.stageCount} ${role}`}
+      >
+        {pipeline.stageAgent}
       </span>
-      {pipeline.verdict && (
-        <span
-          className={`stage-verdict${accepted ? " is-accepted" : " is-changes"}`}
-          title={pipeline.verdictSummary ?? ""}
-        >
-          {accepted ? "ELFOGAD" : "JAVÍTANDÓ"}
-        </span>
-      )}
     </>
   );
 };
@@ -5087,6 +5105,8 @@ type TurnProgressCardProps = {
   onPreviewImage?: (path: string) => void;
   /** Where this card sits inside a chain, so the run reads as one block. */
   runPosition?: "start" | "middle" | "end";
+  /** A review says pass or fail in its colour rather than in a chip. */
+  runTone?: "accepted" | "changes";
   runHeader?: ReactNode;
 };
 
@@ -5111,6 +5131,7 @@ function TurnProgressCard({
   rollbackBusy,
   onPreviewImage,
   runPosition,
+  runTone,
   runHeader,
 }: TurnProgressCardProps) {
   const quoteAnchor = (suffix: string) =>
@@ -5670,7 +5691,9 @@ function TurnProgressCard({
   const openInlineDiff = (activity: CodeActivity) =>
     setInlineDiff(inlineCodeDiffForActivity(activity));
 
-  const runClasses = runPosition ? ` in-run is-run-${runPosition}` : "";
+  const runClasses =
+    (runPosition ? ` in-run is-run-${runPosition}` : "") +
+    (runTone ? ` is-verdict-${runTone}` : "");
   if (compact) {
     return (
       <>
@@ -12868,50 +12891,66 @@ function App() {
         )?.pipeline
       : undefined;
     const runHeader = stage ? (
-        <div className="pipeline-run-header">
-          <strong>FUTAM</strong>
-          <span className="pipeline-run-tabs" role="tablist">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={selectedStage === PIPELINE_ANSWER_TAB}
-              className={`pipeline-run-tab${selectedStage === PIPELINE_ANSWER_TAB ? " is-active" : ""}`}
-              onClick={() =>
-                setSelectedStages((current) => ({
-                  ...current,
-                  [stage.runId]: PIPELINE_ANSWER_TAB,
-                }))
-              }
-            >
-              VÁLASZ
-            </button>
-            {runStages.map((item) => (
+        <div className="pipeline-run-header" data-run-id={stage.runId}>
+          <span
+            className="pipeline-run-tabs"
+            role="tablist"
+            style={{ "--tab-count": runStages.length + 1 } as CSSProperties}
+          >
+            <span
+              className="pipeline-run-slider"
+              aria-hidden="true"
+              style={{
+                transform: `translateX(${
+                  (selectedStage === PIPELINE_ANSWER_TAB
+                    ? 0
+                    : selectedStage + 1) * 100
+                }%)`,
+              }}
+            />
+            {[
+              { key: PIPELINE_ANSWER_TAB, label: "VÁLASZ", agent: "" },
+              ...runStages.map((item) => ({
+                key: item.stageIndex,
+                label: `${item.stageIndex + 1}/${stage.stageCount} ${STAGE_ROLE_LABELS[item.role] ?? item.role}`,
+                agent: item.agent,
+              })),
+            ].map((item) => (
               <button
-                key={item.stageIndex}
+                key={item.key}
                 type="button"
                 role="tab"
-                aria-selected={item.stageIndex === stage.stageIndex}
-                className={`pipeline-run-tab${item.stageIndex === stage.stageIndex ? " is-active" : ""}`}
+                aria-selected={item.key === selectedStage}
+                className={`pipeline-run-tab${item.key === selectedStage ? " is-active" : ""}`}
                 title={item.agent}
-                onClick={() =>
+                onClick={() => {
+                  const runId = stage.runId;
                   setSelectedStages((current) => ({
                     ...current,
-                    [stage.runId]: item.stageIndex,
-                  }))
-                }
+                    [runId]: item.key,
+                  }));
+                  // A longer phase used to open below the fold, leaving the
+                  // reader to scroll for the answer they just asked for. The
+                  // composer floats over the stream, so aligning to the bottom
+                  // of the window still hides the end of the panel.
+                  // Looked up again rather than captured: the header this
+                  // click came from is replaced by the re-render, and a
+                  // detached node measures as nothing.
+                  window.setTimeout(
+                    () =>
+                      revealPanelBottom(
+                        document.querySelector(
+                          `.pipeline-run-header[data-run-id="${runId}"]`,
+                        )?.nextElementSibling ?? null,
+                      ),
+                    80,
+                  );
+                }}
               >
-                {`${item.stageIndex + 1}/${stage.stageCount} ${STAGE_ROLE_LABELS[item.role] ?? item.role}`}
+                {item.label}
               </button>
             ))}
           </span>
-          {runVerdict?.verdict && (
-            <span
-              className={`stage-verdict${runVerdict.verdict === "accepted" ? " is-accepted" : " is-changes"}`}
-              title={runVerdict.verdictSummary ?? ""}
-            >
-              {runVerdict.verdict === "accepted" ? "ELFOGAD" : "JAVÍTANDÓ"}
-            </span>
-          )}
         </div>
       ) : undefined;
     if (stage && selectedStage === PIPELINE_ANSWER_TAB) {
@@ -12928,15 +12967,6 @@ function App() {
         <Fragment key={entry.key}>
           {runHeader}
           <article className="trace-card in-run is-run-end pipeline-answer-card">
-            {runVerdict?.verdict && (
-              <p
-                className={`pipeline-answer-verdict${accepted ? " is-accepted" : " is-changes"}`}
-              >
-                {accepted
-                  ? "A bíráló elfogadta."
-                  : `A bíráló javítást kér: ${runVerdict.verdictSummary ?? "lásd a REVIEW fület."}`}
-              </p>
-            )}
             <div className="pipeline-answer-body">
               <p>
                 {answerWithQuoteBacklinks(
@@ -12954,6 +12984,13 @@ function App() {
       <TurnProgressCard
         key={entry.key}
         runPosition={stage ? "end" : undefined}
+        runTone={
+          groupAnswer.pipeline?.verdict
+            ? groupAnswer.pipeline.verdict === "accepted"
+              ? "accepted"
+              : "changes"
+            : undefined
+        }
         runHeader={runHeader}
         plan={plan}
         activities={entry.group.activities}

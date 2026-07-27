@@ -334,7 +334,12 @@ pub fn stage_agent_label(stage: &RecipeStage) -> String {
         "claude-sonnet-5" => "Sonnet 5",
         other => other,
     };
-    format!("{vendor} · {pretty}")
+    // The card names the stage already, so the badge only has to answer "who
+    // ran this, and how hard did it think".
+    match stage.effort.as_deref() {
+        Some(effort) if !effort.is_empty() => format!("{vendor} · {pretty} · {effort}"),
+        _ => format!("{vendor} · {pretty}"),
+    }
 }
 
 /// Turns a finished stage into what the next one is told about it.

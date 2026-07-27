@@ -1523,14 +1523,28 @@ textarea::placeholder { color: var(--faint); }
   background: #1b2126;
 }
 .pipeline-run-header strong { color: var(--muted); font-size: 8px; font-weight: 700; letter-spacing: .1em; }
-.pipeline-run-tabs { display: flex; gap: 4px; }
-.pipeline-run-tab {
-  padding: 2px 8px; border: 1px solid #3c4650; border-radius: 3px;
-  background: transparent; color: var(--muted);
-  font: inherit; font-size: 9px; letter-spacing: .04em; cursor: pointer;
+/* One control, not four chips: the marker slides to whatever was clicked. */
+.pipeline-run-tabs {
+  position: relative; display: flex; padding: 2px;
+  border: 1px solid #3c4650; border-radius: 4px; background: #171c21;
 }
-.pipeline-run-tab:hover { border-color: #55636e; color: #cfd8de; }
-.pipeline-run-tab.is-active { border-color: var(--accent); background: rgba(123, 217, 171, .12); color: #cfe9db; }
+.pipeline-run-slider {
+  position: absolute; top: 2px; left: 2px; z-index: 0;
+  width: calc((100% - 4px) / var(--tab-count, 4)); height: calc(100% - 4px);
+  border-radius: 3px; background: rgba(123, 217, 171, .16);
+  box-shadow: inset 0 0 0 1px rgba(123, 217, 171, .45);
+  transition: transform .22s cubic-bezier(.4, 0, .2, 1);
+}
+.pipeline-run-tab {
+  /* Equal widths, or the marker cannot know where to stop: a flex item will
+     not shrink below its text unless it is told it may. */
+  position: relative; z-index: 1; flex: 1 0 0; min-width: 0; padding: 3px 10px;
+  border: 0; border-radius: 3px; background: transparent; color: var(--muted);
+  font: inherit; font-size: 9px; letter-spacing: .04em; white-space: nowrap;
+  cursor: pointer; transition: color .18s ease;
+}
+.pipeline-run-tab:hover { color: #cfd8de; }
+.pipeline-run-tab.is-active { color: #cfe9db; }
 .pipeline-run-header .stage-verdict { margin-left: auto; }
 
 .trace-card.in-run { margin-bottom: 0; border-radius: 0; }
@@ -1558,3 +1572,15 @@ textarea::placeholder { color: var(--faint); }
 .pipeline-answer-verdict.is-changes { border: 1px solid #7a6336; background: rgba(60, 48, 22, .5); color: #d8bb72; }
 .pipeline-answer-body { max-height: 320px; overflow-y: auto; }
 .pipeline-answer-body p { margin: 0; white-space: pre-wrap; font-size: 11px; line-height: 1.65; }
+
+/* The review states its verdict by its colour; that is why it carries no chip. */
+.trace-card.is-verdict-accepted,
+.compact-answer-card.is-verdict-accepted {
+  border-color: #55916b; background: #1b3125;
+}
+.trace-card.is-verdict-changes,
+.compact-answer-card.is-verdict-changes {
+  border-color: #9c5f4c; background: #33211c;
+}
+.trace-card.is-verdict-accepted::before { background: #6fc08c; box-shadow: 0 0 13px rgba(111, 192, 140, .36); }
+.trace-card.is-verdict-changes::before { background: #d08a6a; box-shadow: 0 0 13px rgba(208, 138, 106, .36); }

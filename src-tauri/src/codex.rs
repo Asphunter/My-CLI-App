@@ -57,6 +57,10 @@ pub struct CodexRequest {
     pub allow_workspace_writes: Option<bool>,
     #[serde(default)]
     pub request_id: Option<String>,
+    /// See `AgentTurnRequest::keep_workspace`: a chain stage leaves its work in
+    /// the tree for the next stage instead of rolling back.
+    #[serde(default)]
+    pub keep_workspace: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2737,6 +2741,7 @@ pub fn send(
     let cwd = requested_cwd(request.cwd.as_deref())?;
     let image_paths = resolve_codex_image_paths(&cwd, &request.images)?;
     let guard_snapshot = create_agent_snapshot(&cwd)?;
+    let keep_workspace = request.keep_workspace;
     // The app-server deliberately runs in the real selected project folder.
     // This keeps ignored, generated and otherwise untracked project files
     // visible; local files are staged/reverted while OneDrive placeholders
@@ -3101,6 +3106,14 @@ pub fn send(
     let cancelled_before_turn_completion =
         cancellation.load(Ordering::Acquire) && !turn_completed.load(Ordering::Acquire);
     match (result, guard_result) {
+        (Ok(mut response), Ok(report)) if !cancelled_before_turn_completion && keep_workspace => {
+            // A chain stage hands its work to the next stage through the
+            // working tree itself, so this turn does not roll back.
+            let mut report = report;
+            report.isolation_mode = "nonGitSnapshot".to_string();
+            response.guard = report;
+            Ok(response)
+        }
         (Ok(mut response), Ok(report)) if !cancelled_before_turn_completion => {
             let mut report = stage_agent_snapshot(&guard_snapshot, report).map_err(|error| {
                 format!(

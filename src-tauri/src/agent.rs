@@ -85,6 +85,14 @@ pub struct AgentTurnRequest {
     /// a guarantee -- the guarantee is not handing it the tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_profile: Option<StageToolProfile>,
+    /// Leave the working tree as this turn left it instead of restoring the
+    /// pre-turn base. A single turn always restores, because the user decides
+    /// afterwards whether to apply it. A chain must not: the reviewer runs in
+    /// the same tree a moment later, and reviewing a tree the coder's work was
+    /// just rolled back out of is reviewing the wrong code. The chain takes
+    /// over the restoring, once, when every stage is done.
+    #[serde(default)]
+    pub keep_workspace: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +210,7 @@ impl AgentTurnRequest {
             effort: self.effort.clone(),
             cwd: self.cwd.clone(),
             request_id: self.request_id.clone(),
+            keep_workspace: self.keep_workspace,
             allow_workspace_writes: Some(
                 self.tool_profile
                     .map(StageToolProfile::allows_workspace_writes)
@@ -400,6 +409,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_chain_stage_tells_the_codex_runtime_to_leave_the_tree_alone() {
+        // The reviewer runs in the tree the coder just wrote to. If this flag
+        // does not survive the conversion, the coder's work is rolled back
+        // before anyone can review it.
+        let mut request = AgentTurnRequest {
+            prompt: "feladat".to_string(),
+            images: Vec::new(),
+            provider: AgentProvider::Codex,
+            runtime: AgentRuntimeKind::CodexAppServer,
+            conversation_id: None,
+            session_id: None,
+            conversation_context: None,
+            model: None,
+            effort: None,
+            cwd: None,
+            request_id: None,
+            max_budget_usd: None,
+            max_turns: None,
+            tool_profile: None,
+            keep_workspace: true,
+        };
+        assert!(
+            request
+                .to_codex_request()
+                .expect("codex request")
+                .keep_workspace
+        );
+        request.keep_workspace = false;
+        assert!(
+            !request
+                .to_codex_request()
+                .expect("codex request")
+                .keep_workspace,
+            "an ordinary turn must keep restoring, so the user decides what to apply"
+        );
+    }
+
+    #[test]
     fn catalog_exposes_both_runtime_families() {
         let catalog = runtime_catalog();
 
@@ -465,6 +512,7 @@ mod tests {
             max_budget_usd: None,
             max_turns: None,
             tool_profile: profile,
+            keep_workspace: false,
         }
         .to_codex_request()
         .expect("codex request")

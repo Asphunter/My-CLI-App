@@ -759,6 +759,7 @@ pub fn send(
         .unwrap_or(DEFAULT_MAX_TURNS)
         .clamp(1, MAX_TURNS_CEILING);
     let guard_snapshot = crate::codex::begin_agent_workspace_snapshot(&cwd)?;
+    let keep_workspace = request.keep_workspace;
     let mut child: Option<Child> = None;
     let turn_completed = Arc::new(AtomicBool::new(false));
     let result = (|| {
@@ -1065,6 +1066,15 @@ pub fn send(
     let cancelled_before_turn_completion =
         cancellation.load(Ordering::Acquire) && !turn_completed.load(Ordering::Acquire);
     match (result, guard_result) {
+        (Ok(mut response), Ok(report)) if !cancelled_before_turn_completion && keep_workspace => {
+            // A chain stage hands its work to the next stage through the
+            // working tree itself, so this turn does not roll back. The chain
+            // stages its own snapshot once the last stage is done.
+            let mut report = report;
+            report.isolation_mode = "nonGitSnapshot".to_string();
+            response.guard = report;
+            Ok(response)
+        }
         (Ok(mut response), Ok(report)) if !cancelled_before_turn_completion => {
             let mut report = crate::codex::stage_agent_workspace_snapshot(&guard_snapshot, report)
                 .map_err(|error| {

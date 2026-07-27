@@ -784,7 +784,6 @@ mod tests {
         }
 
         fn run(&self, recipe: &Recipe, prompt: &str, session: Option<String>) -> PipelineOutcome {
-            let stop = std::cell::Cell::new(false);
             tauri::async_runtime::block_on(run_stages(
                 recipe,
                 prompt,

@@ -153,6 +153,18 @@ async fn pipeline_send(
     }
 
     let run_id = store::begin_pipeline_run(&request.conversation_id, &recipe)?;
+    // One snapshot for the whole chain. Each stage used to restore the tree at
+    // the end of its own turn, which meant the reviewer looked at a workspace
+    // the coder's work had just been rolled back out of -- it reported the fix
+    // missing every single time, correctly and uselessly. The stages now leave
+    // the tree alone and this snapshot does the restoring once, so the user
+    // still decides afterwards whether to apply the chain's work.
+    let run_guard = match request.cwd.as_deref() {
+        Some(cwd) if !cwd.trim().is_empty() => Some(codex::begin_agent_workspace_snapshot(
+            std::path::Path::new(cwd),
+        )?),
+        _ => None,
+    };
     let stage_count = recipe.stages.len() as i64;
     // Everything with a side effect lives in this closure; `run_stages` owns the
     // chain logic itself and is tested without any of this.
@@ -214,6 +226,7 @@ async fn pipeline_send(
                         max_budget_usd: request.max_budget_usd,
                         max_turns: execution.stage.max_turns,
                         tool_profile: Some(execution.stage.role.tool_profile()),
+                        keep_workspace: true,
                     };
                     let result = run_agent_turn(app.clone(), turn).await;
                     let phase = if result.is_ok() { "finished" } else { "failed" };
@@ -303,6 +316,20 @@ async fn pipeline_send(
     if let Ok(mut runs) = cancelled_pipeline_runs().lock() {
         runs.remove(&run_id);
     }
+    // Whatever the chain wrote is now staged and the tree is back at its base,
+    // exactly as a single turn leaves it. A failure here is worth saying out
+    // loud: it means the workspace still holds the chain's edits.
+    let guard_error = run_guard.and_then(|snapshot| {
+        codex::finalize_agent_workspace_snapshot(&snapshot)
+            .and_then(|report| codex::stage_agent_workspace_snapshot(&snapshot, report))
+            .err()
+            .map(|error| format!("A lánc változásainak elkülönítése nem sikerült: {error}"))
+    });
+    let run_error = match (run_error, guard_error) {
+        (Some(existing), Some(guard)) => Some(format!("{existing} {guard}")),
+        (Some(existing), None) => Some(existing),
+        (None, guard) => guard,
+    };
     store::finish_pipeline_run(&run_id, status.as_wire(), run_error.as_deref())?;
     Ok(pipeline::PipelineRunResult {
         run_id,

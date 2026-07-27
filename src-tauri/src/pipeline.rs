@@ -158,7 +158,12 @@ pub fn builtin_recipes() -> Vec<Recipe> {
         id: "plan_code_review".to_string(),
         label: "Terv → Kód → Review".to_string(),
         stages: vec![
-            claude(StageRole::Plan, "claude-fable-5", "max", 15),
+            // Medium on both working stages: `max` on the planner bought
+            // deliberation the plan rarely needed and paid for it in minutes
+            // per run, and the two stages that produce the work should reason
+            // at the same level rather than one straining while the other
+            // coasts.
+            claude(StageRole::Plan, "claude-opus-5", "medium", 15),
             claude(StageRole::Code, "claude-opus-5", "medium", 40),
             codex(StageRole::Review, "gpt-5.6-sol", "medium", 15),
         ],
@@ -955,7 +960,15 @@ mod tests {
 
     #[test]
     fn u1_a_model_switch_inside_one_vendor_continues_the_same_session() {
-        let recipe = recipe_by_id("plan_code_review").expect("preset");
+        // Its own recipe rather than the preset: the preset may well run the
+        // same model on both authoring stages — it does today — and then it
+        // could not carry the case this test is named after.
+        let recipe = {
+            let mut recipe = recipe_by_id("plan_code_review").expect("preset");
+            recipe.stages[0].model = Some("claude-fable-5".to_string());
+            recipe.stages[1].model = Some("claude-opus-5".to_string());
+            recipe
+        };
         let recorder = Recorder::with(vec![
             ok("terv", Some("claude-session-1")),
             ok("kod", Some("claude-session-1")),
@@ -1208,7 +1221,9 @@ mod tests {
         assert_eq!(recommended.stages[0].provider, AgentProvider::Anthropic);
         assert_eq!(recommended.stages[1].provider, AgentProvider::Anthropic);
         assert_eq!(recommended.stages[2].provider, AgentProvider::Codex);
-        assert_ne!(recommended.stages[0].model, recommended.stages[1].model);
+        // Which Claude model each authoring stage runs is a matter of taste and
+        // changes with it; that a model switch survives the session is the
+        // invariant, and `u1_…` tests it on a recipe of its own.
 
         let two_writers = Recipe {
             id: "bad".to_string(),

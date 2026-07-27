@@ -456,20 +456,28 @@ textarea::placeholder { color: var(--faint); }
 .model-option.is-selected small { color: var(--muted); }
 .model-check { min-width: 12px; color: var(--accent); font-size: 11px; }
 .effort-option { padding-top: 6px; padding-bottom: 6px; }
-.model-menu-nested { width: min(430px, calc(100vw - 32px)); max-height: none; overflow: hidden; padding: 0; }
-.model-menu-body { display: grid; grid-template-columns: 92px 1fr; min-height: 148px; }
-.model-families { padding: 6px; border-right: 1px solid var(--border); background: rgba(255, 255, 255, .015); }
-.model-family-option { display: flex; align-items: center; justify-content: space-between; width: 100%; padding: 8px 7px; border-radius: 5px; background: transparent; color: var(--muted); text-align: left; font-size: 10px; }
-.model-family-option:hover, .model-family-option.is-open, .model-family-option.is-selected { background: var(--panel-soft); color: var(--text); }
-.model-family-option.is-open { color: var(--accent); }
-.model-variants { min-width: 0; padding: 6px 8px 8px; }
-.model-variant { display: flex; align-items: center; justify-content: space-between; width: 100%; padding: 7px 8px; border-radius: 5px; background: transparent; color: var(--muted); text-align: left; }
-.model-variant:hover, .model-variant.is-selected { background: var(--panel-soft); color: var(--text); }
-.model-variant > span:first-child { display: grid; gap: 2px; }
-.model-variant strong { font-size: 10px; font-weight: 650; }
-.model-variant small { color: var(--faint); font-size: 9px; }
-.model-variant.is-selected small { color: var(--muted); }
-.model-empty { padding: 26px 12px; color: var(--faint); font-size: 10px; text-align: center; }
+/* One column, model names only. The old two-column layout carried a
+   description next to every model, and that paragraph — not the names — was
+   what made the menu, and with it the reasoning slider, absurdly wide. */
+.model-menu-nested { width: 178px; max-height: none; overflow: visible; padding: 0; }
+.model-menu-body { display: grid; gap: 2px; padding: 6px; }
+.model-auto-option { display: flex; align-items: center; justify-content: space-between; width: 100%; padding: 7px 8px; border-radius: 5px; background: transparent; color: var(--muted); text-align: left; font-size: 10px; }
+.model-auto-option:hover, .model-auto-option.is-selected { background: var(--panel-soft); color: var(--text); }
+.model-vendor-switch.mode-switch { margin: 2px 0 4px; }
+.model-variants { display: grid; gap: 2px; min-width: 0; }
+.model-variant { display: flex; align-items: center; gap: 6px; width: 100%; padding: 7px 8px; border-radius: 5px; background: transparent; color: var(--muted); text-align: left; }
+.model-variant:hover, .model-variant.is-selected, .model-variant.is-open { background: var(--panel-soft); color: var(--text); }
+.model-variant strong { flex: 1; font-size: 10px; font-weight: 650; }
+/* The generation row and its variants, which open towards the window rather
+   than towards its edge. */
+.model-flyout-anchor { position: relative; }
+.model-flyout-arrow { color: var(--faint); font-size: 10px; }
+.model-flyout {
+  position: absolute; right: calc(100% + 6px); top: -6px; z-index: 110;
+  display: grid; gap: 2px; min-width: 104px; padding: 6px;
+  border: 1px solid var(--border); border-radius: 8px; background: #111113;
+  box-shadow: 0 14px 30px rgba(0, 0, 0, .5);
+}
 .reasoning-control { padding: 9px 11px 10px; border-top: 1px solid var(--border); background: rgba(255, 255, 255, .02); }
 .reasoning-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; color: var(--muted); font-size: 10px; }
 .reasoning-heading strong { color: var(--accent); font-weight: 650; }
@@ -832,6 +840,9 @@ textarea::placeholder { color: var(--faint); }
 .turn-progress-answer-body p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .trace-answer-line { display: flex; min-height: 18px; align-items: flex-start; gap: 8px; }
 .trace-answer-line p { min-width: 0; flex: 1 1 auto; }
+/* One flex item for the whole answer, however many paragraphs it has. */
+.trace-answer-text { min-width: 0; flex: 1 1 auto; }
+.trace-answer-text p + p { margin-top: 5px; }
 .trace-answer-quoted-sentence { display: inline; }
 .trace-answer-quoted-sentence > .quote-backlinks { display: inline-flex; margin: 0 0 0 5px; vertical-align: middle; }
 .trace-answer-pending { display: flex; min-height: 18px; align-items: center; }
@@ -1678,9 +1689,13 @@ textarea::placeholder { color: var(--faint); }
 }
 
 /* Which round of the chain the panel is showing. Only drawn once a re-run has
-   happened, so an ordinary run keeps the strip it always had. */
+   happened, so an ordinary run keeps the strip it always had.
+
+   It sits right after the phase strip rather than pushed to the far edge: the
+   version belongs to the phases it switches, and across the width of the panel
+   the two read as unrelated controls. */
 .pipeline-run-version {
-  display: flex; align-items: center; gap: 5px; margin-left: auto;
+  display: flex; align-items: center; gap: 5px;
   color: var(--faint); font-size: 8px; font-weight: 700; letter-spacing: .1em;
 }
 .pipeline-run-version select {

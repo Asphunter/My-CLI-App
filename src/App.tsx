@@ -479,25 +479,6 @@ type CodexModel = {
   supportedReasoningEfforts: string[];
   defaultReasoningEffort: string | null;
 };
-type ClaudeAuthStatus = {
-  configured: boolean;
-  source: string;
-  preview: string | null;
-  apiKeyConfigured: boolean;
-  subscriptionConfigured: boolean;
-  subscriptionPlan: string | null;
-};
-type ClaudeConnectionResult = {
-  success: boolean;
-  model: string;
-  effort: string;
-  text: string | null;
-  sessionId: string | null;
-  totalCostUsd: number | null;
-  requestId: string;
-  errorCode: string | null;
-  error: string | null;
-};
 type ClaudeApprovalRequest = {
   approvalId: string;
   requestId: string;
@@ -542,7 +523,6 @@ const isTauri =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const DEFAULT_MODEL = "gpt-5.6-luna";
 const DEFAULT_EFFORT = "low";
-const DEFAULT_CLAUDE_MODEL = "claude-sonnet-5";
 const DEFAULT_CLAUDE_EFFORT = "low";
 const DEFAULT_CLAUDE_BUDGET_USD = "0.05";
 // A tool-using coding turn needs several agent turns: read, edit, run the test,
@@ -615,13 +595,30 @@ const fallbackModels: CodexModel[] = [
   },
 ];
 
-const claudeCodingModel: CodexModel = {
-  id: DEFAULT_CLAUDE_MODEL,
-  displayName: "Claude Sonnet 5",
-  description: "Claude coding runtime az Anthropic API-kulccsal.",
-  supportedReasoningEfforts: ["low", "medium", "high"],
-  defaultReasoningEffort: DEFAULT_CLAUDE_EFFORT,
-};
+/**
+ * The Claude side of the picker.
+ *
+ * The same two models a chain stage may run, so "Opus 5" means one thing in
+ * this app rather than one thing per menu. Auth is the Claude Code
+ * subscription, not an API key — the old description said otherwise and was
+ * the last place in the UI still claiming it.
+ */
+const claudeCodingModels: CodexModel[] = [
+  {
+    id: "claude-opus-5",
+    displayName: "Opus 5",
+    description: "A legerősebb Claude coding modell.",
+    supportedReasoningEfforts: FALLBACK_EFFORTS,
+    defaultReasoningEffort: DEFAULT_CLAUDE_EFFORT,
+  },
+  {
+    id: "claude-fable-5",
+    displayName: "Fable 5",
+    description: "Gyors Claude coding modell.",
+    supportedReasoningEfforts: FALLBACK_EFFORTS,
+    defaultReasoningEffort: DEFAULT_CLAUDE_EFFORT,
+  },
+];
 
 type AppSound = "notify" | "complete";
 const APP_SOUND_FILES: Record<AppSound, string> = {
@@ -4180,6 +4177,20 @@ const familyVariantLabel = (family: ModelFamily, model: CodexModel) => {
   return modelLabel(model);
 };
 
+/** Which side of the picker a model sits on. */
+const vendorOfModel = (modelId: string | null): "anthropic" | "codex" =>
+  modelId?.startsWith("claude-") ? "anthropic" : "codex";
+
+/**
+ * The GPT generation whose variants hide behind a hover.
+ *
+ * One row for the generation and a flyout for Luna/Terra/Sol keeps the menu as
+ * narrow as the chip above it; listing all three inline made the panel wider
+ * than the composer needed it to be.
+ */
+const GPT_FLYOUT_FAMILY = "gpt-5.6";
+const GPT_FLYOUT_LABEL = "GPT 5.6";
+
 type ModelPickerProps = {
   /** A chain picks its own model per stage, so this one is not in charge. */
   disabled?: boolean;
@@ -4188,12 +4199,10 @@ type ModelPickerProps = {
   activeLabel: string;
   selectedModel: string | null;
   modelFamilies: ModelFamily[];
-  activeFamily: ModelFamily | undefined;
   activeEffortLabel: string;
   supportedEfforts: string[];
   activeEffortIndex: number;
   onToggle: () => void;
-  onFamilyHover: (key: string) => void;
   onSelectModel: (id: string | null) => void;
   onSelectEffort: (index: number) => void;
 };
@@ -4204,16 +4213,34 @@ function ModelPicker({
   activeLabel,
   selectedModel,
   modelFamilies,
-  activeFamily,
   activeEffortLabel,
   supportedEfforts,
   activeEffortIndex,
   onToggle,
-  onFamilyHover,
   onSelectModel,
   onSelectEffort,
   disabled = false,
 }: ModelPickerProps) {
+  // Which vendor's models the menu is showing. It follows the selection when
+  // the menu opens, so the list you see is the list the chip is naming.
+  const [vendor, setVendor] = useState<"anthropic" | "codex">(() =>
+    vendorOfModel(selectedModel),
+  );
+  const [flyoutOpen, setFlyoutOpen] = useState(false);
+  useEffect(() => {
+    if (open) {
+      setVendor(vendorOfModel(selectedModel));
+      setFlyoutOpen(false);
+    }
+  }, [open, selectedModel]);
+
+  const claudeModels =
+    modelFamilies.find((family) => family.key === "claude")?.models ?? [];
+  const gptVariants =
+    modelFamilies.find((family) => family.key === GPT_FLYOUT_FAMILY)?.models ??
+    [];
+  const gptSelected = gptVariants.some((model) => model.id === selectedModel);
+
   return (
     <div className={`model-picker${disabled ? " is-disabled" : ""}`} aria-disabled={disabled}>
       <button
@@ -4235,61 +4262,105 @@ function ModelPicker({
           aria-label="Modell kiválasztása"
         >
           <div className="model-menu-body">
-            <div className="model-families">
+            <button
+              type="button"
+              className={`model-auto-option${selectedModel === null ? " is-selected" : ""}`}
+              onClick={() => onSelectModel(null)}
+            >
+              <span>Automatikus</span>
+              <span>{selectedModel === null ? "✓" : ""}</span>
+            </button>
+            {/* The same switch as EGY AI | MULTI-AI: one control, two sides,
+                and the models below belong to whichever side is showing. */}
+            <div
+              className="model-vendor-switch mode-switch"
+              role="tablist"
+              aria-label="Gyártó"
+            >
               <button
                 type="button"
-                className={`model-family-option${selectedModel === null ? " is-selected" : ""}`}
-                onClick={() => onSelectModel(null)}
+                role="tab"
+                aria-selected={vendor === "anthropic"}
+                className={vendor === "anthropic" ? "is-active" : ""}
+                onClick={() => {
+                  setVendor("anthropic");
+                  setFlyoutOpen(false);
+                }}
               >
-                <span>Automatikus</span>
-                <span>{selectedModel === null ? "✓" : ""}</span>
+                Claude
               </button>
-              {modelFamilies.map((family) => (
-                <button
-                  type="button"
-                  className={`model-family-option${family.key === activeFamily?.key ? " is-open" : ""}`}
-                  onMouseEnter={() => onFamilyHover(family.key)}
-                  onFocus={() => onFamilyHover(family.key)}
-                  onClick={() => onFamilyHover(family.key)}
-                  key={family.key}
-                >
-                  <span>{family.label}</span>
-                  <span>›</span>
-                </button>
-              ))}
+              <button
+                type="button"
+                role="tab"
+                aria-selected={vendor === "codex"}
+                className={vendor === "codex" ? "is-active" : ""}
+                onClick={() => setVendor("codex")}
+              >
+                ChatGPT
+              </button>
             </div>
             <div className="model-variants">
-              {activeFamily ? (
-                <>
-                  <div className="model-menu-label">
-                    {activeFamily.label === "Codex"
-                      ? "Codex"
-                      : activeFamily.label === "Claude"
-                        ? "Claude"
-                      : `GPT-${activeFamily.label}`}
-                  </div>
-                  {activeFamily.models.map((model) => (
+              {vendor === "anthropic"
+                ? claudeModels.map((model) => (
                     <button
                       type="button"
                       className={`model-variant${model.id === selectedModel ? " is-selected" : ""}`}
                       onClick={() => onSelectModel(model.id)}
                       key={model.id}
                     >
-                      <span>
-                        <strong>
-                          {familyVariantLabel(activeFamily, model)}
-                        </strong>
-                        <small>{model.description}</small>
-                      </span>
+                      <strong>{model.displayName}</strong>
                       <span className="model-check">
                         {model.id === selectedModel ? "✓" : ""}
                       </span>
                     </button>
-                  ))}
-                </>
-              ) : (
-                <div className="model-empty">Válassz modellcsaládot</div>
-              )}
+                  ))
+                : gptVariants.length > 0 && (
+                    <div
+                      className="model-flyout-anchor"
+                      onMouseEnter={() => setFlyoutOpen(true)}
+                      onMouseLeave={() => setFlyoutOpen(false)}
+                    >
+                      <button
+                        type="button"
+                        className={`model-variant${gptSelected ? " is-selected" : ""}${flyoutOpen ? " is-open" : ""}`}
+                        aria-haspopup="menu"
+                        aria-expanded={flyoutOpen}
+                        onFocus={() => setFlyoutOpen(true)}
+                        onClick={() => setFlyoutOpen((value) => !value)}
+                      >
+                        <span className="model-flyout-arrow">‹</span>
+                        <strong>{GPT_FLYOUT_LABEL}</strong>
+                        <span className="model-check">
+                          {gptSelected ? "✓" : ""}
+                        </span>
+                      </button>
+                      {/* Opens to the left: the picker sits at the right edge
+                          of the composer, and a right-hand flyout would run
+                          off the window. */}
+                      {flyoutOpen && (
+                        <div className="model-flyout" role="menu">
+                          {gptVariants.map((model) => (
+                            <button
+                              type="button"
+                              className={`model-variant${model.id === selectedModel ? " is-selected" : ""}`}
+                              onClick={() => onSelectModel(model.id)}
+                              key={model.id}
+                            >
+                              <strong>
+                                {familyVariantLabel(
+                                  { key: GPT_FLYOUT_FAMILY, label: "5.6", models: gptVariants },
+                                  model,
+                                )}
+                              </strong>
+                              <span className="model-check">
+                                {model.id === selectedModel ? "✓" : ""}
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
             </div>
           </div>
           <div className="reasoning-control">
@@ -5981,8 +6052,17 @@ function TurnProgressCard({
                     // a quote spanning a paragraph break would lose its link if
                     // the text were split. Paragraphs when there is nothing to
                     // lose; one block when there is.
+                    //
+                    // The wrapper is load-bearing: this row is a flex line so
+                    // the spinner can sit beside the text, and loose paragraphs
+                    // became flex items — one narrow column per paragraph,
+                    // which is exactly as unreadable as it sounds.
                     (answerQuoteRefs.length === 0 ? (
-                      answerParagraphs(textWithoutCodeBlocks(answer?.text ?? ""))
+                      <div className="trace-answer-text">
+                        {answerParagraphs(
+                          textWithoutCodeBlocks(answer?.text ?? ""),
+                        )}
+                      </div>
                     ) : (
                     <p>
                       {answerWithQuoteBacklinks(
@@ -6892,20 +6972,11 @@ function App() {
     useState<Record<string, string>>(loadLocalThreadIds);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [readingSettingsOpen, setReadingSettingsOpen] = useState(false);
-  const [claudeSettingsOpen, setClaudeSettingsOpen] = useState(false);
-  const [claudeAuthStatus, setClaudeAuthStatus] =
-    useState<ClaudeAuthStatus | null>(null);
-  const [claudeApiKeyInput, setClaudeApiKeyInput] = useState("");
-  const [claudeAuthBusy, setClaudeAuthBusy] = useState(false);
-  const [claudeTestBusy, setClaudeTestBusy] = useState(false);
-  const [claudeTestResult, setClaudeTestResult] =
-    useState<ClaudeConnectionResult | null>(null);
-  const [claudeModel, setClaudeModel] = useState(
-    () => localStorage.getItem("min-claude-model") ?? DEFAULT_CLAUDE_MODEL,
-  );
-  const [claudeEffort, setClaudeEffort] = useState(
-    () => localStorage.getItem("min-claude-effort") ?? DEFAULT_CLAUDE_EFFORT,
-  );
+  // The Claude runtime used to have a settings panel of its own: an API-key
+  // field, a model and effort dropdown, and a connection test. It was the
+  // scaffolding of the API-key era. Auth is the Claude Code subscription now,
+  // and the model and effort are picked where every other model is picked, so
+  // the panel only offered a second, competing answer to the same question.
   const [claudeBudgetUsd, setClaudeBudgetUsd] = useState(
     () => localStorage.getItem("min-claude-budget-usd") ?? DEFAULT_CLAUDE_BUDGET_USD,
   );
@@ -6930,9 +7001,8 @@ function App() {
   const [openMenu, setOpenMenu] = useState<OpenMenu>(null);
   const [newProjectMenuOpen, setNewProjectMenuOpen] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
-  const [activeFamilyKey, setActiveFamilyKey] = useState<string | null>(null);
   const [modelCatalog, setModelCatalog] =
-    useState<CodexModel[]>([...fallbackModels, claudeCodingModel]);
+    useState<CodexModel[]>([...fallbackModels, ...claudeCodingModels]);
   const [modelsLoading, setModelsLoading] = useState(isTauri);
   const [selectedModel, setSelectedModel] = useState<string | null>(() => {
     if (
@@ -6941,7 +7011,12 @@ function App() {
       localStorage.setItem("min-model-version", MODEL_PREFERENCE_VERSION);
       return DEFAULT_MODEL;
     }
-    return localStorage.getItem("min-model") ?? DEFAULT_MODEL;
+    const stored = localStorage.getItem("min-model");
+    // Sonnet is no longer one of the two Claude models the app offers. Falling
+    // through to the catalog check would have answered a Claude selection with
+    // a GPT one, so the vendor is kept and the model moved to its neighbour.
+    if (stored === "claude-sonnet-5") return "claude-opus-5";
+    return stored ?? DEFAULT_MODEL;
   });
   const [selectedEffort, setSelectedEffort] = useState(() => {
     if (
@@ -8141,15 +8216,18 @@ function App() {
       .map((family) => ({
         ...family,
         models: [...family.models].sort((a, b) => {
-          const preferred = ["luna", "terra", "sol"];
-          const aRank = preferred.findIndex((name) =>
-            a.id.endsWith(`-${name}`),
-          );
-          const bRank = preferred.findIndex((name) =>
-            b.id.endsWith(`-${name}`),
-          );
+          // The chain's own order, so a vendor's models are listed the same
+          // way wherever they are offered. Alphabetical put Fable above Opus,
+          // which is neither the strength order nor the chain's.
+          const chainOrder = (id: string) => {
+            const index = [
+              ...PIPELINE_MODELS.anthropic,
+              ...PIPELINE_MODELS.codex,
+            ].indexOf(id);
+            return index < 0 ? 50 : index;
+          };
           return (
-            (aRank < 0 ? 50 : aRank) - (bRank < 0 ? 50 : bRank) ||
+            chainOrder(a.id) - chainOrder(b.id) ||
             a.displayName.localeCompare(b.displayName)
           );
         }),
@@ -8161,7 +8239,12 @@ function App() {
     fallbackModels.find((model) => model.id === DEFAULT_MODEL) ??
     fallbackModels[0];
   const selectedClaudeModel = Boolean(selectedModel?.startsWith("claude-"));
-  const activeLabel = selectedModel ? modelLabel(activeModel) : "Automatikus";
+  // The chip names the model the way the chain's cells do — "Opus 5", "Sol" —
+  // rather than "Claude Sonnet 5" or "GPT-5.6 Luna". The long form set the
+  // width of the chip, and the chip sets the width of the menu under it.
+  const activeLabel = selectedModel
+    ? (PIPELINE_MODEL_LABELS[activeModel.id] ?? modelLabel(activeModel))
+    : "Automatikus";
   const supportedEfforts = activeModel.supportedReasoningEfforts.length
     ? activeModel.supportedReasoningEfforts
     : FALLBACK_EFFORTS;
@@ -8174,13 +8257,6 @@ function App() {
     supportedEfforts.indexOf(effectiveEffort),
   );
   const activeEffortLabel = EFFORT_LABELS[effectiveEffort] ?? effectiveEffort;
-  const selectedFamily = modelFamilies.find((family) =>
-    family.models.some((model) => model.id === selectedModel),
-  );
-  const activeFamily =
-    modelFamilies.find((family) => family.key === activeFamilyKey) ??
-    selectedFamily ??
-    modelFamilies[0];
   const workLogGroups = useMemo<WorkLogGroup[]>(() => {
     return buildWorkLogGroups({
       messages,
@@ -9990,7 +10066,7 @@ function App() {
     void invoke<CodexModel[]>("codex_models")
       .then((models) => {
         if (active && models.length > 0)
-          setModelCatalog([...models, claudeCodingModel]);
+          setModelCatalog([...models, ...claudeCodingModels]);
       })
       .catch(() => undefined)
       .finally(() => {
@@ -10002,27 +10078,9 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!isTauri) return;
-    let active = true;
-    void invoke<ClaudeAuthStatus>("claude_auth_status")
-      .then((status) => {
-        if (active) setClaudeAuthStatus(status);
-      })
-      .catch(() => undefined);
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  useEffect(() => {
     if (activeModel && !supportedEfforts.includes(selectedEffort))
       setSelectedEffort(effectiveEffort);
   }, [modelCatalog, selectedModel]);
-
-  useEffect(() => {
-    if (selectedClaudeModel && supportedEfforts.includes(claudeEffort))
-      setSelectedEffort(claudeEffort);
-  }, [selectedClaudeModel, claudeEffort, supportedEfforts]);
 
   useEffect(() => {
     if (
@@ -10037,14 +10095,6 @@ function App() {
     if (selectedModel) localStorage.setItem("min-model", selectedModel);
     else localStorage.removeItem("min-model");
   }, [selectedModel]);
-
-  useEffect(() => {
-    localStorage.setItem("min-claude-model", claudeModel);
-  }, [claudeModel]);
-
-  useEffect(() => {
-    localStorage.setItem("min-claude-effort", claudeEffort);
-  }, [claudeEffort]);
 
   useEffect(() => {
     localStorage.setItem("min-claude-budget-usd", claudeBudgetUsd);
@@ -10858,11 +10908,6 @@ function App() {
 
   const selectModel = (model: string | null) => {
     setSelectedModel(model);
-    setActiveFamilyKey(
-      modelFamilies.find((family) =>
-        family.models.some((candidate) => candidate.id === model),
-      )?.key ?? null,
-    );
     const modelData = modelCatalog.find((candidate) => candidate.id === model);
     if (
       modelData &&
@@ -10873,8 +10918,6 @@ function App() {
           modelData.supportedReasoningEfforts[0] ??
           DEFAULT_EFFORT,
       );
-    if (model?.startsWith("claude-"))
-      setSelectedEffort(claudeEffort);
     setModelMenuOpen(false);
     notify(
       model
@@ -10884,10 +10927,9 @@ function App() {
   };
 
   const toggleModelMenu = () => {
-    const nextOpen = !modelMenuOpen;
-    if (nextOpen)
-      setActiveFamilyKey(selectedFamily?.key ?? modelFamilies[0]?.key ?? null);
-    setModelMenuOpen(nextOpen);
+    // Which vendor to show is the picker's own business now, and it works it
+    // out from the selection when it opens.
+    setModelMenuOpen((open) => !open);
   };
 
   const selectEffortIndex = (index: number) => {
@@ -11353,101 +11395,6 @@ function App() {
       danger: true,
       onConfirm: () => performDeleteGeneralConversation(conversation),
     });
-  };
-
-  const saveClaudeApiKey = async () => {
-    if (!isTauri) {
-      notify("A Claude-kulcs mentése a natív Tauri appban érhető el");
-      return;
-    }
-    const apiKey = claudeApiKeyInput.trim();
-    if (!apiKey) {
-      notify("Adj meg egy Claude API-kulcsot");
-      return;
-    }
-    setClaudeAuthBusy(true);
-    setClaudeTestResult(null);
-    try {
-      const status = await invoke<ClaudeAuthStatus>("claude_save_api_key", {
-        apiKey,
-      });
-      setClaudeAuthStatus(status);
-      setClaudeApiKeyInput("");
-      notify("A Claude API-kulcs biztonságosan elmentve");
-    } catch (error) {
-      notify(`Nem sikerült elmenteni a Claude API-kulcsot: ${String(error)}`);
-    } finally {
-      setClaudeAuthBusy(false);
-    }
-  };
-
-  const deleteClaudeApiKey = async () => {
-    if (!isTauri) return;
-    setClaudeAuthBusy(true);
-    setClaudeTestResult(null);
-    try {
-      const status = await invoke<ClaudeAuthStatus>("claude_delete_api_key");
-      setClaudeAuthStatus(status);
-      setClaudeApiKeyInput("");
-      notify("A Claude API-kulcs törölve");
-    } catch (error) {
-      notify(`Nem sikerült törölni a Claude API-kulcsot: ${String(error)}`);
-    } finally {
-      setClaudeAuthBusy(false);
-    }
-  };
-
-  const testClaudeConnection = async () => {
-    if (!isTauri) {
-      notify("A Claude kapcsolat-teszt a natív Tauri appban érhető el");
-      return;
-    }
-    setClaudeTestBusy(true);
-    setClaudeTestResult(null);
-    try {
-      const result = await invoke<ClaudeConnectionResult>(
-        "claude_test_connection",
-        {
-          model: claudeModel,
-          effort: claudeEffort,
-          maxBudgetUsd: Number(claudeBudgetUsd) || 0.05,
-          maxTurns: Number(claudeMaxTurns) || Number(DEFAULT_CLAUDE_MAX_TURNS),
-          cwd: workspaceRoot || null,
-        },
-      );
-      setClaudeTestResult(result);
-      if (result.success) {
-        const cost =
-          typeof result.totalCostUsd === "number"
-            ? ` · ${result.totalCostUsd.toFixed(4)} USD`
-            : "";
-        notify(`Claude kapcsolat rendben${cost}`);
-      } else {
-        const description = describeAgentError(
-          result.errorCode,
-          result.error,
-          "Claude",
-        );
-        notify(description.notification);
-      }
-    } catch (error) {
-      const description = describeThrownAgentError(error, "Claude");
-      const failed: ClaudeConnectionResult = {
-        success: false,
-        model: claudeModel,
-        effort: claudeEffort,
-        text: null,
-        sessionId: null,
-        totalCostUsd: null,
-        requestId: "",
-        errorCode: description.code,
-        error: description.detail,
-      };
-      setClaudeTestResult(failed);
-      notify(description.notification);
-    } finally {
-      setClaudeTestBusy(false);
-    }
   };
 
   const changeProjectsRoot = async () => {
@@ -12483,7 +12430,10 @@ function App() {
               sessionId: resumeClaudeSessionId,
               conversationContext: rehydrationContext || null,
               model: selectedModel,
-              effort: claudeEffort || effectiveEffort,
+              // The reasoning slider, like every other model: the Claude panel
+              // used to carry an effort of its own, and being set it always
+              // won — moving the slider changed nothing for a Claude turn.
+              effort: effectiveEffort,
               cwd: activeProjectData.path,
               requestId,
               maxBudgetUsd: Number(claudeBudgetUsd),
@@ -14556,169 +14506,6 @@ Javítsd ki, majd futtasd le újra a teszteket.`
                   type="button"
                   className="settings-option"
                   disabled={!isTauri}
-                  aria-expanded={claudeSettingsOpen}
-                  onClick={() => {
-                    if (isTauri) setClaudeSettingsOpen((open) => !open);
-                  }}
-                >
-                  <span>
-                    <strong>Claude</strong>
-                    <small className="settings-option-hint">
-                      {claudeAuthStatus?.subscriptionConfigured
-                        ? `${claudeAuthStatus.preview ?? "Előfizetés"} · aktív`
-                        : claudeAuthStatus?.apiKeyConfigured
-                          ? "API-kulcs beállítva"
-                          : "Nincs hitelesítés"}
-                    </small>
-                  </span>
-                  <span aria-hidden="true">
-                    {claudeSettingsOpen ? "⌃" : "⌄"}
-                  </span>
-                </button>
-                {claudeSettingsOpen && (
-                  <div className="settings-subpanel claude-settings-panel">
-                    <div className="claude-auth-status">
-                      <span>Hitelesítés</span>
-                      <strong>
-                        {claudeAuthStatus?.subscriptionConfigured
-                          ? `${claudeAuthStatus.preview ?? "Előfizetés"} · bejelentkezve`
-                          : claudeAuthStatus?.apiKeyConfigured
-                            ? `API-kulcs${claudeAuthStatus.preview ? ` · ${claudeAuthStatus.preview}` : ""}`
-                            : "Nincs beállítva"}
-                      </strong>
-                    </div>
-                    <p className="claude-auth-hint">
-                      {claudeAuthStatus?.subscriptionConfigured
-                        ? claudeAuthStatus.apiKeyConfigured
-                          ? "A coding turnök az előfizetéssel futnak. A mentett API-kulcs csak akkor lép be, ha kilépsz a Claude Code bejelentkezésből."
-                          : "A coding turnök az előfizetéssel futnak, nincs per-turn USD költség. A turnlimit a guard."
-                        : "Előfizetéses futtatáshoz jelentkezz be a Claude Code-ba ezen a gépen, vagy add meg egy pay-per-token API-kulcsot."}
-                    </p>
-                    <div className="claude-runtime-grid">
-                      <label>
-                        <span>Modell</span>
-                        <select
-                          value={claudeModel}
-                          onChange={(event) => setClaudeModel(event.target.value)}
-                        >
-                          <option value="claude-sonnet-5">Claude Sonnet 5</option>
-                        </select>
-                      </label>
-                      <label>
-                        <span>Effort</span>
-                        <select
-                          value={claudeEffort}
-                          onChange={(event) => setClaudeEffort(event.target.value)}
-                        >
-                          <option value="low">Low</option>
-                          <option value="medium">Medium</option>
-                          <option value="high">High</option>
-                        </select>
-                      </label>
-                      <label>
-                        <span>
-                          {claudeAuthStatus?.subscriptionConfigured
-                            ? "Budget / turn (USD, előfizetésnél inaktív)"
-                            : "Budget / turn (USD)"}
-                        </span>
-                        <input
-                          type="number"
-                          min="0.01"
-                          max="5"
-                          step="0.01"
-                          value={claudeBudgetUsd}
-                          onChange={(event) => setClaudeBudgetUsd(event.target.value)}
-                          disabled={claudeAuthStatus?.subscriptionConfigured ?? false}
-                        />
-                      </label>
-                      <label>
-                        <span>Turnlimit</span>
-                        <input
-                          type="number"
-                          min="1"
-                          max="200"
-                          step="1"
-                          value={claudeMaxTurns}
-                          onChange={(event) => setClaudeMaxTurns(event.target.value)}
-                        />
-                      </label>
-                    </div>
-                    <label className="claude-key-field">
-                      <span>API-kulcs</span>
-                      <input
-                        type="password"
-                        value={claudeApiKeyInput}
-                        onChange={(event) =>
-                          setClaudeApiKeyInput(event.target.value)
-                        }
-                        placeholder={
-                          claudeAuthStatus?.configured
-                            ? "Új kulcs megadása a cseréhez"
-                            : "sk-ant-…"
-                        }
-                        autoComplete="off"
-                        spellCheck={false}
-                        disabled={claudeAuthBusy || claudeTestBusy}
-                      />
-                    </label>
-                    <div className="claude-settings-actions">
-                      <button
-                        type="button"
-                        className="settings-compact-button"
-                        onClick={() => void saveClaudeApiKey()}
-                        disabled={
-                          claudeAuthBusy || claudeTestBusy || !claudeApiKeyInput.trim()
-                        }
-                      >
-                        Mentés
-                      </button>
-                      <button
-                        type="button"
-                        className="settings-compact-button"
-                        onClick={() => void testClaudeConnection()}
-                        disabled={
-                          claudeAuthBusy || claudeTestBusy || !claudeAuthStatus?.configured
-                        }
-                      >
-                        {claudeTestBusy ? "Tesztelés…" : "Kapcsolat tesztelése"}
-                      </button>
-                      <button
-                        type="button"
-                        className="settings-compact-button danger"
-                        onClick={() => void deleteClaudeApiKey()}
-                        disabled={
-                          claudeAuthBusy ||
-                          claudeTestBusy ||
-                          !claudeAuthStatus?.apiKeyConfigured
-                        }
-                      >
-                        Törlés
-                      </button>
-                    </div>
-                    {claudeTestResult && (
-                      <div
-                        className={`claude-test-result ${claudeTestResult.success ? "is-success" : "is-error"}`}
-                      >
-                        <strong>
-                          {claudeTestResult.success ? "Kapcsolat rendben" : "Kapcsolat-hiba"}
-                        </strong>
-                        <span>
-                          {claudeTestResult.success
-                            ? `${claudeTestResult.model}${
-                                typeof claudeTestResult.totalCostUsd === "number"
-                                  ? ` · ${claudeTestResult.totalCostUsd.toFixed(4)} USD`
-                                  : ""
-                              }`
-                            : `${claudeTestResult.errorCode ? `${claudeTestResult.errorCode}: ` : ""}${claudeTestResult.error ?? "Ismeretlen hiba"}`}
-                        </span>
-                      </div>
-                    )}
-                  </div>
-                )}
-                <button
-                  type="button"
-                  className="settings-option"
-                  disabled={!isTauri}
                   onClick={() => {
                     if (isTauri) {
                       void changeProjectsRoot();
@@ -15003,12 +14790,10 @@ Javítsd ki, majd futtasd le újra a teszteket.`
                     activeLabel={activeLabel}
                     selectedModel={selectedModel}
                     modelFamilies={modelFamilies}
-                    activeFamily={activeFamily}
                     activeEffortLabel={activeEffortLabel}
                     supportedEfforts={supportedEfforts}
                     activeEffortIndex={activeEffortIndex}
                     onToggle={toggleModelMenu}
-                    onFamilyHover={setActiveFamilyKey}
                     onSelectModel={selectModel}
                     onSelectEffort={selectEffortIndex}
                   />

@@ -12995,7 +12995,15 @@ function App() {
                 type="button"
                 role="tab"
                 aria-selected={item.key === selectedStage}
-                className={`pipeline-run-tab${item.key === selectedStage ? " is-active" : ""}`}
+                // The phase that carries the verdict says so in the strip as
+                // well, so a run's outcome is readable without opening it.
+                className={`pipeline-run-tab${item.key === selectedStage ? " is-active" : ""}${
+                  item.key === lastStageIndex && runVerdict?.verdict
+                    ? runVerdict.verdict === "accepted"
+                      ? " is-verdict-accepted"
+                      : " is-verdict-changes"
+                    : ""
+                }`}
                 title={item.agent}
                 onClick={() => {
                   const runId = stage.runId;

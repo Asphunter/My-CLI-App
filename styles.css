@@ -1618,3 +1618,9 @@ textarea::placeholder { color: var(--faint); }
   font: inherit; font-size: 9px; letter-spacing: .04em; cursor: pointer;
 }
 .pipeline-answer-next button:hover { background: rgba(150, 147, 116, .28); }
+
+/* The verdict is visible in the strip too, so a glance is enough. */
+.pipeline-run-tab.is-verdict-accepted { color: #7fc79a; }
+.pipeline-run-tab.is-verdict-changes { color: #e09b78; }
+.pipeline-run-tab.is-verdict-accepted.is-active { color: #a5e0ba; }
+.pipeline-run-tab.is-verdict-changes.is-active { color: #f3b391; }

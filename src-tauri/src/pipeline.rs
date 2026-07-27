@@ -588,7 +588,19 @@ where
             is_first: index == 0,
         };
         let is_last = index + 1 == recipe.stages.len();
-        match execute(execution).await {
+        // A provider can hand back a turn that simply says nothing -- an
+        // unknown model name produced exactly that, with no error anywhere.
+        // Passing it on would let the chain report success while the next role
+        // reasons about an artifact that is not there, and leave the user an
+        // empty bubble where the answer belongs.
+        let outcome = match execute(execution).await {
+            Ok(outcome) if outcome.text.trim().is_empty() => Err(format!(
+                "A(z) {} szakasz üres választ adott. Ellenőrizd a szakaszhoz választott modellt.",
+                stage.role.label()
+            )),
+            other => other,
+        };
+        match outcome {
             Ok(outcome) => {
                 if let Some(session) = outcome.session_id.clone() {
                     session_by_runtime.insert(runtime_key, session);
@@ -903,7 +915,9 @@ mod tests {
     #[test]
     fn u6_only_the_first_stage_carries_the_original_attachments() {
         let recipe = recipe_by_id("plan_code_review").expect("preset");
-        let recorder = Recorder::with(Vec::new());
+        // Every stage has to answer something, or the chain stops before the
+        // later stages this test is about.
+        let recorder = Recorder::with(vec![ok("terv", None), ok("kod", None), ok("review", None)]);
         recorder.run(&recipe, "Feladat.", None);
         let seen = recorder.seen.borrow();
         assert!(seen[0].is_first);
@@ -931,6 +945,30 @@ mod tests {
         assert!(
             outcome.stages[0].review.is_none() && outcome.stages[1].review.is_none(),
             "only a review stage carries a verdict"
+        );
+    }
+
+    #[test]
+    fn l5_a_stage_that_answers_nothing_stops_the_chain() {
+        let recipe = recipe_by_id("plan_code_review").expect("preset");
+        // What an unknown model name actually did: a turn that ended cleanly
+        // and said nothing at all.
+        let recorder = Recorder::with(vec![
+            ok("terv", None),
+            ok(
+                "   
+  ", None,
+            ),
+        ]);
+        let outcome = recorder.run(&recipe, "Feladat.", None);
+
+        assert_eq!(recorder.seen.borrow().len(), 2, "the review must not start");
+        assert_eq!(outcome.status, RunStatus::Failed);
+        assert!(!outcome.stages[1].succeeded);
+        let reason = outcome.error.clone().unwrap_or_default();
+        assert!(
+            reason.contains("üres választ") && reason.contains("KÓD"),
+            "the reason must name the stage and say what happened, got: {reason}"
         );
     }
 

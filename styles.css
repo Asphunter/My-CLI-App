@@ -1511,3 +1511,50 @@ textarea::placeholder { color: var(--faint); }
    available while a chain is selected. */
 .model-picker.is-disabled { pointer-events: none; opacity: .4; }
 .composer-pipeline-waiting { color: var(--accent); font-weight: 700; }
+
+/* --- Egy lánc egy blokk ---------------------------------------------------
+   A szakaszok külön kártyák (külön turn, külön diff, külön rollback), de a
+   futam egyetlen dolog. A közéjük eső margót elvesszük, a kerekítést csak a
+   két végén hagyjuk meg, így összeérnek egyetlen kerettel. */
+.pipeline-run-header {
+  display: flex; align-items: center; gap: 8px;
+  width: calc(100% - 29px); margin: 10px 0 0 29px; padding: 5px 10px;
+  border: 1px solid #45515a; border-bottom: none; border-radius: 3px 3px 0 0;
+  background: #1b2126;
+}
+.pipeline-run-header strong { color: var(--muted); font-size: 8px; font-weight: 700; letter-spacing: .1em; }
+.pipeline-run-tabs { display: flex; gap: 4px; }
+.pipeline-run-tab {
+  padding: 2px 8px; border: 1px solid #3c4650; border-radius: 3px;
+  background: transparent; color: var(--muted);
+  font: inherit; font-size: 9px; letter-spacing: .04em; cursor: pointer;
+}
+.pipeline-run-tab:hover { border-color: #55636e; color: #cfd8de; }
+.pipeline-run-tab.is-active { border-color: var(--accent); background: rgba(123, 217, 171, .12); color: #cfe9db; }
+.pipeline-run-header .stage-verdict { margin-left: auto; }
+
+.trace-card.in-run { margin-bottom: 0; border-radius: 0; }
+.trace-card.is-run-start { border-top-left-radius: 0; border-top-right-radius: 0; }
+.trace-card.is-run-end { margin-bottom: 10px; border-radius: 0 0 3px 3px; }
+/* One shared border between neighbouring stages instead of two touching ones. */
+.trace-card.is-run-middle, .trace-card.is-run-end { border-top: none; }
+
+.compact-answer-card.in-run { margin-bottom: 0; border-radius: 0; }
+.compact-answer-card.is-run-start { border-top-left-radius: 0; border-top-right-radius: 0; }
+.compact-answer-card.is-run-end { margin-bottom: 10px; border-radius: 0 0 3px 3px; }
+.compact-answer-card.is-run-middle, .compact-answer-card.is-run-end { border-top: none; }
+
+/* A run is always the same size, whatever the models felt like writing. */
+.trace-card.in-run .turn-progress-answer-body,
+.compact-answer-card.in-run .compact-answer-body,
+.trace-card.in-run .turn-progress-steps { max-height: 320px; overflow-y: auto; }
+
+.pipeline-answer-card { padding: 10px 13px; }
+.pipeline-answer-verdict {
+  margin: 0 0 8px; padding: 5px 8px; border-radius: 3px;
+  font-size: 10px; line-height: 1.5;
+}
+.pipeline-answer-verdict.is-accepted { border: 1px solid #4d8060; background: rgba(30, 60, 40, .5); color: #8fd6a6; }
+.pipeline-answer-verdict.is-changes { border: 1px solid #7a6336; background: rgba(60, 48, 22, .5); color: #d8bb72; }
+.pipeline-answer-body { max-height: 320px; overflow-y: auto; }
+.pipeline-answer-body p { margin: 0; white-space: pre-wrap; font-size: 11px; line-height: 1.65; }

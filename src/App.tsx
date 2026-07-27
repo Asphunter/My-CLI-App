@@ -274,6 +274,9 @@ const PIPELINE_MODEL_LABELS: Record<string, string> = {
 const shortModelLabel = (modelId: string) =>
   PIPELINE_MODEL_LABELS[modelId] ?? modelId;
 
+/** The composed answer tab, which is not one of the chain's stages. */
+const PIPELINE_ANSWER_TAB = -1;
+
 const STAGE_ROLE_LABELS: Record<string, string> = {
   plan: "TERV",
   code: "KÓD",
@@ -5082,6 +5085,9 @@ type TurnProgressCardProps = {
   onRollbackChanges?: () => void;
   rollbackBusy?: boolean;
   onPreviewImage?: (path: string) => void;
+  /** Where this card sits inside a chain, so the run reads as one block. */
+  runPosition?: "start" | "middle" | "end";
+  runHeader?: ReactNode;
 };
 
 function TurnProgressCard({
@@ -5104,6 +5110,8 @@ function TurnProgressCard({
   onRollbackChanges,
   rollbackBusy,
   onPreviewImage,
+  runPosition,
+  runHeader,
 }: TurnProgressCardProps) {
   const quoteAnchor = (suffix: string) =>
     `${quoteAnchorPrefix}:${suffix}`;
@@ -5662,10 +5670,13 @@ function TurnProgressCard({
   const openInlineDiff = (activity: CodeActivity) =>
     setInlineDiff(inlineCodeDiffForActivity(activity));
 
+  const runClasses = runPosition ? ` in-run is-run-${runPosition}` : "";
   if (compact) {
     return (
+      <>
+      {runHeader}
       <article
-        className="compact-answer-card"
+        className={`compact-answer-card${runClasses}`}
         data-quote-selectable="true"
         data-quote-anchor={answerAnchorId}
         aria-label="Válasz"
@@ -5717,14 +5728,17 @@ function TurnProgressCard({
           </div>
         )}
       </article>
+      </>
     );
   }
 
   return (
-    <article
-      className={`turn-progress-card trace-card trace-view-${traceView}${streaming ? " is-live" : ""}`}
-      aria-label="Lépések és gondolkodás"
-    >
+    <>
+      {runHeader}
+      <article
+        className={`turn-progress-card trace-card trace-view-${traceView}${streaming ? " is-live" : ""}${runClasses}`}
+        aria-label="Lépések és gondolkodás"
+      >
       {(hasAnswer || streaming) && (
         <section
           className="turn-progress-answer"
@@ -6015,7 +6029,8 @@ function TurnProgressCard({
           </section>
         </div>
       )}
-    </article>
+      </article>
+    </>
   );
 }
 
@@ -6702,6 +6717,10 @@ function App() {
     }
     return localStorage.getItem("min-effort") ?? DEFAULT_EFFORT;
   });
+  // A chain is one panel showing one phase at a time. Three stacked answers
+  // filled the screen and buried the verdict; the tabs keep a run the same
+  // size no matter how much the models wrote.
+  const [selectedStages, setSelectedStages] = useState<Record<string, number>>({});
   const [expandedWorkLogs, setExpandedWorkLogs] = useState<
     Record<string, boolean>
   >({});
@@ -12050,7 +12069,13 @@ function App() {
               verdictSummary: stage.review?.summary,
             },
           }));
-          setMessages((current) => [...current, ...stageMessages]);
+          // The outer request has a live bubble of its own, and the first
+          // stage's stream filled it. Left in place it became a second,
+          // badge-less copy of the plan sitting above the run panel.
+          setMessages((current) => [
+            ...current.filter((message) => message.id !== liveMessageId),
+            ...stageMessages,
+          ]);
           const lastSession = [...run.stages]
             .reverse()
             .find((stage) => stage.sessionId)?.sessionId;
@@ -12623,7 +12648,10 @@ function App() {
   const workGroupForMessage = (message: Message, messageIndex: number) =>
     workLogGroups.find(
       (group) =>
-        workGroupHasVisibleTrace(group) &&
+        // A chain stage always has a card of its own, even when its steps were
+        // recorded against the provider's thread rather than its request. The
+        // row must give way to that card, or the stage is shown twice.
+        (Boolean(message.pipeline) || workGroupHasVisibleTrace(group)) &&
         messageBelongsToWorkGroup(message, messageIndex, group),
     );
   const allQuoteRefs = messages.flatMap((message) => message.quoteRefs ?? []);
@@ -12639,6 +12667,25 @@ function App() {
     const userMessage = userMessageForWorkGroup(group);
     return userMessage ? messageUsesDetailedTrace(userMessage) : true;
   };
+  const stagesByRun = new Map<
+    string,
+    Array<{ stageIndex: number; role: string; agent: string }>
+  >();
+  for (const entry of timelineEntries) {
+    if (entry.kind !== "work") continue;
+    const stage = answerForWorkGroup(entry.group)?.pipeline;
+    if (!stage) continue;
+    const stages = stagesByRun.get(stage.runId) ?? [];
+    stages.push({
+      stageIndex: stage.stageIndex,
+      role: stage.stageRole,
+      agent: stage.stageAgent,
+    });
+    stagesByRun.set(stage.runId, stages);
+  }
+  for (const stages of stagesByRun.values())
+    stages.sort((left, right) => left.stageIndex - right.stageIndex);
+
   const timelineContent = timelineEntries
     .filter((entry) => activeMode === "coding" || entry.kind === "message")
     .map((entry) => {
@@ -12679,6 +12726,19 @@ function App() {
             )
           : entry.message.final;
       if (entry.message.role === "assistant" && !isFinal) return null;
+      // Before the chain stopped persisting it, the outer request's live
+      // bubble was saved alongside the stage answers -- the same text twice,
+      // once with a badge and once without. Hide the copy that has no stage.
+      if (
+        entry.message.role === "assistant" &&
+        !entry.message.pipeline &&
+        entry.message.turnId &&
+        messages.some((other) =>
+          other.pipeline &&
+          other.turnId?.startsWith(`${entry.message.turnId}-stage-`),
+        )
+      )
+        return null;
       const showAvatar =
         entry.message.role === "user" ||
         messages[entry.messageIndex - 1]?.role !== "assistant";
@@ -12717,7 +12777,20 @@ function App() {
       entry.group,
       groupAnswer.turnId,
     );
-    if (!workGroupHasVisibleTrace(entry.group)) return null;
+    if (!groupAnswer.pipeline && !workGroupHasVisibleTrace(entry.group))
+      return null;
+    // The same legacy leftover as in the message branch, but this copy owns a
+    // work group of its own and would draw a full card above its own run.
+    if (
+      !groupAnswer.pipeline &&
+      groupAnswer.turnId &&
+      messages.some(
+        (other) =>
+          other.pipeline &&
+          other.turnId?.startsWith(`${groupAnswer.turnId}-stage-`),
+      )
+    )
+      return null;
     const isLatestGroup = entry.group.key === latestWorkGroup?.key;
     const isCurrentGroup = entry.group.key === currentWorkGroup?.key;
     // A completed turn should open on its answer after a restart as well.
@@ -12755,9 +12828,119 @@ function App() {
               : undefined,
         }
       : basePlan);
+    const stage = groupAnswer.pipeline;
+    const runStages = stage ? (stagesByRun.get(stage.runId) ?? []) : [];
+    const lastStageIndex = runStages.length
+      ? runStages[runStages.length - 1].stageIndex
+      : 0;
+    // -1 is the composed answer: what the chain did, in the words of whoever
+    // did it, instead of the reviewer's opinion of the coder.
+    const selectedStage = stage
+      ? (selectedStages[stage.runId] ?? PIPELINE_ANSWER_TAB)
+      : 0;
+    // Only the chosen phase draws itself; the others are one click away. The
+    // answer tab has no stage of its own, so the last one hosts it.
+    if (
+      stage &&
+      stage.stageIndex !==
+        (selectedStage === PIPELINE_ANSWER_TAB ? lastStageIndex : selectedStage)
+    )
+      return null;
+    const runVerdict = stage
+      ? messages.find(
+          (message) =>
+            message.pipeline?.runId === stage.runId &&
+            Boolean(message.pipeline?.verdict),
+        )?.pipeline
+      : undefined;
+    const runHeader = stage ? (
+        <div className="pipeline-run-header">
+          <strong>FUTAM</strong>
+          <span className="pipeline-run-tabs" role="tablist">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={selectedStage === PIPELINE_ANSWER_TAB}
+              className={`pipeline-run-tab${selectedStage === PIPELINE_ANSWER_TAB ? " is-active" : ""}`}
+              onClick={() =>
+                setSelectedStages((current) => ({
+                  ...current,
+                  [stage.runId]: PIPELINE_ANSWER_TAB,
+                }))
+              }
+            >
+              VÁLASZ
+            </button>
+            {runStages.map((item) => (
+              <button
+                key={item.stageIndex}
+                type="button"
+                role="tab"
+                aria-selected={item.stageIndex === stage.stageIndex}
+                className={`pipeline-run-tab${item.stageIndex === stage.stageIndex ? " is-active" : ""}`}
+                title={item.agent}
+                onClick={() =>
+                  setSelectedStages((current) => ({
+                    ...current,
+                    [stage.runId]: item.stageIndex,
+                  }))
+                }
+              >
+                {`${item.stageIndex + 1}/${stage.stageCount} ${STAGE_ROLE_LABELS[item.role] ?? item.role}`}
+              </button>
+            ))}
+          </span>
+          {runVerdict?.verdict && (
+            <span
+              className={`stage-verdict${runVerdict.verdict === "accepted" ? " is-accepted" : " is-changes"}`}
+              title={runVerdict.verdictSummary ?? ""}
+            >
+              {runVerdict.verdict === "accepted" ? "ELFOGAD" : "JAVÍTANDÓ"}
+            </span>
+          )}
+        </div>
+      ) : undefined;
+    if (stage && selectedStage === PIPELINE_ANSWER_TAB) {
+      // Composed here rather than asked of a fourth model: the coder already
+      // wrote what changed, and the reviewer already said whether to trust it.
+      const doer = messages.find(
+        (message) =>
+          message.pipeline?.runId === stage.runId &&
+          message.pipeline?.stageRole === "code",
+      );
+      const answerText = (doer ?? groupAnswer).text;
+      const accepted = runVerdict?.verdict === "accepted";
+      return (
+        <Fragment key={entry.key}>
+          {runHeader}
+          <article className="trace-card in-run is-run-end pipeline-answer-card">
+            {runVerdict?.verdict && (
+              <p
+                className={`pipeline-answer-verdict${accepted ? " is-accepted" : " is-changes"}`}
+              >
+                {accepted
+                  ? "A bíráló elfogadta."
+                  : `A bíráló javítást kér: ${runVerdict.verdictSummary ?? "lásd a REVIEW fület."}`}
+              </p>
+            )}
+            <div className="pipeline-answer-body">
+              <p>
+                {answerWithQuoteBacklinks(
+                  textWithoutCodeBlocks(answerText),
+                  [],
+                  () => undefined,
+                )}
+              </p>
+            </div>
+          </article>
+        </Fragment>
+      );
+    }
     return (
       <TurnProgressCard
         key={entry.key}
+        runPosition={stage ? "end" : undefined}
+        runHeader={runHeader}
         plan={plan}
         activities={entry.group.activities}
         commentary={groupCommentary}

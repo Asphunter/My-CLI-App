@@ -8,6 +8,8 @@ export type TimelineMessageLike = {
   turnId?: string;
   hlc?: string;
   originDeviceId?: string;
+  /** Set on every answer a chain produced, one per stage. */
+  pipeline?: { runId: string; stageIndex: number };
 };
 
 export type TimelineActivityLike = {
@@ -138,6 +140,45 @@ export const buildWorkLogGroups = <
     return bucket?.key ?? "before-first-user";
   };
 
+  // A chain's stages all follow one prompt, so bucketing by the preceding user
+  // message folded the whole run into a single card. That card then showed only
+  // its last answer -- the review -- and the plan and the coding answer fell out
+  // as plain rows below it, which is why a run read back to front. Each stage
+  // gets its own bucket instead, and therefore its own card, steps and diff.
+  const stageBucketByTurn = new Map<string, string>();
+  const stageUserKeyByBucket = new Map<string, string>();
+  const stageBoundsByUserKey = new Map<
+    string,
+    Array<{ sequence: number; bucket: string }>
+  >();
+  messages.forEach((message, index) => {
+    const stage = message.pipeline;
+    if (message.role !== "assistant" || !stage || !message.turnId) return;
+    const sequence = messageSequence(message, index);
+    const userKey =
+      userMessageKeyAtIndex(messages, index) ?? precedingUserBucket(sequence);
+    const bucket = `${userKey}::run:${stage.runId}#${stage.stageIndex}`;
+    stageBucketByTurn.set(message.turnId, bucket);
+    stageUserKeyByBucket.set(bucket, userKey);
+    const bounds = stageBoundsByUserKey.get(userKey) ?? [];
+    bounds.push({ sequence, bucket });
+    bounds.sort((left, right) => left.sequence - right.sequence);
+    stageBoundsByUserKey.set(userKey, bounds);
+  });
+  const stageBucket = (turnKey: string | undefined) =>
+    turnKey ? stageBucketByTurn.get(turnKey) : undefined;
+  // Work items are recorded against the provider's own thread id, which never
+  // matches the request id an answer carries, so a stage's steps could not be
+  // found by id. The stages of a chain run strictly one after another, so the
+  // clock settles it: a step belongs to the first stage that had not answered
+  // yet when the step happened.
+  const stageBucketAt = (userKey: string, sequence: number) => {
+    const bounds = stageBoundsByUserKey.get(userKey);
+    if (!bounds?.length) return undefined;
+    return (bounds.find((stage) => sequence <= stage.sequence) ?? bounds[bounds.length - 1])
+      .bucket;
+  };
+
   type MutableGroup = WorkLogGroup<Activity> & {
     turnKeySet: Set<string>;
   };
@@ -177,7 +218,9 @@ export const buildWorkLogGroups = <
         turnKeys: [],
         turnKeySet: new Set<string>(),
         userMessageKey:
-          bucket === "before-first-user" ? undefined : bucket,
+          bucket === "before-first-user"
+            ? undefined
+            : (stageUserKeyByBucket.get(bucket) ?? bucket),
         activities: [],
         sequence,
         hlc: evidence.hlc,
@@ -202,18 +245,26 @@ export const buildWorkLogGroups = <
   // repeat across requests; grouping by turn id first would collapse history.
   for (const activity of activities) {
     const bucket = precedingUserBucket(activity.id);
-    const group = ensureGroup(bucket, activity.turnId ?? "legacy", {
-      sequence: activity.id,
-      hlc: activity.hlc,
-      originDeviceId: activity.originDeviceId,
-    });
+    const group = ensureGroup(
+      stageBucket(activity.turnId) ?? stageBucketAt(bucket, activity.id) ?? bucket,
+      activity.turnId ?? "legacy",
+      {
+        sequence: activity.id,
+        hlc: activity.hlc,
+        originDeviceId: activity.originDeviceId,
+      },
+    );
     group.activities.push(activity);
   }
 
   for (const entry of commentary) {
     if (!entry.turnId || !finiteNumber(entry.sequence)) continue;
     const bucket = precedingUserBucket(entry.sequence);
-    ensureGroup(bucket, entry.turnId, { sequence: entry.sequence });
+    ensureGroup(
+      stageBucket(entry.turnId) ?? stageBucketAt(bucket, entry.sequence) ?? bucket,
+      entry.turnId,
+      { sequence: entry.sequence },
+    );
   }
 
   messages.forEach((message, index) => {
@@ -221,7 +272,7 @@ export const buildWorkLogGroups = <
     const sequence = messageSequence(message, index);
     const bucket =
       userMessageKeyAtIndex(messages, index) ?? precedingUserBucket(sequence);
-    ensureGroup(bucket, message.turnId, {
+    ensureGroup(stageBucket(message.turnId) ?? bucket, message.turnId, {
       sequence,
       hlc: message.hlc,
       originDeviceId: message.originDeviceId,

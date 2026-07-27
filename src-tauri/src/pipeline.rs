@@ -383,6 +383,11 @@ pub struct PipelineRunRequest {
     /// left alone keeps what the recipe recommends.
     #[serde(default)]
     pub stage_overrides: Vec<StageOverride>,
+    /// The request the user's submit created. It runs no turn of its own, but
+    /// its live bubble is filled by the first stage and would be saved as a
+    /// second copy of that answer.
+    #[serde(default)]
+    pub placeholder_request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

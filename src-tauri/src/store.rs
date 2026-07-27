@@ -3511,6 +3511,31 @@ pub(crate) fn finish_pipeline_run(
 
 /// Stamps the stage metadata onto the answer the canonical writer has just
 /// stored for this request, keyed the same way that writer keys it.
+/// Removes the answer row the outer request left behind.
+///
+/// A chain is submitted under one request id and then runs its stages under
+/// their own. The outer request never has a turn of its own, but its live
+/// bubble is filled by the first stage's stream and saved with the rest, so the
+/// conversation ended up holding the plan twice -- once as a stage, once as a
+/// badge-less copy. Dropping it here keeps the other device clean too.
+pub(crate) fn forget_pipeline_placeholder_answer(
+    conversation_id: &str,
+    request_id: &str,
+) -> Result<usize, String> {
+    let store = open_local_store()?;
+    store
+        .connection
+        .execute(
+            "DELETE FROM messages
+             WHERE conversation_id = ?1
+               AND role = 'assistant'
+               AND turn_id = ?2
+               AND pipeline_json IS NULL",
+            params![conversation_id, format!("request:{request_id}")],
+        )
+        .map_err(|error| format!("A lánc ideiglenes válasza nem törölhető: {error}"))
+}
+
 pub(crate) fn label_pipeline_stage_answer(
     conversation_id: &str,
     request_id: &str,

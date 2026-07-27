@@ -332,6 +332,9 @@ async fn pipeline_send(
     let status = outcome.status;
     let run_error = outcome.error;
 
+    if let Some(placeholder) = request.placeholder_request_id.as_deref() {
+        let _ = store::forget_pipeline_placeholder_answer(&request.conversation_id, placeholder);
+    }
     if let Ok(mut runs) = cancelled_pipeline_runs().lock() {
         runs.remove(&run_id);
     }
@@ -766,7 +769,15 @@ async fn local_store_import_v1() -> Result<Vec<migration::ImportReport>, String>
 async fn local_store_load() -> Result<store::LocalStoreSnapshot, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let _ = store::recover_orphaned_agent_turns();
-        let _ = store::recover_interrupted_pipeline_runs(&live_pipeline_run_ids());
+        // Only the first load of a process can honestly find a run "interrupted
+        // by a restart": every later load happens while this process is running
+        // chains of its own. The store is reloaded whenever a sync pull lands,
+        // and one of those landed 80 seconds into a live chain and declared it
+        // dead. The live-run list below stays as a second line of defence.
+        static RECOVERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !RECOVERED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let _ = store::recover_interrupted_pipeline_runs(&live_pipeline_run_ids());
+        }
         let snapshot = store::load_snapshot()?;
         let (snapshot, recovered) = codex::recover_local_store_snapshot(snapshot)?;
         if recovered {

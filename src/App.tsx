@@ -12032,6 +12032,7 @@ function App() {
               prompt: codexPrompt,
               conversationId: requestConversationId,
               requestIds: stageRequestIds,
+              placeholderRequestId: requestId,
               images: storedImages,
               cwd: isGeneralMode ? null : activeProjectData.path,
               sessionId: resumeClaudeSessionId,
@@ -12072,10 +12073,26 @@ function App() {
           // The outer request has a live bubble of its own, and the first
           // stage's stream filled it. Left in place it became a second,
           // badge-less copy of the plan sitting above the run panel.
-          setMessages((current) => [
-            ...current.filter((message) => message.id !== liveMessageId),
-            ...stageMessages,
-          ]);
+          setMessages((current) => {
+            const kept = current.filter(
+              (message) => message.id !== liveMessageId,
+            );
+            // Without a sequence these rows fall back to their array index,
+            // which is nowhere near the conversation's clock -- the run then
+            // sorted to the top of the timeline instead of after its prompt,
+            // and its panel was nowhere to be seen until a reload.
+            const lastSequence = kept.reduce(
+              (highest, message) => Math.max(highest, message.sequence ?? 0),
+              0,
+            );
+            return [
+              ...kept,
+              ...stageMessages.map((message, index) => ({
+                ...message,
+                sequence: lastSequence + 1 + index,
+              })),
+            ];
+          });
           const lastSession = [...run.stages]
             .reverse()
             .find((stage) => stage.sessionId)?.sessionId;
@@ -12734,7 +12751,6 @@ function App() {
         !entry.message.pipeline &&
         entry.message.turnId &&
         messages.some((other) =>
-          other.pipeline &&
           other.turnId?.startsWith(`${entry.message.turnId}-stage-`),
         )
       )
@@ -12784,10 +12800,8 @@ function App() {
     if (
       !groupAnswer.pipeline &&
       groupAnswer.turnId &&
-      messages.some(
-        (other) =>
-          other.pipeline &&
-          other.turnId?.startsWith(`${groupAnswer.turnId}-stage-`),
+      messages.some((other) =>
+        other.turnId?.startsWith(`${groupAnswer.turnId}-stage-`),
       )
     )
       return null;

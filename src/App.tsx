@@ -1924,13 +1924,36 @@ const compareWorkItems = (left: CodeActivity, right: CodeActivity) =>
     },
   );
 
+/**
+ * A chain's outer request carries a live bubble that the first stage's stream
+ * fills, and that bubble reaches SQLite before the run can delete it. Loading
+ * it back put a badge-less twin of the plan beside the real stage answer, and
+ * the merge below then kept the twin -- the plan lost its badge and its tab
+ * vanished from the run. The outer request never answers on its own, so any
+ * row whose turn has stages of its own is dropped on the way in.
+ */
+const withoutChainPlaceholders = (messages: Message[]) => {
+  const turnsWithStages = new Set<string>();
+  for (const message of messages) {
+    const marker = message.turnId?.indexOf("-stage-") ?? -1;
+    if (marker > 0) turnsWithStages.add(message.turnId!.slice(0, marker));
+  }
+  if (turnsWithStages.size === 0) return messages;
+  return messages.filter(
+    (message) =>
+      message.role !== "assistant" ||
+      !message.turnId ||
+      !turnsWithStages.has(message.turnId),
+  );
+};
+
 const mergeMessages = (
   primary: Message[],
   secondary: Message[] = [],
   settleInterrupted = false,
 ) => {
   const merged = coalesceMessageIdentities(
-    [...primary, ...secondary],
+    withoutChainPlaceholders([...primary, ...secondary]),
     (existing, message) => {
       // Sync and SQLite can contain the same row with different private/runtime
       // fields. Keep the most complete text and merge lifecycle flags instead of
@@ -5707,7 +5730,9 @@ function TurnProgressCard({
         <div className="compact-answer-header">
           <strong>VÁLASZ</strong>
           {stageBadge(answer?.pipeline)}
-          <span>{streaming ? "készül" : "kész"}</span>
+          {(streaming || !runPosition) && (
+            <span>{streaming ? "készül" : "kész"}</span>
+          )}
           {answerActions}
         </div>
         <div className="compact-answer-body">
@@ -5797,7 +5822,9 @@ function TurnProgressCard({
                   </button>
                 </div>
                 {stageBadge(answer?.pipeline)}
-                <span>{streaming ? "készül" : "kész"}</span>
+                {(streaming || !runPosition) && (
+                  <span>{streaming ? "készül" : "kész"}</span>
+                )}
                 {overallElapsed && <time>{overallElapsed}</time>}
                 {answerActions}
               </div>
@@ -12125,6 +12152,15 @@ function App() {
               [requestThreadKey]: lastSession,
             }));
           if (run.status === "failed" && run.error) notify(run.error);
+          // The runner already dropped the outer request's answer, but a save
+          // queued while its bubble was still on screen can land afterwards
+          // and put the row back. Ask again once this state has settled.
+          window.setTimeout(() => {
+            void invoke("pipeline_forget_placeholder", {
+              conversationId: requestConversationId,
+              requestId,
+            }).catch(() => undefined);
+          }, 2500);
         } finally {
           setPipelineProgress(null);
           // A chain runs under one request id per stage, so the shared reset

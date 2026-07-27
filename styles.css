@@ -1531,8 +1531,8 @@ textarea::placeholder { color: var(--faint); }
 .pipeline-run-slider {
   position: absolute; top: 2px; left: 2px; z-index: 0;
   width: calc((100% - 4px) / var(--tab-count, 4)); height: calc(100% - 4px);
-  border-radius: 3px; background: rgba(123, 217, 171, .16);
-  box-shadow: inset 0 0 0 1px rgba(123, 217, 171, .45);
+  border-radius: 3px; background: rgba(150, 147, 116, .18);
+  box-shadow: inset 0 0 0 1px var(--accent);
   transition: transform .22s cubic-bezier(.4, 0, .2, 1);
 }
 .pipeline-run-tab {
@@ -1544,7 +1544,7 @@ textarea::placeholder { color: var(--faint); }
   cursor: pointer; transition: color .18s ease;
 }
 .pipeline-run-tab:hover { color: #cfd8de; }
-.pipeline-run-tab.is-active { color: #cfe9db; }
+.pipeline-run-tab.is-active { color: var(--accent-strong); }
 .pipeline-run-header .stage-verdict { margin-left: auto; }
 
 .trace-card.in-run { margin-bottom: 0; border-radius: 0; }
@@ -1576,11 +1576,30 @@ textarea::placeholder { color: var(--faint); }
 /* The review states its verdict by its colour; that is why it carries no chip. */
 .trace-card.is-verdict-accepted,
 .compact-answer-card.is-verdict-accepted {
-  border-color: #55916b; background: #1b3125;
+  border-color: #5fa878; background: #17351f;
 }
 .trace-card.is-verdict-changes,
 .compact-answer-card.is-verdict-changes {
-  border-color: #9c5f4c; background: #33211c;
+  border-color: #b06a53; background: #3a2018;
 }
 .trace-card.is-verdict-accepted::before { background: #6fc08c; box-shadow: 0 0 13px rgba(111, 192, 140, .36); }
 .trace-card.is-verdict-changes::before { background: #d08a6a; box-shadow: 0 0 13px rgba(208, 138, 106, .36); }
+
+/* The answer section paints over the card, so the verdict has to reach it too
+   -- otherwise a passing review shows its colour only as a hairline border. */
+/* The shared surface below is declared with !important, so the verdict has to
+   answer in kind or a passing review shows its colour only as a hairline. */
+.trace-card.is-verdict-accepted .turn-progress-answer,
+.trace-card.is-verdict-accepted .trace-answer-layout,
+.trace-card.is-verdict-accepted .trace-answer-main,
+.trace-card.is-verdict-accepted .turn-progress-answer-heading {
+  background: #17351f !important; border-color: #2f6b45;
+}
+.trace-card.is-verdict-changes .turn-progress-answer,
+.trace-card.is-verdict-changes .trace-answer-layout,
+.trace-card.is-verdict-changes .trace-answer-main,
+.trace-card.is-verdict-changes .turn-progress-answer-heading {
+  background: #3a2018 !important; border-color: #7d4436;
+}
+.trace-card.is-verdict-accepted::before { background: #6fc08c !important; }
+.trace-card.is-verdict-changes::before { background: #d08a6a !important; }

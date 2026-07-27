@@ -372,6 +372,14 @@ fn agent_conversation_status(
     store::agent_conversation_status(&conversation_id)
 }
 
+/// The chain deletes this row when it finishes, but the frontend may still
+/// flush a save that was queued while the outer bubble was on screen. The
+/// frontend calls this once its own state has settled.
+#[tauri::command(rename_all = "camelCase")]
+fn pipeline_forget_placeholder(conversation_id: String, request_id: String) -> Result<(), String> {
+    store::forget_pipeline_placeholder_answer(&conversation_id, &request_id).map(|_| ())
+}
+
 #[tauri::command(rename_all = "camelCase")]
 fn agent_answer_checkpoint(
     conversation_id: String,
@@ -905,6 +913,7 @@ pub fn run() {
             pipeline_recipes,
             pipeline_send,
             pipeline_cancel,
+            pipeline_forget_placeholder,
             agent_conversation_status,
             agent_answer_checkpoint,
             agent_cancel,

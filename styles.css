@@ -1603,3 +1603,6 @@ textarea::placeholder { color: var(--faint); }
 }
 .trace-card.is-verdict-accepted::before { background: #6fc08c !important; }
 .trace-card.is-verdict-changes::before { background: #d08a6a !important; }
+.pipeline-run-tab:disabled { opacity: .38; cursor: default; }
+.pipeline-run-tab.is-running { color: var(--accent-strong); }
+.live-turn-anchor .pipeline-run-header { margin-top: 0; }

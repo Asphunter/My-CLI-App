@@ -6609,6 +6609,11 @@ function App() {
   const [pipelineRecipeId, setPipelineRecipeId] = useState("plan_code_review");
   const [pipelineProgress, setPipelineProgress] =
     useState<PipelineProgressEvent | null>(null);
+  const pipelineProgressRef = useRef<PipelineProgressEvent | null>(null);
+  pipelineProgressRef.current = pipelineProgress;
+  // Which phase of a running chain the reader is looking at. Null follows the
+  // one that is actually running, which is what a progress display should do.
+  const [liveStageChoice, setLiveStageChoice] = useState<number | null>(null);
   // Per-stage model and reasoning, keyed by `${recipeId}:${stageIndex}`. Empty
   // means "keep what the preset recommends", so the picker never has to
   // pre-fill values the user did not choose.
@@ -7165,6 +7170,10 @@ function App() {
   };
 
   const playCompletionSoundOnce = (requestOrTurnId: string) => {
+    // A chain is one answer as far as the room is concerned. Chiming after
+    // every stage turned a single question into three announcements.
+    const progress = pipelineProgressRef.current;
+    if (progress && progress.stageIndex + 1 < progress.stageCount) return;
     const played = completionSoundRequestsRef.current;
     if (played.has(requestOrTurnId)) return;
     played.add(requestOrTurnId);
@@ -12762,9 +12771,38 @@ function App() {
   for (const stages of stagesByRun.values())
     stages.sort((left, right) => left.stageIndex - right.stageIndex);
 
+  // While a chain runs, its finished stages belong to the live panel. Left in
+  // the timeline they piled up as separate cards under the question, which is
+  // how a single answer turned into a wall of stacked windows.
+  const liveRunOuterRequestId = pipelineProgress
+    ? pipelineProgress.requestId.replace(/-stage-\d+$/, "")
+    : null;
+  const liveRunStagePrefix = liveRunOuterRequestId
+    ? `request:${liveRunOuterRequestId}-stage-`
+    : null;
+
   const timelineContent = timelineEntries
     .filter((entry) => activeMode === "coding" || entry.kind === "message")
     .map((entry) => {
+    if (liveRunStagePrefix && liveRunOuterRequestId) {
+      // Only answers. The question carries the same turn id, and hiding that
+      // is exactly the bug this was meant to fix.
+      const turnId =
+        entry.kind === "message"
+          ? entry.message.role === "assistant"
+            ? entry.message.turnId
+            : undefined
+          : answerForWorkGroup(entry.group)?.turnId;
+      // The stage answers are one thing, and the outer request's own settled
+      // bubble is another: while the chain runs the frontend only knows the
+      // latter, and left alone it drew a finished phase as a separate card
+      // above the panel that owns it.
+      if (
+        turnId?.startsWith(liveRunStagePrefix) ||
+        turnId === `request:${liveRunOuterRequestId}`
+      )
+        return null;
+    }
     if (entry.kind === "message") {
       // A persisted turn may contain an empty assistant row when the app was
       // closed before any final text was stored. Do not silently erase that
@@ -13077,12 +13115,108 @@ function App() {
   const liveCompact = activeUserMessage
     ? !messageUsesDetailedTrace(activeUserMessage)
     : !showDetailedTrace;
+  // Everything a running chain shows lives in one panel. Its phases are known
+  // the moment it starts, so the strip is complete from the first second and
+  // the marker simply follows the phase that is running.
+  const liveRunStages = pipelineProgress
+    ? (activePipelineRecipe?.stages.map((stage, index) => ({
+        index,
+        role: stage.role,
+      })) ??
+      Array.from({ length: pipelineProgress.stageCount }, (_, index) => ({
+        index,
+        role: index === pipelineProgress.stageIndex ? pipelineProgress.role : "",
+      })))
+    : [];
+  const liveShownStage = pipelineProgress
+    ? (liveStageChoice ?? pipelineProgress.stageIndex)
+    : 0;
+  const liveFinishedStageText = (index: number) => {
+    const byStage = messages.find(
+      (message) =>
+        message.role === "assistant" &&
+        message.turnId === `request:${liveRunOuterRequestId}-stage-${index}`,
+    );
+    if (byStage) return byStage.text;
+    // Mid-run the only settled copy the frontend has is the outer bubble, and
+    // it holds the phase that finished last. Anything older is not in memory
+    // yet, so say that instead of showing the wrong phase.
+    if (pipelineProgress && index === pipelineProgress.stageIndex - 1)
+      return (
+        messages.find(
+          (message) =>
+            message.role === "assistant" &&
+            message.turnId === `request:${liveRunOuterRequestId}` &&
+            !message.live,
+        )?.text ?? ""
+      );
+    return "Ez a szakasz akkor lesz olvasható, ha a lánc befejeződött.";
+  };
+  const liveRunHeader = pipelineProgress ? (
+    <div className="pipeline-run-header" data-run-id={pipelineProgress.runId}>
+      <span
+        className="pipeline-run-tabs"
+        role="tablist"
+        style={{ "--tab-count": liveRunStages.length + 1 } as CSSProperties}
+      >
+        <span
+          className="pipeline-run-slider"
+          aria-hidden="true"
+          style={{ transform: `translateX(${(liveShownStage + 1) * 100}%)` }}
+        />
+        <button type="button" className="pipeline-run-tab" disabled>
+          VÁLASZ
+        </button>
+        {liveRunStages.map((stage) => {
+          const done = stage.index < pipelineProgress.stageIndex;
+          const running = stage.index === pipelineProgress.stageIndex;
+          return (
+            <button
+              key={stage.index}
+              type="button"
+              role="tab"
+              aria-selected={stage.index === liveShownStage}
+              disabled={!done && !running}
+              className={`pipeline-run-tab${stage.index === liveShownStage ? " is-active" : ""}${running ? " is-running" : ""}`}
+              onClick={() =>
+                setLiveStageChoice(running ? null : stage.index)
+              }
+            >
+              {`${stage.index + 1}/${pipelineProgress.stageCount} ${STAGE_ROLE_LABELS[stage.role] ?? stage.role}`}
+            </button>
+          );
+        })}
+      </span>
+    </div>
+  ) : undefined;
+  const liveFinishedStagePanel =
+    pipelineProgress && liveShownStage !== pipelineProgress.stageIndex ? (
+      <article className="trace-card in-run is-run-end pipeline-answer-card">
+        <div className="pipeline-answer-body">
+          <p>
+            {answerWithQuoteBacklinks(
+              textWithoutCodeBlocks(liveFinishedStageText(liveShownStage)),
+              [],
+              () => undefined,
+            )}
+          </p>
+        </div>
+      </article>
+    ) : null;
   const liveTurnContent =
     activeMode === "coding" &&
     isStreaming &&
     !activeTurnHasCompleted && (
       <div className="live-turn-anchor">
+        {liveFinishedStagePanel ? (
+          <>
+            {liveRunHeader}
+            {liveFinishedStagePanel}
+          </>
+        ) : (
         <TurnProgressCard
+          runPosition={pipelineProgress ? "end" : undefined}
+          runHeader={liveRunHeader}
           plan={activePlan}
           activities={liveWorkGroup?.activities ?? []}
           commentary={
@@ -13119,6 +13253,7 @@ function App() {
             )
           }
         />
+        )}
       </div>
     );
   const generalLiveTurnContent =

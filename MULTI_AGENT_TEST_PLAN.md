@@ -30,7 +30,7 @@ tanultuk meg (mérőszám ≠ ránézés; "lefordul" ≠ "működik").
 | L4 JAVÍTANDÓ-ág szándékosan | ⬜ | az L1 véletlenül produkálta, de nem célzottan |
 | L5 hibás szakasz | ⬜ | |
 | L6 újraindítás lánc közben | ⬜ | |
-| L7 megszakítás | ⚠️ | **defekt, nem teszteset** — nincs lánc-megszakítás |
+| L7 megszakítás | 🔄 | a lánc-megszakítás megvan (`l7`, `l7b`); az élő futás sorra vár |
 | L8 budget subscription alatt | ⬜ | |
 | L9 interaktivitás | 🔄 | a jóváhagyás-ág élesben lefutott; kérdés-ág nem |
 | L10 újragenerálás | ⬜ | |
@@ -38,6 +38,21 @@ tanultuk meg (mérőszám ≠ ránézés; "lefordul" ≠ "működik").
 
 Menet közben javított defektek, mind teszttel rögzítve: futam öngyilkosság ·
 jóváhagyásra váró turn halála · néma gyártó-csere · elvesző jelvény.
+
+Az éjszakai automata sor (2026-07-27) két továbbit talált, mindkettőt a saját
+futásán, nem elemzésből:
+
+- **A stop gomb hibának számított.** A leállítás a szolgáltatónál megszakított
+  kérésként csapódik le, így a szakasz hibát adott vissza, és a futam `failed`
+  lett „A Claude-kérés megszakítva" indoklással — vagyis a program a felhasználó
+  ellen könyvelte el, hogy megnyomta a gombot. Javítva (`e78b1d0`), teszt: `l7b`.
+- **Egy lánc után a szerkesztő némán megtagadta a küldést.** A lánc szakaszonként
+  külön request id-vel fut, a turn-lezáró reset viszont a beküldés id-jére van
+  kötve, így lánc után soha nem futott le: az `isStreaming` és a submit-zár bent
+  ragadt. A gomb késznek látszott, és minden további üzenetet eldobott app-
+  újraindításig — a funkció indításonként egyszer volt használható. Javítva
+  (`0efcd2f`). Ezt a defekt maga rejtette el: az utána következő teszteket is
+  ő tette tönkre, amíg a küldés eredménye nem került a naplóba.
 
 ## 0. Kiindulási állapot — mi van már lefedve és mi nincs
 

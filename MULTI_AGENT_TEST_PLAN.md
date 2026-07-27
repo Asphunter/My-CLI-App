@@ -26,14 +26,14 @@ tanultuk meg (mérőszám ≠ ránézés; "lefordul" ≠ "működik").
 | I3 három szakasz = három válasz | ✅ | |
 | **L1 teljes lánc** | ✅ | lent részletezve; a bíráló megfogta a kódoló hamis sikerjelentését |
 | L2 terv nem ír | ✅ | az L1 mellékesen igazolta |
-| L3 Claude-bíráló tesztet futtat | ⬜ | |
-| L4 JAVÍTANDÓ-ág szándékosan | ⬜ | az L1 véletlenül produkálta, de nem célzottan |
-| L5 hibás szakasz | ⬜ | |
-| L6 újraindítás lánc közben | ⬜ | |
-| L7 megszakítás | 🔄 | a lánc-megszakítás megvan (`l7`, `l7b`); az élő futás sorra vár |
-| L8 budget subscription alatt | ⬜ | |
-| L9 interaktivitás | 🔄 | a jóváhagyás-ág élesben lefutott; kérdés-ág nem |
-| L10 újragenerálás | ⬜ | |
+| L3 Claude-bíráló tesztet futtat | ✅ | saját tesztfuttatás, bővített esetekkel |
+| L4 teljes lánc verdikttel | ✅ | a JAVÍTANDÓ-ág az L3-ban és az L9a-ban is előjött |
+| L5 hibás szakasz | ✅ | **hibát talált:** az üres válasz sikernek számított |
+| L6 újraindítás lánc közben | ✅ | |
+| L7 megszakítás | ✅ | `cancelled`, a review el sem indul, a terv megmarad |
+| L8 budget subscription alatt | ✅ | előfizetésben nincs plafon, nulla budget-halál |
+| L9 interaktivitás | ✅ | a kérdés-ág is: a lánc vár, a terv a válaszra hivatkozik |
+| L10 újragenerálás | ✅ | a futam jelvényei érintetlenek |
 | X1–X3 másik gép | ⬜ | |
 
 Menet közben javított defektek, mind teszttel rögzítve: futam öngyilkosság ·
@@ -46,6 +46,17 @@ futásán, nem elemzésből:
   kérésként csapódik le, így a szakasz hibát adott vissza, és a futam `failed`
   lett „A Claude-kérés megszakítva" indoklással — vagyis a program a felhasználó
   ellen könyvelte el, hogy megnyomta a gombot. Javítva (`e78b1d0`), teszt: `l7b`.
+- **A store-újratöltés megölte az élő láncot.** A megszakadt-futam helyreállítás
+  a `local_store_load`-ba került, ami nem indítási hook: egy tízperces lánc
+  közepén bármelyik újratöltés „újraindítás miatt megszakadt"-nak írta a futamot,
+  ami közben dolgozott, és utána be is fejeződött. Javítva (`207ab4b`), teszt `u8c`.
+- **Az üres válasz sikernek számított.** Nem létező modellre állított szakasz
+  némán semmit adott vissza, a lánc ezt sikernek vette, a futam `completed` lett,
+  a bíráló helyén üres buborék maradt. Javítva (`b9aaa4a`), teszt `l5`.
+- **A bíráló a kódoló munkája nélküli fát nézte.** Minden turn visszaállítja a
+  munkakönyvtárat a turn előtti állapotra, így a kódoló javítását a rendszer
+  visszavonta, mielőtt a bíráló elindult — az minden alkalommal hiányzó javítást
+  jelentett, helyesen és haszontalanul. Javítva (`2ecaeaf`).
 - **Egy lánc után a szerkesztő némán megtagadta a küldést.** A lánc szakaszonként
   külön request id-vel fut, a turn-lezáró reset viszont a beküldés id-jére van
   kötve, így lánc után soha nem futott le: az `isStreaming` és a submit-zár bent

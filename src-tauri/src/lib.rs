@@ -113,6 +113,22 @@ fn cancelled_pipeline_runs() -> &'static std::sync::Mutex<std::collections::Hash
     RUNS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
+/// The runs this process is driving right now. The store is reloaded while a
+/// chain is in flight, and the interrupted-run recovery must be able to tell
+/// "nobody is driving this" from "it is running in the next room".
+fn live_pipeline_runs() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static RUNS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    RUNS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn live_pipeline_run_ids() -> Vec<String> {
+    live_pipeline_runs()
+        .lock()
+        .map(|runs| runs.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
 fn pipeline_run_is_cancelled(run_id: &str) -> bool {
     cancelled_pipeline_runs()
         .lock()
@@ -153,6 +169,9 @@ async fn pipeline_send(
     }
 
     let run_id = store::begin_pipeline_run(&request.conversation_id, &recipe)?;
+    if let Ok(mut runs) = live_pipeline_runs().lock() {
+        runs.insert(run_id.clone());
+    }
     // One snapshot for the whole chain. Each stage used to restore the tree at
     // the end of its own turn, which meant the reviewer looked at a workspace
     // the coder's work had just been rolled back out of -- it reported the fix
@@ -314,6 +333,9 @@ async fn pipeline_send(
     let run_error = outcome.error;
 
     if let Ok(mut runs) = cancelled_pipeline_runs().lock() {
+        runs.remove(&run_id);
+    }
+    if let Ok(mut runs) = live_pipeline_runs().lock() {
         runs.remove(&run_id);
     }
     // Whatever the chain wrote is now staged and the tree is back at its base,
@@ -744,7 +766,7 @@ async fn local_store_import_v1() -> Result<Vec<migration::ImportReport>, String>
 async fn local_store_load() -> Result<store::LocalStoreSnapshot, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let _ = store::recover_orphaned_agent_turns();
-        let _ = store::recover_interrupted_pipeline_runs();
+        let _ = store::recover_interrupted_pipeline_runs(&live_pipeline_run_ids());
         let snapshot = store::load_snapshot()?;
         let (snapshot, recovered) = codex::recover_local_store_snapshot(snapshot)?;
         if recovered {

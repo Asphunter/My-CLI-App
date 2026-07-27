@@ -3301,13 +3301,13 @@ fn recover_orphaned_agent_turns_in_connection(
         .map_err(|error| format!("Az orphaned agent turnök helyreállítása sikertelen: {error}"))
 }
 
-/// Startup-only, exactly like the orphaned-turn recovery beside it. It must not
-/// run on every store open: the runner opens the store several times while a
-/// chain is in flight, and closing "interrupted" runs there killed the very run
-/// that was still going.
-pub(crate) fn recover_interrupted_pipeline_runs() -> Result<usize, String> {
+/// Closes runs nobody is driving any more. `live` names the runs this process
+/// is running right now: the store is reloaded on ordinary events, not only at
+/// startup, and without that list a reload in the middle of a ten-minute chain
+/// declared the very run it was reloading for interrupted.
+pub(crate) fn recover_interrupted_pipeline_runs(live: &[String]) -> Result<usize, String> {
     let store = open_local_store()?;
-    fail_interrupted_pipeline_runs(&store.connection)
+    fail_interrupted_pipeline_runs(&store.connection, live)
 }
 
 pub(crate) fn recover_orphaned_agent_turns() -> Result<usize, String> {
@@ -3546,7 +3546,10 @@ pub(crate) fn label_pipeline_stage_answer(
 /// A run is driven by a live process, so it cannot survive that process going
 /// away. Leaving it `running` would show a stage spinner that never resolves;
 /// the finished stages keep their answers either way.
-fn fail_interrupted_pipeline_runs(connection: &Connection) -> Result<usize, String> {
+fn fail_interrupted_pipeline_runs(
+    connection: &Connection,
+    live: &[String],
+) -> Result<usize, String> {
     let has_table: bool = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_runs')",
@@ -3557,15 +3560,34 @@ fn fail_interrupted_pipeline_runs(connection: &Connection) -> Result<usize, Stri
     if !has_table {
         return Ok(0);
     }
-    connection
-        .execute(
+    // Bound, not interpolated: a run id is generated here, but a query built by
+    // pasting values is a habit worth not having.
+    let spared = (0..live.len())
+        .map(|index| format!("?{}", index + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let statement = if spared.is_empty() {
+        "UPDATE pipeline_runs SET
+             status = 'failed',
+             error = COALESCE(error, 'A lánc újraindítás miatt megszakadt.'),
+             updated_at = ?1
+         WHERE status = 'running'"
+            .to_string()
+    } else {
+        format!(
             "UPDATE pipeline_runs SET
                  status = 'failed',
                  error = COALESCE(error, 'A lánc újraindítás miatt megszakadt.'),
                  updated_at = ?1
-             WHERE status = 'running'",
-            params![now_millis()],
+             WHERE status = 'running' AND id NOT IN ({spared})"
         )
+    };
+    let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now_millis())];
+    for id in live {
+        values.push(Box::new(id.clone()));
+    }
+    connection
+        .execute(&statement, rusqlite::params_from_iter(values.iter()))
         .map_err(|error| format!("A megszakadt láncok lezárása sikertelen: {error}"))
 }
 
@@ -5990,7 +6012,7 @@ mod tests {
 
         // A run is driven by a process that is now gone; leaving it running
         // would spin a stage forever.
-        fail_interrupted_pipeline_runs(&connection).expect("recover runs");
+        fail_interrupted_pipeline_runs(&connection, &[]).expect("recover runs");
 
         let live: (String, Option<String>) = connection
             .query_row(
@@ -6046,6 +6068,48 @@ mod tests {
         assert_eq!(
             status, "running",
             "a running chain must survive the store being opened again"
+        );
+    }
+
+    #[test]
+    fn u8c_a_run_this_process_is_driving_survives_a_store_reload() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+        connection
+            .execute(
+                "INSERT INTO pipeline_runs
+                     (id, conversation_id, recipe_json, status, current_stage, error, created_at, updated_at)
+                 VALUES ('run-mine', 'conversation-1', '{}', 'running', 1, NULL, '100', '100'),
+                        ('run-orphan', 'conversation-1', '{}', 'running', 0, NULL, '100', '100')",
+                [],
+            )
+            .expect("insert runs");
+
+        // The store is reloaded on ordinary events, not only at startup. A
+        // reload in the middle of a chain must not declare that chain dead.
+        fail_interrupted_pipeline_runs(&connection, &["run-mine".to_string()])
+            .expect("recover runs");
+
+        let mine: String = connection
+            .query_row(
+                "SELECT status FROM pipeline_runs WHERE id = 'run-mine'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read run");
+        assert_eq!(mine, "running", "a chain in flight must be left alone");
+
+        let orphan: String = connection
+            .query_row(
+                "SELECT status FROM pipeline_runs WHERE id = 'run-orphan'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read run");
+        assert_eq!(
+            orphan, "failed",
+            "a run nobody drives still has to be closed"
         );
     }
 

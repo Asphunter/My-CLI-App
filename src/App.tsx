@@ -13027,6 +13027,19 @@ function App() {
           </span>
         </div>
       ) : undefined;
+    const askForTheFix = () => {
+      const reason = runVerdict?.verdictSummary?.trim();
+      const draft = reason
+        ? `A bíráló ezt kifogásolta: ${reason}
+Javítsd ki, majd futtasd le újra a teszteket.`
+        : "Javítsd ki, amit a bíráló kifogásolt, majd futtasd le újra a teszteket.";
+      inputDraftRef.current = draft;
+      if (inputRef.current) {
+        inputRef.current.value = draft;
+        resizeComposerTextarea(inputRef.current);
+        inputRef.current.focus();
+      }
+    };
     if (stage && selectedStage === PIPELINE_ANSWER_TAB) {
       // Composed here rather than asked of a fourth model: the coder already
       // wrote what changed, and the reviewer already said whether to trust it.
@@ -13050,6 +13063,16 @@ function App() {
                 )}
               </p>
             </div>
+            {runVerdict?.verdict === "changes_requested" && (
+              // A verdict that asks for changes has to say what happens next,
+              // or the run ends on a red panel and a shrug.
+              <div className="pipeline-answer-next">
+                <span>A bíráló javítást kér.</span>
+                <button type="button" onClick={askForTheFix}>
+                  Javíttatom
+                </button>
+              </div>
+            )}
           </article>
         </Fragment>
       );
@@ -13102,13 +13125,20 @@ function App() {
     : Object.prototype.hasOwnProperty.call(expandedWorkLogs, liveTurnKey)
       ? expandedWorkLogs[liveTurnKey]
       : (expandedWorkLogChoicesRef.current[liveTurnKey] ?? true);
-  const liveAnswer = [...messages]
-    .reverse()
-    .find(
-      (message) =>
-        message.role === "assistant" &&
-        message.live,
-    );
+  // A stage that has started but not yet streamed has no bubble of its own,
+  // and the newest "live" row can then be a leftover from an earlier run --
+  // which is how the panel came to show a verdict while the coder was working.
+  // While a chain runs, only the running stage's own bubble counts.
+  const liveAnswer = pipelineProgress
+    ? messages.find(
+        (message) =>
+          message.role === "assistant" &&
+          message.live &&
+          message.turnId === `request:${pipelineProgress.requestId}`,
+      )
+    : [...messages]
+        .reverse()
+        .find((message) => message.role === "assistant" && message.live);
   const activeUserMessage = [...messages]
     .reverse()
     .find((message) => message.role === "user");

@@ -1606,3 +1606,15 @@ textarea::placeholder { color: var(--faint); }
 .pipeline-run-tab:disabled { opacity: .38; cursor: default; }
 .pipeline-run-tab.is-running { color: var(--accent-strong); }
 .live-turn-anchor .pipeline-run-header { margin-top: 0; }
+
+.pipeline-answer-next {
+  display: flex; align-items: center; gap: 10px;
+  margin-top: 10px; padding-top: 9px; border-top: 1px solid #7d4436;
+  color: #d8bb72; font-size: 10px;
+}
+.pipeline-answer-next button {
+  padding: 3px 10px; border: 1px solid var(--accent); border-radius: 3px;
+  background: rgba(150, 147, 116, .16); color: var(--accent-strong);
+  font: inherit; font-size: 9px; letter-spacing: .04em; cursor: pointer;
+}
+.pipeline-answer-next button:hover { background: rgba(150, 147, 116, .28); }

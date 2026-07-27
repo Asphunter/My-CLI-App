@@ -12062,6 +12062,21 @@ function App() {
           if (run.status === "failed" && run.error) notify(run.error);
         } finally {
           setPipelineProgress(null);
+          // A chain runs under one request id per stage, so the shared reset
+          // at the end of this function — which only fires when the active
+          // request id is still the one it started with — never matches after
+          // a chain. Without this the composer stayed "busy" for good: the
+          // send button looked ready and silently dropped every next message
+          // until the app was restarted.
+          isStreamingRef.current = false;
+          setIsStreaming(false);
+          setIsCancelling(false);
+          activeRequestIdRef.current = null;
+          activeLiveMessageIdRef.current = null;
+          preparingRequestIdRef.current = null;
+          turnCompletedRequestIdRef.current = null;
+          setTurnCompletedRequestId(null);
+          submitBusyRef.current = false;
         }
         return;
       }

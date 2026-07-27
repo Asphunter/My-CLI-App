@@ -415,6 +415,15 @@ pub struct LocalMessage {
 #[serde(rename_all = "camelCase")]
 pub struct LocalMessagePipeline {
     pub run_id: String,
+    /// Ties the iterations of one question together, so a re-run after a
+    /// rejected review lands in the same panel instead of a second one below
+    /// it. Empty on rows written before re-runs existed; the UI falls back to
+    /// `run_id`, which is what a single-iteration chain would have anyway.
+    #[serde(default)]
+    pub chain_id: String,
+    /// 1-based. Zero means a row that predates versioning, read as v1.
+    #[serde(default)]
+    pub iteration: i64,
     pub stage_index: i64,
     pub stage_count: i64,
     /// `plan` / `code` / `review` — the wire form of the stage role.
@@ -6193,6 +6202,8 @@ mod tests {
                     change_summary: Vec::new(),
                     pipeline: Some(LocalMessagePipeline {
                         run_id: "run-1".to_string(),
+                        chain_id: "run-1".to_string(),
+                        iteration: 1,
                         stage_index: index as i64,
                         stage_count: 3,
                         stage_role: role.to_string(),
@@ -6285,6 +6296,8 @@ mod tests {
                 change_summary: Vec::new(),
                 pipeline: Some(LocalMessagePipeline {
                     run_id: "run-1".to_string(),
+                    chain_id: "run-1".to_string(),
+                    iteration: 1,
                     stage_index: 2,
                     stage_count: 3,
                     stage_role: "review".to_string(),

@@ -167,8 +167,33 @@ async fn pipeline_send(
             request.request_ids.len()
         ));
     }
+    // A resumed chain still allocates an id per stage, so the ids stay indexed
+    // by stage and the skipped ones simply go unused.
+    let start_stage = request.start_stage.unwrap_or(0);
+    if start_stage >= recipe.stages.len() {
+        return Err(format!(
+            "A(z) {start_stage}. szakasztól nincs mit futtatni: a recept {} szakaszból áll.",
+            recipe.stages.len()
+        ));
+    }
+    let iteration = request.iteration.unwrap_or(1).max(1);
+    if iteration > pipeline::MAX_CHAIN_ITERATIONS {
+        return Err(format!(
+            "Egy kérdés legfeljebb {} kört futhat; a v{iteration} már nem indul.",
+            pipeline::MAX_CHAIN_ITERATIONS
+        ));
+    }
 
     let run_id = store::begin_pipeline_run(&request.conversation_id, &recipe)?;
+    // The first run *is* the chain; every later one names the chain it belongs
+    // to, which is what puts the iterations in one panel.
+    let chain_id = request
+        .chain_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&run_id)
+        .to_string();
     if let Ok(mut runs) = live_pipeline_runs().lock() {
         runs.insert(run_id.clone());
     }
@@ -192,10 +217,20 @@ async fn pipeline_send(
         let request = &request;
         let run_id = run_id.clone();
         let cancel_run_id = run_id.clone();
-        pipeline::run_stages(
+        pipeline::run_stages_from(
             &recipe,
             &request.prompt,
-            request.session_id.clone(),
+            pipeline::RunStart {
+                initial_session: request.session_id.clone(),
+                start_index: start_stage,
+                seed_artifacts: request
+                    .seed_artifacts
+                    .iter()
+                    .cloned()
+                    .map(Into::into)
+                    .collect(),
+                feedback: request.retry_feedback.clone(),
+            },
             move || pipeline_run_is_cancelled(&cancel_run_id),
             move |execution| {
                 let app = app.clone();
@@ -292,6 +327,8 @@ async fn pipeline_send(
                 &request_id,
                 &store::LocalMessagePipeline {
                     run_id: run_id.clone(),
+                    chain_id: chain_id.clone(),
+                    iteration,
                     stage_index: stage_result.index as i64,
                     stage_count,
                     stage_role: format!("{:?}", stage.role).to_lowercase(),
@@ -342,14 +379,28 @@ async fn pipeline_send(
         runs.remove(&run_id);
     }
     // Whatever the chain wrote is now staged and the tree is back at its base,
-    // exactly as a single turn leaves it. A failure here is worth saying out
-    // loud: it means the workspace still holds the chain's edits.
-    let guard_error = run_guard.and_then(|snapshot| {
-        codex::finalize_agent_workspace_snapshot(&snapshot)
+    // exactly as a single turn leaves it. The staged report goes back to the
+    // frontend, which applies it the same way it applies a single turn's —
+    // without that hand-off the chain's edits stay parked in the snapshot
+    // directory while the tree sits at base. A failure here is worth saying
+    // out loud: it means the workspace still holds the chain's edits.
+    let (chain_guard, guard_error) = match run_guard {
+        Some(snapshot) => match codex::finalize_agent_workspace_snapshot(&snapshot)
             .and_then(|report| codex::stage_agent_workspace_snapshot(&snapshot, report))
-            .err()
-            .map(|error| format!("A lánc változásainak elkülönítése nem sikerült: {error}"))
-    });
+        {
+            Ok(mut report) => {
+                report.isolation_mode = "nonGitSnapshot".to_string();
+                (Some(report), None)
+            }
+            Err(error) => (
+                None,
+                Some(format!(
+                    "A lánc változásainak elkülönítése nem sikerült: {error}"
+                )),
+            ),
+        },
+        None => (None, None),
+    };
     let run_error = match (run_error, guard_error) {
         (Some(existing), Some(guard)) => Some(format!("{existing} {guard}")),
         (Some(existing), None) => Some(existing),
@@ -358,9 +409,12 @@ async fn pipeline_send(
     store::finish_pipeline_run(&run_id, status.as_wire(), run_error.as_deref())?;
     Ok(pipeline::PipelineRunResult {
         run_id,
+        chain_id,
+        iteration,
         recipe,
         status,
         stages,
+        guard: chain_guard,
         error: run_error,
     })
 }

@@ -1,5 +1,5 @@
 import readline from "node:readline";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { query } from "@anthropic-ai/claude-agent-sdk";
@@ -24,6 +24,58 @@ const pendingInteractions = new Map();
 const pendingSessionStore = new Map();
 const sessionAllowedTools = new Set();
 const SESSION_STORE_TIMEOUT_MS = 15_000;
+
+/**
+ * Tools the user has granted, per workspace.
+ *
+ * This process is spawned per turn, so a grant kept in memory alone was gone
+ * before the next command: "allow for this session" asked again every time,
+ * every stage, forever. The grant is written to disk instead, keyed by the
+ * workspace it was given in -- approving a command in one project must not
+ * quietly approve it in another.
+ */
+const approvalsPath = () => process.env.MIN_AGENT_APPROVALS_PATH || "";
+
+const workspaceKey = (cwd) =>
+  typeof cwd === "string" && cwd.trim()
+    ? path.resolve(cwd).replace(/\\/g, "/").toLowerCase()
+    : "";
+
+function readApprovals() {
+  const file = approvalsPath();
+  if (!file) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(file, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    // No file yet, or a corrupted one. Either way the safe reading is "nothing
+    // has been granted": a missing grant costs one dialog, a wrong one runs a
+    // command the user never approved.
+    return {};
+  }
+}
+
+function grantedTools(cwd) {
+  const key = workspaceKey(cwd);
+  if (!key) return [];
+  const entry = readApprovals()[key];
+  return Array.isArray(entry) ? entry : [];
+}
+
+function rememberGrantedTool(cwd, toolName) {
+  const file = approvalsPath();
+  const key = workspaceKey(cwd);
+  if (!file || !key || !toolName) return;
+  try {
+    const approvals = readApprovals();
+    const existing = Array.isArray(approvals[key]) ? approvals[key] : [];
+    if (existing.includes(toolName)) return;
+    approvals[key] = [...existing, toolName];
+    writeFileSync(file, `${JSON.stringify(approvals, null, 2)}\n`, "utf8");
+  } catch (error) {
+    diagnostic("a jóváhagyás nem menthető", { message: error?.message });
+  }
+}
 let outputSequence = 0;
 let shuttingDown = false;
 
@@ -242,6 +294,11 @@ async function canUseToolForTurn(turn, toolName, input, options) {
   const cwd = turn.cwd;
   if (options?.signal?.aborted) return deny("A Claude-kérés megszakadt.");
   if (sessionAllowedTools.has(toolName)) return allow();
+  // A grant given in an earlier turn counts: the dialog promised it would.
+  if (grantedTools(cwd).includes(toolName)) {
+    sessionAllowedTools.add(toolName);
+    return allow(undefined, permissionUpdateFor(toolName));
+  }
 
   const kind = classifyTool(toolName);
 
@@ -293,6 +350,7 @@ async function canUseToolForTurn(turn, toolName, input, options) {
     const decision = result?.decision;
     if (decision === "acceptForSession") {
       sessionAllowedTools.add(toolName);
+      rememberGrantedTool(cwd, toolName);
       return allow(undefined, permissionUpdateFor(toolName));
     }
     if (decision === "accept") return allow();
@@ -318,6 +376,7 @@ async function canUseToolForTurn(turn, toolName, input, options) {
 }
 
 function emitAgentEvent(request, sessionId, eventType, payload = {}) {
+  diagnostic("emit", { eventType, itemId: payload?.item?.id ?? payload?.itemId ?? null });
   writeMessage({
     type: "agent_event",
     request,
@@ -326,7 +385,66 @@ function emitAgentEvent(request, sessionId, eventType, payload = {}) {
   });
 }
 
-function emitToolStarted(request, sessionId, block) {
+/** Tools whose whole point is changing a file; their card is a file card. */
+const FILE_CHANGE_TOOLS = new Set(["Edit", "Write", "NotebookEdit"]);
+
+/** Tool output forwarded to the GUI; the rest stays in the session log. */
+const TOOL_OUTPUT_LIMIT = 4000;
+
+function truncatedOutput(value) {
+  if (typeof value !== "string") return undefined;
+  return value.length > TOOL_OUTPUT_LIMIT ? `${value.slice(0, TOOL_OUTPUT_LIMIT)}\n[...]` : value;
+}
+
+/** Paths shown to the user are project-relative; absolute ones repeat the
+ * project prefix on every row and push the file name out of view. */
+function displayPath(filePath, cwd) {
+  if (typeof filePath !== "string" || typeof cwd !== "string" || !cwd) return filePath;
+  const normalized = filePath.replaceAll("/", "\\");
+  const root = cwd.replaceAll("/", "\\").replace(/\\+$/, "");
+  if (normalized.toLowerCase().startsWith(`${root.toLowerCase()}\\`)) {
+    return normalized.slice(root.length + 1);
+  }
+  return filePath;
+}
+
+/** The GUI shape of one tool call, shared by its started and completed events. */
+function toolItemFor(toolName, input, id, cwd) {
+  const rawPath =
+    typeof input.file_path === "string"
+      ? input.file_path
+      : typeof input.notebook_path === "string"
+        ? input.notebook_path
+        : undefined;
+  const filePath = displayPath(rawPath, cwd);
+  const isFileChange = FILE_CHANGE_TOOLS.has(toolName) && typeof filePath === "string";
+  const type = toolName === "Bash" ? "commandExecution" : isFileChange ? "fileChange" : "tool";
+  return {
+    kindSlug: type === "commandExecution" ? "commandExecution" : type === "fileChange" ? "fileChange" : "tool",
+    item: {
+      id,
+      type,
+      name: toolName,
+      toolName,
+      command: typeof input.command === "string" ? input.command : undefined,
+      filePath,
+      path: typeof input.path === "string" ? input.path : undefined,
+      // What the edit does, so the trace can show a real diff instead of a
+      // bare tool name. Write has no before; the SDK does not send one.
+      before: typeof input.old_string === "string" ? input.old_string : undefined,
+      after:
+        typeof input.new_string === "string"
+          ? input.new_string
+          : typeof input.content === "string"
+            ? input.content
+            : undefined,
+    },
+  };
+}
+
+function emitToolStarted(turn, block) {
+  const request = turn.request;
+  const sessionId = turn.sessionId;
   const toolName = typeof block?.name === "string" ? block.name : "tool";
   const input = block?.input && typeof block.input === "object" ? block.input : {};
 
@@ -344,18 +462,49 @@ function emitToolStarted(request, sessionId, block) {
     return;
   }
 
-  const eventType = toolName === "Bash" ? "item/commandExecution/started" : "item/tool/started";
-  emitAgentEvent(request, sessionId, eventType, {
+  const id = block?.id ?? randomUUID();
+  const { kindSlug, item } = toolItemFor(toolName, input, id, turn.cwd);
+  // The streamed content_block_start arrives with an empty input — the input
+  // itself streams as deltas — so this fires again from the complete assistant
+  // message with the same id, and the second pass carries the file path and
+  // the edit body. Recording the meta lets the tool_result, which carries only
+  // the id, get a completion event of the right kind.
+  turn.toolMeta.set(id, {
+    name: toolName,
+    kindSlug,
+    filePath: item.filePath,
+    command: item.command,
+  });
+  emitAgentEvent(request, sessionId, `item/${kindSlug}/started`, {
+    item: { ...item, status: "running" },
+  });
+}
+
+/** Turns a tool_result block into the completion of the call that caused it. */
+function emitToolCompleted(turn, block) {
+  const id = typeof block?.tool_use_id === "string" ? block.tool_use_id : null;
+  if (!id) return;
+  const meta = turn.toolMeta.get(id);
+  if (!meta) return;
+  const rawContent = block?.content;
+  const outputText = typeof rawContent === "string"
+    ? rawContent
+    : Array.isArray(rawContent)
+      ? rawContent
+          .map((part) => (typeof part?.text === "string" ? part.text : ""))
+          .filter(Boolean)
+          .join("\n")
+      : undefined;
+  emitAgentEvent(turn.request, turn.sessionId, `item/${meta.kindSlug}/completed`, {
     item: {
-      id: block?.id ?? randomUUID(),
-      type: toolName === "Bash" ? "commandExecution" : "tool",
-      name: toolName,
-      toolName,
-      input,
-      command: typeof input.command === "string" ? input.command : undefined,
-      filePath: typeof input.file_path === "string" ? input.file_path : undefined,
-      path: typeof input.path === "string" ? input.path : undefined,
-      status: "running",
+      id,
+      type: meta.kindSlug,
+      name: meta.name,
+      toolName: meta.name,
+      filePath: meta.filePath,
+      command: meta.command,
+      output: truncatedOutput(outputText),
+      status: block?.is_error ? "error" : "completed",
     },
   });
 }
@@ -396,15 +545,44 @@ function handleSdkEvent(turn, event) {
         phase: "commentary",
         item: { type: "reasoning", phase: "commentary" },
       });
-    } else if (raw.type === "content_block_start" && raw.content_block?.type === "tool_use") {
-      emitToolStarted(request, turn.sessionId, raw.content_block);
     }
+    // A streamed `content_block_start` carries an empty tool input — the input
+    // arrives afterwards as deltas — so emitting the tool card from here named
+    // the row after the tool ("Edit") and left the enriched copy to merge into
+    // it later. That merge is what kept losing the file path in a chain. The
+    // card is emitted once, from the complete assistant message below, which
+    // still lands before the tool actually runs.
     return;
   }
   if (event?.type === "assistant") {
     const blocks = Array.isArray(event.message?.content) ? event.message.content : [];
+    const textParts = [];
+    for (const [index, block] of blocks.entries()) {
+      if (block?.type === "tool_use") {
+        emitToolStarted(turn, block);
+      } else if (block?.type === "text" && typeof block.text === "string" && block.text.trim()) {
+        textParts.push(block.text);
+      } else if (block?.type === "thinking" && typeof block.thinking === "string" && block.thinking.trim()) {
+        // The stream shows the thinking as it happens; this is the durable
+        // row for it, so a Claude stage's GONDOLKODÁS list is no longer
+        // empty on reload while a Codex stage's is full.
+        emitAgentEvent(request, turn.sessionId, "item/reasoning/completed", {
+          item: {
+            id: `thinking-${event.message?.id ?? turn.assistantTexts.length}-${index}`,
+            type: "reasoning",
+            text: block.thinking,
+            status: "completed",
+          },
+        });
+      }
+    }
+    if (textParts.length > 0) turn.assistantTexts.push(textParts.join("\n\n"));
+    return;
+  }
+  if (event?.type === "user") {
+    const blocks = Array.isArray(event.message?.content) ? event.message.content : [];
     for (const block of blocks) {
-      if (block?.type === "tool_use") emitToolStarted(request, turn.sessionId, block);
+      if (block?.type === "tool_result") emitToolCompleted(turn, block);
     }
     return;
   }
@@ -553,6 +731,15 @@ async function runLiveTurn(request) {
     abortController,
     sessionId: initialResume,
     sawText: false,
+    // tool_use id → {name, filePath, command}: a tool_result block carries only
+    // the id, so typing its completion event needs what the call looked like.
+    toolMeta: new Map(),
+    // Joined text of every complete assistant message, in order. The last one
+    // is the actual answer; the earlier ones are commentary the model wrote
+    // between tool calls. `result.result` glues all of them together without
+    // separators, which is where the "tests.32/32 teszt zöld" artifacts came
+    // from — so the answer is reconstructed from here instead.
+    assistantTexts: [],
   };
   activeRequests.set(request.requestId, turn);
   // Without an explicit systemPrompt the SDK uses a minimal prompt that omits
@@ -628,6 +815,8 @@ async function runLiveTurn(request) {
             resumeForQuery = null;
             turn.sessionId = null;
             turn.sawText = false;
+            turn.assistantTexts = [];
+            turn.toolMeta.clear();
             continue;
           }
         }
@@ -642,6 +831,8 @@ async function runLiveTurn(request) {
         resumeForQuery = null;
         turn.sessionId = null;
         turn.sawText = false;
+        turn.assistantTexts = [];
+        turn.toolMeta.clear();
       }
     }
     if (!finalResult) throw new Error("A Claude bridge nem adott turn eredményt.");
@@ -656,16 +847,39 @@ async function runLiveTurn(request) {
       });
       return;
     }
-    const text = typeof finalResult.result === "string" ? finalResult.result : "";
-    if (!turn.sawText && text) {
-      emitAgentEvent(request, turn.sessionId, "item/agentMessage/delta", { delta: text, itemId: "assistant-final", turnId: turn.sessionId, phase: "final_answer", item: { type: "agentMessage", phase: "final_answer" } });
+    const gluedText = typeof finalResult.result === "string" ? finalResult.result : "";
+    // `result.result` is every text block of the turn glued together without
+    // separators — "tests.32/32 teszt zöld" was born there. The answer is the
+    // last complete assistant message; what came before it is the model's
+    // between-tools narration and belongs on the thinking lane.
+    const finalAnswer =
+      turn.assistantTexts.length > 0
+        ? turn.assistantTexts[turn.assistantTexts.length - 1]
+        : gluedText;
+    for (const [index, commentaryText] of turn.assistantTexts.slice(0, -1).entries()) {
+      emitAgentEvent(request, turn.sessionId, "item/agentMessage/delta", {
+        delta: commentaryText,
+        itemId: `commentary-${index}`,
+        turnId: turn.sessionId,
+        phase: "commentary",
+        item: { type: "agentMessage", phase: "commentary" },
+      });
     }
-    emitAgentEvent(request, turn.sessionId, "turn/completed", { finalText: text, turnId: turn.sessionId, totalCostUsd: finalResult.total_cost_usd ?? null, usage: finalResult.usage ?? null, item: { type: "turn", status: "completed" } });
+    if (!turn.sawText && finalAnswer) {
+      emitAgentEvent(request, turn.sessionId, "item/agentMessage/delta", { delta: finalAnswer, itemId: "assistant-final", turnId: turn.sessionId, phase: "final_answer", item: { type: "agentMessage", phase: "final_answer" } });
+    }
+    // The live bubble accumulated the glued stream; this swaps in the answer
+    // alone once the turn is over.
+    emitAgentEvent(request, turn.sessionId, "item/completed", {
+      itemId: "assistant-final",
+      item: { id: "assistant-final", type: "agentMessage", phase: "final_answer", text: finalAnswer, status: "completed" },
+    });
+    emitAgentEvent(request, turn.sessionId, "turn/completed", { finalText: finalAnswer, turnId: turn.sessionId, totalCostUsd: finalResult.total_cost_usd ?? null, usage: finalResult.usage ?? null, item: { type: "turn", status: "completed" } });
     writeMessage({
       type: "turn_completed",
       request,
       sessionId: turn.sessionId,
-      payload: { text, sessionId: turn.sessionId, totalCostUsd: typeof finalResult.total_cost_usd === "number" ? finalResult.total_cost_usd : null, usage: finalResult.usage ?? null, numTurns: finalResult.num_turns ?? null },
+      payload: { text: finalAnswer, sessionId: turn.sessionId, totalCostUsd: typeof finalResult.total_cost_usd === "number" ? finalResult.total_cost_usd : null, usage: finalResult.usage ?? null, numTurns: finalResult.num_turns ?? null },
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

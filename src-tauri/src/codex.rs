@@ -2947,6 +2947,10 @@ pub fn send(
         )?;
 
         let mut final_text = String::new();
+        // Which final-answer item the last delta belonged to. Two items are
+        // two paragraphs; gluing their deltas straight after one another is
+        // where "módosítok.Az implementáció" came from.
+        let mut last_final_item: Option<String> = None;
         let mut events = Vec::new();
         let mut event_sequence = 0_u64;
         let mut agent_message_phases: HashMap<String, String> = HashMap::new();
@@ -3023,6 +3027,14 @@ pub fn send(
                                 .map(str::to_string)
                         });
                     if phase.as_deref() == Some("final_answer") {
+                        if last_final_item != item_id {
+                            if !final_text.is_empty()
+                                && !final_text.ends_with(char::is_whitespace)
+                            {
+                                final_text.push_str("\n\n");
+                            }
+                            last_final_item = item_id.clone();
+                        }
                         final_text.push_str(delta);
                     } else if phase.is_none() {
                         let message_key = item_id
@@ -3063,7 +3075,20 @@ pub fn send(
                     });
                 if phase.as_deref() == Some("final_answer") {
                     if let Some(text) = value["params"]["item"]["text"].as_str() {
-                        final_text = text.to_string();
+                        // One item: the completed text is the authoritative
+                        // clean copy. Several items: the accumulated text is
+                        // longer than any single item's, and replacing it
+                        // would throw the earlier paragraphs away.
+                        if text.trim().len() >= final_text.trim().len() {
+                            final_text = text.to_string();
+                        } else if !final_text.contains(text.trim()) {
+                            if !final_text.is_empty()
+                                && !final_text.ends_with(char::is_whitespace)
+                            {
+                                final_text.push_str("\n\n");
+                            }
+                            final_text.push_str(text);
+                        }
                     }
                 } else if phase.is_none() {
                     if let Some(text) = value["params"]["item"]["text"].as_str() {

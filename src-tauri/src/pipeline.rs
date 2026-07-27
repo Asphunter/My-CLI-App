@@ -192,7 +192,18 @@ fn truncated(value: &str, limit: usize) -> String {
 ///
 /// The original task always goes in verbatim and first: a stage that only sees
 /// the previous stage's output drifts away from what was actually asked.
-pub fn stage_prompt(role: StageRole, original_prompt: &str, artifacts: &[StageArtifact]) -> String {
+///
+/// `feedback` is what the reviewer objected to on the previous pass, and only a
+/// re-run has any. A re-run hands the coder the very artifacts it already
+/// produced, so without this block the strongest signal in the prompt is its own
+/// earlier summary and the obvious move is to write it again; stating the
+/// objection as the reason this stage is running at all is what prevents that.
+pub fn stage_prompt(
+    role: StageRole,
+    original_prompt: &str,
+    artifacts: &[StageArtifact],
+    feedback: Option<&str>,
+) -> String {
     let mut prompt = String::new();
     prompt.push_str("[EREDETI FELADAT]\n");
     prompt.push_str(original_prompt.trim());
@@ -222,6 +233,18 @@ pub fn stage_prompt(role: StageRole, original_prompt: &str, artifacts: &[StageAr
             }
             prompt.push('\n');
         }
+    }
+
+    if let Some(feedback) = feedback.map(str::trim).filter(|value| !value.is_empty()) {
+        prompt.push_str("\n[MIÉRT FUTSZ ÚJRA]\n");
+        prompt.push_str(
+            "A bíráló az előző körben javítást kért. A kifogása:\n",
+        );
+        prompt.push_str(&truncated(feedback, MAX_ARTIFACT_CHARS));
+        prompt.push_str(
+            "\nEzt kell orvosolnod. A tervtől csak annyiban térj el, amennyiben a \
+             kifogás megköveteli, és ne írd újra azt, ami már jó volt.\n",
+        );
     }
 
     prompt.push_str("[SZEREP]\n");
@@ -393,7 +416,52 @@ pub struct PipelineRunRequest {
     /// second copy of that answer.
     #[serde(default)]
     pub placeholder_request_id: Option<String>,
+    /// Where the chain starts. A re-run after a rejected review resumes at the
+    /// coding stage: the plan was already accepted, and re-planning costs a
+    /// model call only to risk drifting away from what the reviewer agreed to.
+    #[serde(default)]
+    pub start_stage: Option<usize>,
+    /// What the skipped stages produced, so the resumed chain still has the
+    /// history its prompts are built from.
+    #[serde(default)]
+    pub seed_artifacts: Vec<SeedArtifact>,
+    /// The reviewer's objection, handed to the first stage of a re-run.
+    #[serde(default)]
+    pub retry_feedback: Option<String>,
+    /// Ties the iterations of one question together. The first run leaves this
+    /// empty and becomes the chain; every re-run names it.
+    #[serde(default)]
+    pub chain_id: Option<String>,
+    /// 1-based. v1 is the original run, v2 and v3 are the re-runs.
+    #[serde(default)]
+    pub iteration: Option<i64>,
 }
+
+/// A stage the caller already has an answer for. The wire form of
+/// [`StageArtifact`], which is internal and not deserializable.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeedArtifact {
+    pub role: StageRole,
+    pub text: String,
+    #[serde(default)]
+    pub changed_files: Vec<String>,
+}
+
+impl From<SeedArtifact> for StageArtifact {
+    fn from(seed: SeedArtifact) -> Self {
+        Self {
+            role: seed.role,
+            text: seed.text,
+            changed_files: seed.changed_files,
+            diff: None,
+        }
+    }
+}
+
+/// How many times one question may go round the chain. Past this the two sides
+/// are not converging, and another pass only costs money.
+pub const MAX_CHAIN_ITERATIONS: i64 = 3;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -481,9 +549,18 @@ pub struct PipelineStageResult {
 #[serde(rename_all = "camelCase")]
 pub struct PipelineRunResult {
     pub run_id: String,
+    /// Shared by every iteration of one question; equals `run_id` on the first.
+    pub chain_id: String,
+    pub iteration: i64,
     pub recipe: Recipe,
     pub status: RunStatus,
     pub stages: Vec<PipelineStageResult>,
+    /// The chain's staged workspace changes. Staging restores the tree to its
+    /// base, so without this report reaching the frontend nothing would ever
+    /// apply the chain's work back to disk — the coder's edits would sit in the
+    /// snapshot directory forever while the answer claimed they exist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guard: Option<crate::codex::AgentGuardReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -548,16 +625,29 @@ pub struct PipelineOutcome {
     pub error: Option<String>,
 }
 
-/// Walks the chain.
+/// Where a walk of the chain begins and what it already knows.
+#[derive(Debug, Clone, Default)]
+pub struct RunStart {
+    pub initial_session: Option<String>,
+    /// Index of the first stage to run. Everything before it is expected to
+    /// arrive as a seed artifact instead.
+    pub start_index: usize,
+    pub seed_artifacts: Vec<StageArtifact>,
+    /// Handed to the first stage that actually runs, and to that one only: the
+    /// stages after it read the objection out of the review artifact anyway.
+    pub feedback: Option<String>,
+}
+
+/// Walks the chain, possibly from partway through it.
 ///
 /// Everything with a side effect -- running the turn, writing to the store,
 /// emitting progress -- happens inside `execute`, so what remains here is the
 /// part worth testing on its own: which prompt each stage is handed, which
 /// session it continues, what a failure does to the rest of the chain.
-pub async fn run_stages<F, Fut, S>(
+pub async fn run_stages_from<F, Fut, S>(
     recipe: &Recipe,
     original_prompt: &str,
-    initial_session: Option<String>,
+    start: RunStart,
     should_stop: S,
     mut execute: F,
 ) -> PipelineOutcome
@@ -566,7 +656,13 @@ where
     Fut: std::future::Future<Output = Result<StageOutcome, String>>,
     S: Fn() -> bool,
 {
-    let mut artifacts = Vec::<StageArtifact>::new();
+    let RunStart {
+        initial_session,
+        start_index,
+        seed_artifacts,
+        feedback,
+    } = start;
+    let mut artifacts = seed_artifacts;
     let mut stages = Vec::<StageRunResult>::new();
     // Keyed by runtime: a stage continues the session of its own runtime, which
     // is what lets a model switch inside one vendor keep the context while a
@@ -581,7 +677,7 @@ where
     let mut status = RunStatus::Running;
     let mut error = None;
 
-    for (index, stage) in recipe.stages.iter().enumerate() {
+    for (index, stage) in recipe.stages.iter().enumerate().skip(start_index) {
         // Checked between stages rather than inside one: a stage cannot be torn
         // out of the provider mid-turn today, so the honest promise is that no
         // further stage starts. Whatever already ran keeps its answer.
@@ -593,8 +689,16 @@ where
         let execution = StageExecution {
             index,
             stage: stage.clone(),
-            prompt: stage_prompt(stage.role, original_prompt, &artifacts),
+            prompt: stage_prompt(
+                stage.role,
+                original_prompt,
+                &artifacts,
+                (index == start_index).then_some(feedback.as_deref()).flatten(),
+            ),
             session_id: session_by_runtime.get(&runtime_key).cloned(),
+            // The user's attachments and conversation context belong to the
+            // stage that opens the chain, and a re-run opens nothing: stage 0
+            // already carried them on the first pass.
             is_first: index == 0,
         };
         let is_last = index + 1 == recipe.stages.len();
@@ -672,6 +776,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The prompt of a stage that is running for the first time, which is what
+    /// every case below except the re-run one is about.
+    fn stage_prompt(
+        role: StageRole,
+        original_prompt: &str,
+        artifacts: &[StageArtifact],
+    ) -> String {
+        super::stage_prompt(role, original_prompt, artifacts, None)
+    }
 
     fn artifact(role: StageRole, text: &str) -> StageArtifact {
         StageArtifact {
@@ -806,10 +920,13 @@ mod tests {
         }
 
         fn run(&self, recipe: &Recipe, prompt: &str, session: Option<String>) -> PipelineOutcome {
-            tauri::async_runtime::block_on(run_stages(
+            tauri::async_runtime::block_on(run_stages_from(
                 recipe,
                 prompt,
-                session,
+                RunStart {
+                    initial_session: session,
+                    ..RunStart::default()
+                },
                 || {
                     self.stop_after
                         .get()
@@ -1101,6 +1218,66 @@ mod tests {
         assert!(
             two_writers.validate().is_err(),
             "two coding stages would both claim the working tree and break rollback attribution"
+        );
+    }
+
+    #[test]
+    fn a_rejected_review_reruns_from_the_coder_and_says_why() {
+        let recipe = recipe_by_id("plan_code_review").expect("preset");
+        let seen = std::cell::RefCell::new(Vec::<StageExecution>::new());
+        let outcome = tauri::async_runtime::block_on(run_stages_from(
+            &recipe,
+            "Feladat.",
+            RunStart {
+                initial_session: None,
+                start_index: 1,
+                seed_artifacts: vec![artifact(StageRole::Plan, "1. lépés: írd át a szorzást.")],
+                feedback: Some("a szorzás helyett összeadás maradt.".to_string()),
+            },
+            || false,
+            |execution| {
+                seen.borrow_mut().push(execution);
+                async { ok("kész.", None) }
+            },
+        ));
+        let seen = seen.borrow();
+
+        assert_eq!(
+            seen.iter().map(|run| run.index).collect::<Vec<_>>(),
+            vec![1, 2],
+            "the accepted plan does not get re-planned"
+        );
+        assert!(
+            seen[0].prompt.contains("1. lépés: írd át a szorzást."),
+            "the resumed coder still needs the plan it is executing"
+        );
+        assert!(
+            seen[0]
+                .prompt
+                .contains("a szorzás helyett összeadás maradt."),
+            "without the objection the coder's strongest cue is its own earlier summary"
+        );
+        assert!(
+            !seen[1].prompt.contains("[MIÉRT FUTSZ ÚJRA]"),
+            "the reviewer reads the objection out of the artifacts, and re-stating it invites anchoring"
+        );
+        assert!(
+            !seen[0].is_first,
+            "a re-run opens nothing: the attachments and context went with stage 0 on the first pass"
+        );
+        assert_eq!(
+            outcome.status,
+            RunStatus::Completed,
+            "reaching the last stage completes the run whatever the verdict says"
+        );
+        assert_eq!(outcome.stages.len(), 2);
+    }
+
+    #[test]
+    fn a_chain_cannot_iterate_forever() {
+        assert_eq!(
+            MAX_CHAIN_ITERATIONS, 3,
+            "v1 plus two re-runs; past that the two sides are not converging"
         );
     }
 }

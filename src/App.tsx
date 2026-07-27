@@ -230,15 +230,23 @@ type PipelineStageResult = {
 
 type PipelineRunResult = {
   runId: string;
+  chainId: string;
+  iteration: number;
   recipe: PipelineRecipe;
   status: "running" | "completed" | "failed" | "cancelled";
   stages: PipelineStageResult[];
+  /** The chain's staged workspace changes; applying them is the caller's job. */
+  guard?: AgentGuardReport | null;
   error?: string;
 };
 
 /** The stage badge a message carries so a run groups on any device. */
 type MessagePipeline = {
   runId: string;
+  /** Shared by every iteration of one question. Absent on pre-versioning rows. */
+  chainId?: string;
+  /** 1-based; absent or 0 on rows written before re-runs existed. */
+  iteration?: number;
   stageIndex: number;
   stageCount: number;
   stageRole: string;
@@ -246,6 +254,23 @@ type MessagePipeline = {
   verdict?: string;
   verdictSummary?: string;
 };
+
+/**
+ * Which panel a stage belongs to.
+ *
+ * A re-run is its own run with its own id, so grouping by run would draw the
+ * second attempt as a separate panel below the first. The chain is what the
+ * user asked one question about, and that is what gets one panel.
+ */
+const chainKeyOf = (pipeline: MessagePipeline) =>
+  pipeline.chainId?.trim() || pipeline.runId;
+
+/** Rows written before versioning existed are the first and only iteration. */
+const iterationOf = (pipeline: MessagePipeline) =>
+  pipeline.iteration && pipeline.iteration > 0 ? pipeline.iteration : 1;
+
+/** v1 plus two re-runs. Mirrors `MAX_CHAIN_ITERATIONS` in the runner. */
+const MAX_CHAIN_ITERATIONS = 3;
 
 /**
  * What a chain stage may run, per vendor.
@@ -305,6 +330,20 @@ const STAGE_ROLE_LABELS: Record<string, string> = {
   code: "KÓD",
   review: "REVIEW",
 };
+
+/**
+ * The client-side step shown before the model's own plan arrives. A chain
+ * runs three different roles through the same trace panel, and a reviewer
+ * "preparing a plan" reads as the wrong stage running — the placeholder has
+ * to say what this stage is actually warming up to do.
+ */
+const PRE_PLAN_STEP_LABELS: Record<string, string> = {
+  plan: "0. Terv előkészítése és feladatértelmezése",
+  code: "0. Kódolás előkészítése és a terv értelmezése",
+  review: "0. Bírálat előkészítése és a változások áttekintése",
+};
+const prePlanStepLabel = (stageRole?: string | null) =>
+  PRE_PLAN_STEP_LABELS[stageRole ?? ""] ?? PRE_PLAN_STEP_LABELS.plan;
 
 /** The badge that tells a stage apart from an ordinary answer at a glance. */
 const stageBadge = (pipeline?: MessagePipeline) => {
@@ -724,6 +763,25 @@ const quoteBacklinkButtons = (
     </span>
   );
 };
+
+/**
+ * An answer as paragraphs rather than one `pre-wrap` block.
+ *
+ * A model separates paragraphs with a blank line, and `pre-wrap` renders that
+ * blank line as a full line box — which is why every paragraph break looked
+ * like a whole empty row of text. Splitting on the blank line and letting CSS
+ * set the gap keeps the structure and drops the hole.
+ */
+const answerParagraphs = (text: string) =>
+  text
+    .split(/\n{2,}/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean)
+    .map((paragraph, index) => (
+      <p key={`para-${index}`}>
+        <InlineMarkdown text={paragraph} />
+      </p>
+    ));
 
 const answerWithQuoteBacklinks = (
   text: string,
@@ -1628,11 +1686,20 @@ const compactMessages = (messages: Message[]) => {
   const compacted: Message[] = [];
   for (const message of messages) {
     const previous = compacted[compacted.length - 1];
+    // Same turn as well as same item: a provider labels content blocks by
+    // position, so every turn's first answer block is `assistant-0`. A chain
+    // runs each stage as its own turn, so the planner's answer and the coder's
+    // answer are adjacent and both `assistant-0` -- gluing on the item alone
+    // appended the coder's summary to the plan and destroyed its row, which is
+    // why the KÓD tab was missing and the run's answer showed the review.
+    // `messageIdentityKeys` already scopes an item id to its turn; this is the
+    // one place that had not been told.
     if (
       message.role === "assistant" &&
       message.itemId &&
       previous?.role === "assistant" &&
-      previous.itemId === message.itemId
+      previous.itemId === message.itemId &&
+      (previous.turnId ?? "") === (message.turnId ?? "")
     ) {
       const final = Boolean(previous.final || message.final);
       compacted[compacted.length - 1] = {
@@ -2992,13 +3059,22 @@ const appendCodexDelta = (
   }
   if (targetIndex >= 0) {
     const target = messages[targetIndex];
+    // A new content block gluing straight onto the previous one is how
+    // "tests.32/32 teszt zöld" happens: blocks are separate paragraphs, so a
+    // block boundary that lands mid-text earns a blank line.
+    const blockBoundary =
+      Boolean(itemId) &&
+      Boolean(target.itemId) &&
+      target.itemId !== itemId &&
+      target.text.length > 0 &&
+      !/\s$/.test(target.text);
     return messages.map((message, index) =>
       index === targetIndex
         ? {
             ...message,
             itemId: itemId ?? message.itemId,
             turnId: message.turnId ?? delta.turnId ?? undefined,
-            text: `${target.text}${delta.delta}`,
+            text: `${target.text}${blockBoundary ? "\n\n" : ""}${delta.delta}`,
             final: false,
           }
         : message,
@@ -3271,13 +3347,16 @@ const summarizeCodexWorkEvent = (
     return null;
 
   const itemId = eventItemId(event, params, item);
+  // `item.name` is deliberately absent: for tool items it holds the tool's
+  // name ("Read", "Edit"), and treating that as a path is how the change
+  // summary once listed a file called Read with +138 lines.
+  // `extractFilePath` still accepts a `name` that looks like a filename.
   const filePath = firstString(
     params.path,
     params.filePath,
     item.path,
     item.filePath,
     item.filename,
-    item.name,
     extractFilePath(event.payload),
   );
   const kind = inferWorkItemKind(`${event.eventType} ${itemType}`);
@@ -3305,7 +3384,9 @@ const summarizeCodexWorkEvent = (
       : kind === "command"
         ? (command ?? filePath ?? itemType)
         : kind === "tool"
-          ? (tool ?? itemType)
+          // "Read — math.js" tells the reader what happened; "Read" alone
+          // reads as a step that did nothing in particular.
+          ? (tool && filePath ? `${tool} — ${filePath}` : (tool ?? itemType))
           : (firstString(
               item.title,
               item.name,
@@ -3968,6 +4049,10 @@ const changeSummaryFromActivities = (
   const byPath = new Map<string, ChangeSummaryFile>();
   for (const activity of activities) {
     const path = activity.detail.trim();
+    // A bare tool name ("Read", "Edit") sneaking in as a detail must not
+    // become a file row; anything without a separator or an extension is not
+    // a path the summary can honestly claim was modified.
+    const pathLike = /[\\/]/.test(path) || /\.[a-z0-9]{1,8}$/i.test(path);
     const readOnlyActivity =
       /(?:^|[\\/._-])(read|inspect|view|open)(?:$|[\\/._-])/i.test(
         activity.eventType,
@@ -3978,7 +4063,7 @@ const changeSummaryFromActivities = (
     const looksLikeChange =
       activity.kind === "file" &&
       /(change|create|delete|remove|write|patch|edit)/i.test(activity.eventType);
-    if (!path || (!hasCodeBoundary && !looksLikeChange)) continue;
+    if (!path || !pathLike || (!hasCodeBoundary && !looksLikeChange)) continue;
     const before = activity.beforeCode ?? "";
     const after = activity.afterCode ?? activity.code ?? "";
     const rows = buildInlineDiffRows(before, after);
@@ -5131,6 +5216,10 @@ type TurnProgressCardProps = {
   /** A review says pass or fail in its colour rather than in a chip. */
   runTone?: "accepted" | "changes";
   runHeader?: ReactNode;
+  /** What a run offers once it has a verdict, e.g. re-running after a reject. */
+  runFooter?: ReactNode;
+  /** Which chain stage this card belongs to; labels the pre-plan step. */
+  stageRole?: string;
 };
 
 function TurnProgressCard({
@@ -5156,6 +5245,8 @@ function TurnProgressCard({
   runPosition,
   runTone,
   runHeader,
+  runFooter,
+  stageRole,
 }: TurnProgressCardProps) {
   const quoteAnchor = (suffix: string) =>
     `${quoteAnchorPrefix}:${suffix}`;
@@ -5238,7 +5329,7 @@ function TurnProgressCard({
       });
   const fallbackStep: PlanStep = {
     id: "client-pre-plan",
-    step: "0. Terv előkészítése és feladatértelmezése",
+    step: prePlanStepLabel(stageRole ?? answer?.pipeline?.stageRole),
     status: streaming && plannedSteps.length === 0 ? "inProgress" : "completed",
   };
   const isPrePlanStepId = (stepId?: string | null) =>
@@ -5380,10 +5471,43 @@ function TurnProgressCard({
           activity,
         })),
     );
+    // A Claude thinking block arrives twice: streamed live as commentary and
+    // once more as the durable reasoning row of the complete message. Showing
+    // both would repeat every thought verbatim; the durable row wins.
+    const internalBodies = new Set(
+      internalActivities.map((activity) => activity.body?.trim() ?? ""),
+    );
+    // What the stage actually did, one row per tool call. Without these a
+    // coding stage that thought silently showed a single "Kódmódosítás
+    // történt." line for four edits and a test run.
+    const toolBullet = (activity: CodeActivity) =>
+      activity.kind === "command"
+        ? `$ ${
+            activity.detail.length > 110
+              ? `${activity.detail.slice(0, 110)}…`
+              : activity.detail
+          }`
+        : activity.kind === "file"
+          ? `Fájl — ${activity.detail}`
+          : activity.detail;
+    const toolRecords = stepActivities
+      .filter(
+        (activity) =>
+          (activity.kind === "file" ||
+            activity.kind === "command" ||
+            activity.kind === "tool") &&
+          Boolean(activity.detail?.trim()),
+      )
+      .map((activity) => ({
+        activity,
+        body: toolBullet(activity),
+        sequence: activity.id,
+      }));
     const commentaryRecords = stepCommentary
       .map((entry, index) => {
         const body = entry.body.trim();
         if (!body) return null;
+        if (internalBodies.has(body)) return null;
         const fallbackSequence =
           (orderedActivities.at(-1)?.id ?? Date.now()) + (index + 1) / 1000;
         return {
@@ -5410,6 +5534,7 @@ function TurnProgressCard({
         kind: "commentary" as const,
         record,
       })),
+      ...toolRecords.map((record) => ({ kind: "tool" as const, record })),
     ].sort((left, right) => {
       const leftSequence =
         left.kind === "internal" ? left.chunk.sequence : left.record.sequence;
@@ -5452,6 +5577,20 @@ function TurnProgressCard({
       // Keep only the last internal phase in each gap, while retaining its
       // complete history behind the clickable English line.
       flushInternal();
+      if (item.kind === "tool") {
+        const toolActivity = item.record.activity;
+        entries.push({
+          id: `tool-${toolActivity.id}`,
+          body: item.record.body,
+          kind: "commentary",
+          sequence: item.record.sequence,
+          codeActivity:
+            toolActivity.code || toolActivity.beforeCode || toolActivity.afterCode
+              ? toolActivity
+              : undefined,
+        });
+        continue;
+      }
       entries.push({
         id: `commentary-${item.record.entry.id}`,
         body: item.record.body,
@@ -5540,7 +5679,13 @@ function TurnProgressCard({
   const changeSummary =
     answer?.changeSummary && answer.changeSummary.length > 0
       ? answer.changeSummary
-      : changeSummaryFromActivities(activities);
+      : answer?.pipeline
+        // A chain's files card comes from the chain guard and sits on the
+        // coding stage's answer. Deriving one from another stage's activities
+        // put a "modified" card with absolute paths on the reviewer, which
+        // never wrote a file.
+        ? []
+        : changeSummaryFromActivities(activities);
   const [copiedAnswer, setCopiedAnswer] = useState(false);
   const copyAnswer = async () => {
     if (!answer?.text.trim()) return;
@@ -5775,6 +5920,7 @@ function TurnProgressCard({
             />
           </div>
         )}
+        {runFooter}
       </article>
       </>
     );
@@ -5830,7 +5976,14 @@ function TurnProgressCard({
               </div>
               {traceView === "answer" && <div className="turn-progress-answer-body">
                 <div className="trace-answer-line">
-                  {hasAnswer && (
+                  {hasAnswer &&
+                    // A quote backlink is matched against the whole answer, so
+                    // a quote spanning a paragraph break would lose its link if
+                    // the text were split. Paragraphs when there is nothing to
+                    // lose; one block when there is.
+                    (answerQuoteRefs.length === 0 ? (
+                      answerParagraphs(textWithoutCodeBlocks(answer?.text ?? ""))
+                    ) : (
                     <p>
                       {answerWithQuoteBacklinks(
                         textWithoutCodeBlocks(answer?.text ?? ""),
@@ -5838,7 +5991,7 @@ function TurnProgressCard({
                         onQuoteJump ?? (() => undefined),
                       )}
                     </p>
-                  )}
+                  ))}
                   {streaming && (
                     <span className="trace-answer-spinner" aria-label="Válasz készül" />
                   )}
@@ -5869,7 +6022,20 @@ function TurnProgressCard({
         </section>
       )}
 
-      {traceView === "steps" && <div
+      {traceView === "steps" && !streaming &&
+        plannedSteps.length === 0 &&
+        activities.length === 0 &&
+        commentary.every((entry) => !entry.body.trim()) ? (
+        // A stage that only wrote text has no steps to show. An empty
+        // two-pane frame with a fake spinning step reads as a stage that
+        // failed to report; the honest state is one sentence.
+        <div className="trace-content is-expanded">
+          <p className="trace-empty-note">
+            Ez a szakasz nem használt eszközt és nem rögzített lépést — a
+            teljes kimenete a VÁLASZ fülön olvasható.
+          </p>
+        </div>
+      ) : traceView === "steps" && <div
         className="trace-content is-expanded"
         aria-hidden={false}
       >
@@ -6079,6 +6245,7 @@ function TurnProgressCard({
           </section>
         </div>
       )}
+      {runFooter}
       </article>
     </>
   );
@@ -6610,10 +6777,23 @@ function App() {
   const [pipelineProgress, setPipelineProgress] =
     useState<PipelineProgressEvent | null>(null);
   const pipelineProgressRef = useRef<PipelineProgressEvent | null>(null);
+  // Request ids the running chain has already gone through. A stage's last
+  // events — the complete assistant message with the file paths in it — race
+  // the next stage's "started" progress, and the active-request filter used to
+  // drop exactly those. Anything in this set is still ours to process.
+  const chainRequestIdsRef = useRef<Set<string>>(new Set());
   pipelineProgressRef.current = pipelineProgress;
   // Which phase of a running chain the reader is looking at. Null follows the
   // one that is actually running, which is what a progress display should do.
   const [liveStageChoice, setLiveStageChoice] = useState<number | null>(null);
+  // Set while a re-run is in flight. The stages before `startStage` are not
+  // running and never will in this pass; without this the strip would draw the
+  // carried-over plan as a phase still waiting its turn.
+  const [liveRunResume, setLiveRunResume] = useState<{
+    startStage: number;
+    iteration: number;
+    carried: Record<number, string>;
+  } | null>(null);
   // Per-stage model and reasoning, keyed by `${recipeId}:${stageIndex}`. Empty
   // means "keep what the preset recommends", so the picker never has to
   // pre-fill values the user did not choose.
@@ -6776,6 +6956,11 @@ function App() {
   // filled the screen and buried the verdict; the tabs keep a run the same
   // size no matter how much the models wrote.
   const [selectedStages, setSelectedStages] = useState<Record<string, number>>({});
+  // Which iteration of a chain the panel is showing, keyed by chain. Absent
+  // means the newest, so a fresh re-run opens on itself without being told.
+  const [selectedVersions, setSelectedVersions] = useState<
+    Record<string, number>
+  >({});
   const [expandedWorkLogs, setExpandedWorkLogs] = useState<
     Record<string, boolean>
   >({});
@@ -7414,6 +7599,45 @@ function App() {
     }
   };
 
+  /**
+   * Applies a finished chain's staged snapshot to the working tree.
+   *
+   * `pipeline_send` stages the whole chain's edits and restores the tree to
+   * its base, exactly like a single turn; this is the chain's version of the
+   * apply-after-answer step. Without it the coder's work stays parked in the
+   * snapshot directory while the answer claims the files exist. Returns the
+   * change summary for the coding stage's card, or [] when nothing changed.
+   */
+  const settleChainGuard = async (
+    guard: AgentGuardReport | null | undefined,
+  ): Promise<ChangeSummaryFile[]> => {
+    if (!guard) return [];
+    const hasChanges =
+      guard.changedFiles.length > 0 ||
+      guard.addedFiles.length > 0 ||
+      guard.removedFiles.length > 0;
+    if (!hasChanges) return [];
+    let summary = changeSummaryFromGuard(guard);
+    if (isTauri) {
+      try {
+        const preview = await invoke<AgentDiffPreview>("agent_preview_snapshot", {
+          snapshotId: guard.snapshotId,
+        });
+        const previewSummary = changeSummaryFromDiffFiles(preview.files);
+        if (previewSummary.length > 0) summary = previewSummary;
+      } catch (error) {
+        console.warn("Chain diff preview unavailable", error);
+      }
+    }
+    const applied = await applyAgentSnapshotAutomatically(guard);
+    setUndoableSnapshot(
+      applied || guard.rollbackAvailable
+        ? { snapshotId: guard.snapshotId }
+        : null,
+    );
+    return summary;
+  };
+
   const markSyncHealthError = (message: string) => {
     setSyncHealth((current) => {
       const fallback: SyncHealth = {
@@ -8033,8 +8257,23 @@ function App() {
       const progress = event.payload;
       setPipelineProgress(progress);
       if (progress.phase === "started") {
+        chainRequestIdsRef.current.add(progress.requestId);
+        // A bounded memory of recent stages is enough; a chain has three.
+        if (chainRequestIdsRef.current.size > 12) {
+          const oldest = chainRequestIdsRef.current.values().next().value;
+          if (oldest) chainRequestIdsRef.current.delete(oldest);
+        }
         activeRequestIdRef.current = progress.requestId;
-        activeTurnIdRef.current = undefined;
+        // Named, not cleared. Clearing it left the stage's first event to fall
+        // back to `thread:${threadId}` -- and the bridge sends no thread id, so
+        // every stage streamed into a message whose turn was the literal
+        // string "thread:". That message carried no stage badge, was saved
+        // next to the badged one the runner stores, and with no sequence of
+        // its own it sorted to the top of the conversation: the same answer
+        // again, in a card of its own, above the panel that owns it.
+        // The runner stores the stage answer under exactly this turn id, so
+        // naming it here makes the live bubble and the stored row one row.
+        activeTurnIdRef.current = `request:${progress.requestId}`;
       }
     });
     return () => {
@@ -9934,9 +10173,16 @@ function App() {
       if (!activeRequestIdRef.current) return;
       const codexEvent = normalizeCodexEvent(value);
       if (!codexEvent) return;
+      // A chain stage's final events — the complete assistant message that
+      // carries the tool inputs and file paths — race the next stage's
+      // "started" progress. They are still this run's events; dropping them
+      // is how the coding stage's trace lost its file rows.
+      const isActiveRequest =
+        !codexEvent.requestId ||
+        codexEvent.requestId === activeRequestIdRef.current;
       if (
-        codexEvent.requestId &&
-        codexEvent.requestId !== activeRequestIdRef.current
+        !isActiveRequest &&
+        !chainRequestIdsRef.current.has(codexEvent.requestId!)
       )
         return;
       if (codexEvent.sequence !== undefined) {
@@ -9956,7 +10202,12 @@ function App() {
         activeTurnIdRef.current = explicitTurnId;
       // The UI identity is created before the request leaves the client and
       // remains stable even if app-server emits multiple/fallback turn ids.
-      const uiTurnId = activeTurnIdRef.current ?? explicitTurnId;
+      // A straggler from an earlier chain stage keeps its own turn: filing it
+      // under the stage that is running now would move its rows to the wrong
+      // panel.
+      const uiTurnId = isActiveRequest
+        ? (activeTurnIdRef.current ?? explicitTurnId)
+        : `request:${codexEvent.requestId}`;
       const terminalTurnKey =
         codexEvent.terminalEventId ??
         `${codexEvent.requestId ?? activeRequestIdRef.current}:${uiTurnId}`;
@@ -10067,6 +10318,11 @@ function App() {
           // deltas. Commit it as soon as `item/completed` arrives so a slow
           // snapshot finalization (or an app restart during it) cannot turn a
           // valid answer into an empty interrupted placeholder.
+          //
+          // The completed item wins over the accumulated stream: the stream
+          // glues the model's between-tools narration onto the answer, while
+          // this event carries the answer alone. Keeping "whichever is longer"
+          // preserved exactly the glued junk this event exists to shed.
           const completedText = firstString(item.text, params.text);
           if (completedText) {
             const liveMessageId = activeLiveMessageIdRef.current;
@@ -10077,10 +10333,7 @@ function App() {
                       ...message,
                       itemId: itemId ?? message.itemId,
                       turnId: message.turnId ?? uiTurnId,
-                      text:
-                        message.text.trim().length >= completedText.trim().length
-                          ? message.text
-                          : completedText,
+                      text: completedText,
                     }
                   : message,
               ),
@@ -10197,7 +10450,9 @@ function App() {
             : [
                 {
                   id: "client-pre-plan",
-                  step: "0. Terv előkészítése és feladatértelmezése",
+                  // During a chain the running stage names the placeholder;
+                  // outside one this falls back to the plan wording.
+                  step: prePlanStepLabel(pipelineProgressRef.current?.role),
                   status: "inProgress" as const,
                 },
               ];
@@ -11940,7 +12195,9 @@ function App() {
         : [
         {
           id: "client-pre-plan",
-          step: "0. Terv előkészítése és feladatértelmezése",
+          step: prePlanStepLabel(
+            runPipeline ? activePipelineRecipe?.stages[0]?.role : null,
+          ),
           status: "inProgress",
         },
           ],
@@ -12105,7 +12362,16 @@ function App() {
             },
           });
           if (cancelledRequestIdsRef.current.delete(requestId)) return;
-          const stageMessages: Message[] = run.stages.map((stage) => ({
+          // Put the chain's edits on disk before the answer shows up: an
+          // answer that names files which are not there yet reads as a lie.
+          const chainSummary = await settleChainGuard(run.guard);
+          // The card with the real file list belongs to the stage that wrote
+          // the files.
+          const codeStageIndex = run.stages.reduce(
+            (last, stage, index) => (stage.role === "code" ? index : last),
+            -1,
+          );
+          const stageMessages: Message[] = run.stages.map((stage, stageIndex) => ({
             // The runner already stored this answer; reuse its id so the row it
             // wrote and the row shown here are the same row. Inventing an id
             // here produced a second copy of every stage answer.
@@ -12119,8 +12385,14 @@ function App() {
             final: true,
             turnId: `request:${stage.requestId}`,
             itemId: "assistant-0",
+            changeSummary:
+              stageIndex === codeStageIndex && chainSummary.length > 0
+                ? chainSummary
+                : undefined,
             pipeline: {
               runId: run.runId,
+              chainId: run.chainId,
+              iteration: run.iteration,
               stageIndex: stage.index,
               stageCount: run.recipe.stages.length,
               stageRole: stage.role,
@@ -12133,8 +12405,18 @@ function App() {
           // stage's stream filled it. Left in place it became a second,
           // badge-less copy of the plan sitting above the run panel.
           setMessages((current) => {
+            // Every stage streamed into a live bubble of its own, and the
+            // runner hands back the stored, badged copy of each. Dropping only
+            // the outer bubble left both in state under the same turn id: two
+            // work groups, two run panels, the same answer twice on screen.
+            // The store never saw it -- it keys by turn id -- so the duplicate
+            // vanished on reload, which is why it looked like a render bug
+            // with a clean database behind it.
+            const stagePrefix = `request:${requestId}-stage-`;
             const kept = current.filter(
-              (message) => message.id !== liveMessageId,
+              (message) =>
+                message.id !== liveMessageId &&
+                !message.turnId?.startsWith(stagePrefix),
             );
             // Without a sequence these rows fall back to their array index,
             // which is nowhere near the conversation's clock -- the run then
@@ -12504,6 +12786,200 @@ function App() {
     window.setTimeout(() => composerFormRef.current?.requestSubmit(), 0);
   };
 
+  /**
+   * Runs the chain again from the coding stage after a rejected review.
+   *
+   * Not a fresh chain, and not a new question: the plan the reviewer agreed to
+   * is handed back as an artifact, so the coder fixes what was objected to
+   * instead of re-deciding what to do. The result joins the same panel as the
+   * next version rather than opening a second one below it.
+   */
+  const rerunChainFromCode = async (chainKey: string) => {
+    if (!isTauri || !activePipelineRecipe) return;
+    if (isStreamingRef.current) {
+      notify("Előbb fejeződjön be a futó kérés.");
+      return;
+    }
+    if (!activeConversationId) {
+      notify("A beszélgetés azonosítója hiányzik, a lánc nem indítható újra.");
+      return;
+    }
+    const chainMessages = messagesRef.current.filter(
+      (message) =>
+        message.pipeline && chainKeyOf(message.pipeline) === chainKey,
+    );
+    if (chainMessages.length === 0) return;
+    const latestVersion = Math.max(
+      ...chainMessages.map((message) => iterationOf(message.pipeline!)),
+    );
+    if (latestVersion >= MAX_CHAIN_ITERATIONS) {
+      notify(
+        `A lánc már ${MAX_CHAIN_ITERATIONS} kört futott; ennél tovább nem iterál.`,
+      );
+      return;
+    }
+    // Newest first by construction: the timeline holds later versions later.
+    const newestOfRole = (role: string) =>
+      chainMessages.filter((message) => message.pipeline!.stageRole === role).at(-1);
+    const objection = newestOfRole("review")?.text.trim();
+    if (!objection) {
+      notify("A bíráló szövege nélkül nincs mit javítani.");
+      return;
+    }
+    const chainStartsAt = messagesRef.current.indexOf(chainMessages[0]);
+    const originalPrompt = [...messagesRef.current.slice(0, chainStartsAt)]
+      .reverse()
+      .find((message) => message.role === "user")
+      ?.text.trim();
+    if (!originalPrompt) {
+      notify("Az eredeti kérdés nem található, a lánc nem indítható újra.");
+      return;
+    }
+    const startStage = activePipelineRecipe.stages.findIndex(
+      (recipeStage) => recipeStage.role === "code",
+    );
+    if (startStage < 0) {
+      notify("A recept nem tartalmaz kódoló szakaszt.");
+      return;
+    }
+    // The plan is carried, not re-run, so the tab that shows it needs its text
+    // from here -- the re-run writes no answer of its own under that stage.
+    const carried: Record<number, string> = {};
+    for (const message of chainMessages) {
+      if (message.pipeline!.stageIndex < startStage)
+        carried[message.pipeline!.stageIndex] = message.text;
+    }
+    // The objection travels in its own block rather than as a fourth artifact:
+    // stated as history it reads as something that already happened, and the
+    // coder's own earlier summary then wins as the thing to repeat.
+    const seedArtifacts = [
+      newestOfRole("plan") && {
+        role: "plan",
+        text: newestOfRole("plan")!.text,
+        changedFiles: [],
+      },
+      newestOfRole("code") && {
+        role: "code",
+        text: newestOfRole("code")!.text,
+        changedFiles: [],
+      },
+    ].filter(Boolean);
+
+    const iteration = latestVersion + 1;
+    const requestId = createEntityId();
+    const stageRequestIds = activePipelineRecipe.stages.map(
+      (_, index) => `${requestId}-stage-${index}`,
+    );
+    isStreamingRef.current = true;
+    setIsStreaming(true);
+    setLiveStageChoice(null);
+    setLiveRunResume({ startStage, iteration, carried });
+    try {
+      const run = await invoke<PipelineRunResult>("pipeline_send", {
+        request: {
+          recipeId: activePipelineRecipe.id,
+          prompt: originalPrompt,
+          conversationId: activeConversationId,
+          requestIds: stageRequestIds,
+          placeholderRequestId: null,
+          images: [],
+          cwd: activeMode === "general" ? null : activeProjectData.path,
+          sessionId: claudeSessionIds[threadKey] ?? null,
+          conversationContext: null,
+          maxBudgetUsd: Number(claudeBudgetUsd),
+          stageOverrides: activePipelineRecipe.stages.map((_, index) => ({
+            model: stageValue(index, "model") || undefined,
+            effort: stageValue(index, "effort") || undefined,
+            provider: stageProvider(index),
+          })),
+          startStage,
+          seedArtifacts,
+          retryFeedback: objection,
+          chainId: chainKey,
+          iteration,
+        },
+      });
+      // Same as the first pass: the edits go on disk before the answer does.
+      const chainSummary = await settleChainGuard(run.guard);
+      const codeStageIndex = run.stages.reduce(
+        (last, stage, index) => (stage.role === "code" ? index : last),
+        -1,
+      );
+      const stageMessages: Message[] = run.stages.map((stageResult, stageIndex) => ({
+        id: stageResult.answerMessageId ?? crypto.randomUUID(),
+        role: "assistant",
+        text: stageResult.succeeded
+          ? stageResult.text
+          : `A(z) ${STAGE_ROLE_LABELS[stageResult.role] ?? stageResult.role} szakasz megszakadt: ${stageResult.error ?? "ismeretlen hiba"}`,
+        time: "most",
+        live: false,
+        final: true,
+        turnId: `request:${stageResult.requestId}`,
+        itemId: "assistant-0",
+        changeSummary:
+          stageIndex === codeStageIndex && chainSummary.length > 0
+            ? chainSummary
+            : undefined,
+        pipeline: {
+          runId: run.runId,
+          chainId: run.chainId,
+          iteration: run.iteration,
+          stageIndex: stageResult.index,
+          stageCount: run.recipe.stages.length,
+          stageRole: stageResult.role,
+          stageAgent: stageResult.agentLabel,
+          verdict: stageResult.review?.verdict,
+          verdictSummary: stageResult.review?.summary,
+        },
+      }));
+      setMessages((current) => {
+        // The same swap as the first run: the re-run's stages streamed into
+        // live bubbles, and these are the stored copies of them.
+        const stagePrefix = `request:${requestId}-stage-`;
+        const kept = current.filter(
+          (message) => !message.turnId?.startsWith(stagePrefix),
+        );
+        const lastSequence = kept.reduce(
+          (highest, message) => Math.max(highest, message.sequence ?? 0),
+          0,
+        );
+        return [
+          ...kept,
+          ...stageMessages.map((message, index) => ({
+            ...message,
+            sequence: lastSequence + 1 + index,
+          })),
+        ];
+      });
+      // Open on what was just produced. Without this an explicit earlier pick
+      // would pin the panel to the version the user was reading when they
+      // pressed the button.
+      setSelectedVersions((current) => ({
+        ...current,
+        [chainKey]: run.iteration,
+      }));
+      const lastSession = [...run.stages]
+        .reverse()
+        .find((stageResult) => stageResult.sessionId)?.sessionId;
+      if (lastSession)
+        setClaudeSessionIds((current) => ({
+          ...current,
+          [threadKey]: lastSession,
+        }));
+      if (run.status === "failed" && run.error) notify(run.error);
+    } catch (error) {
+      notify(
+        `A lánc újrafuttatása nem sikerült: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      setPipelineProgress(null);
+      setLiveRunResume(null);
+      isStreamingRef.current = false;
+      setIsStreaming(false);
+      setIsCancelling(false);
+    }
+  };
+
   const handleInputKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key !== "Enter") return;
     if (event.shiftKey) {
@@ -12752,24 +13228,65 @@ function App() {
     const userMessage = userMessageForWorkGroup(group);
     return userMessage ? messageUsesDetailedTrace(userMessage) : true;
   };
-  const stagesByRun = new Map<
-    string,
-    Array<{ stageIndex: number; role: string; agent: string }>
-  >();
+  type ChainStage = {
+    stageIndex: number;
+    role: string;
+    agent: string;
+    iteration: number;
+    runId: string;
+    verdict?: string;
+    verdictSummary?: string;
+  };
+  // Every iteration of one question, in one bucket. A re-run adds later
+  // versions of the stages it re-ran, not a second chain.
+  const stagesByChain = new Map<string, ChainStage[]>();
   for (const entry of timelineEntries) {
     if (entry.kind !== "work") continue;
     const stage = answerForWorkGroup(entry.group)?.pipeline;
     if (!stage) continue;
-    const stages = stagesByRun.get(stage.runId) ?? [];
+    const key = chainKeyOf(stage);
+    const stages = stagesByChain.get(key) ?? [];
     stages.push({
       stageIndex: stage.stageIndex,
       role: stage.stageRole,
       agent: stage.stageAgent,
+      iteration: iterationOf(stage),
+      runId: stage.runId,
+      verdict: stage.verdict,
+      verdictSummary: stage.verdictSummary,
     });
-    stagesByRun.set(stage.runId, stages);
+    stagesByChain.set(key, stages);
   }
-  for (const stages of stagesByRun.values())
-    stages.sort((left, right) => left.stageIndex - right.stageIndex);
+  for (const stages of stagesByChain.values())
+    stages.sort(
+      (left, right) =>
+        left.iteration - right.iteration || left.stageIndex - right.stageIndex,
+    );
+  /**
+   * The stage a given version shows in a given slot.
+   *
+   * A re-run resumes at the coder, so v2 has no plan of its own -- and a TERV
+   * tab that goes blank on v2 would read as "the plan was thrown away" when in
+   * fact it is the one thing both versions agree on. The newest version at or
+   * before the one being read wins, so the carried-over plan simply stays.
+   */
+  const stageForVersion = (
+    chain: ChainStage[],
+    iteration: number,
+    stageIndex: number,
+  ) =>
+    chain
+      .filter(
+        (item) => item.stageIndex === stageIndex && item.iteration <= iteration,
+      )
+      .at(-1);
+  const versionsOfChain = (chain: ChainStage[]) => [
+    ...new Set(chain.map((item) => item.iteration)),
+  ];
+  const slotsOfChain = (chain: ChainStage[]) =>
+    [...new Set(chain.map((item) => item.stageIndex))].sort(
+      (left, right) => left - right,
+    );
 
   // While a chain runs, its finished stages belong to the live panel. Left in
   // the timeline they piled up as separate cards under the question, which is
@@ -12940,32 +13457,47 @@ function App() {
         }
       : basePlan);
     const stage = groupAnswer.pipeline;
-    const runStages = stage ? (stagesByRun.get(stage.runId) ?? []) : [];
-    const lastStageIndex = runStages.length
-      ? runStages[runStages.length - 1].stageIndex
-      : 0;
+    const chainKey = stage ? chainKeyOf(stage) : "";
+    const chain = stage ? (stagesByChain.get(chainKey) ?? []) : [];
+    const chainVersions = versionsOfChain(chain);
+    const latestVersion = chainVersions.at(-1) ?? 1;
+    const selectedVersion = stage
+      ? (selectedVersions[chainKey] ?? latestVersion)
+      : 1;
+    const chainSlots = slotsOfChain(chain);
+    // The strip is built from the chain's slots, so a re-run that skipped the
+    // planner still shows a TERV tab -- filled by the version that wrote it.
+    const runStages = chainSlots
+      .map((slot) => stageForVersion(chain, selectedVersion, slot))
+      .filter((item): item is ChainStage => Boolean(item));
+    const lastStageIndex = chainSlots.at(-1) ?? 0;
     // -1 is the composed answer: what the chain did, in the words of whoever
     // did it, instead of the reviewer's opinion of the coder.
     const selectedStage = stage
-      ? (selectedStages[stage.runId] ?? PIPELINE_ANSWER_TAB)
+      ? (selectedStages[chainKey] ?? PIPELINE_ANSWER_TAB)
       : 0;
     // Only the chosen phase draws itself; the others are one click away. The
-    // answer tab has no stage of its own, so the last one hosts it.
+    // answer tab has no stage of its own, so the last one hosts it. Matched on
+    // the run as well as the slot: two versions own the same slot, and without
+    // the run id both of them would draw the panel.
+    const shownStage = stage
+      ? stageForVersion(
+          chain,
+          selectedVersion,
+          selectedStage === PIPELINE_ANSWER_TAB ? lastStageIndex : selectedStage,
+        )
+      : undefined;
     if (
       stage &&
-      stage.stageIndex !==
-        (selectedStage === PIPELINE_ANSWER_TAB ? lastStageIndex : selectedStage)
+      (shownStage?.runId !== stage.runId ||
+        shownStage?.stageIndex !== stage.stageIndex)
     )
       return null;
-    const runVerdict = stage
-      ? messages.find(
-          (message) =>
-            message.pipeline?.runId === stage.runId &&
-            Boolean(message.pipeline?.verdict),
-        )?.pipeline
-      : undefined;
+    // The verdict of the version being read, not of the newest one: a reader
+    // who went back to v1 is looking at what v1 concluded.
+    const runVerdict = stageForVersion(chain, selectedVersion, lastStageIndex);
     const runHeader = stage ? (
-        <div className="pipeline-run-header" data-run-id={stage.runId}>
+        <div className="pipeline-run-header" data-run-id={chainKey}>
           <span
             className="pipeline-run-tabs"
             role="tablist"
@@ -12978,7 +13510,7 @@ function App() {
                 transform: `translateX(${
                   (selectedStage === PIPELINE_ANSWER_TAB
                     ? 0
-                    : selectedStage + 1) * 100
+                    : chainSlots.indexOf(selectedStage) + 1) * 100
                 }%)`,
               }}
             />
@@ -13006,10 +13538,9 @@ function App() {
                 }`}
                 title={item.agent}
                 onClick={() => {
-                  const runId = stage.runId;
                   setSelectedStages((current) => ({
                     ...current,
-                    [runId]: item.key,
+                    [chainKey]: item.key,
                   }));
                   // A longer phase used to open below the fold, leaving the
                   // reader to scroll for the answer they just asked for. The
@@ -13022,7 +13553,7 @@ function App() {
                     () =>
                       revealPanelBottom(
                         document.querySelector(
-                          `.pipeline-run-header[data-run-id="${runId}"]`,
+                          `.pipeline-run-header[data-run-id="${chainKey}"]`,
                         )?.nextElementSibling ?? null,
                       ),
                     80,
@@ -13033,6 +13564,28 @@ function App() {
               </button>
             ))}
           </span>
+          {chainVersions.length > 1 && (
+            // A re-run does not replace what it was answering: both attempts
+            // stay readable, and this picks which one the panel is showing.
+            <label className="pipeline-run-version">
+              <span>VERZIÓ</span>
+              <select
+                value={selectedVersion}
+                onChange={(event) =>
+                  setSelectedVersions((current) => ({
+                    ...current,
+                    [chainKey]: Number(event.target.value),
+                  }))
+                }
+              >
+                {chainVersions.map((version) => (
+                  <option key={version} value={version}>
+                    {`v${version}`}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
         </div>
       ) : undefined;
     const askForTheFix = () => {
@@ -13048,39 +13601,67 @@ Javítsd ki, majd futtasd le újra a teszteket.`
         inputRef.current.focus();
       }
     };
+    // A rejected verdict used to end the run on a red panel and a shrug: the
+    // only affordance wrote a draft into the composer and left the sending to
+    // the reader. This re-runs the chain itself, from the coder -- the plan was
+    // what the reviewer agreed to, and re-planning only risks drifting off it.
+    const rejected = runVerdict?.verdict === "changes_requested";
+    const atNewestVersion = selectedVersion === latestVersion;
+    const canRerun =
+      rejected &&
+      atNewestVersion &&
+      latestVersion < MAX_CHAIN_ITERATIONS &&
+      !isStreaming;
+    // On the answer and on the review, which are the two places the verdict is
+    // stated. The plan and the code tabs are what the run did, not what it
+    // concluded, and a call to action there reads as belonging to that phase.
+    const footerBelongsHere =
+      selectedStage === PIPELINE_ANSWER_TAB || selectedStage === lastStageIndex;
+    const runFooter =
+      rejected && atNewestVersion && footerBelongsHere ? (
+        <div className="pipeline-answer-next">
+          <span>
+            {latestVersion < MAX_CHAIN_ITERATIONS
+              ? "A bíráló javítást kér."
+              : `A lánc ${MAX_CHAIN_ITERATIONS} kört futott, és még mindig javítást kér. Innen érdemesebb kézbe venni.`}
+          </span>
+          {latestVersion < MAX_CHAIN_ITERATIONS && (
+            <button
+              type="button"
+              disabled={!canRerun}
+              title={
+                isStreaming
+                  ? "Előbb fejezze be a futó kérés."
+                  : "A tervet megtartja, a kódolást és a bírálatot futtatja újra."
+              }
+              onClick={() => void rerunChainFromCode(chainKey)}
+            >
+              {`Újra a KÓD-tól (v${latestVersion + 1})`}
+            </button>
+          )}
+          <button type="button" className="is-secondary" onClick={askForTheFix}>
+            Javíttatom
+          </button>
+        </div>
+      ) : undefined;
     if (stage && selectedStage === PIPELINE_ANSWER_TAB) {
       // Composed here rather than asked of a fourth model: the coder already
       // wrote what changed, and the reviewer already said whether to trust it.
+      const coder = runStages.find((item) => item.role === "code");
       const doer = messages.find(
         (message) =>
-          message.pipeline?.runId === stage.runId &&
+          message.pipeline?.runId === coder?.runId &&
           message.pipeline?.stageRole === "code",
       );
       const answerText = (doer ?? groupAnswer).text;
-      const accepted = runVerdict?.verdict === "accepted";
       return (
         <Fragment key={entry.key}>
           {runHeader}
           <article className="trace-card in-run is-run-end pipeline-answer-card">
             <div className="pipeline-answer-body">
-              <p>
-                {answerWithQuoteBacklinks(
-                  textWithoutCodeBlocks(answerText),
-                  [],
-                  () => undefined,
-                )}
-              </p>
+              {answerParagraphs(textWithoutCodeBlocks(answerText))}
             </div>
-            {runVerdict?.verdict === "changes_requested" && (
-              // A verdict that asks for changes has to say what happens next,
-              // or the run ends on a red panel and a shrug.
-              <div className="pipeline-answer-next">
-                <span>A bíráló javítást kér.</span>
-                <button type="button" onClick={askForTheFix}>
-                  Javíttatom
-                </button>
-              </div>
-            )}
+            {runFooter}
           </article>
         </Fragment>
       );
@@ -13097,6 +13678,7 @@ Javítsd ki, majd futtasd le újra a teszteket.`
             : undefined
         }
         runHeader={runHeader}
+        runFooter={runFooter}
         plan={plan}
         activities={entry.group.activities}
         commentary={groupCommentary}
@@ -13170,6 +13752,10 @@ Javítsd ki, majd futtasd le újra a teszteket.`
     ? (liveStageChoice ?? pipelineProgress.stageIndex)
     : 0;
   const liveFinishedStageText = (index: number) => {
+    // A re-run carries its earlier phases rather than producing them, so their
+    // text comes from the version that wrote it, not from this pass.
+    const carried = liveRunResume?.carried[index];
+    if (carried) return carried;
     const byStage = messages.find(
       (message) =>
         message.role === "assistant" &&
@@ -13206,7 +13792,9 @@ Javítsd ki, majd futtasd le újra a teszteket.`
           VÁLASZ
         </button>
         {liveRunStages.map((stage) => {
-          const done = stage.index < pipelineProgress.stageIndex;
+          const done =
+            stage.index < pipelineProgress.stageIndex ||
+            stage.index < (liveRunResume?.startStage ?? 0);
           const running = stage.index === pipelineProgress.stageIndex;
           return (
             <button
@@ -13225,26 +13813,35 @@ Javítsd ki, majd futtasd le újra a teszteket.`
           );
         })}
       </span>
+      {liveRunResume && liveRunResume.iteration > 1 && (
+        // Says which round is running, so a re-run is not mistaken for the
+        // original chain starting over from nothing.
+        <span className="pipeline-run-version is-live">
+          {`v${liveRunResume.iteration}`}
+        </span>
+      )}
     </div>
   ) : undefined;
   const liveFinishedStagePanel =
     pipelineProgress && liveShownStage !== pipelineProgress.stageIndex ? (
       <article className="trace-card in-run is-run-end pipeline-answer-card">
         <div className="pipeline-answer-body">
-          <p>
-            {answerWithQuoteBacklinks(
-              textWithoutCodeBlocks(liveFinishedStageText(liveShownStage)),
-              [],
-              () => undefined,
-            )}
-          </p>
+          {answerParagraphs(
+            textWithoutCodeBlocks(liveFinishedStageText(liveShownStage)),
+          )}
         </div>
       </article>
     ) : null;
+  // A chain finishes a turn per stage, so between two stages the completed
+  // request is still the active one and this panel used to unmount -- while the
+  // settled stage cards stayed hidden, because the run that owns them is still
+  // going. The result was the whole answer blinking out of existence for a few
+  // seconds at every hand-off. A chain is one panel from its first second to
+  // its last, so a stage boundary is not a reason to take it down.
   const liveTurnContent =
     activeMode === "coding" &&
     isStreaming &&
-    !activeTurnHasCompleted && (
+    (!activeTurnHasCompleted || Boolean(pipelineProgress)) && (
       <div className="live-turn-anchor">
         {liveFinishedStagePanel ? (
           <>
@@ -13255,6 +13852,7 @@ Javítsd ki, majd futtasd le újra a teszteket.`
         <TurnProgressCard
           runPosition={pipelineProgress ? "end" : undefined}
           runHeader={liveRunHeader}
+          stageRole={pipelineProgress?.role}
           plan={activePlan}
           activities={liveWorkGroup?.activities ?? []}
           commentary={
@@ -14563,7 +15161,10 @@ Javítsd ki, majd futtasd le újra a teszteket.`
             </pre>
             <div className="agent-interaction-actions">
               <button type="button" onClick={() => void respondClaudeApproval("decline", "A felhasználó elutasította a műveletet.")}>Tiltás</button>
-              <button type="button" onClick={() => void respondClaudeApproval("acceptForSession")}>Engedélyezés erre a munkamenetre</button>
+              {/* The grant outlives the turn now, so the label says what it
+                  actually does: it is remembered for this project until the
+                  approvals file is cleared. */}
+              <button type="button" onClick={() => void respondClaudeApproval("acceptForSession")}>Engedélyezés ebben a projektben</button>
               <button type="button" className="agent-interaction-primary" onClick={() => void respondClaudeApproval("accept")}>Engedélyezés egyszer</button>
             </div>
           </section>

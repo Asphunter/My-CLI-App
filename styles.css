@@ -932,6 +932,8 @@ textarea::placeholder { color: var(--faint); }
 .trace-code-button:hover, .trace-code-button:focus-visible { border-color: var(--accent); background: #1c3b2b; color: #d3f8e1; }
 .trace-thinking-empty { display: flex; align-items: center; gap: 4px; min-height: 42px; padding: 0 13px; color: var(--faint); }
 .trace-thinking-empty-text { font-size: 10px; line-height: 1.45; color: var(--faint); }
+/* A stage that only wrote text: one honest sentence instead of an empty two-pane frame. */
+.trace-empty-note { grid-column: 1 / -1; margin: 0; padding: 14px 13px; color: var(--faint); font-size: 11px; line-height: 1.5; }
 .trace-total-elapsed { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 5px 10px 7px; border-top: 1px solid var(--border-soft); color: var(--faint); font-size: 9px; }
 .trace-total-elapsed time { color: var(--faint); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 9px; }
 
@@ -1502,7 +1504,7 @@ textarea::placeholder { color: var(--faint); }
 .composer-stage-role { color: var(--faint); font-size: 9px; font-weight: 700; letter-spacing: .06em; text-align: center; }
 .composer-stage-col button { position: relative; width: 100%; min-height: 17px; padding: 1px 3px; border: 1px solid #40515a; border-radius: 4px; background: rgba(25, 32, 36, .72); color: var(--muted); font-size: 9px; font-weight: 600; white-space: nowrap; cursor: pointer; }
 .composer-stage-col button:hover { border-color: #5e9877; color: var(--text); }
-".composer-stage-col .composer-stage-vendor { color: var(--text); font-weight: 700; }
+.composer-stage-col .composer-stage-vendor { color: var(--text); font-weight: 700; }
 /* The model and reasoning rows read as a chain, so the hand-off is drawn
    between them; the vendor row is a per-stage fact, not a sequence. */
 .composer-stage-col:not(:last-child) button:nth-of-type(2)::after,
@@ -1517,10 +1519,21 @@ textarea::placeholder { color: var(--faint); }
    futam egyetlen dolog. A közéjük eső margót elvesszük, a kerekítést csak a
    két végén hagyjuk meg, így összeérnek egyetlen kerettel. */
 .pipeline-run-header {
+  position: relative;
   display: flex; align-items: center; gap: 8px;
   width: calc(100% - 29px); margin: 10px 0 0 29px; padding: 5px 10px;
   border: 1px solid #45515a; border-bottom: none; border-radius: 3px 3px 0 0;
   background: #1b2126;
+}
+/* The accent bar belongs to the whole panel, and the phase strip is the panel's
+   top — starting the bar below it made the strip look like a separate row
+   floating above the run. */
+.pipeline-run-header::before {
+  content: ""; position: absolute; z-index: 1; top: 0; bottom: 0; left: 0;
+  width: 3px; border-radius: 3px 0 0 0;
+  background: var(--tick4-khaki-accent);
+  box-shadow: 0 0 13px rgba(150, 147, 116, .28);
+  pointer-events: none;
 }
 .pipeline-run-header strong { color: var(--muted); font-size: 8px; font-weight: 700; letter-spacing: .1em; }
 /* One control, not four chips: the marker slides to whatever was clicked. */
@@ -1548,6 +1561,10 @@ textarea::placeholder { color: var(--faint); }
 .pipeline-run-header .stage-verdict { margin-left: auto; }
 
 .trace-card.in-run { margin-bottom: 0; border-radius: 0; }
+/* One continuous bar down the panel: a rounded top on a card that has the phase
+   strip above it would notch the line where the two meet. */
+.trace-card.in-run::before { border-radius: 0; }
+.trace-card.is-run-end::before { border-radius: 0 0 0 3px; }
 .trace-card.is-run-start { border-top-left-radius: 0; border-top-right-radius: 0; }
 .trace-card.is-run-end { margin-bottom: 10px; border-radius: 0 0 3px 3px; }
 /* One shared border between neighbouring stages instead of two touching ones. */
@@ -1563,7 +1580,11 @@ textarea::placeholder { color: var(--faint); }
 .compact-answer-card.in-run .compact-answer-body,
 .trace-card.in-run .turn-progress-steps { max-height: 320px; overflow-y: auto; }
 
-.pipeline-answer-card { padding: 10px 13px; }
+/* The same reading surface as every phase body and as the project tree — the
+   run's answer is one more layer of the same panel, not a different app. The
+   literal used to be a shade lighter than `--tick4-answer-bg`, which is what
+   made the VÁLASZ tab look like it belonged somewhere else. */
+.pipeline-answer-card { padding: 10px 13px; background: var(--tick4-answer-bg); }
 .pipeline-answer-verdict {
   margin: 0 0 8px; padding: 5px 8px; border-radius: 3px;
   font-size: 10px; line-height: 1.5;
@@ -1571,7 +1592,13 @@ textarea::placeholder { color: var(--faint); }
 .pipeline-answer-verdict.is-accepted { border: 1px solid #4d8060; background: rgba(30, 60, 40, .5); color: #8fd6a6; }
 .pipeline-answer-verdict.is-changes { border: 1px solid #7a6336; background: rgba(60, 48, 22, .5); color: #d8bb72; }
 .pipeline-answer-body { max-height: 320px; overflow-y: auto; }
-.pipeline-answer-body p { margin: 0; white-space: pre-wrap; font-size: 11px; line-height: 1.65; }
+/* The same size as every other answer body in the panel. It was a point larger
+   for no reason, which made the run's own answer look like a different app. */
+.pipeline-answer-body p { margin: 0; white-space: pre-wrap; font-size: 10px; line-height: 1.48; }
+/* A paragraph break is a gap, not an empty row of text: the answer is rendered
+   as paragraphs now, so this is the whole distance between them. */
+.pipeline-answer-body p + p,
+.turn-progress-answer-body p + p { margin-top: 5px; }
 
 /* The review states its verdict by its colour; that is why it carries no chip. */
 .trace-card.is-verdict-accepted,
@@ -1608,19 +1635,60 @@ textarea::placeholder { color: var(--faint); }
 .live-turn-anchor .pipeline-run-header { margin-top: 0; }
 
 .pipeline-answer-next {
-  display: flex; align-items: center; gap: 10px;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 10px;
   margin-top: 10px; padding-top: 9px; border-top: 1px solid #7d4436;
   color: #d8bb72; font-size: 10px;
 }
+/* The same row on the review card, which has no padding of its own. */
+.trace-card > .pipeline-answer-next,
+.compact-answer-card > .pipeline-answer-next {
+  margin-top: 0; padding: 9px 13px 10px;
+}
+.pipeline-answer-next > span { min-width: 0; flex: 1 1 auto; }
 .pipeline-answer-next button {
+  flex: 0 0 auto;
   padding: 3px 10px; border: 1px solid var(--accent); border-radius: 3px;
   background: rgba(150, 147, 116, .16); color: var(--accent-strong);
   font: inherit; font-size: 9px; letter-spacing: .04em; cursor: pointer;
 }
 .pipeline-answer-next button:hover { background: rgba(150, 147, 116, .28); }
+.pipeline-answer-next button:disabled {
+  opacity: .42; cursor: default; background: rgba(150, 147, 116, .16);
+}
+/* Prefilling the composer is the fallback, not the offer. */
+.pipeline-answer-next button.is-secondary {
+  border-color: #5c6670; background: transparent; color: var(--muted);
+}
+.pipeline-answer-next button.is-secondary:hover {
+  border-color: #7a848d; background: rgba(255, 255, 255, .05); color: #cfd8de;
+}
 
-/* The verdict is visible in the strip too, so a glance is enough. */
-.pipeline-run-tab.is-verdict-accepted { color: #7fc79a; }
-.pipeline-run-tab.is-verdict-changes { color: #e09b78; }
-.pipeline-run-tab.is-verdict-accepted.is-active { color: #a5e0ba; }
-.pipeline-run-tab.is-verdict-changes.is-active { color: #f3b391; }
+/* The verdict is a surface, not a font colour: coloured lettering in a strip of
+   identical labels reads as emphasis long before it reads as pass or fail, and
+   at 9px it is the least legible part of the panel to carry the one thing worth
+   seeing at a glance. Translucent on purpose -- the active-tab marker sits
+   underneath, and a solid fill would hide which phase is open. */
+.pipeline-run-tab.is-verdict-accepted { background: rgba(47, 107, 69, .58); color: #dcece1; }
+.pipeline-run-tab.is-verdict-changes { background: rgba(125, 68, 54, .58); color: #f0dfd8; }
+.pipeline-run-tab.is-verdict-accepted:hover,
+.pipeline-run-tab.is-verdict-changes:hover { color: #fff; }
+.pipeline-run-tab.is-verdict-accepted.is-active,
+.pipeline-run-tab.is-verdict-changes.is-active {
+  color: #fff; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .45);
+}
+
+/* Which round of the chain the panel is showing. Only drawn once a re-run has
+   happened, so an ordinary run keeps the strip it always had. */
+.pipeline-run-version {
+  display: flex; align-items: center; gap: 5px; margin-left: auto;
+  color: var(--faint); font-size: 8px; font-weight: 700; letter-spacing: .1em;
+}
+.pipeline-run-version select {
+  padding: 2px 4px; border: 1px solid #3c4650; border-radius: 3px;
+  background: #171c21; color: var(--accent-strong);
+  font: inherit; font-size: 9px; letter-spacing: .04em; cursor: pointer;
+}
+.pipeline-run-version.is-live {
+  padding: 2px 7px; border: 1px solid var(--accent); border-radius: 3px;
+  background: rgba(150, 147, 116, .18); color: var(--accent-strong); font-size: 9px;
+}

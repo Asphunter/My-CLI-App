@@ -496,6 +496,21 @@ fn bridge_path() -> Result<PathBuf, String> {
     ))
 }
 
+/// Where the bridge remembers a tool the user granted for a workspace.
+///
+/// Next to the local store rather than inside the project: a grant is a
+/// decision about this machine, and it has no business travelling in the
+/// user's repository or in the sync journal.
+fn approvals_path() -> PathBuf {
+    crate::store::local_store_path()
+        .map(|path| {
+            path.parent()
+                .map(|directory| directory.join("approved-tools.json"))
+                .unwrap_or_else(|| PathBuf::from("approved-tools.json"))
+        })
+        .unwrap_or_else(|_| PathBuf::from("approved-tools.json"))
+}
+
 fn bridge_cwd(requested: Option<String>) -> Result<PathBuf, String> {
     let requested = requested.filter(|value| !value.trim().is_empty());
     let path = crate::codex::requested_agent_cwd(requested.as_deref())?;
@@ -617,6 +632,18 @@ fn emit_compat_event(
         }
     }
     let normalized_event_type = crate::agent::normalize_event_type(&event_type, &payload);
+    // Mirrors the bridge's MIN_AGENT_BRIDGE_LOG: which events actually cross
+    // the Rust boundary, and under which normalized name.
+    if let Ok(log_path) = std::env::var("MIN_AGENT_EVENT_LOG") {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+        {
+            let _ = writeln!(file, "{event_type} -> {normalized_event_type}");
+        }
+    }
     let provider_turn_id =
         crate::agent::provider_turn_id_from_payload(&payload).or_else(|| session_id.clone());
     let event = crate::agent::AgentEventEnvelope {
@@ -773,7 +800,12 @@ pub fn send(
             .env(
                 "MIN_AGENT_BRIDGE_PROTOCOL",
                 BRIDGE_PROTOCOL_VERSION.to_string(),
-            );
+            )
+            // Where a granted tool is remembered. The bridge is a fresh process
+            // per turn, so a grant kept only in its memory is forgotten before
+            // the next command -- which is why "allow for this session" asked
+            // again every single time.
+            .env("MIN_AGENT_APPROVALS_PATH", approvals_path());
         auth.apply(&mut command);
         #[cfg(windows)]
         command.creation_flags(0x0800_0000);
@@ -934,7 +966,12 @@ pub fn send(
                     if event_type == "turn/completed" {
                         if let Some(payload_text) = payload.get("finalText").and_then(Value::as_str)
                         {
-                            if payload_text.len() > final_text.len() {
+                            // The bridge's finalText is the answer alone; the
+                            // accumulated deltas may still carry the model's
+                            // between-tools narration glued on. "Longer wins"
+                            // kept exactly that junk, so the clean text wins
+                            // whenever the bridge produced one.
+                            if !payload_text.trim().is_empty() {
                                 final_text = payload_text.to_string();
                             }
                         }

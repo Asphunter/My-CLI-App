@@ -45,7 +45,18 @@ async fn agent_send(
 /// rollback guard.
 async fn run_agent_turn(
     app: tauri::AppHandle,
+    request: agent::AgentTurnRequest,
+) -> Result<agent::AgentResponse, String> {
+    run_agent_turn_inner(app, request, true).await
+}
+
+/// `claims_project` is false for a chain stage: the chain took the project for
+/// the whole run, and a stage asking for it again would be told, correctly,
+/// that the project is busy — by itself.
+async fn run_agent_turn_inner(
+    app: tauri::AppHandle,
     mut request: agent::AgentTurnRequest,
+    claims_project: bool,
 ) -> Result<agent::AgentResponse, String> {
     let request_id = request.request_id.clone().unwrap_or_else(|| {
         let stamp = SystemTime::now()
@@ -55,6 +66,13 @@ async fn run_agent_turn(
         format!("agent-request-{stamp}")
     });
     request.request_id = Some(request_id.clone());
+    // Held for the whole turn and released by its guard on every exit path,
+    // including the error ones.
+    let _claim = if claims_project {
+        claim_project(request.cwd.as_deref(), &request_id)?
+    } else {
+        None
+    };
     store::record_agent_turn_start(&mut request)?;
     if request.provider == agent::AgentProvider::Codex
         && request.runtime == agent::AgentRuntimeKind::CodexAppServer
@@ -122,6 +140,57 @@ fn live_pipeline_runs() -> &'static std::sync::Mutex<std::collections::HashSet<S
     RUNS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
+/// Which project each running turn has claimed, keyed by canonical path.
+///
+/// Two turns in two different projects are independent — separate processes,
+/// separate cancellation, separate stores — and the app is meant to let you
+/// work in one while the other thinks. Two turns in the *same* project are
+/// not: they would both take a workspace snapshot of the same tree, and the
+/// second one's "before" would contain the first one's half-finished edits.
+/// Whichever finished last would then hand back a rollback point that never
+/// existed. This is the guarantee, not the frontend's disabled button.
+fn live_project_locks() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, String>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, String>>,
+    > = std::sync::OnceLock::new();
+    LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Claims a project for one turn. Returns the guard that frees it again.
+///
+/// A turn with no project (the general mode) claims nothing: there is no tree
+/// to protect, and two of those may run side by side.
+fn claim_project(cwd: Option<&str>, request_id: &str) -> Result<Option<ProjectClaim>, String> {
+    let Some(cwd) = cwd.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let root = codex::requested_agent_cwd(Some(cwd))?;
+    let mut locks = live_project_locks()
+        .lock()
+        .map_err(|_| "A projektzár állapota zárolva maradt.".to_string())?;
+    if locks.contains_key(&root) {
+        return Err(
+            "Ebben a projektben már fut egy kérés. Várd meg, vagy állítsd le, mielőtt újat indítasz."
+                .to_string(),
+        );
+    }
+    locks.insert(root.clone(), request_id.to_string());
+    Ok(Some(ProjectClaim { root }))
+}
+
+/// Frees the project when the turn ends, however it ends.
+struct ProjectClaim {
+    root: std::path::PathBuf,
+}
+
+impl Drop for ProjectClaim {
+    fn drop(&mut self) {
+        if let Ok(mut locks) = live_project_locks().lock() {
+            locks.remove(&self.root);
+        }
+    }
+}
+
 fn live_pipeline_run_ids() -> Vec<String> {
     live_pipeline_runs()
         .lock()
@@ -184,6 +253,13 @@ async fn pipeline_send(
         ));
     }
 
+    // The chain holds the project for its whole length, not stage by stage:
+    // between two stages the tree is mid-work, and a turn starting there would
+    // snapshot the coder's unfinished state as its own "before".
+    let _claim = claim_project(
+        request.cwd.as_deref(),
+        request.request_ids.first().map_or("chain", String::as_str),
+    )?;
     let run_id = store::begin_pipeline_run(&request.conversation_id, &recipe)?;
     // The first run *is* the chain; every later one names the chain it belongs
     // to, which is what puts the iterations in one panel.
@@ -282,7 +358,7 @@ async fn pipeline_send(
                         tool_profile: Some(execution.stage.role.tool_profile()),
                         keep_workspace: true,
                     };
-                    let result = run_agent_turn(app.clone(), turn).await;
+                    let result = run_agent_turn_inner(app.clone(), turn, false).await;
                     let phase = if result.is_ok() { "finished" } else { "failed" };
                     let _ = codex::emit_main_window(
                         &app,
@@ -1101,4 +1177,57 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running min");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A project may be claimed once at a time, and the claim frees itself.
+    ///
+    /// The frontend also refuses to send while a project is busy, but that is
+    /// a courtesy: this is the rule, and it is what keeps two turns from
+    /// snapshotting the same tree on top of one another.
+    #[test]
+    fn a_project_takes_one_turn_at_a_time_and_frees_itself() {
+        let root = std::env::temp_dir().join("min-project-lock-test");
+        std::fs::create_dir_all(&root).expect("test project directory");
+        let canonical = root.canonicalize().expect("canonical test project");
+
+        {
+            let mut locks = live_project_locks().lock().expect("lock map");
+            locks.insert(canonical.clone(), "first-request".to_string());
+        }
+        // A second turn in the same project is refused, and told why in a
+        // sentence the user can act on.
+        let busy = {
+            let locks = live_project_locks().lock().expect("lock map");
+            locks.contains_key(&canonical)
+        };
+        assert!(busy, "the first turn holds the project");
+
+        {
+            let claim = ProjectClaim {
+                root: canonical.clone(),
+            };
+            drop(claim);
+        }
+        let freed = {
+            let locks = live_project_locks().lock().expect("lock map");
+            !locks.contains_key(&canonical)
+        };
+        assert!(
+            freed,
+            "the guard must free the project however the turn ended"
+        );
+
+        // A turn with no project claims nothing: two general-mode questions
+        // have no tree to fight over.
+        assert!(claim_project(None, "general").expect("no project").is_none());
+        assert!(claim_project(Some("   "), "blank")
+            .expect("blank project")
+            .is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

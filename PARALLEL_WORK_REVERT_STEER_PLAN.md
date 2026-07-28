@@ -202,6 +202,16 @@ Fut a kódoló, látod, hogy rossz irányba megy → beírsz egy sort, és az
 egyetlen eszköz.
 
 ### Technika
+> **Igazolva (2026-07-28, `agent-bridge/steering-probe.mjs`).** A terv egyetlen
+> bizonyítatlan feltevése állt: elfogad-e a Claude SDK inputot futó turn
+> közben. Igen. A próba egy async generátorral indított turnbe 3 másodperc
+> múlva beküldött egy `priority: "now"` üzenetet; a modell abbahagyta az
+> eredeti feladatot és a terelést hajtotta végre, a turn pedig **normálisan
+> lezárult** (6,5 s, `num_turns: 1`) — a nyitva tartott input-stream nem
+> akasztja meg. Az SDK-ban erre külön mező van (`priority: 'now' | 'next' |
+> 'later'`) és külön API (`query.streamInput`), tehát a terelés nem trükk,
+> hanem támogatott fogalom.
+
 - **Claude (bridge): valódi mid-turn terelés.** A SDK `query()` promptja
   string HELYETT async generátor: először a feladatot adja, utána nyitva
   marad, és a bridge stdin-jén érkező `steer` üzeneteket adja tovább

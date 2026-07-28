@@ -7460,6 +7460,37 @@ function App() {
 
   const messagesForThread = (key: string) =>
     localConversationCacheRef.current[key]?.messages ?? loadThreadMessages(key);
+
+  /**
+   * Writes into the conversation that owns the change, wherever the reader is.
+   *
+   * `messages` describes the conversation on screen, so a run that finishes
+   * while you read something else has nowhere to put its answer. On screen the
+   * update takes the normal path; off screen it goes straight into that
+   * conversation's cache entry — which is exactly what the view loads when you
+   * come back, and what the next save writes to disk.
+   */
+  const commitMessagesForThread = (
+    key: string,
+    next: (current: Message[]) => Message[],
+  ) => {
+    if (messageKeyRef.current === key) {
+      commitMessages(next);
+      return;
+    }
+    const existing = localConversationCacheRef.current[key];
+    if (!existing) return;
+    const updated = {
+      ...existing,
+      messages: next(existing.messages ?? []),
+      updatedAt: new Date().toISOString(),
+    };
+    localConversationCacheRef.current = {
+      ...localConversationCacheRef.current,
+      [key]: updated,
+    };
+    setLocalConversationCache(localConversationCacheRef.current);
+  };
   const workItemsForThread = (key: string) =>
     localConversationCacheRef.current[key]?.workItems ??
     loadThreadWorkItems(key);
@@ -12535,12 +12566,10 @@ function App() {
           // stage's stream filled it. Left in place it became a second,
           // badge-less copy of the plan sitting above the run panel.
           //
-          // Only into the conversation that asked: the runner has already
-          // stored every stage, so a reader who walked away loses nothing but
-          // the live view, while writing here would put this chain's answers
-          // into whatever conversation is on screen now.
-          if (messageKeyRef.current === requestThreadKey)
-          setMessages((current) => {
+          // Into the conversation that asked, even if the reader has walked
+          // off to another one: writing into `messages` would put this chain's
+          // answers wherever the eye happens to be.
+          commitMessagesForThread(requestThreadKey, (current) => {
             // Every stage streamed into a live bubble of its own, and the
             // runner hands back the stored, badged copy of each. Dropping only
             // the outer bubble left both in state under the same turn id: two
@@ -12702,13 +12731,10 @@ function App() {
           }));
         }
       }
-      // Committed only into the conversation that asked. If the reader has
-      // moved on, the answer is already in the store — the runtime wrote it —
-      // and writing it into whatever is on screen now would put one
-      // conversation's answer inside another.
-      const answerBelongsToView = messageKeyRef.current === requestThreadKey;
-      if (answerBelongsToView)
-      commitMessages((current) => {
+      // Into the conversation that asked, not into whatever is on screen: one
+      // conversation's answer must never land inside another, and a reader who
+      // walked away must still find it waiting when they come back.
+      commitMessagesForThread(requestThreadKey, (current) => {
         const targetIndex = current.findIndex(
           (message) => message.id === liveMessageId,
         );
@@ -13114,8 +13140,7 @@ function App() {
           verdictSummary: stageResult.review?.summary,
         },
       }));
-      if (messageKeyRef.current === threadKey)
-      setMessages((current) => {
+      commitMessagesForThread(threadKey, (current) => {
         // The same swap as the first run: the re-run's stages streamed into
         // live bubbles, and these are the stored copies of them.
         const stagePrefix = `request:${requestId}-stage-`;
@@ -14056,9 +14081,15 @@ Javítsd ki, majd futtasd le újra a teszteket.`
   // going. The result was the whole answer blinking out of existence for a few
   // seconds at every hand-off. A chain is one panel from its first second to
   // its last, so a stage boundary is not a reason to take it down.
+  // A run is drawn where it was asked, and nowhere else. `isStreaming` says
+  // only that the app is busy; on its own it painted a "thinking" panel into
+  // whatever conversation the reader opened next, as if they had asked it.
+  const liveRunShowsHere =
+    !liveRunThreadKeyRef.current || liveRunThreadKeyRef.current === threadKey;
   const liveTurnContent =
     activeMode === "coding" &&
     isStreaming &&
+    liveRunShowsHere &&
     (!activeTurnHasCompleted || Boolean(pipelineProgress)) && (
       <div className="live-turn-anchor">
         {liveFinishedStagePanel ? (
@@ -14119,7 +14150,7 @@ Javítsd ki, majd futtasd le újra a teszteket.`
       )
     : timelineContent.filter((node) => node !== LIVE_RERUN_SLOT);
   const generalLiveTurnContent =
-    activeMode === "general" && isStreaming && liveAnswer ? (
+    activeMode === "general" && isStreaming && liveRunShowsHere && liveAnswer ? (
       <div className="general-live-answer">
         <MessageRow
           message={liveAnswer}

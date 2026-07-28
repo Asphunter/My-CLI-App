@@ -205,12 +205,94 @@ fn pipeline_run_is_cancelled(run_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Every request id a running chain answers to, mapped to its run.
+///
+/// A chain is cancellable from the moment it is asked for, not from the moment
+/// it first reports progress. The frontend allocates the ids before it calls
+/// `pipeline_send` and knows nothing else about the run until a stage starts —
+/// so stopping in the first seconds had nothing to name, and the run carried on
+/// for as long as it liked. These ids are that name.
+fn pipeline_runs_by_request() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, String>,
+> {
+    static RUNS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, String>>,
+    > = std::sync::OnceLock::new();
+    RUNS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn register_pipeline_request_ids(run_id: &str, request_ids: &[String]) {
+    if let Ok(mut runs) = pipeline_runs_by_request().lock() {
+        for request_id in request_ids {
+            runs.insert(request_id.clone(), run_id.to_string());
+        }
+    }
+}
+
+fn forget_pipeline_request_ids(run_id: &str) {
+    if let Ok(mut runs) = pipeline_runs_by_request().lock() {
+        runs.retain(|_, value| value != run_id);
+    }
+}
+
+/// Frees a run's request ids however the run ends.
+struct PipelineRequestIds {
+    run_id: String,
+}
+
+impl Drop for PipelineRequestIds {
+    fn drop(&mut self) {
+        forget_pipeline_request_ids(&self.run_id);
+    }
+}
+
+fn pipeline_run_for_request(request_id: &str) -> Option<String> {
+    pipeline_runs_by_request()
+        .lock()
+        .ok()
+        .and_then(|runs| runs.get(request_id).cloned())
+}
+
 #[tauri::command(rename_all = "camelCase")]
 fn pipeline_cancel(run_id: String) -> Result<(), String> {
+    cancel_pipeline_run(&run_id)
+}
+
+/// Stops a chain named by any of its request ids.
+///
+/// Marks the run so no further stage starts, and tells whichever runtime is
+/// mid-stage to stop now — a stage that has already been handed to a provider
+/// is not torn out by a flag, and eight minutes of coding is a long time to
+/// watch something you have already stopped.
+#[tauri::command(rename_all = "camelCase")]
+fn pipeline_cancel_request(request_id: String) -> Result<bool, String> {
+    let Some(run_id) = pipeline_run_for_request(&request_id) else {
+        return Ok(false);
+    };
+    cancel_pipeline_run(&run_id)?;
+    Ok(true)
+}
+
+fn cancel_pipeline_run(run_id: &str) -> Result<(), String> {
     cancelled_pipeline_runs()
         .lock()
         .map_err(|_| "A lánc megszakítási állapota zárolva maradt.".to_string())?
-        .insert(run_id);
+        .insert(run_id.to_string());
+    // Whatever stage is in flight belongs to this run; cancelling a request no
+    // runtime owns is a no-op, so this needs no bookkeeping of its own.
+    let request_ids: Vec<String> = pipeline_runs_by_request()
+        .lock()
+        .map(|runs| {
+            runs.iter()
+                .filter(|(_, value)| value.as_str() == run_id)
+                .map(|(key, _)| key.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    for request_id in request_ids {
+        let _ = claude::cancel_request(&request_id);
+        let _ = codex::cancel_request(&request_id);
+    }
     Ok(())
 }
 
@@ -261,6 +343,17 @@ async fn pipeline_send(
         request.request_ids.first().map_or("chain", String::as_str),
     )?;
     let run_id = store::begin_pipeline_run(&request.conversation_id, &recipe)?;
+    // Registered before the first stage starts, so a stop pressed in the first
+    // second has something to name. Includes the placeholder the frontend is
+    // still showing as the active request at that point.
+    let mut cancellable_ids = request.request_ids.clone();
+    if let Some(placeholder) = request.placeholder_request_id.clone() {
+        cancellable_ids.push(placeholder);
+    }
+    register_pipeline_request_ids(&run_id, &cancellable_ids);
+    let _request_id_guard = PipelineRequestIds {
+        run_id: run_id.clone(),
+    };
     // The first run *is* the chain; every later one names the chain it belongs
     // to, which is what puts the iterations in one panel.
     let chain_id = request
@@ -1113,6 +1206,7 @@ pub fn run() {
             pipeline_recipes,
             pipeline_send,
             pipeline_cancel,
+            pipeline_cancel_request,
             pipeline_forget_placeholder,
             agent_conversation_status,
             agent_answer_checkpoint,
@@ -1229,5 +1323,51 @@ mod tests {
             .is_none());
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A chain is stoppable by any of its request ids, from the moment it is
+    /// registered — which is before the first stage reports itself.
+    ///
+    /// This is the gap that let a chain run for eleven minutes after the user
+    /// pressed stop: the frontend could only name the run once a stage had
+    /// started, so a stop pressed in the first second named nothing.
+    #[test]
+    fn a_chain_is_cancellable_before_its_first_stage_reports() {
+        let run_id = "run-under-test";
+        let request_ids = vec![
+            "req-stage-0".to_string(),
+            "req-stage-1".to_string(),
+            "req-placeholder".to_string(),
+        ];
+        register_pipeline_request_ids(run_id, &request_ids);
+
+        // The placeholder is what the frontend still calls "active" while the
+        // chain is starting up, so it has to resolve like any stage id.
+        assert_eq!(
+            pipeline_run_for_request("req-placeholder").as_deref(),
+            Some(run_id),
+        );
+        assert_eq!(
+            pipeline_run_for_request("req-stage-1").as_deref(),
+            Some(run_id),
+        );
+        assert!(pipeline_run_for_request("req-unknown").is_none());
+
+        assert!(!pipeline_run_is_cancelled(run_id));
+        assert!(
+            pipeline_cancel_request("req-placeholder".to_string()).expect("cancel"),
+            "a known request must report that it stopped something",
+        );
+        assert!(pipeline_run_is_cancelled(run_id));
+        assert!(
+            !pipeline_cancel_request("req-unknown".to_string()).expect("cancel"),
+            "an unknown request stops nothing and must say so, so the caller can fall back",
+        );
+
+        forget_pipeline_request_ids(run_id);
+        assert!(pipeline_run_for_request("req-stage-0").is_none());
+        if let Ok(mut runs) = cancelled_pipeline_runs().lock() {
+            runs.remove(run_id);
+        }
     }
 }

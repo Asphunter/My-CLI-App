@@ -11858,7 +11858,32 @@ function App() {
       setCodeStatus("kész");
       setWatchdogMessage("");
     };
+    // A chain is already running by the time it is "preparing": `pipeline_send`
+    // has been called and the runner is off. Closing the placeholder locally
+    // and returning — which is what this branch used to do — left it working
+    // for another eleven minutes after the user had stopped it. Ask the backend
+    // by request id, which is the one name that exists before the first stage
+    // reports itself.
     if (preparingRequestIdRef.current === requestId) {
+      let stoppedChain = false;
+      try {
+        stoppedChain = await invoke<boolean>("pipeline_cancel_request", {
+          requestId,
+        });
+      } catch (error) {
+        console.warn("Pipeline cancel by request failed", error);
+      }
+      if (!stoppedChain) {
+        // An ordinary turn: whichever runtime owns it, if any. Both refuse
+        // harmlessly for a request that never reached them.
+        for (const command of ["claude_cancel", "codex_cancel"]) {
+          try {
+            await invoke(command, { requestId });
+          } catch {
+            // The request was never handed over; nothing to stop.
+          }
+        }
+      }
       finalizeCancellation();
       notify("A válaszgenerálás leállítva");
       return;
@@ -11866,13 +11891,13 @@ function App() {
     setIsCancelling(true);
     try {
       // A chain has to be told as well: cancelling the running stage would
-      // otherwise just let the next one start.
-      if (pipelineProgress) {
-        try {
-          await invoke("pipeline_cancel", { runId: pipelineProgress.runId });
-        } catch (error) {
-          console.warn("Pipeline cancel failed", error);
-        }
+      // otherwise just let the next one start. By request id rather than by
+      // run id — the run id only arrives with the first stage's progress, and
+      // a chain must be stoppable before that.
+      try {
+        await invoke<boolean>("pipeline_cancel_request", { requestId });
+      } catch (error) {
+        console.warn("Pipeline cancel by request failed", error);
       }
       await invoke(
         activeProviderRef.current === "anthropic"
@@ -12428,10 +12453,17 @@ function App() {
               })),
             },
           });
-          if (cancelledRequestIdsRef.current.delete(requestId)) return;
+          // Stopping a chain used to throw away everything it had already
+          // produced: the runner returns the finished stages with a cancelled
+          // status, and this line dropped them on the floor. A plan and a
+          // finished implementation are worth keeping — pressing stop means
+          // "go no further", not "pretend none of it happened".
+          const cancelled = cancelledRequestIdsRef.current.delete(requestId);
           // Put the chain's edits on disk before the answer shows up: an
           // answer that names files which are not there yet reads as a lie.
-          const chainSummary = await settleChainGuard(run.guard);
+          // A cancelled chain leaves the tree alone: its work is half-done by
+          // definition, and the user stopped it rather than accepted it.
+          const chainSummary = cancelled ? [] : await settleChainGuard(run.guard);
           // The card with the real file list belongs to the stage that wrote
           // the files.
           const codeStageIndex = run.stages.reduce(
@@ -12446,7 +12478,11 @@ function App() {
             role: "assistant",
             text: stage.succeeded
               ? stage.text
-              : `A(z) ${STAGE_ROLE_LABELS[stage.role] ?? stage.role} szakasz megszakadt: ${stage.error ?? "ismeretlen hiba"}`,
+              : run.status === "cancelled"
+                ? // Stopping is not a failure, and the provider's own
+                  // cancellation error is not an explanation the reader wants.
+                  `A(z) ${STAGE_ROLE_LABELS[stage.role] ?? stage.role} szakasz leállítva.`
+                : `A(z) ${STAGE_ROLE_LABELS[stage.role] ?? stage.role} szakasz megszakadt: ${stage.error ?? "ismeretlen hiba"}`,
             time: "most",
             live: false,
             final: true,

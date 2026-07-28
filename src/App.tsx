@@ -479,8 +479,12 @@ type RunHandle = {
   ownerConversationKey: string;
   /** Coding: a projekt-zár kulcsa (normalizált path). GENERAL: null. */
   readonly projectPathKey: string | null;
+  /** A futás munkakönyvtára. A kiválasztott projekt közben változhat. */
+  readonly projectPath: string;
   readonly provider: "codex" | "anthropic";
   readonly clientTurnId: string;
+  /** A felhasználó leállította-e; a lezáró ágak ezt kérdezik. */
+  cancelled: boolean;
   liveMessageId: string;
   /** A provider szálazonosítója; a requestId nélküli események tartaléka. */
   threadId?: string;
@@ -517,6 +521,14 @@ type RunHandle = {
   };
   status: "preparing" | "streaming" | "finalizing" | "done";
   turnCompleted: boolean;
+  /**
+   * Amit a futás a felületnek üzen. Eddig globális state volt, tehát két
+   * futás mellett a legutóbbié látszott — bármelyik beszélgetésben.
+   */
+  statusLabel: string;
+  transport: CodexTransportStatus | null;
+  watchdog: string;
+  cancelling: boolean;
 };
 
 type CommentaryEntry = {
@@ -7187,7 +7199,9 @@ function App() {
   // rerenders) instead of falling back to the default-open state.
   const expandedWorkLogChoicesRef = useRef<Record<string, boolean>>({});
   const [codeActivity, setCodeActivity] = useState<CodeActivity[]>([]);
-  const [codeStatus, setCodeStatus] = useState("készen");
+  // A *nézet* alapállapota: futás nélkül ez látszik. Futás közben a futás
+  // sajátja írja felül — így egy másik beszélgetés köre nem üzen ide.
+  const [viewCodeStatus, setViewCodeStatus] = useState("készen");
   const [activePlan, setActivePlan] = useState<PlanSnapshot>({
     turnId: null,
     explanation: "",
@@ -7199,12 +7213,12 @@ function App() {
   const [commentaryEntries, setCommentaryEntries] = useState<CommentaryEntry[]>(
     [],
   );
-  const [transportStatus, setTransportStatus] =
+  const [viewTransportStatus, setViewTransportStatus] =
     useState<CodexTransportStatus | null>(null);
   const [agentConversationStatus, setAgentConversationStatus] =
     useState<AgentConversationStatus | null>(null);
   const [agentStatusRevision, setAgentStatusRevision] = useState(0);
-  const [watchdogMessage, setWatchdogMessage] = useState("");
+  const [viewWatchdogMessage, setViewWatchdogMessage] = useState("");
   // Melyik projekten fut épp automatikus apply. Projektenként, mert két
   // projekt egymástól függetlenül alkalmazhat.
   const [agentApplyProjects, setAgentApplyProjects] = useState<string[]>([]);
@@ -7234,7 +7248,7 @@ function App() {
   const [queuedSendConversations, setQueuedSendConversations] = useState<
     string[]
   >([]);
-  const [isCancelling, setIsCancelling] = useState(false);
+  const [viewIsCancelling, setViewIsCancelling] = useState(false);
   // The model turn can be complete while the native command is still
   // finalizing the workspace snapshot. Keep the request locked during that
   // short phase, but remove the stop affordance so a late click cannot cancel
@@ -7499,9 +7513,10 @@ function App() {
     setActiveGeneralConversationId(conversationId);
   };
   const timelineSequenceRef = useRef(Date.now());
-  const activeTurnIdRef = useRef<string | undefined>(undefined);
   const activePlanRef = useRef(activePlan);
-  const activeTurnTimingRef = useRef<PlanStepTiming>({});
+  // A *nézet* terv-órája: történeti terv rendezésekor (navigáláskor) nincs
+  // futás, amitől az eltelt időt kérdezhetnénk. A futásé a handle-ben van.
+  const viewTurnTimingRef = useRef<PlanStepTiming>({});
   const planKeyRef = useRef<string | null>(null);
   const commentaryKeyRef = useRef<string | null>(null);
   const messageStreamRef = useRef<HTMLDivElement>(null);
@@ -7560,13 +7575,8 @@ function App() {
   }, [composerQuotes, pendingImages, threadKey]);
   const shouldStickToBottom = useRef(true);
   const autoScrollFrameRef = useRef<number | null>(null);
-  const activeRequestIdRef = useRef<string | null>(null);
   const completionSoundRequestsRef = useRef<Set<string>>(new Set());
-  const activeLiveMessageIdRef = useRef<string | null>(null);
-  const preparingRequestIdRef = useRef<string | null>(null);
-  const turnCompletedRequestIdRef = useRef<string | null>(null);
   const syncActionBusyRef = useRef(false);
-  const cancelledRequestIdsRef = useRef<Set<string>>(new Set());
   const activeProjectPathRef = useRef(activeProjectPath);
 
   activeProjectPathRef.current = activeProjectPath;
@@ -7585,34 +7595,38 @@ function App() {
   const runByConversationRef = useRef<Map<string, string>>(new Map());
   const runByProjectRef = useRef<Map<string, string>>(new Map());
 
-  /**
-   * A régi, modulszintű refek a 2. fázisig élnek: sok olvasó (render-beli
-   * származtatott értékek, hang, watchdog) még rájuk néz. Egyetlen írójuk ez
-   * a függvény, és mindig az élő futásból írja őket — így nem lehet belőlük
-   * második igazság. Amint elfogy az utolsó olvasójuk, a refek eltűnnek.
-   */
-  const syncRunAliases = () => {
-    const run = runsRef.current.values().next().value as RunHandle | undefined;
-    activeRequestIdRef.current = run?.requestId ?? null;
-    runOwnerConversationIdRef.current = run?.ownerConversationId ?? null;
-    activeLiveMessageIdRef.current = run?.liveMessageId ?? null;
-    activeTurnIdRef.current = run?.turnId;
-    activeTurnTimingRef.current = run?.turnTiming ?? {};
-    runPlanRef.current = run?.plan ?? EMPTY_PLAN;
-    turnCompletedRequestIdRef.current = run?.turnCompleted
-      ? run.requestId
-      : null;
-  };
-
   /** Fut-e bármi. A sync-pull szünete és a munkaterület-zárak kérdezik. */
   const anyRunActive = () => runsRef.current.size > 0;
+
+  /**
+   * „Megszakították-e, és ha igen, ezt még nem dolgoztuk fel."
+   *
+   * Egyszer felel igazat: a lezáró ágak közül az fut le, amelyik előbb ér oda,
+   * és a többinek már nem szabad ugyanazt a megszakítást másodszor kezelnie.
+   */
+  const consumeRunCancellation = (run: RunHandle | undefined) => {
+    if (!run?.cancelled) return false;
+    run.cancelled = false;
+    return true;
+  };
+
+  /** A futás üzenete a felületnek. Gazdátlan írás itt is eldobás. */
+  const setRunStatus = (
+    run: RunHandle | undefined,
+    patch: Partial<
+      Pick<RunHandle, "statusLabel" | "transport" | "watchdog" | "cancelling">
+    >,
+  ) => {
+    if (!run) return;
+    Object.assign(run, patch);
+    setRunsRevision((revision) => revision + 1);
+  };
 
   const beginRun = (run: RunHandle) => {
     runsRef.current.set(run.requestId, run);
     runByConversationRef.current.set(run.ownerConversationId, run.requestId);
     if (run.projectPathKey)
       runByProjectRef.current.set(run.projectPathKey, run.requestId);
-    syncRunAliases();
     setRunsRevision((revision) => revision + 1);
     return run;
   };
@@ -7631,7 +7645,6 @@ function App() {
       runByProjectRef.current.get(run.projectPathKey) === requestId
     )
       runByProjectRef.current.delete(run.projectPathKey);
-    syncRunAliases();
     setRunsRevision((revision) => revision + 1);
   };
 
@@ -7723,19 +7736,8 @@ function App() {
 
   // A futás tulajdonosa. A `finally` nem nullázza vissza „mindenkire": a
   // gazdátlan írás eldobás, nem broadcast.
-  const runOwnerConversationIdRef = useRef<string | null>(null);
   const activeConversationIdRef = useRef<string | null>(null);
-  // A futás munkakönyvtára. Az `activeProjectPathRef` a kiválasztott projekté;
-  // ha futás közben másik projektre kattintanak, a futás fájljait attól
-  // kezdve a másik projektben kereste volna.
-  const runProjectPathRef = useRef("");
-  // A futás saját terve. Az `activePlanRef` azé a beszélgetésé, amit épp
-  // nézünk — ha a kettő szétvált, a futás ebből építi a következő lépést.
-  const runPlanRef = useRef<PlanSnapshot>({
-    turnId: null,
-    explanation: "",
-    steps: [],
-  });
+  const viewedRunRef = useRef<RunHandle | undefined>(undefined);
 
   /**
    * Melyik beszélgetés sorai vannak most a nézet-állapotban. Nem a render-beli
@@ -7748,12 +7750,6 @@ function App() {
   const ownedConversationKey = (conversationId: string) =>
     conversationKeyByIdRef.current[conversationId.trim()] ?? null;
 
-  /** A futó beszélgetés cache-kulcsa, ha épp fut valami. */
-  const runOwnerConversationKey = () => {
-    const ownerId = runOwnerConversationIdRef.current;
-    if (!ownerId) return null;
-    return conversationKeyByIdRef.current[ownerId] ?? null;
-  };
 
   /**
    * Egy háttérben futó beszélgetés slice-ának írása. A tár a cache — nincs
@@ -7962,9 +7958,16 @@ function App() {
   // nem rajzolhatnak ide panelt.
   const pipelineProgress = viewedRun?.chain?.progress ?? null;
   const liveRunResume = viewedRun?.chain?.resume ?? null;
+  // Amit a felület mutat: a nézett futás üzenete, ha van futás; különben a
+  // nézet saját alapállapota. Egy másik beszélgetés köre nem üzenhet ide.
+  const codeStatus = viewedRun?.statusLabel ?? viewCodeStatus;
+  const transportStatus = viewedRun?.transport ?? viewTransportStatus;
+  const watchdogMessage = viewedRun?.watchdog ?? viewWatchdogMessage;
+  const isCancelling = viewedRun?.cancelling ?? viewIsCancelling;
   // A dokumentumra kötött kattintásfigyelő a renderen kívül fut, ezért a
   // nézett beszélgetés azonosítóját ref-ben is látnia kell.
   activeConversationIdRef.current = activeConversationId;
+  viewedRunRef.current = viewedRun;
   const viewingActiveRun = Boolean(viewedRun);
 
   const maxKnownTimelineSequence = [
@@ -8018,7 +8021,7 @@ function App() {
   const normalizePlanCommit = (next: PlanSnapshot, run?: RunHandle) => {
     // Az eltelt idő órája a futásé. Amíg nincs futás (történeti terv
     // rendezése navigáláskor), a régi, közös óra marad — az a nézeté.
-    const timing = run?.turnTiming ?? activeTurnTimingRef.current;
+    const timing = run?.turnTiming ?? viewTurnTimingRef.current;
     const startedAt = next.startedAt ?? timing.startedAt;
     const completedAt = next.completedAt ?? timing.completedAt;
     if (startedAt !== undefined) timing.startedAt = startedAt;
@@ -8026,8 +8029,8 @@ function App() {
     return { ...next, startedAt, completedAt };
   };
 
-  const planSnapshotKey = (snapshot: PlanSnapshot) =>
-    snapshot.turnId ?? activeTurnIdRef.current ?? "current";
+  const planSnapshotKey = (snapshot: PlanSnapshot, run?: RunHandle) =>
+    snapshot.turnId ?? run?.turnId ?? viewedRunRef.current?.turnId ?? "current";
 
   const updatePlanState = (next: PlanSnapshot) => {
     const normalizedNext = normalizePlanCommit(next);
@@ -8059,8 +8062,7 @@ function App() {
       const normalizedNext = normalizePlanCommit(next, owned);
       if (owned) {
         owned.plan = normalizedNext;
-        syncRunAliases();
-      }
+          }
       activePlanRef.current = normalizedNext;
       setActivePlan(normalizedNext);
       setPlanHistory((current) => ({
@@ -8072,8 +8074,7 @@ function App() {
     const normalizedNext = normalizePlanCommit(next, owned);
     if (owned) {
       owned.plan = normalizedNext;
-      syncRunAliases();
-    }
+      }
     writeBackgroundConversation(ownerId!.trim(), (conversation) => ({
       ...conversation,
       planHistory: {
@@ -8143,7 +8144,7 @@ function App() {
     now = Date.now(),
   ) => {
     if (!stepId) return;
-    const plan = runForConversation(ownerId)?.plan ?? runPlanRef.current;
+    const plan = runForConversation(ownerId)?.plan ?? activePlanRef.current;
     const next = planWithStartedStep(plan, stepId, now);
     if (next) updateOwnedPlanState(ownerId, next);
   };
@@ -8232,7 +8233,7 @@ function App() {
         snapshotId: snapshot.snapshotId,
       });
       rememberUndoableSnapshot(activeConversationId, null);
-      setCodeStatus("változások visszavonva");
+      setViewCodeStatus("változások visszavonva");
       notify("A turn fájlváltozásai visszaálltak a turn előtti állapotra");
     } catch (error) {
       // The guard refuses to roll back when the files changed after the turn,
@@ -8399,7 +8400,7 @@ function App() {
     } catch (error) {
       // Applying is automatic, so a failure only warrants a short toast; the
       // undo affordance stays pointed at the last snapshot that did apply.
-      setCodeStatus("apply hiba");
+      setViewCodeStatus("apply hiba");
       notify(
         `A létrehozott fájlok automatikus alkalmazása sikertelen: ${String(error)}`,
         "notify",
@@ -8902,7 +8903,7 @@ function App() {
     workLogKeyRef.current = selectedKey;
     commitMessages(selectedConversation?.messages ?? []);
     setCodeActivity(selectedConversation?.workItems ?? []);
-    setCodeStatus(
+    setViewCodeStatus(
       (selectedConversation?.workItems?.length ?? 0) > 0 ? "kész" : "készen",
     );
     setPlanHistory(selectedHistory);
@@ -9004,7 +9005,7 @@ function App() {
       activities: codeActivity,
       planHistory,
       commentary: commentaryEntries,
-      activeTurnKey: activeTurnIdRef.current,
+      activeTurnKey: viewedRun?.turnId,
       compareActivities: compareWorkItems,
     }).sort((left, right) =>
       compareTimelineOrder(
@@ -9099,8 +9100,7 @@ function App() {
         // The runner stores the stage answer under exactly this turn id, so
         // naming it here makes the live bubble and the stored row one row.
         chainRun.turnId = `request:${progress.requestId}`;
-        syncRunAliases();
-      }
+          }
     });
     return () => {
       void unlisten.then((dispose) => dispose());
@@ -10358,7 +10358,7 @@ function App() {
         localConversationCacheRef.current[threadKey]?.workItems ??
         loadThreadWorkItems(threadKey);
       setCodeActivity(saved);
-      setCodeStatus(saved.length > 0 ? "kész" : "készen");
+      setViewCodeStatus(saved.length > 0 ? "kész" : "készen");
       setExpandedWorkLogs({});
       return;
     }
@@ -10937,7 +10937,10 @@ function App() {
     let cleanup: (() => void) | undefined;
     let disposed = false;
     void listen<CodexTransportStatus>("codex-transport", (event) => {
-      setTransportStatus(event.payload);
+      // A transport-jelentés a kérésé; a futása mondja meg, hol látszik.
+      const transportRun = runForRequest(event.payload.requestId);
+      if (transportRun) setRunStatus(transportRun, { transport: event.payload });
+      else setViewTransportStatus(event.payload);
     })
       .then((unlisten) => {
         if (disposed) {
@@ -10957,15 +10960,16 @@ function App() {
 
   useEffect(() => {
     if (!viewingActiveRun) {
-      setWatchdogMessage("");
+      setViewWatchdogMessage("");
       return;
     }
-    setWatchdogMessage("");
+    setViewWatchdogMessage("");
     const timer = window.setTimeout(
       () =>
-        setWatchdogMessage(
-          "A Codex dolgozik; még nem érkezett megjeleníthető összefoglaló.",
-        ),
+        setRunStatus(viewedRunRef.current, {
+          watchdog:
+            "A Codex dolgozik; még nem érkezett megjeleníthető összefoglaló.",
+        }),
       8000,
     );
     return () => window.clearTimeout(timer);
@@ -11009,8 +11013,7 @@ function App() {
       const explicitTurnId = eventTurnId(codexEvent, params, item);
       if (!run.turnId) {
         run.turnId = explicitTurnId;
-        syncRunAliases();
-      }
+          }
       // A szálazonosító a requestId nélküli események egyetlen fogódzója.
       if (!run.threadId && codexEvent.threadId?.trim())
         run.threadId = codexEvent.threadId.trim();
@@ -11065,7 +11068,7 @@ function App() {
           (itemId ? run.agentMessagePhases[itemId] : undefined) ??
           firstString(params.phase, item.phase);
         if (deltaText) {
-          setWatchdogMessage("");
+          setRunStatus(run, { watchdog: "" });
           if (phase === "final_answer") {
             enqueueAnswerDelta(run, deltaText, {
               threadId: codexEvent.threadId,
@@ -11178,8 +11181,8 @@ function App() {
             planStepIdOverride = targetStep.id;
           }
           updateOwnedPlanState(ownerConversationId, next);
-          setWatchdogMessage("");
-          setCodeStatus("terv frissítve");
+          setRunStatus(run, { watchdog: "" });
+          setRunStatus(run, { statusLabel: "terv frissítve" });
         }
       } else if (
         codexEvent.eventType === "item/plan/delta" ||
@@ -11230,7 +11233,7 @@ function App() {
           /\.[a-z0-9]{1,8}$/i.test(filePath)
         ) {
           void invoke<string | null>("read_code_file", {
-            cwd: runProjectPathRef.current || activeProjectPathRef.current,
+            cwd: run.projectPath || activeProjectPathRef.current,
             path: filePath,
           })
             .then((code) => {
@@ -11274,8 +11277,8 @@ function App() {
             Date.now(),
           ),
         );
-        setWatchdogMessage("");
-        setCodeStatus("dolgozik");
+        setRunStatus(run, { watchdog: "" });
+        setRunStatus(run, { statusLabel: "dolgozik" });
       } else if (codexEvent.eventType === "turn/completed") {
         settleAnswerStream(run);
         const completedRequestId = run.requestId;
@@ -11380,8 +11383,7 @@ function App() {
         // its provisional empty assistant row.
         markLocalMutation();
         run.turnCompleted = true;
-        syncRunAliases();
-        setTurnCompletedRequestId(completedRequestId);
+            setTurnCompletedRequestId(completedRequestId);
         const completedSteps = run.plan.steps.map((step) =>
           step.status === "inProgress"
             ? { ...step, status: "completed" as const }
@@ -11394,7 +11396,7 @@ function App() {
           completedAt,
         );
         updateOwnedPlanState(ownerConversationId, completedPlan);
-        setCodeStatus("kész");
+        setRunStatus(run, { statusLabel: "kész" });
         playCompletionSoundOnce(run.requestId, run);
         // Ha nem ezt a beszélgetést nézzük, a hang önmagában nem mondja meg,
         // melyik készült el.
@@ -11407,7 +11409,8 @@ function App() {
               : "Egy másik beszélgetés válasza kész",
           );
         }
-      } else if (codexEvent.eventType.includes("error")) setCodeStatus("hiba");
+      } else if (codexEvent.eventType.includes("error"))
+        setRunStatus(run, { statusLabel: "hiba" });
     };
     void Promise.all([
       listen<unknown>("agent-event", (event) =>
@@ -11585,9 +11588,7 @@ function App() {
    * futást: az a saját ID-jére ír, nem arra, ami a képernyőn van.
    */
   const blockRunOwnerMutation = (conversationKey: string) => {
-    const ownerKey = runOwnerConversationKey();
-    if (!ownerKey || !conversationKeysMatch(ownerKey, conversationKey))
-      return false;
+    if (!runForConversationKey(conversationKey)) return false;
     notify(
       "Ebben a beszélgetésben épp fut egy válasz. Előbb állítsd le.",
       "notify",
@@ -11597,11 +11598,9 @@ function App() {
 
   /** Ugyanez projektre: a benne futó beszélgetés miatt zárol. */
   const blockRunProjectMutation = (project: Project) => {
-    const ownerKey = runOwnerConversationKey();
     if (
-      !ownerKey ||
       !project.threads.some((thread) =>
-        conversationKeysMatch(ownerKey, `${project.path}/${thread}`),
+        runForConversationKey(`${project.path}/${thread}`),
       )
     )
       return false;
@@ -12256,7 +12255,7 @@ function App() {
       setActiveThread("Új beszélgetés");
       commitMessages([]);
       setCodeActivity([]);
-      setCodeStatus("készen");
+      setViewCodeStatus("készen");
       setExpandedWorkLogs({});
       setOpenProjects((current) => ({ ...current, [selectedPath]: true }));
       notify(`Projektmappa létrehozva: ${projectName}`);
@@ -12331,7 +12330,7 @@ function App() {
       setCodeActivity(
         workItemsForThread(`${project.path}/${project.threads[0]}`),
       );
-      setCodeStatus("készen");
+      setViewCodeStatus("készen");
       setExpandedWorkLogs({});
       setOpenProjects((current) => ({ ...current, [project.path]: true }));
       notify(`Meglévő projekt hozzáadva: ${project.name}`);
@@ -12365,7 +12364,7 @@ function App() {
     const workItems = conversation?.workItems ?? loadThreadWorkItems(key);
     commitMessages(conversation?.messages ?? loadThreadMessages(key));
     setCodeActivity(workItems);
-    setCodeStatus(workItems.length ? "kÃ©sz" : "kÃ©szen");
+    setViewCodeStatus(workItems.length ? "kÃ©sz" : "kÃ©szen");
     const cachedHistory = conversation?.planHistory ?? {};
     const history =
       Object.keys(cachedHistory).length > 0
@@ -12510,7 +12509,7 @@ function App() {
     status: "completed" | "error",
     run = runForConversation(ownerId),
   ) => {
-    const current = run?.plan ?? runPlanRef.current;
+    const current = run?.plan ?? activePlanRef.current;
     if (
       current.steps.length === 0 ||
       !current.steps.some((step) => step.status === "inProgress")
@@ -12530,28 +12529,21 @@ function App() {
     );
   };
 
-  const activeTurnHasCompleted = Boolean(
-    activeRequestIdRef.current &&
-      turnCompletedRequestId === activeRequestIdRef.current,
-  );
+  const activeTurnHasCompleted = Boolean(viewedRun?.turnCompleted);
 
   const stopGeneration = async () => {
-    const requestId = activeRequestIdRef.current;
-    if (
-      !requestId ||
-      isCancelling ||
-      turnCompletedRequestIdRef.current === requestId
-    )
-      return;
-    const stoppingRun = runForRequest(requestId);
+    // A leállítás a *nézett* beszélgetés futására vonatkozik: a stop gomb is
+    // ott van, és több futás mellett „az aktuális kérés" nem létezik.
+    const stoppingRun = viewedRunRef.current;
+    const requestId = stoppingRun?.requestId;
+    if (!requestId || isCancelling || stoppingRun?.turnCompleted) return;
     const liveMessageId = stoppingRun?.liveMessageId ?? null;
     const finalizeCancellation = () => {
-      cancelledRequestIdsRef.current.add(requestId);
+      if (stoppingRun) stoppingRun.cancelled = true;
       // A leállítás is a futásnak szól: a „megszakítva" jelölés a futás
       // beszélgetésébe kerül, nem abba, amit közben megnyitottak.
       const ownerConversationId = stoppingRun?.ownerConversationId ?? null;
       settleAnswerStream(stoppingRun);
-      preparingRequestIdRef.current = null;
       writeOwnedMessages(ownerConversationId, (current) =>
         current.map((message) =>
           message.id === liveMessageId
@@ -12572,14 +12564,14 @@ function App() {
       // A futás csak most kerül ki a táblából: a terv lezárása még a saját
       // pillanatképéből dolgozott.
       endRun(requestId);
-      setIsCancelling(false);
+      setRunStatus(stoppingRun, { cancelling: false });
       // `codex_send` runs in a native background task and may only settle
       // after the process has been killed. Release the client-side submit
       // guard here so a cancelled request cannot block the next message.
       markSubmitBusy(ownerConversationId, false);
       setImagesPreparing(false);
-      setCodeStatus("kész");
-      setWatchdogMessage("");
+      setRunStatus(stoppingRun, { statusLabel: "kész" });
+      setRunStatus(stoppingRun, { watchdog: "" });
     };
     // A chain is already running by the time it is "preparing": `pipeline_send`
     // has been called and the runner is off. Closing the placeholder locally
@@ -12587,7 +12579,7 @@ function App() {
     // for another eleven minutes after the user had stopped it. Ask the backend
     // by request id, which is the one name that exists before the first stage
     // reports itself.
-    if (preparingRequestIdRef.current === requestId) {
+    if (stoppingRun.status === "preparing") {
       let stoppedChain = false;
       try {
         stoppedChain = await invoke<boolean>("pipeline_cancel_request", {
@@ -12611,7 +12603,7 @@ function App() {
       notify("A válaszgenerálás leállítva");
       return;
     }
-    setIsCancelling(true);
+    setRunStatus(stoppingRun, { cancelling: true });
     try {
       // A chain has to be told as well: cancelling the running stage would
       // otherwise just let the next one start. By request id rather than by
@@ -12636,7 +12628,7 @@ function App() {
         finalizeCancellation();
         notify("A válaszgenerálás leállítva");
       } else {
-        setIsCancelling(false);
+        setRunStatus(stoppingRun, { cancelling: false });
         notify(`Nem sikerült leállítani: ${String(error)}`, "notify");
       }
     }
@@ -12888,7 +12880,6 @@ function App() {
       localConversationCacheRef.current[requestThreadKey]?.id,
       createEntityId,
     );
-    runProjectPathRef.current = isGeneralMode ? "" : activeProjectData.path;
     const previousMessages = mergeMessages(
       localConversationCacheRef.current[requestThreadKey]?.messages ?? [],
       messagesRef.current,
@@ -13060,11 +13051,11 @@ function App() {
         requestThreadKey = nextThreadKey;
       }
     }
-    setTransportStatus({
+    const initialTransport: CodexTransportStatus = {
       stage: "request-accepted",
       detail: "Kérés fogadva; a feladat értelmezése indul.",
       threadId: null,
-    });
+    };
     const initialPlan: PlanSnapshot = {
       turnId: clientTurnId,
       explanation: "",
@@ -13131,6 +13122,7 @@ function App() {
       projectPathKey: isGeneralMode
         ? null
         : normalizeConversationKey(activeProjectData.path),
+      projectPath: isGeneralMode ? "" : activeProjectData.path,
       provider: useClaude ? "anthropic" : "codex",
       clientTurnId,
       liveMessageId,
@@ -13144,7 +13136,12 @@ function App() {
       chainRequestIds: new Set(),
       answerStream: { meta: null, pending: "", frame: null },
       status: "preparing",
+      cancelled: false,
       turnCompleted: false,
+      statusLabel: "dolgozik",
+      transport: initialTransport,
+      watchdog: "",
+      cancelling: false,
     });
     // A küldés maga az állítás, hogy ez a beszélgetés van a képernyőn. Ezt a
     // nézet-óra is így lássa, különben az első két címzett írás — a kérdés és
@@ -13159,9 +13156,8 @@ function App() {
     setComposerQuotes([]);
     setPendingImages([]);
     setTurnCompletedRequestId(null);
-    preparingRequestIdRef.current = requestId;
-    setIsCancelling(false);
-    setCodeStatus("dolgozik");
+    setRunStatus(runHandle, { cancelling: false });
+    setRunStatus(runHandle, { statusLabel: "dolgozik" });
     const baseCodexPrompt = modelPrompt || promptText;
     let codexPrompt = baseCodexPrompt;
     const requestContextMessages = regeneration
@@ -13178,7 +13174,7 @@ function App() {
       if (localFileContext)
         codexPrompt = `${baseCodexPrompt}\n\n${localFileContext}`;
     }
-    if (cancelledRequestIdsRef.current.delete(requestId)) {
+    if (consumeRunCancellation(runHandle)) {
       settleAnswerStream(runHandle);
       if (regeneration) {
         writeOwnedMessages(runConversationId, (current) =>
@@ -13189,12 +13185,10 @@ function App() {
           ),
         );
       }
-      preparingRequestIdRef.current = null;
       endRun(requestId);
       markSubmitBusy(runConversationId, false);
       return;
     }
-    preparingRequestIdRef.current = null;
     runHandle.status = "streaming";
 
     try {
@@ -13265,7 +13259,7 @@ function App() {
           // status, and this line dropped them on the floor. A plan and a
           // finished implementation are worth keeping — pressing stop means
           // "go no further", not "pretend none of it happened".
-          const cancelled = cancelledRequestIdsRef.current.delete(requestId);
+          const cancelled = consumeRunCancellation(runHandle);
           // Put the chain's edits on disk before the answer shows up: an
           // answer that names files which are not there yet reads as a lie.
           // A cancelled chain leaves the tree alone: its work is half-done by
@@ -13378,9 +13372,8 @@ function App() {
           // a chain. Without this the composer stayed "busy" for good: the
           // send button looked ready and silently dropped every next message
           // until the app was restarted.
-          setIsCancelling(false);
-          preparingRequestIdRef.current = null;
-          setTurnCompletedRequestId(null);
+          setRunStatus(runHandle, { cancelling: false });
+              setTurnCompletedRequestId(null);
           markSubmitBusy(runConversationId, false);
           endRun(requestId);
           releaseQueuedSend(runConversationId);
@@ -13433,7 +13426,7 @@ function App() {
               requestId,
             },
           });
-      if (cancelledRequestIdsRef.current.delete(requestId)) return;
+      if (consumeRunCancellation(runHandle)) return;
       const hasAgentChanges =
         response.guard.changedFiles.length > 0 ||
         response.guard.addedFiles.length > 0 ||
@@ -13557,7 +13550,7 @@ function App() {
                 : [
                     {
                       id: activityId,
-                      turnId: activeTurnIdRef.current,
+                      turnId: runHandle.turnId,
                       kind: "file" as const,
                       status: "done" as const,
                       label: "Fájl tartalma",
@@ -13591,8 +13584,8 @@ function App() {
           ),
         );
       }
-      setCodeStatus("kész");
-      setWatchdogMessage("");
+      setRunStatus(runHandle, { statusLabel: "kész" });
+      setRunStatus(runHandle, { watchdog: "" });
       // Fallback for an app-server that completes the request without
       // emitting turn/completed. The per-request guard prevents duplicates.
       playCompletionSoundOnce(requestId);
@@ -13615,7 +13608,7 @@ function App() {
       );
       const hasStreamedAnswer = Boolean(streamedAnswer?.text.trim());
       const wasCancelled =
-        cancelledRequestIdsRef.current.delete(requestId) ||
+        consumeRunCancellation(runHandle) ||
         /megszakítva|leállítva|cancel/i.test(errorText);
       writeOwnedMessages(runConversationId, (current) => {
         const targetIndex = current.findIndex(
@@ -13632,7 +13625,7 @@ function App() {
                   (wasCancelled
                     ? "A válasz megszakítva."
                     : `Nem sikerült a ${providerName}-kérés: ${errorDescription.userMessage}`),
-                turnId: message.turnId ?? activeTurnIdRef.current,
+                turnId: message.turnId ?? runHandle.turnId,
                 live: false,
                 final: true,
                 interrupted: wasCancelled || message.interrupted,
@@ -13648,12 +13641,14 @@ function App() {
         runConversationId,
         wasCancelled || answerArrived ? "completed" : "error",
       );
-      setCodeStatus(wasCancelled || answerArrived ? "kész" : "hiba");
-      setTransportStatus({
-        requestId,
-        stage: wasCancelled ? "cancelled" : "error",
-        detail: `${errorDescription.code}: ${errorDescription.detail}`,
-        threadId: activeTurnIdRef.current,
+      setRunStatus(runHandle, {
+        statusLabel: wasCancelled || answerArrived ? "kész" : "hiba",
+        transport: {
+          requestId,
+          stage: wasCancelled ? "cancelled" : "error",
+          detail: `${errorDescription.code}: ${errorDescription.detail}`,
+          threadId: runHandle.turnId,
+        },
       });
       notify(
         answerArrived
@@ -13665,10 +13660,9 @@ function App() {
       );
     } finally {
       setAgentStatusRevision((current) => current + 1);
-      if (activeRequestIdRef.current === requestId) {
-        setIsCancelling(false);
-        preparingRequestIdRef.current = null;
-        setTurnCompletedRequestId(null);
+      if (runsRef.current.has(requestId)) {
+        setRunStatus(runHandle, { cancelling: false });
+          setTurnCompletedRequestId(null);
       }
       markSubmitBusy(runConversationId, false);
       // Gazdátlan futás nincs: a táblából kikerülve a késői eseményei nem
@@ -13831,8 +13825,6 @@ function App() {
     // the *original* run's timestamp — which is how a one-minute re-run came
     // to report an hour and twenty minutes. This round starts now.
     const rerunStartedAt = Date.now();
-    runProjectPathRef.current =
-      activeMode === "general" ? "" : activeProjectData.path;
     const rerunRun = beginRun({
       requestId,
       ownerConversationId: rerunConversationId,
@@ -13841,6 +13833,7 @@ function App() {
         activeMode === "general"
           ? null
           : normalizeConversationKey(activeProjectData.path),
+      projectPath: activeMode === "general" ? "" : activeProjectData.path,
       provider: "anthropic",
       clientTurnId: `request:${requestId}`,
       // Az újrafuttatásnak nincs saját élő buborékja: a szakaszok a maguk
@@ -13859,7 +13852,12 @@ function App() {
       chain: { resume: { chainKey, startStage, iteration, carried } },
       answerStream: { meta: null, pending: "", frame: null },
       status: "streaming",
+      cancelled: false,
       turnCompleted: false,
+      statusLabel: "dolgozik",
+      transport: null,
+      watchdog: "",
+      cancelling: false,
     });
     updateOwnedPlanState(rerunConversationId, {
       turnId: `request:${requestId}`,
@@ -13981,7 +13979,7 @@ function App() {
     } finally {
       rerunRun.chain = undefined;
       setRunsRevision((revision) => revision + 1);
-      setIsCancelling(false);
+      setRunStatus(rerunRun, { cancelling: false });
       endRun(requestId);
       releaseQueuedSend(rerunConversationId);
     }
@@ -14064,7 +14062,7 @@ function App() {
     setCommentaryEntries([]);
     setPlanHistory({});
     setActivePlan({ turnId: null, explanation: "", steps: [] });
-    setCodeStatus("készen");
+    setViewCodeStatus("készen");
     shouldStickToBottom.current = true;
     setIsAtBottom(true);
     setExpandedWorkLogs({});
@@ -14124,18 +14122,15 @@ function App() {
   const latestWorkGroup = [...workLogGroups]
     .reverse()
     .find(workGroupHasVisibleTrace);
+  const viewedTurnId = viewedRun?.turnId;
   const activeWorkGroup = viewingActiveRun
-    ? findActiveWorkGroup(
-        workLogGroups,
-        messages,
-        activeTurnIdRef.current,
-      )
+    ? findActiveWorkGroup(workLogGroups, messages, viewedTurnId)
     : undefined;
   const currentWorkGroup =
     activeWorkGroup ??
-    (activeTurnIdRef.current
+    (viewedTurnId
       ? workLogGroups.find((group) =>
-          workGroupTurnKeys(group).includes(activeTurnIdRef.current!),
+          workGroupTurnKeys(group).includes(viewedTurnId),
         )
       : undefined);
   const messageBelongsToWorkGroup = (
@@ -14746,7 +14741,7 @@ Javítsd ki, majd futtasd le újra a teszteket.`
   });
   const liveWorkGroup = activeWorkGroup;
   const liveTurnKey = liveWorkGroup?.key ?? activePlan.turnId ?? "current";
-  const liveTurnId = activePlan.turnId ?? activeTurnIdRef.current;
+  const liveTurnId = activePlan.turnId ?? viewedRun?.turnId;
   const liveExpanded = liveWorkGroup
     ? expandedForWorkGroup(liveWorkGroup, true)
     : Object.prototype.hasOwnProperty.call(expandedWorkLogs, liveTurnKey)

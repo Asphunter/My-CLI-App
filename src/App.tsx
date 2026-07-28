@@ -12995,6 +12995,30 @@ function App() {
     setIsStreaming(true);
     setLiveStageChoice(null);
     setLiveRunResume({ chainKey, startStage, iteration, carried });
+    // A re-run is a chain, and a chain is read in the detailed layout: the
+    // panel it draws has phases. Without this the composer still showed the
+    // plain single-agent settings, and the run rendered as if it were one.
+    setShowDetailedTrace(true);
+    setPipelineMode(true);
+    // The elapsed clock counts from the plan's start, and the plan still held
+    // the *original* run's timestamp — which is how a one-minute re-run came
+    // to report an hour and twenty minutes. This round starts now.
+    const rerunStartedAt = Date.now();
+    updatePlanState({
+      turnId: `request:${requestId}`,
+      explanation: "",
+      steps: [
+        {
+          id: "client-pre-plan",
+          step: prePlanStepLabel(
+            activePipelineRecipe.stages[startStage]?.role ?? "code",
+          ),
+          status: "inProgress",
+        },
+      ],
+      startedAt: rerunStartedAt,
+      stepTimes: { "client-pre-plan": { startedAt: rerunStartedAt } },
+    });
     try {
       const run = await invoke<PipelineRunResult>("pipeline_send", {
         request: {
@@ -13430,7 +13454,18 @@ function App() {
           ? entry.message.role === "assistant"
             ? entry.message.turnId
             : undefined
-          : answerForWorkGroup(entry.group)?.turnId;
+          : // The settled answer first, then the bubble the running stage is
+            // still streaming into: `answerForWorkGroup` only considers rows
+            // that have finished, so mid-run the group looked like it belonged
+            // to nobody and drew itself as a loose card beside the panel that
+            // owns it.
+            (answerForWorkGroup(entry.group)?.turnId ??
+            messages.find(
+              (message, index) =>
+                message.role === "assistant" &&
+                message.live &&
+                messageBelongsToWorkGroup(message, index, entry.group),
+            )?.turnId);
       // The stage answers are one thing, and the outer request's own settled
       // bubble is another: while the chain runs the frontend only knows the
       // latter, and left alone it drew a finished phase as a separate card
@@ -13628,7 +13663,12 @@ function App() {
     // bottom of the conversation; the live card is assembled further down the
     // file, so this leaves a marker and the card is dropped in afterwards —
     // cheaper than hoisting half the render above the timeline.
-    if (stage && liveRunResume?.chainKey === chainKey && pipelineProgress) {
+    // Deliberately not waiting for `pipelineProgress`: that arrives with the
+    // first stage, and until then the card would render at the bottom and then
+    // jump into place — which is exactly the "it started a new conversation"
+    // moment this is meant to remove. `liveRunResume` is set before the run is
+    // even asked for.
+    if (stage && liveRunResume?.chainKey === chainKey) {
       return LIVE_RERUN_SLOT;
     }
     // The verdict of the version being read, not of the newest one: a reader

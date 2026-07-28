@@ -286,6 +286,27 @@ button { color: inherit; border: 0; cursor: pointer; }
 .message-avatar-column { display: flex; grid-column: 1; grid-row: 1; width: 21px; min-width: 21px; align-self: start; align-items: center; flex-direction: column; gap: 2px; margin-top: 1px; }
 .message-prompt-time { color: var(--faint); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 8px; line-height: 1; white-space: nowrap; }
 .message-content { grid-column: 2; min-width: 0; }
+/* Beside the bubble, never over it: a prompt bubble is only as wide as its
+   text, so a control pinned to the content box lands on the words. */
+.user-message .message-content {
+  display: flex; align-items: flex-start; gap: 7px;
+}
+.user-message .message-content > .message-body { min-width: 0; }
+/* Returning to a prompt is a deliberate act, not a thing to trip over: the
+   control stays invisible until the row is hovered. */
+.message-revert {
+  flex: none; margin-top: 3px;
+  padding: 2px 7px; border: 1px solid var(--border-soft); border-radius: 999px;
+  background: var(--panel); color: var(--faint);
+  font-size: 8px; letter-spacing: .04em; white-space: nowrap;
+  opacity: 0; pointer-events: none; transition: opacity .15s ease, color .15s ease;
+}
+.message:hover .message-revert, .message-revert:focus-visible {
+  opacity: 1; pointer-events: auto;
+}
+.message-revert:hover, .message-revert:focus-visible {
+  border-color: #7a6336; color: #d8bb72;
+}
 .message-meta { min-height: 21px; gap: 7px; margin-bottom: 3px; color: var(--muted); font-size: 10px; }
 .avatar { display: grid; width: 21px; height: 21px; place-items: center; border-radius: 6px; font-size: 10px; font-weight: 750; }
 .user-avatar { background: #315b48; color: #c1f4db; }

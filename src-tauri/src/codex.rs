@@ -2127,6 +2127,59 @@ fn restore_snapshot_base_preserving_manifest(
     Ok(true)
 }
 
+/// Puts the workspace back to what a snapshot was taken *before*, whatever it
+/// looks like now.
+///
+/// The staging path above refuses when the tree no longer matches the
+/// snapshot's post-hash, and rightly so: it is guarding one turn's own change.
+/// Returning to an earlier prompt is the opposite intent — everything after
+/// that prompt is meant to go, including turns that came later — so the check
+/// that protects a single turn would forbid exactly the case this exists for.
+/// The caller takes a snapshot of the present state first, which is what keeps
+/// the discard undoable.
+fn restore_workspace_to_snapshot_base_at(
+    snapshot_root: &Path,
+    snapshot_id: &str,
+    allowed_root: Option<&Path>,
+) -> Result<AgentRollbackResult, String> {
+    let (directory, manifest) = read_guard_manifest(snapshot_root, snapshot_id)?;
+    let root = validate_guard_root(&manifest, allowed_root)?;
+    let current_files = collect_guard_files_for_manifest(&root, &manifest)?;
+    let (restored_files, removed_files) =
+        restore_guard_file_set(&root, &directory, "files", &manifest.base_files, &current_files)?;
+    let resulting_files = collect_guard_files_for_manifest(&root, &manifest)?;
+    let resulting_hash = guard_manifest_hash(&resulting_files)?;
+    if resulting_hash != manifest.base_hash {
+        return Err(
+            "A visszaállítás után a munkaterület nem egyezik a snapshot alapállapotával."
+                .to_string(),
+        );
+    }
+    Ok(AgentRollbackResult {
+        snapshot_id: snapshot_id.to_string(),
+        root: root.to_string_lossy().to_string(),
+        restored_files,
+        removed_files,
+        base_hash: manifest.base_hash.clone(),
+        resulting_hash,
+    })
+}
+
+pub fn restore_workspace_to_snapshot_base(
+    snapshot_id: &str,
+) -> Result<AgentRollbackResult, String> {
+    let snapshot_root = agent_snapshot_root()?;
+    let allowed_root = require_projects_root()?;
+    restore_workspace_to_snapshot_base_at(&snapshot_root, snapshot_id, Some(&allowed_root))
+}
+
+/// A snapshot of the workspace as it is right now, so a revert can be undone.
+pub fn snapshot_workspace_now(root: &Path) -> Result<String, String> {
+    let snapshot = create_agent_snapshot(root)?;
+    let report = finalize_agent_snapshot(&snapshot)?;
+    Ok(report.snapshot_id)
+}
+
 fn apply_agent_snapshot_at(
     snapshot_root: &Path,
     snapshot_id: &str,

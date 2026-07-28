@@ -144,6 +144,14 @@ type AgentGuardReport = {
   rebased: boolean;
   isolationMode: "gitWorktree" | "nonGitSnapshot";
 };
+/** What returning to an earlier prompt would cost, asked before doing it. */
+type RevertPreview = {
+  removedMessages: number;
+  removedTurns: number;
+  snapshotId: string | null;
+  prompt: string;
+  filesUnavailable: boolean;
+};
 type AgentApplyResult = {
   snapshotId: string;
   root: string;
@@ -4481,12 +4489,15 @@ function MessageRow({
   isFinal,
   showAvatar = true,
   onQuoteJump,
+  onRevert,
 }: {
   message: Message;
   projectPath: string;
   isFinal?: boolean;
   showAvatar?: boolean;
   onQuoteJump?: QuoteJumpHandler;
+  /** Offered on a prompt: return the conversation and the files to here. */
+  onRevert?: (message: Message) => void;
 }) {
   const visibleText =
     message.role === "user"
@@ -4558,6 +4569,19 @@ function MessageRow({
             </div>
           )}
         </div>
+        {message.role === "user" && onRevert && (
+          // On the prompt rather than on the answer: what you return to is a
+          // question you asked, and the state the project was in when you
+          // asked it. Beside the bubble, so it never covers the words.
+          <button
+            type="button"
+            className="message-revert"
+            title="A beszélgetés és a fájlok visszaállítása erre a pontra"
+            onClick={() => onRevert(message)}
+          >
+            ⤺ Visszaállítás ide
+          </button>
+        )}
       </div>
     </article>
   );
@@ -7610,6 +7634,102 @@ function App() {
     } finally {
       setAgentRollbackBusy(false);
     }
+  };
+
+  /**
+   * Returns the conversation and the workspace to an earlier prompt.
+   *
+   * The dialog states what will be lost in counts rather than in adjectives:
+   * this deletes history on both machines, and a vague warning is not consent.
+   */
+  const revertToMessage = async (message: Message) => {
+    if (!isTauri || !activeConversationId || !message.id) return;
+    if (isStreamingRef.current) {
+      notify("Előbb állítsd le a futó kérést.");
+      return;
+    }
+    let preview: RevertPreview;
+    try {
+      preview = await invoke<RevertPreview>("conversation_revert_preview", {
+        conversationId: activeConversationId,
+        messageId: message.id,
+      });
+    } catch (error) {
+      notify(`A visszaállítás nem készíthető elő: ${String(error)}`, "notify");
+      return;
+    }
+    if (preview.removedMessages === 0) {
+      notify("Ez az utolsó kérdés; nincs mit visszaállítani.");
+      return;
+    }
+    const files = preview.filesUnavailable
+      ? "A fájlok nem állíthatók vissza: ez a szakasz még a snapshotok rögzítése előtt futott."
+      : preview.snapshotId
+        ? "A projekt fájljai visszaállnak arra az állapotra, amilyenek a kérdés elküldésekor voltak."
+        : "Ehhez a ponthoz nem tartozik fájlváltozás.";
+    setAppDialog({
+      kind: "confirm",
+      title: "Visszaállítás erre a kérdésre",
+      message: [
+        `${preview.removedMessages} üzenet és ${preview.removedTurns} futás törlődik.`,
+        files,
+        "A törlés a másik gépedre is átterjed. A visszaállítás előtti állapotról mentés készül, tehát a művelet visszavonható.",
+      ].join("\n\n"),
+      confirmLabel: "Visszaállítás",
+      danger: true,
+      onConfirm: () => {
+        void (async () => {
+          try {
+            const result = await invoke<{
+              removedMessages: number;
+              restoredFiles: number;
+              undoSnapshotId: string | null;
+              sessionId: string | null;
+            }>("conversation_revert_to", {
+              conversationId: activeConversationId,
+              messageId: message.id,
+              cwd: activeMode === "general" ? null : activeProjectData.path,
+            });
+            // The prompt itself survives, so put it in the composer: the point
+            // of going back is usually to ask it differently.
+            inputDraftRef.current = preview.prompt;
+            if (inputRef.current) {
+              inputRef.current.value = preview.prompt;
+              resizeComposerTextarea(inputRef.current);
+            }
+            setUndoableSnapshot(
+              result.undoSnapshotId
+                ? { snapshotId: result.undoSnapshotId }
+                : null,
+            );
+            setClaudeSessionIds((current) => ({
+              ...current,
+              [threadKey]: result.sessionId ?? "",
+            }));
+            // Truncated in place rather than re-hydrated: the store is already
+            // the truth, and a full reload would rebuild every conversation to
+            // shorten one.
+            const cutoff = message.sequence ?? 0;
+            commitMessages((current) =>
+              current.filter((row) => (row.sequence ?? 0) <= cutoff),
+            );
+            setCodeActivity((current) =>
+              current.filter((item) => item.id <= cutoff),
+            );
+            setCommentaryEntries((current) =>
+              current.filter((entry) => (entry.sequence ?? 0) <= cutoff),
+            );
+            markLocalMutation();
+            notify(
+              `Visszaállítva: ${result.removedMessages} üzenet törölve, ${result.restoredFiles} fájl visszaállítva.`,
+              "notify",
+            );
+          } catch (error) {
+            notify(`A visszaállítás nem sikerült: ${String(error)}`, "notify");
+          }
+        })();
+      },
+    });
   };
 
   const openImagePreview = (path: string) => {
@@ -12440,18 +12560,28 @@ function App() {
               maxTurns: Number(claudeMaxTurns),
             },
           })
-        : await invoke<CodexResponse>("codex_send", {
+        : // Through the same door as every other turn. `codex_send` is the
+          // older, parallel entrance: it runs the turn but records no turn row,
+          // so a Codex answer left no trace of which workspace snapshot it ran
+          // against — and returning to an earlier prompt needs exactly that.
+          // The chain's reviewer has always come this way.
+          await invoke<CodexResponse>("agent_send", {
             request: {
               prompt: codexPrompt,
+              images: storedImages,
+              provider: "codex",
+              runtime: "codexAppServer",
+              conversationId: requestConversationId,
               // Regeneration creates a fresh branch from the context preceding the
               // source prompt; the old native thread already contains the answer
-              // that is being replaced.
-              threadId: regeneration ? null : (threadIds[requestThreadKey] ?? null),
+              // that is being replaced. `sessionId` is the Codex thread here.
+              sessionId: regeneration
+                ? null
+                : (threadIds[requestThreadKey] ?? null),
               conversationContext: rehydrationContext || null,
               model: selectedClaudeModel ? DEFAULT_MODEL : selectedModel,
               effort: effectiveEffort,
               cwd: isGeneralMode ? null : activeProjectData.path,
-              images: storedImages,
               requestId,
             },
           });
@@ -13343,6 +13473,15 @@ function App() {
           isFinal={isFinal}
           showAvatar={showAvatar}
           onQuoteJump={jumpToQuote}
+          // Offered on prompts that have something after them; the newest one
+          // has nothing to return from.
+          onRevert={
+            isTauri &&
+            entry.message.role === "user" &&
+            entry.messageIndex < messages.length - 1
+              ? revertToMessage
+              : undefined
+          }
         />
       );
     }

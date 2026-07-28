@@ -609,6 +609,76 @@ async fn codex_rebase_snapshot(snapshot_id: String) -> Result<codex::AgentRebase
         .map_err(|error| format!("A Codex 3-way merge háttérfeladata leállt: {error}"))?
 }
 
+/// What returning to an earlier prompt would cost, before it is done.
+#[tauri::command(rename_all = "camelCase")]
+async fn conversation_revert_preview(
+    conversation_id: String,
+    message_id: String,
+) -> Result<store::RevertPreview, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        store::preview_conversation_revert(&conversation_id, &message_id)
+    })
+    .await
+    .map_err(|error| format!("A visszaállítás előnézetének háttérfeladata leállt: {error}"))?
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevertResult {
+    pub removed_messages: i64,
+    pub restored_files: usize,
+    pub removed_files: usize,
+    /// The snapshot of the state this revert replaced, so it can be undone.
+    pub undo_snapshot_id: Option<String>,
+    pub session_id: Option<String>,
+}
+
+/// Returns the conversation and the workspace to an earlier prompt.
+///
+/// Files first, history second, and a snapshot of the present state before
+/// either: if the restore fails the conversation is untouched, and if it
+/// succeeds the discarded state is still on disk. A half-done revert — files
+/// back but the history still describing them, or the reverse — would be worse
+/// than not offering the button at all.
+#[tauri::command(rename_all = "camelCase")]
+async fn conversation_revert_to(
+    conversation_id: String,
+    message_id: String,
+    cwd: Option<String>,
+) -> Result<RevertResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let preview = store::preview_conversation_revert(&conversation_id, &message_id)?;
+        let mut restored_files = 0;
+        let mut removed_files = 0;
+        let mut undo_snapshot_id = None;
+        if let Some(snapshot_id) = preview.snapshot_id.as_deref() {
+            let root = cwd
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    "A fájlok visszaállításához a projekt útvonala kell.".to_string()
+                })?;
+            let root = codex::requested_agent_cwd(Some(root))?;
+            undo_snapshot_id = Some(codex::snapshot_workspace_now(&root)?);
+            let restored = codex::restore_workspace_to_snapshot_base(snapshot_id)?;
+            restored_files = restored.restored_files;
+            removed_files = restored.removed_files;
+        }
+        let (removed_messages, session_id) =
+            store::truncate_conversation_after(&conversation_id, &message_id)?;
+        Ok::<_, String>(RevertResult {
+            removed_messages,
+            restored_files,
+            removed_files,
+            undo_snapshot_id,
+            session_id,
+        })
+    })
+    .await
+    .map_err(|error| format!("A visszaállítás háttérfeladata leállt: {error}"))?
+}
+
 #[tauri::command(rename_all = "camelCase")]
 async fn agent_rollback_snapshot(
     snapshot_id: String,
@@ -986,6 +1056,8 @@ pub fn run() {
             codex_preview_snapshot,
             codex_rebase_snapshot,
             agent_rollback_snapshot,
+            conversation_revert_preview,
+            conversation_revert_to,
             agent_apply_snapshot,
             agent_discard_snapshot,
             agent_preview_snapshot,

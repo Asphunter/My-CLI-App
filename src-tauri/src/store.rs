@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
-pub const STORE_SCHEMA_VERSION: i64 = 22;
+pub const STORE_SCHEMA_VERSION: i64 = 23;
 // The public snapshot and sync contracts represent GENERAL with
 // projectId = null. SQLite keeps this hidden FK target only because the
 // existing conversations.project_id column is intentionally NOT NULL and
@@ -104,6 +104,9 @@ CREATE TABLE IF NOT EXISTS turns (
     max_budget_usd REAL,
     total_cost_usd REAL,
     terminal_event_id TEXT,
+    -- The workspace snapshot taken before this turn ran. Returning to an
+    -- earlier prompt restores from here.
+    snapshot_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -1666,6 +1669,43 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
             format!("A lokális SQLite v22 migráció commitja sikertelen: {error}")
         })?;
     }
+    let migrated_version = read_schema_version(connection)?;
+    if migrated_version == 22 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("A lokális SQLite v23 migráció nem indítható el: {error}"))?;
+        // Every turn already leaves a full pre-turn copy of the workspace on
+        // disk; nothing recorded which copy belonged to which turn, so the
+        // link lived only in the frontend's memory and only for the newest
+        // one. Written down, it is what lets any earlier prompt be returned
+        // to. Not backfilled: turns that ran before this column cannot be
+        // given a snapshot after the fact, and the UI says so rather than
+        // pretending.
+        let has_snapshot_column: bool = {
+            let mut statement = transaction
+                .prepare("PRAGMA table_info(turns)")
+                .map_err(|error| format!("A v23 turns schema nem olvasható: {error}"))?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|error| format!("A v23 turns oszloplista nem olvasható: {error}"))?
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(|error| format!("A v23 turns schema hibás: {error}"))?;
+            columns.contains("snapshot_id")
+        };
+        if !has_snapshot_column {
+            transaction
+                .execute_batch("ALTER TABLE turns ADD COLUMN snapshot_id TEXT;")
+                .map_err(|error| {
+                    format!("A v23 turns.snapshot_id oszlop nem hozható létre: {error}")
+                })?;
+        }
+        transaction
+            .execute_batch("PRAGMA user_version = 23;")
+            .map_err(|error| format!("A v23 schema-verzió nem menthető: {error}"))?;
+        transaction.commit().map_err(|error| {
+            format!("A lokális SQLite v23 migráció commitja sikertelen: {error}")
+        })?;
+    }
     // Cheap invariant check rather than a one-shot migration: the fossils can
     // also arrive later from another device that has not been updated yet.
     repair_answers_before_their_question(connection)?;
@@ -2177,6 +2217,7 @@ pub(crate) fn record_agent_turn_terminal(
                  provider_turn_id = COALESCE(?3, provider_turn_id),
                  total_cost_usd = COALESCE(?4, total_cost_usd),
                  terminal_event_id = COALESCE(?5, terminal_event_id),
+                 snapshot_id = COALESCE(?10, snapshot_id),
                  updated_at = ?6
              WHERE id = ?7 AND conversation_id = ?8 AND request_id = ?9",
             params![
@@ -2189,6 +2230,11 @@ pub(crate) fn record_agent_turn_terminal(
                 turn_id,
                 conversation_id,
                 request_id,
+                // The pre-turn workspace copy this turn ran against. Empty for
+                // a turn with no project (the general mode), which simply has
+                // no files to return to.
+                Some(response.guard.snapshot_id.as_str())
+                    .filter(|value| !value.trim().is_empty()),
             ],
         )
         .map_err(|error| format!("Az agent turn lezÃ¡rÃ¡si metadata nem menthetÅ‘: {error}"))?;
@@ -3469,6 +3515,201 @@ pub(crate) fn repair_answers_before_their_question(
     Ok(fossils.len())
 }
 
+/// What returning to an earlier prompt would do, worked out before doing it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevertPreview {
+    /// Messages that would be removed, the target prompt itself excluded.
+    pub removed_messages: i64,
+    pub removed_turns: i64,
+    /// The snapshot the files would come back from, if there is one.
+    pub snapshot_id: Option<String>,
+    /// The prompt's own text, so the caller can offer it for editing.
+    pub prompt: String,
+    /// Set when the conversation predates snapshot recording: the history can
+    /// still be truncated, the files cannot be returned.
+    pub files_unavailable: bool,
+}
+
+/// The turn a revert would restore from, and everything it would delete.
+///
+/// The snapshot wanted is the one taken *before* the first turn that followed
+/// the target prompt: its base is the whole workspace as it stood when the
+/// prompt was written. One restore, not a walk backwards turn by turn.
+pub(crate) fn preview_conversation_revert(
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<RevertPreview, String> {
+    let store = open_local_store()?;
+    preview_conversation_revert_in(&store.connection, conversation_id, message_id)
+}
+
+fn preview_conversation_revert_in(
+    connection: &Connection,
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<RevertPreview, String> {
+    let (sequence, role, prompt) = connection
+        .query_row(
+            "SELECT sequence, role, body FROM messages WHERE id = ?1 AND conversation_id = ?2",
+            params![message_id, conversation_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .map_err(|error| format!("A visszaállítási pont nem található: {error}"))?;
+    if role != "user" {
+        return Err("Visszaállítani csak saját üzenetre lehet.".to_string());
+    }
+    let removed_messages = connection
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1 AND sequence > ?2",
+            params![conversation_id, sequence],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("A törlendő üzenetek nem számolhatók: {error}"))?;
+    let removed_turns = connection
+        .query_row(
+            "SELECT COUNT(*) FROM turns
+             WHERE conversation_id = ?1 AND CAST(created_at AS INTEGER) > ?2",
+            params![conversation_id, sequence],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("A törlendő turnök nem számolhatók: {error}"))?;
+    let snapshot_id = connection
+        .query_row(
+            "SELECT snapshot_id FROM turns
+             WHERE conversation_id = ?1 AND CAST(created_at AS INTEGER) > ?2
+               AND snapshot_id IS NOT NULL
+             ORDER BY CAST(created_at AS INTEGER) ASC LIMIT 1",
+            params![conversation_id, sequence],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|error| format!("A visszaállítási snapshot nem kereshető: {error}"))?
+        .flatten();
+    Ok(RevertPreview {
+        removed_messages,
+        removed_turns,
+        files_unavailable: snapshot_id.is_none() && removed_turns > 0,
+        snapshot_id,
+        prompt,
+    })
+}
+
+/// Truncates the conversation after the target prompt, tombstoning as it goes.
+///
+/// Tombstones rather than plain deletes: the other machine replays an
+/// append-only journal, and without them the rows it already has would simply
+/// come back on the next pull.
+pub(crate) fn truncate_conversation_after(
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<(i64, Option<String>), String> {
+    let mut store = open_local_store()?;
+    truncate_conversation_after_in(&mut store.connection, conversation_id, message_id)
+}
+
+fn truncate_conversation_after_in(
+    connection: &mut Connection,
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<(i64, Option<String>), String> {
+    let sequence = connection
+        .query_row(
+            "SELECT sequence FROM messages WHERE id = ?1 AND conversation_id = ?2 AND role = 'user'",
+            params![message_id, conversation_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("A visszaállítási pont nem található: {error}"))?;
+    let now = now_millis();
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("A visszaállítás tranzakciója nem indítható: {error}"))?;
+
+    let doomed_messages: Vec<String> = {
+        let mut statement = transaction
+            .prepare("SELECT id FROM messages WHERE conversation_id = ?1 AND sequence > ?2")
+            .map_err(|error| format!("A törlendő üzenetek nem olvashatók: {error}"))?;
+        let rows = statement
+            .query_map(params![conversation_id, sequence], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| format!("A törlendő üzenetek nem olvashatók: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("A törlendő üzenetek nem olvashatók: {error}"))?;
+        rows
+    };
+    for id in &doomed_messages {
+        transaction
+            .execute(
+                "INSERT INTO sync_tombstones
+                     (entity_type, entity_id, archived_at, project_id, title, relative_path, path_hint, reason)
+                 VALUES ('message', ?1, ?2, NULL, NULL, NULL, NULL, 'conversation-revert')
+                 ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+                     archived_at = excluded.archived_at,
+                     reason = excluded.reason",
+                params![id, now],
+            )
+            .map_err(|error| format!("A visszaállítás tombstone-ja nem menthető: {error}"))?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM messages WHERE conversation_id = ?1 AND sequence > ?2",
+            params![conversation_id, sequence],
+        )
+        .map_err(|error| format!("A visszaállítás üzenettörlése sikertelen: {error}"))?;
+    // The trace and the runs belong to the turns that are going; a work item
+    // whose turn no longer exists would render as an orphaned card.
+    transaction
+        .execute(
+            "DELETE FROM work_items WHERE conversation_id = ?1 AND sequence > ?2",
+            params![conversation_id, sequence],
+        )
+        .map_err(|error| format!("A visszaállítás work item törlése sikertelen: {error}"))?;
+    transaction
+        .execute(
+            "DELETE FROM turns WHERE conversation_id = ?1 AND CAST(created_at AS INTEGER) > ?2",
+            params![conversation_id, sequence],
+        )
+        .map_err(|error| format!("A visszaállítás turn-törlése sikertelen: {error}"))?;
+    transaction
+        .execute(
+            "DELETE FROM pipeline_runs WHERE conversation_id = ?1 AND CAST(created_at AS INTEGER) > ?2",
+            params![conversation_id, sequence],
+        )
+        .map_err(|error| format!("A visszaállítás run-törlése sikertelen: {error}"))?;
+
+    // The session to carry on from is the one the surviving history ended in;
+    // resuming the session of a turn that no longer exists would hand the
+    // model a memory the conversation no longer has.
+    let session: Option<String> = transaction
+        .query_row(
+            "SELECT provider_session_id FROM turns
+             WHERE conversation_id = ?1 AND provider_session_id IS NOT NULL
+             ORDER BY created_at DESC LIMIT 1",
+            params![conversation_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|error| format!("A visszaállítás sessionje nem kereshető: {error}"))?
+        .flatten();
+    transaction
+        .execute(
+            "UPDATE conversations SET active_agent_session_id = ?1, updated_at = ?2 WHERE id = ?3",
+            params![session, now, conversation_id],
+        )
+        .map_err(|error| format!("A visszaállítás session-frissítése sikertelen: {error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("A visszaállítás commitja sikertelen: {error}"))?;
+    Ok((doomed_messages.len() as i64, session))
+}
+
 pub(crate) fn begin_pipeline_run(
     conversation_id: &str,
     recipe: &crate::pipeline::Recipe,
@@ -4480,6 +4721,12 @@ pub(crate) fn save_snapshot_in_connection(
             .map_err(|error| format!("A régi tombstone-azonosító hibás: {error}"))?;
         rows.into_iter()
             .filter(|key| !incoming_tombstones.contains(key))
+            // A conversation tombstone is the client's to lift — that is how
+            // un-archiving works. A message tombstone is not: it is written
+            // here, by a revert, and the frontend has never heard of it. Left
+            // prunable, the frontend's next save would lift it and put every
+            // deleted message back.
+            .filter(|(entity_type, _)| entity_type != "message")
             .collect::<Vec<_>>()
     };
     for (entity_type, entity_id) in stale_tombstones {
@@ -4689,8 +4936,30 @@ pub(crate) fn save_snapshot_in_connection(
         // Conversation/project tombstones remain the explicit removal path.
 
         let conversation_messages = coalesce_snapshot_messages(&conversation.messages);
+        // ...which is why a deliberate removal needs a tombstone to survive:
+        // returning to an earlier prompt deletes rows the frontend still holds
+        // in memory, and the very next save would put every one of them back.
+        // The same guard is what stops the other machine resurrecting them.
+        let buried_messages: HashSet<String> = {
+            let mut statement = transaction
+                .prepare("SELECT entity_id FROM sync_tombstones WHERE entity_type = 'message'")
+                .map_err(|error| format!("Az üzenet-tombstone-ok nem olvashatók: {error}"))?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| format!("Az üzenet-tombstone-ok nem olvashatók: {error}"))?
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(|error| format!("Az üzenet-tombstone-ok nem olvashatók: {error}"))?;
+            rows
+        };
         let mut message_ids = HashSet::new();
         for (index, raw_message) in conversation_messages.iter().enumerate() {
+            if raw_message
+                .id
+                .as_deref()
+                .is_some_and(|id| buried_messages.contains(id))
+            {
+                continue;
+            }
             let mut message = raw_message.clone();
             message.text = collapse_repeated_assistant_text(&message.role, &message.text);
             if message.role != "user" && message.role != "assistant" {
@@ -7759,5 +8028,235 @@ mod tests {
         assert!(legacy_marker.is_file());
 
         fs::remove_dir_all(directory).expect("remove test fixture");
+    }
+
+    /// Fixture ids must be UUIDs: the save path regenerates anything else, and
+    /// a tombstone keyed to the old id would then guard nothing.
+    fn fixture_message_id(index: usize) -> String {
+        format!("00000000-0000-4000-8000-00000000000{index}")
+    }
+
+    /// A conversation to revert inside: one prompt, one answer, one turn each.
+    fn revert_fixture() -> Connection {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+        connection
+            .execute(
+                "INSERT INTO projects (id, name, canonical_path, created_at, updated_at)
+                 VALUES ('project', 'Project', 'C:\\Project', '1', '1')",
+                [],
+            )
+            .expect("insert project");
+        connection
+            .execute(
+                "INSERT INTO conversations (id, project_id, title, created_at, updated_at)
+                 VALUES ('conversation', 'project', 'Work', '1', '1')",
+                [],
+            )
+            .expect("insert conversation");
+        for (index, (role, body)) in [
+            ("user", "Elso kerdes"),
+            ("assistant", "Elso valasz"),
+            ("user", "Masodik kerdes"),
+            ("assistant", "Masodik valasz"),
+            ("user", "Harmadik kerdes"),
+            ("assistant", "Harmadik valasz"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            connection
+                .execute(
+                    "INSERT INTO messages (id, conversation_id, role, body, sequence, created_at)
+                     VALUES (?1, 'conversation', ?2, ?3, ?4, '1')",
+                    params![fixture_message_id(index), role, body, index as i64 + 1],
+                )
+                .expect("insert message");
+        }
+        // One turn per answer, each with the snapshot taken before it ran.
+        for (index, sequence) in [2_i64, 4, 6].iter().enumerate() {
+            connection
+                .execute(
+                    "INSERT INTO turns (
+                         id, conversation_id, request_id, status, provider_session_id,
+                         snapshot_id, created_at, updated_at
+                     ) VALUES (?1, 'conversation', ?2, 'completed', ?3, ?4, ?5, ?5)",
+                    params![
+                        format!("turn-{index}"),
+                        format!("request-{index}"),
+                        format!("session-{index}"),
+                        format!("snapshot-{index}"),
+                        sequence.to_string()
+                    ],
+                )
+                .expect("insert turn");
+            connection
+                .execute(
+                    "INSERT INTO work_items (
+                         id, conversation_id, turn_id, kind, status, label, detail, event_type,
+                         sequence, created_at
+                     ) VALUES (?1, 'conversation', ?2, 'file', 'done', 'Fajl', 'a.js', 'file/read', ?3, '1')",
+                    params![format!("work-{index}"), format!("turn-{index}"), sequence],
+                )
+                .expect("insert work item");
+        }
+        connection
+    }
+
+    #[test]
+    fn a_revert_names_the_snapshot_taken_before_the_first_discarded_turn() {
+        let connection = revert_fixture();
+        let preview = preview_conversation_revert_in(&connection, "conversation", &fixture_message_id(2))
+            .expect("preview");
+
+        // Reverting to the second prompt discards the answer to it and the
+        // whole third exchange: three messages, two turns.
+        assert_eq!(preview.removed_messages, 3);
+        assert_eq!(preview.removed_turns, 2);
+        // The files come back from the copy taken before the *first* discarded
+        // turn — that is the workspace as it stood when the prompt was written.
+        assert_eq!(preview.snapshot_id.as_deref(), Some("snapshot-1"));
+        assert_eq!(preview.prompt, "Masodik kerdes");
+        assert!(!preview.files_unavailable);
+    }
+
+    #[test]
+    fn a_revert_refuses_an_answer_as_its_target() {
+        let connection = revert_fixture();
+        let error = preview_conversation_revert_in(&connection, "conversation", &fixture_message_id(1))
+            .expect_err("an answer is not a place to return to");
+        assert!(error.contains("saját üzenetre"), "{error}");
+    }
+
+    #[test]
+    fn a_conversation_without_snapshots_can_still_be_truncated() {
+        let connection = revert_fixture();
+        connection
+            .execute("UPDATE turns SET snapshot_id = NULL", [])
+            .expect("clear snapshots");
+        let preview = preview_conversation_revert_in(&connection, "conversation", &fixture_message_id(2))
+            .expect("preview");
+        assert!(preview.snapshot_id.is_none());
+        assert!(
+            preview.files_unavailable,
+            "a turn that ran before snapshots were recorded cannot give its files back, and the UI has to say so"
+        );
+    }
+
+    #[test]
+    fn truncating_tombstones_what_it_deletes_and_rewinds_the_session() {
+        let mut connection = revert_fixture();
+        let (removed, session) =
+            truncate_conversation_after_in(&mut connection, "conversation", &fixture_message_id(2))
+                .expect("truncate");
+        assert_eq!(removed, 3);
+
+        let surviving: i64 = connection
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .expect("count messages");
+        assert_eq!(surviving, 3, "the target prompt and everything before it stay");
+        let turns: i64 = connection
+            .query_row("SELECT COUNT(*) FROM turns", [], |row| row.get(0))
+            .expect("count turns");
+        assert_eq!(turns, 1);
+        let work_items: i64 = connection
+            .query_row("SELECT COUNT(*) FROM work_items", [], |row| row.get(0))
+            .expect("count work items");
+        assert_eq!(work_items, 1, "a trace whose turn is gone would render as an orphan");
+
+        // Without tombstones the other machine's journal would simply put the
+        // deleted rows back on the next pull.
+        let tombstones: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_tombstones WHERE reason = 'conversation-revert'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count tombstones");
+        assert_eq!(tombstones, 3);
+
+        // Resuming a session that belonged to a discarded turn would hand the
+        // model a memory the conversation no longer has.
+        assert_eq!(session.as_deref(), Some("session-0"));
+        let active: Option<String> = connection
+            .query_row(
+                "SELECT active_agent_session_id FROM conversations WHERE id = 'conversation'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read conversation session");
+        assert_eq!(active.as_deref(), Some("session-0"));
+    }
+
+    #[test]
+    fn a_buried_message_is_not_resurrected_by_the_next_save() {
+        let mut connection = revert_fixture();
+        let (removed, _) =
+            truncate_conversation_after_in(&mut connection, "conversation", &fixture_message_id(2))
+                .expect("truncate");
+        assert_eq!(removed, 3);
+
+        // Exactly what the frontend does moments later: it still holds the
+        // whole conversation in memory and saves it. Without the tombstone
+        // guard this call would put every deleted row straight back, and the
+        // revert would appear to have worked on the files only.
+        let mut conversations = BTreeMap::new();
+        conversations.insert(
+            "conversation".to_string(),
+            LocalConversation {
+                id: Some("conversation".to_string()),
+                scope: CODING_SCOPE.to_string(),
+                project_id: "project".to_string(),
+                title: "Work".to_string(),
+                messages: (0..6)
+                    .map(|index| LocalMessage {
+                        id: Some(fixture_message_id(index)),
+                        role: if index % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                        text: format!("uzenet {index}"),
+                        time: "most".to_string(),
+                        code: Some(false),
+                        live: Some(false),
+                        final_message: Some(true),
+                        item_id: None,
+                        turn_id: None,
+                        sequence: Some(index as i64 + 1),
+                        hlc: None,
+                        origin_device_id: None,
+                        images: Vec::new(),
+                        quote_refs: Vec::new(),
+                        detailed: None,
+                        change_summary: Vec::new(),
+                        pipeline: None,
+                    })
+                    .collect(),
+                work_items: Vec::new(),
+                thread_id: None,
+                updated_at: "1".to_string(),
+                plan_history: BTreeMap::new(),
+                commentary: Vec::new(),
+            },
+        );
+        let snapshot = LocalStoreSnapshot {
+            schema_version: STORE_SCHEMA_VERSION,
+            projects: vec![LocalProject {
+                id: "project".to_string(),
+                name: "Project".to_string(),
+                relative_path: None,
+                path_hint: "Project".to_string(),
+                threads: vec!["Work".to_string()],
+            }],
+            conversations,
+            tombstones: Vec::new(),
+        };
+        save_snapshot_in_connection(&mut connection, snapshot).expect("save");
+
+        let surviving: i64 = connection
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .expect("count messages");
+        assert_eq!(
+            surviving, 3,
+            "a save that carries the pre-revert history must not undo the revert"
+        );
     }
 }

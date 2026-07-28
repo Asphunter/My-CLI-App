@@ -66,6 +66,7 @@ import {
   describeAgentError,
   describeThrownAgentError,
 } from "./agentError";
+import { SidebarSettingsPanel } from "./components/SettingsPanel";
 import {
   AppDialogOverlay,
   ClaudeApprovalOverlay,
@@ -15345,79 +15346,19 @@ Javítsd ki, majd futtasd le újra a teszteket.`
               <span>⚙</span> Beállítások
             </button>
             {settingsOpen && (
-              <div className="settings-popover sidebar-settings-popover">
-                <button
-                  type="button"
-                  className="settings-option"
-                  aria-expanded={readingSettingsOpen}
-                  onClick={() => setReadingSettingsOpen((open) => !open)}
-                >
-                  <span>
-                    <strong>Megjelenítés</strong>
-                  </span>
-                  <span aria-hidden="true">
-                    {readingSettingsOpen ? "⌃" : "⌄"}
-                  </span>
-                </button>
-                {readingSettingsOpen && (
-                  <div className="settings-subpanel">
-                    <label className="range-row">
-                      <span>Betűméret</span>
-                      <output>{fontSize}</output>
-                      <input
-                        type="range"
-                        min="8"
-                        max="17"
-                        value={parseInt(fontSize, 10)}
-                        onChange={(event) =>
-                          setFontSize(`${event.target.value}px`)
-                        }
-                      />
-                    </label>
-                    <label className="range-row">
-                      <span>Sorköz</span>
-                      <output>{lineHeight}</output>
-                      <input
-                        type="range"
-                        min="100"
-                        max="180"
-                        value={Math.round(parseFloat(lineHeight) * 100)}
-                        onChange={(event) =>
-                          setLineHeight(
-                            (Number(event.target.value) / 100).toFixed(2),
-                          )
-                        }
-                      />
-                    </label>
-                    <button
-                      type="button"
-                      className="reset-button"
-                      onClick={() => {
-                        setFontSize("10px");
-                        setLineHeight("1.00");
-                        notify("Olvasási beállítások visszaállítva");
-                      }}
-                    >
-                      Alapértékek visszaállítása
-                    </button>
-                  </div>
-                )}
-                <button
-                  type="button"
-                  className="settings-option"
-                  disabled={!isTauri}
-                  onClick={() => {
-                    if (isTauri) {
-                      void changeProjectsRoot();
-                    }
-                  }}
-                >
-                  <span>
-                    <strong>Mappa</strong>
-                  </span>
-                  <span aria-hidden="true">›</span>
-                </button>
-              </div>
+              <SidebarSettingsPanel
+                fontSize={fontSize}
+                lineHeight={lineHeight}
+                readingSettingsOpen={readingSettingsOpen}
+                canChangeProjectsRoot={isTauri}
+                onToggleReadingSettings={() =>
+                  setReadingSettingsOpen((open) => !open)
+                }
+                onFontSizeChange={setFontSize}
+                onLineHeightChange={setLineHeight}
+                onChangeProjectsRoot={() => void changeProjectsRoot()}
+                onNotify={notify}
+              />
             )}
           </div>
         </aside>

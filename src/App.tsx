@@ -7320,6 +7320,18 @@ function App() {
   }, []);
 
   const messageKeyRef = useRef(threadKey);
+  // Which conversation the running turn belongs to.
+  //
+  // The live trace writes into one shared set of state — messages, plan, work
+  // items — that always describes "the conversation on screen". That is why
+  // switching away used to be forbidden outright: leave, and the running
+  // turn's stream would pour into whatever you opened next. Naming the owner
+  // means every write can ask whether it is still talking to it.
+  const liveRunThreadKeyRef = useRef<string | null>(null);
+  /** True while the view still shows the conversation the run belongs to. */
+  const viewingLiveRun = () =>
+    !liveRunThreadKeyRef.current ||
+    liveRunThreadKeyRef.current === messageKeyRef.current;
   const workLogKeyRef = useRef<string | null>(null);
   const projectsRef = useRef(projects);
   const activeModeRef = useRef(activeMode);
@@ -10346,6 +10358,12 @@ function App() {
       // view. Late notifications from a completed/cancelled request must not
       // leak into a conversation selected afterwards.
       if (!activeRequestIdRef.current) return;
+      // The reader has walked into another conversation. The turn carries on —
+      // it is a background process, not a screen — but its stream stops here:
+      // every write below lands in "the conversation on screen", and that is
+      // no longer the one that asked. What it produces is stored by the
+      // runtime either way, and arrives when the reader comes back.
+      if (!viewingLiveRun()) return;
       const codexEvent = normalizeCodexEvent(value);
       if (!codexEvent) return;
       // A chain stage's final events — the complete assistant message that
@@ -11649,7 +11667,8 @@ function App() {
   };
 
   const selectThread = (project: Project, thread: string) => {
-    if (blockConversationMutationDuringStream()) return;
+    // Reading elsewhere is not a mutation. The run keeps going in the conversation
+    // that owns it; its stream simply stops writing while you are not looking.
     activeModeRef.current = "coding";
     localStorage.setItem(ACTIVE_MODE_STORAGE_KEY, "coding");
     setActiveMode("coding");
@@ -11712,7 +11731,8 @@ function App() {
   };
 
   const selectGeneralConversation = (conversationId: string) => {
-    if (blockConversationMutationDuringStream()) return;
+    // Reading elsewhere is not a mutation. The run keeps going in the conversation
+    // that owns it; its stream simply stops writing while you are not looking.
     const key = generalConversationCacheKey(conversationId);
     const conversation = localConversationCacheRef.current[key];
     if (!conversation) return;
@@ -11852,6 +11872,7 @@ function App() {
         ),
       );
       settleActivePlan("error");
+      liveRunThreadKeyRef.current = null;
       isStreamingRef.current = false;
       setIsStreaming(false);
       setIsCancelling(false);
@@ -12320,6 +12341,7 @@ function App() {
     preparingRequestIdRef.current = requestId;
     activeRequestIdRef.current = requestId;
     activeLiveMessageIdRef.current = liveMessageId;
+    liveRunThreadKeyRef.current = requestThreadKey;
     setIsStreaming(true);
     setIsCancelling(false);
     setCodeStatus("dolgozik");
@@ -12512,6 +12534,12 @@ function App() {
           // The outer request has a live bubble of its own, and the first
           // stage's stream filled it. Left in place it became a second,
           // badge-less copy of the plan sitting above the run panel.
+          //
+          // Only into the conversation that asked: the runner has already
+          // stored every stage, so a reader who walked away loses nothing but
+          // the live view, while writing here would put this chain's answers
+          // into whatever conversation is on screen now.
+          if (messageKeyRef.current === requestThreadKey)
           setMessages((current) => {
             // Every stage streamed into a live bubble of its own, and the
             // runner hands back the stored, badged copy of each. Dropping only
@@ -12568,6 +12596,7 @@ function App() {
           // a chain. Without this the composer stayed "busy" for good: the
           // send button looked ready and silently dropped every next message
           // until the app was restarted.
+          liveRunThreadKeyRef.current = null;
           isStreamingRef.current = false;
           setIsStreaming(false);
           setIsCancelling(false);
@@ -12673,6 +12702,12 @@ function App() {
           }));
         }
       }
+      // Committed only into the conversation that asked. If the reader has
+      // moved on, the answer is already in the store — the runtime wrote it —
+      // and writing it into whatever is on screen now would put one
+      // conversation's answer inside another.
+      const answerBelongsToView = messageKeyRef.current === requestThreadKey;
+      if (answerBelongsToView)
       commitMessages((current) => {
         const targetIndex = current.findIndex(
           (message) => message.id === liveMessageId,
@@ -12847,6 +12882,7 @@ function App() {
     } finally {
       setAgentStatusRevision((current) => current + 1);
       if (activeRequestIdRef.current === requestId) {
+        liveRunThreadKeyRef.current = null;
         isStreamingRef.current = false;
         setIsStreaming(false);
         setIsCancelling(false);
@@ -12992,6 +13028,7 @@ function App() {
       (_, index) => `${requestId}-stage-${index}`,
     );
     isStreamingRef.current = true;
+    liveRunThreadKeyRef.current = threadKey;
     setIsStreaming(true);
     setLiveStageChoice(null);
     setLiveRunResume({ chainKey, startStage, iteration, carried });
@@ -13077,6 +13114,7 @@ function App() {
           verdictSummary: stageResult.review?.summary,
         },
       }));
+      if (messageKeyRef.current === threadKey)
       setMessages((current) => {
         // The same swap as the first run: the re-run's stages streamed into
         // live bubbles, and these are the stored copies of them.
@@ -13119,6 +13157,7 @@ function App() {
     } finally {
       setPipelineProgress(null);
       setLiveRunResume(null);
+      liveRunThreadKeyRef.current = null;
       isStreamingRef.current = false;
       setIsStreaming(false);
       setIsCancelling(false);
@@ -13225,7 +13264,8 @@ function App() {
   };
 
   const selectProject = (project: Project) => {
-    if (blockConversationMutationDuringStream()) return;
+    // Reading elsewhere is not a mutation. The run keeps going in the conversation
+    // that owns it; its stream simply stops writing while you are not looking.
     activeModeRef.current = "coding";
     localStorage.setItem(ACTIVE_MODE_STORAGE_KEY, "coding");
     setActiveMode("coding");

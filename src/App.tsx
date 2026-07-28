@@ -7478,6 +7478,9 @@ function App() {
       commitMessages(next);
       return;
     }
+    // Off screen this is a best-effort patch of a cache that may already be
+    // behind. It is not what makes the answer survive — the turn is on disk,
+    // and opening the conversation reads it back from there.
     const existing = localConversationCacheRef.current[key];
     if (!existing) return;
     const updated = {
@@ -7490,6 +7493,49 @@ function App() {
       [key]: updated,
     };
     setLocalConversationCache(localConversationCacheRef.current);
+  };
+
+  /**
+   * Rebuilds one conversation from the store, the way a restart does.
+   *
+   * What the view holds is a cache, and a run that finished while the reader
+   * was elsewhere — or a sync pull that landed mid-turn — can leave it behind
+   * the truth on disk. Merging the stored conversation back in is what makes
+   * the question and its answer both survive a walk to another project.
+   */
+  const refreshThreadFromStore = async (
+    key: string,
+    projectId: string | null | undefined,
+    title: string,
+  ) => {
+    if (!isTauri || !projectId) return;
+    const snapshot = await invoke<LocalStoreSnapshot>("local_store_load").catch(
+      () => null,
+    );
+    if (!snapshot) return;
+    const stored = normalizeLocalStoreSnapshot(snapshot).conversations[
+      syncConversationKey(projectId, title)
+    ];
+    if (!stored) return;
+    const existing = localConversationCacheRef.current[key];
+    const merged: SyncConversation = {
+      ...(existing ?? stored),
+      ...stored,
+      messages: mergeMessages(stored.messages ?? [], existing?.messages ?? []),
+      workItems: mergeWorkItems(
+        stored.workItems ?? [],
+        existing?.workItems ?? [],
+      ),
+    };
+    localConversationCacheRef.current = {
+      ...localConversationCacheRef.current,
+      [key]: merged,
+    };
+    setLocalConversationCache(localConversationCacheRef.current);
+    if (messageKeyRef.current === key) {
+      commitMessages(merged.messages ?? []);
+      setCodeActivity(merged.workItems ?? []);
+    }
   };
   const workItemsForThread = (key: string) =>
     localConversationCacheRef.current[key]?.workItems ??
@@ -11705,14 +11751,25 @@ function App() {
     setActiveMode("coding");
     setActiveProject(project.name);
     setActiveThread(thread);
-    commitMessages(messagesForThread(`${project.path}/${thread}`));
-    setCodeActivity(workItemsForThread(`${project.path}/${thread}`));
-    setCodeStatus(
-      workItemsForThread(`${project.path}/${thread}`).length > 0
-        ? "kész"
-        : "készen",
-    );
-    setExpandedWorkLogs({});
+    // Clicking the conversation already on screen is not a switch. Loading the
+    // cache over it would drop whatever the open turn has produced since the
+    // last save — the question included, while its answer is still coming.
+    if (messageKeyRef.current !== `${project.path}/${thread}`) {
+      commitMessages(messagesForThread(`${project.path}/${thread}`));
+      setCodeActivity(workItemsForThread(`${project.path}/${thread}`));
+      setCodeStatus(
+        workItemsForThread(`${project.path}/${thread}`).length > 0
+          ? "kész"
+          : "készen",
+      );
+      setExpandedWorkLogs({});
+    }
+    // What is in memory is a cache of the conversation, and it can be behind:
+    // a run that finished off screen, or a sync pull that landed mid-turn,
+    // both leave the newest rows only on disk. Opening a conversation reads
+    // the stored copy back, which is why a restart used to be the only way to
+    // see a question again.
+    void refreshThreadFromStore(`${project.path}/${thread}`, project.id, thread);
     notify(`Megnyitva: ${thread}`);
   };
 
@@ -13304,15 +13361,20 @@ function App() {
           );
     setActiveProject(project.name);
     setActiveThread(thread);
-    commitMessages(messagesForThread(`${project.path}/${thread}`));
-    setCodeActivity(workItemsForThread(`${project.path}/${thread}`));
-    setCodeStatus(
-      workItemsForThread(`${project.path}/${thread}`).length > 0
-        ? "kész"
-        : "készen",
-    );
-    setExpandedWorkLogs({});
+    // Same as above: re-picking the conversation on screen is not a switch.
+    if (messageKeyRef.current !== `${project.path}/${thread}`) {
+      commitMessages(messagesForThread(`${project.path}/${thread}`));
+      setCodeActivity(workItemsForThread(`${project.path}/${thread}`));
+      setCodeStatus(
+        workItemsForThread(`${project.path}/${thread}`).length > 0
+          ? "kész"
+          : "készen",
+      );
+      setExpandedWorkLogs({});
+    }
     setOpenProjects((current) => ({ ...current, [project.path]: true }));
+    // Same as opening the conversation directly: read the stored copy back.
+    void refreshThreadFromStore(`${project.path}/${thread}`, project.id, thread);
   };
 
   const workGroupHasVisibleTrace = (group: WorkLogGroup) =>

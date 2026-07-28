@@ -42,3 +42,31 @@ test("timeout, cancellation and bridge crash have separate recovery labels", () 
   assert.equal(describeThrownAgentError("A Claude-kérés megszakadt").code, "cancelled");
   assert.equal(describeThrownAgentError("A Claude bridge closed its stdout").code, "bridge_crashed");
 });
+
+test("a busy workspace is its own diagnosis, not a failed connection", () => {
+  const description = describeThrownAgentError(
+    "A projekt munkaterületén még egy előző futás lezárása dolgozik. Próbáld újra.",
+    "Claude",
+  );
+
+  assert.equal(description.code, "workspace_busy");
+  assert.equal(
+    description.userMessage,
+    "A projekt munkaterületén még egy előző futás lezárása dolgozik.",
+  );
+});
+
+test("an unrecognized failure shows the native reason instead of hiding it", () => {
+  // A generikus címke ("a kérés nem sikerült") eddig elnyelte az egyetlen
+  // kapaszkodót, és a hiba a felhasználó szemszögéből ok nélkül állt elő.
+  const description = describeThrownAgentError(
+    "Az agent snapshot fájlja nem olvasható: os error 2",
+    "Claude",
+  );
+
+  assert.equal(description.code, "connection_failed");
+  assert.equal(
+    description.userMessage.includes("Az agent snapshot fájlja nem olvasható"),
+    true,
+  );
+});

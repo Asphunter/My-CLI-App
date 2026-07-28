@@ -9,6 +9,7 @@ export type AgentErrorCode =
   | "timeout"
   | "cancelled"
   | "bridge_crashed"
+  | "workspace_busy"
   | "connection_failed"
   | "unknown";
 
@@ -30,6 +31,7 @@ const knownCodes = new Set<AgentErrorCode>([
   "timeout",
   "cancelled",
   "bridge_crashed",
+  "workspace_busy",
   "connection_failed",
   "unknown",
 ]);
@@ -59,6 +61,12 @@ const codeFromErrorText = (text: string): AgentErrorCode => {
     return "turn_limit";
   if (/timeout|timed out|time.?out|idle/.test(lower)) return "timeout";
   if (/cancel|abort|megszak/.test(lower)) return "cancelled";
+  // Szűken csak a foglaltság: egy előző futás lezárása még dolgozik a
+  // projekten. A teendő is más — várni kell, nem újraindítani. Minden más
+  // guard-hiba (hiányzó fájl, hash-eltérés) marad a maga saját üzenetével,
+  // mert azokra a „várj egy kicsit" tanács hazugság lenne.
+  if (/munkaterület(?:én)?\s+még|workspace\s+is\s+busy|lezárása dolgozik/.test(lower))
+    return "workspace_busy";
   if (/bridge.*(?:closed|crash|exit)|connection.*closed|eof|epipe/.test(lower))
     return "bridge_crashed";
   if (/\b5\d{2}\b|service unavailable|internal server/.test(lower))
@@ -89,6 +97,8 @@ const labelFor = (code: AgentErrorCode, provider: string) => {
       return `A ${name}-kérés megszakadt.`;
     case "bridge_crashed":
       return `A ${name}-bridge leállt; indítsd újra a kérést.`;
+    case "workspace_busy":
+      return "A projekt munkaterületén még egy előző futás lezárása dolgozik.";
     case "connection_failed":
       return `A ${name}-kérés nem sikerült.`;
     case "unknown":
@@ -103,10 +113,15 @@ export const describeAgentError = (
 ): AgentErrorDescription => {
   const safe = safeDetail(detail);
   const normalized = normalizeCode(code) ?? codeFromErrorText(safe);
-  const userMessage = labelFor(normalized, provider);
+  const label = labelFor(normalized, provider);
+  // Ha a hibát nem ismertük fel, a címke semmit nem mond ("a kérés nem
+  // sikerült"), és az egyetlen kapaszkodó — a natív üzenet — pont elveszne.
+  // Ilyenkor az kerül a felhasználó elé is.
+  const unrecognized = normalized === "connection_failed" || normalized === "unknown";
+  const userMessage = unrecognized && safe ? `${label} ${safe}` : label;
   return {
     code: normalized,
-    detail: safe || userMessage,
+    detail: safe || label,
     userMessage,
     notification: `${provider}: ${userMessage}`,
   };

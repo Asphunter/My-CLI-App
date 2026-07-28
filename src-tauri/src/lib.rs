@@ -149,11 +149,50 @@ fn live_pipeline_runs() -> &'static std::sync::Mutex<std::collections::HashSet<S
 /// second one's "before" would contain the first one's half-finished edits.
 /// Whichever finished last would then hand back a rollback point that never
 /// existed. This is the guarantee, not the frontend's disabled button.
-fn live_project_locks() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, String>> {
+fn live_project_locks(
+) -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, ProjectLockState>> {
     static LOCKS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, String>>,
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, ProjectLockState>>,
     > = std::sync::OnceLock::new();
     LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// A foglalás felszabadulására várók ébresztője.
+fn project_lock_released() -> &'static std::sync::Condvar {
+    static RELEASED: std::sync::OnceLock<std::sync::Condvar> = std::sync::OnceLock::new();
+    RELEASED.get_or_init(std::sync::Condvar::new)
+}
+
+/// Egy projektet foglaló turn állapota.
+///
+/// A `draining` az a különbség, ami miatt a megállított kör után nem hibaüzenet
+/// jön: a megszakított turn már nem dolgozik, csak a lezárása fut (a
+/// munkaterület visszaállítása, ami nagy fán tíz másodperceket is elvisz).
+/// Arra érdemes várni. Egy *élő* turnra nem: az percekig futhat, és a csendben
+/// várakozó második kérés rosszabb, mint egy világos mondat.
+struct ProjectLockState {
+    request_id: String,
+    draining: bool,
+}
+
+/// Egy megszakított kör lezárására ennyit érdemes várni; utána a hiba
+/// megnevezi, mi tart.
+const PROJECT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A megszakított turn foglalását lezárás alattira állítja.
+///
+/// Innentől a következő kérés megvárja a felszabadulást ahelyett, hogy
+/// elutasításra kerülne. A stop után azonnal küldött prompt eddig pontosan
+/// ezen hasalt el — a felhasználó szemszögéből ok nélkül.
+fn mark_project_draining(request_id: &str) {
+    if let Ok(mut locks) = live_project_locks().lock() {
+        for state in locks.values_mut() {
+            if state.request_id == request_id {
+                state.draining = true;
+            }
+        }
+    }
+    project_lock_released().notify_all();
 }
 
 /// Claims a project for one turn. Returns the guard that frees it again.
@@ -165,17 +204,50 @@ fn claim_project(cwd: Option<&str>, request_id: &str) -> Result<Option<ProjectCl
         return Ok(None);
     };
     let root = codex::requested_agent_cwd(Some(cwd))?;
+    claim_project_root(root, request_id).map(Some)
+}
+
+/// A foglalás döntése, a már feloldott projektgyökérrel.
+///
+/// Külön a `claim_project`-től, mert az útvonal-ellenőrzés a beállított
+/// projektgyökérhez köti a hívást — a döntés maga viszont enélkül is
+/// megvizsgálható.
+fn claim_project_root(
+    root: std::path::PathBuf,
+    request_id: &str,
+) -> Result<ProjectClaim, String> {
     let mut locks = live_project_locks()
         .lock()
         .map_err(|_| "A projektzár állapota zárolva maradt.".to_string())?;
-    if locks.contains_key(&root) {
-        return Err(
-            "Ebben a projektben már fut egy kérés. Várd meg, vagy állítsd le, mielőtt újat indítasz."
-                .to_string(),
-        );
+    if let Some(state) = locks.get(&root) {
+        if !state.draining {
+            return Err(
+                "Ebben a projektben már fut egy kérés. Várd meg, vagy állítsd le, mielőtt újat indítasz."
+                    .to_string(),
+            );
+        }
+        // A megállított kör lezárása véges: megvárjuk, nem utasítjuk el.
+        let (guard, timeout) = project_lock_released()
+            .wait_timeout_while(locks, PROJECT_DRAIN_TIMEOUT, |locks| {
+                locks.contains_key(&root)
+            })
+            .map_err(|_| "A projektzár állapota zárolva maradt.".to_string())?;
+        if timeout.timed_out() {
+            return Err(
+                "A leállított kérés lezárása még tart ebben a projektben. Próbáld újra."
+                    .to_string(),
+            );
+        }
+        locks = guard;
     }
-    locks.insert(root.clone(), request_id.to_string());
-    Ok(Some(ProjectClaim { root }))
+    locks.insert(
+        root.clone(),
+        ProjectLockState {
+            request_id: request_id.to_string(),
+            draining: false,
+        },
+    );
+    Ok(ProjectClaim { root })
 }
 
 /// Frees the project when the turn ends, however it ends.
@@ -188,6 +260,7 @@ impl Drop for ProjectClaim {
         if let Ok(mut locks) = live_project_locks().lock() {
             locks.remove(&self.root);
         }
+        project_lock_released().notify_all();
     }
 }
 
@@ -266,6 +339,7 @@ fn pipeline_cancel(run_id: String) -> Result<(), String> {
 /// watch something you have already stopped.
 #[tauri::command(rename_all = "camelCase")]
 fn pipeline_cancel_request(request_id: String) -> Result<bool, String> {
+    mark_project_draining(&request_id);
     let Some(run_id) = pipeline_run_for_request(&request_id) else {
         return Ok(false);
     };
@@ -652,6 +726,7 @@ fn agent_question_response(
 
 #[tauri::command(rename_all = "camelCase")]
 fn claude_cancel(request_id: String) -> Result<(), String> {
+    mark_project_draining(&request_id);
     claude::cancel_request(&request_id)
 }
 
@@ -892,6 +967,7 @@ fn codex_respond_approval(approval_id: String, decision: String) -> Result<(), S
 
 #[tauri::command(rename_all = "camelCase")]
 fn codex_cancel(request_id: String) -> Result<(), String> {
+    mark_project_draining(&request_id);
     codex::cancel_request(&request_id)
 }
 
@@ -1290,7 +1366,13 @@ mod tests {
 
         {
             let mut locks = live_project_locks().lock().expect("lock map");
-            locks.insert(canonical.clone(), "first-request".to_string());
+            locks.insert(
+                canonical.clone(),
+                ProjectLockState {
+                    request_id: "first-request".to_string(),
+                    draining: false,
+                },
+            );
         }
         // A second turn in the same project is refused, and told why in a
         // sentence the user can act on.
@@ -1321,6 +1403,59 @@ mod tests {
         assert!(claim_project(Some("   "), "blank")
             .expect("blank project")
             .is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A megállított kör lezárását meg kell várni, nem elutasítani.
+    ///
+    /// Ez volt a stop utáni gyors prompt hibája: a megszakított turn foglalása
+    /// addig élt, amíg a lezárása (a munkaterület visszaállítása) tartott, és
+    /// a következő kérés ezalatt „ebben a projektben már fut egy kérés"
+    /// üzenettel bukott el — a felhasználó szemszögéből ok nélkül, hiszen ő
+    /// épp az imént állította le azt a kört.
+    #[test]
+    fn a_stopped_turn_is_waited_out_instead_of_refusing_the_next_one() {
+        let root = std::env::temp_dir().join(format!(
+            "min-project-drain-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("drain test project");
+        let canonical = root.canonicalize().expect("canonical drain project");
+        {
+            let mut locks = live_project_locks().lock().expect("lock map");
+            locks.insert(
+                canonical.clone(),
+                ProjectLockState {
+                    request_id: "stopped-request".to_string(),
+                    draining: false,
+                },
+            );
+        }
+
+        // Amíg él a kör, a második kérés világos mondatot kap.
+        let refused = match claim_project_root(canonical.clone(), "second-request") {
+            Ok(_) => panic!("a live turn must still refuse the next one"),
+            Err(error) => error,
+        };
+        assert!(refused.contains("már fut egy kérés"));
+
+        // A leállítás után ugyanez a kérés megvárja a felszabadulást.
+        mark_project_draining("stopped-request");
+        let releaser = {
+            let canonical = canonical.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                let claim = ProjectClaim { root: canonical };
+                drop(claim);
+            })
+        };
+        let claim = match claim_project_root(canonical.clone(), "second-request") {
+            Ok(claim) => claim,
+            Err(error) => panic!("a drained project must be claimable: {error}"),
+        };
+        releaser.join().expect("releaser thread");
+        drop(claim);
 
         std::fs::remove_dir_all(&root).ok();
     }

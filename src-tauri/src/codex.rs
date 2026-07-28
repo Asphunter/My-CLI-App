@@ -629,6 +629,18 @@ struct GuardManifest {
     apply_base_files: Option<Vec<GuardFile>>,
     #[serde(default)]
     rebased: bool,
+    /// A `post-files` mappában ténylegesen ott lévő útvonalak.
+    ///
+    /// A turn végén az egész munkaterületet lemásolni — a változatlan fájlokkal
+    /// együtt — egy OneDrive-os projekten tíz másodperceket vitt el. Csak a
+    /// megváltozott fájlok kerülnek le; a többi tartalma bitre azonos a
+    /// base-szel, tehát onnan olvasható.
+    ///
+    /// `None` a régi snapshotokat jelenti, ahol minden fájl lement: ott a
+    /// `post-files` marad az egyetlen forrás. A mező tehát nem kapcsoló, hanem
+    /// annak a leírása, mi van a lemezen.
+    #[serde(default)]
+    post_changed_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -646,6 +658,120 @@ struct AgentSnapshot {
 /// snapshot private prevents adapters from bypassing the manifest checks.
 pub struct AgentWorkspaceSnapshot {
     inner: AgentSnapshot,
+}
+
+/// Egy munkaterületen egyszerre egy guard-művelet dolgozhat.
+///
+/// A megszakított futás a lezárásakor *visszaállítja* a munkaterületet a
+/// base-re, ami fájlokat ír és töröl. Ha közben egy új futás base-snapshotja
+/// épp beolvassa ugyanazokat a fájlokat, az olvasás egy eltűnt fájlon hasal el
+/// — és az új kérés úgy bukik meg, hogy a felhasználó csak annyit lát: „a
+/// kérés nem sikerült". Pont ezért volt jó a stop utáni prompt, ha várt vele
+/// húsz másodpercet: addigra a régi futás lezárása befejeződött.
+///
+/// A zár a *műveletre* szól, nem a snapshot élettartamára. Ez fontos: a lánc
+/// egy külső snapshotot tart az egész futásra, és közben a szakaszok a saját
+/// snapshotjaikat készítik — ha a zár a snapshot életére szólna, a lánc
+/// magamagát zárná ki.
+static WORKSPACE_GUARD_LOCKS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static WORKSPACE_GUARD_RELEASED: OnceLock<Condvar> = OnceLock::new();
+
+thread_local! {
+    /// Beágyazott foglalás ugyanazon a szálon (a staging belül visszaállít)
+    /// nem várakozhat magára.
+    static HELD_WORKSPACE_GUARD_LOCKS: std::cell::RefCell<HashMap<String, usize>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+const WORKSPACE_GUARD_LOCK_TIMEOUT: Duration = Duration::from_secs(180);
+
+fn workspace_guard_locks() -> &'static Mutex<HashSet<String>> {
+    WORKSPACE_GUARD_LOCKS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn workspace_guard_released() -> &'static Condvar {
+    WORKSPACE_GUARD_RELEASED.get_or_init(Condvar::new)
+}
+
+fn workspace_guard_key(root: &Path) -> String {
+    root.to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_lowercase()
+}
+
+struct WorkspaceGuardLock {
+    key: String,
+    reentrant: bool,
+}
+
+impl Drop for WorkspaceGuardLock {
+    fn drop(&mut self) {
+        HELD_WORKSPACE_GUARD_LOCKS.with(|held| {
+            let mut held = held.borrow_mut();
+            if let Some(depth) = held.get_mut(&self.key) {
+                *depth = depth.saturating_sub(1);
+                if *depth == 0 {
+                    held.remove(&self.key);
+                }
+            }
+        });
+        if self.reentrant {
+            return;
+        }
+        if let Ok(mut locks) = workspace_guard_locks().lock() {
+            locks.remove(&self.key);
+        }
+        workspace_guard_released().notify_all();
+    }
+}
+
+/// Megvárja, amíg a munkaterület felszabadul. A várakozás a helyes viselkedés:
+/// a másik művelet véges, és utána az új futás a rendezett állapotot látja.
+fn lock_workspace_guard(root: &Path) -> Result<WorkspaceGuardLock, String> {
+    let key = workspace_guard_key(root);
+    let already_held = HELD_WORKSPACE_GUARD_LOCKS.with(|held| {
+        let mut held = held.borrow_mut();
+        let depth = held.entry(key.clone()).or_insert(0);
+        let already = *depth > 0;
+        *depth += 1;
+        already
+    });
+    if already_held {
+        return Ok(WorkspaceGuardLock {
+            key,
+            reentrant: true,
+        });
+    }
+    let locks = workspace_guard_locks()
+        .lock()
+        .map_err(|_| "A munkaterület zárolása inkonzisztens állapotba került.".to_string())?;
+    let (mut locks, timeout) = workspace_guard_released()
+        .wait_timeout_while(locks, WORKSPACE_GUARD_LOCK_TIMEOUT, |locks| {
+            locks.contains(&key)
+        })
+        .map_err(|_| "A munkaterület zárolása inkonzisztens állapotba került.".to_string())?;
+    if timeout.timed_out() {
+        HELD_WORKSPACE_GUARD_LOCKS.with(|held| {
+            let mut held = held.borrow_mut();
+            if let Some(depth) = held.get_mut(&key) {
+                *depth = depth.saturating_sub(1);
+                if *depth == 0 {
+                    held.remove(&key);
+                }
+            }
+        });
+        return Err(
+            "A projekt munkaterületén még egy előző futás lezárása dolgozik. Próbáld újra."
+                .to_string(),
+        );
+    }
+    locks.insert(key.clone());
+    Ok(WorkspaceGuardLock {
+        key,
+        reentrant: false,
+    })
 }
 
 pub fn begin_agent_workspace_snapshot(root: &Path) -> Result<AgentWorkspaceSnapshot, String> {
@@ -1151,10 +1277,74 @@ fn guard_relative_path(path: &str) -> Result<PathBuf, String> {
     Ok(relative)
 }
 
+/// Egy fájlonkénti munka szétosztása szálakra, a sorrend megtartásával.
+///
+/// A guard költsége nem a CPU, hanem a várakozás: OneDrive-on minden fájl
+/// megnyitása külön kör. Egy szálon ez összeadódik, párhuzamosan viszont
+/// átfedi egymást. A hash és a másolás ettől nem lesz más — csak hamarabb kész.
+///
+/// A hibát az *első* elem adja, amelyik elhasalt (nem az, amelyik szál előbb
+/// ért oda), hogy ugyanarra a munkaterületre mindig ugyanaz az üzenet jöjjön.
+fn run_guard_file_jobs<Item, Output>(
+    items: &[Item],
+    job: impl Fn(&Item) -> Result<Output, String> + Sync,
+) -> Result<Vec<Output>, String>
+where
+    Item: Sync,
+    Output: Send,
+{
+    // Kevés fájlnál a szálindítás többe kerül, mint amennyit nyer.
+    if items.len() < 32 {
+        return items.iter().map(&job).collect();
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(4)
+        .saturating_mul(2)
+        .clamp(4, 16)
+        .min(items.len());
+    let chunk_size = items.len().div_ceil(workers);
+    let chunks = items.chunks(chunk_size).collect::<Vec<_>>();
+    let job = &job;
+    let results = std::thread::scope(|scope| {
+        let handles = chunks
+            .into_iter()
+            .map(|chunk| {
+                scope.spawn(move || chunk.iter().map(job).collect::<Vec<_>>())
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join())
+            .collect::<Vec<_>>()
+    });
+    let mut outputs = Vec::with_capacity(items.len());
+    for chunk in results {
+        let chunk = chunk.map_err(|_| {
+            "Az agent snapshot fájlfeldolgozó szála összeomlott.".to_string()
+        })?;
+        for value in chunk {
+            outputs.push(value?);
+        }
+    }
+    Ok(outputs)
+}
+
+/// Egy bejárás közben megtalált fájl, még olvasás előtt.
+///
+/// A bejárás marad egy szálon: a limitek (fájlszám, összméret) és a
+/// symlink-tiltás sorrendfüggők, és ugyanazt az üzenetet kell adniuk, mint
+/// eddig. Az olvasás és a hashelés az, ami utána párhuzamosítható.
+struct GuardCandidate {
+    path: PathBuf,
+    relative_path: String,
+    bytes: u64,
+}
+
 fn collect_guard_files_inner(
     root: &Path,
     current: &Path,
-    files: &mut Vec<GuardFile>,
+    files: &mut Vec<GuardCandidate>,
     total_bytes: &mut u64,
     forced_cloud_paths: &HashSet<String>,
     discovered_cloud_paths: &mut BTreeSet<String>,
@@ -1223,19 +1413,30 @@ fn collect_guard_files_inner(
                 GUARD_MAX_TOTAL_BYTES
             ));
         }
-        let bytes = fs::read(&path)
-            .map_err(|error| format!("Az agent snapshot fájlja nem olvasható: {error}"))?;
         let relative = path.strip_prefix(root).map_err(|error| {
             format!("Az agent snapshot relatív útvonala nem képezhető: {error}")
         })?;
         let relative_path = relative.to_string_lossy().replace('\\', "/");
-        files.push(GuardFile {
+        files.push(GuardCandidate {
+            path,
             relative_path,
             bytes: metadata.len(),
-            sha256: sha256_hex(&bytes),
         });
     }
     Ok(())
+}
+
+/// A megtalált fájlok beolvasása és hashelése — ez a guard drága fele.
+fn hash_guard_candidates(candidates: &[GuardCandidate]) -> Result<Vec<GuardFile>, String> {
+    run_guard_file_jobs(candidates, |candidate| {
+        let bytes = fs::read(&candidate.path)
+            .map_err(|error| format!("Az agent snapshot fájlja nem olvasható: {error}"))?;
+        Ok(GuardFile {
+            relative_path: candidate.relative_path.clone(),
+            bytes: candidate.bytes,
+            sha256: sha256_hex(&bytes),
+        })
+    })
 }
 
 fn collect_guard_snapshot(root: &Path) -> Result<(Vec<GuardFile>, Vec<String>), String> {
@@ -1251,6 +1452,7 @@ fn collect_guard_snapshot(root: &Path) -> Result<(Vec<GuardFile>, Vec<String>), 
         &forced_cloud_paths,
         &mut discovered_cloud_paths,
     )?;
+    let mut files = hash_guard_candidates(&files)?;
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok((files, discovered_cloud_paths.into_iter().collect()))
 }
@@ -1283,6 +1485,7 @@ fn collect_guard_files_for_manifest(
             ));
         }
     }
+    let mut files = hash_guard_candidates(&files)?;
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(files)
 }
@@ -1290,7 +1493,9 @@ fn collect_guard_files_for_manifest(
 fn copy_guard_files(root: &Path, files: &[GuardFile], target_root: &Path) -> Result<(), String> {
     fs::create_dir_all(target_root)
         .map_err(|error| format!("Az agent snapshot post-mappája nem hozható létre: {error}"))?;
-    for file in files {
+    // Ugyanaz a fájlonkénti munka, mint a hashelés: a másolás is a várakozáson
+    // megy el, nem a processzoron.
+    run_guard_file_jobs(files, |file| {
         let relative = guard_relative_path(&file.relative_path)?;
         let source = root.join(&relative);
         let source_type = fs::symlink_metadata(&source)
@@ -1310,8 +1515,54 @@ fn copy_guard_files(root: &Path, files: &[GuardFile], target_root: &Path) -> Res
         }
         fs::copy(&source, &target)
             .map_err(|error| format!("Az agent snapshot fájlja nem másolható: {error}"))?;
-    }
+        Ok(())
+    })?;
     Ok(())
+}
+
+/// A base-hez képest megváltozott (vagy új) fájlok.
+///
+/// Ez a halmaz kerül le a `post-files` mappába. Ami nincs benne, annak a
+/// tartalma bitre azonos a base-fájllal — a hash a manifestben mindkettőre ott
+/// van, tehát ezt nem hinni kell, hanem ellenőrizni.
+fn changed_post_guard_files<'a>(
+    base_files: &[GuardFile],
+    post_files: &'a [GuardFile],
+) -> Vec<&'a GuardFile> {
+    let base_hashes = base_files
+        .iter()
+        .map(|file| (file.relative_path.as_str(), file.sha256.as_str()))
+        .collect::<std::collections::HashMap<_, _>>();
+    post_files
+        .iter()
+        .filter(|file| {
+            base_hashes.get(file.relative_path.as_str())
+                != Some(&file.sha256.as_str())
+        })
+        .collect()
+}
+
+/// Honnan olvasható egy post-fájl tartalma.
+///
+/// Új snapshotokban a változatlan fájlok nincsenek lemásolva; azok a base-ből
+/// jönnek. Ha a manifest szerint a fájl a `post-files`-ban van, de nincs ott, az
+/// hiba marad — a hiányzó másolatot nem helyettesítjük csendben a base-szel.
+fn post_guard_file_path(
+    directory: &Path,
+    manifest: &GuardManifest,
+    relative_path: &str,
+) -> Result<PathBuf, String> {
+    let relative = guard_relative_path(relative_path)?;
+    let copied = match manifest.post_changed_paths.as_ref() {
+        // Régi snapshot: minden post-fájl lemásolva.
+        None => true,
+        Some(paths) => paths.iter().any(|path| path == relative_path),
+    };
+    Ok(if copied {
+        directory.join("post-files").join(relative)
+    } else {
+        directory.join("files").join(relative)
+    })
 }
 
 fn guard_manifest_hash(files: &[GuardFile]) -> Result<String, String> {
@@ -1339,6 +1590,7 @@ fn create_agent_snapshot_at(root: &Path, snapshot_root: &Path) -> Result<AgentSn
     let root = root
         .canonicalize()
         .map_err(|error| format!("Az agent snapshot gyökere nem canonicalizálható: {error}"))?;
+    let _workspace = lock_workspace_guard(&root)?;
     let (files, cloud_placeholder_paths) = collect_guard_snapshot(&root)?;
     let base_hash = guard_manifest_hash(&files)?;
     let id = Uuid::new_v4().to_string();
@@ -1379,6 +1631,7 @@ fn create_agent_snapshot_at(root: &Path, snapshot_root: &Path) -> Result<AgentSn
         apply_base_hash: Some(base_hash.clone()),
         apply_base_files: Some(files.clone()),
         rebased: false,
+        post_changed_paths: None,
     };
     write_guard_manifest(&directory, &manifest)?;
     Ok(AgentSnapshot {
@@ -1459,15 +1712,29 @@ fn finalize_agent_snapshot_from_root(
     snapshot: &AgentSnapshot,
     source_root: &Path,
 ) -> Result<AgentGuardReport, String> {
+    let _workspace = lock_workspace_guard(source_root)?;
     let post_files = collect_guard_files_for_manifest(source_root, &snapshot.manifest)?;
     let post_hash = guard_manifest_hash(&post_files)?;
+    // A változatlan fájlokat nem másoljuk le még egyszer: bitre azonosak a
+    // base-példánnyal, és egy nagy munkaterületen ez a másolás volt a turn
+    // végi várakozás java.
+    let changed_files = changed_post_guard_files(&snapshot.manifest.base_files, &post_files)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
     copy_guard_files(
         source_root,
-        &post_files,
+        &changed_files,
         &snapshot.directory.join("post-files"),
     )?;
     let mut manifest = snapshot.manifest.clone();
     manifest.post_hash = Some(post_hash);
+    manifest.post_changed_paths = Some(
+        changed_files
+            .iter()
+            .map(|file| file.relative_path.clone())
+            .collect(),
+    );
     manifest.post_files = Some(post_files.clone());
     manifest.applied = false;
     manifest.apply_base_hash = Some(manifest.base_hash.clone());
@@ -1512,8 +1779,19 @@ fn restore_guard_file_set(
         .iter()
         .map(|file| file.relative_path.as_str())
         .collect::<std::collections::HashSet<_>>();
+    // Amelyik fájl a munkaterületen már bitre a cél-tartalom, azt nem írjuk
+    // vissza: a záró hash-ellenőrzés ugyanazt méri, viszont egy nagy projekten
+    // ez a kör is teljes másolás volt. A számláló így azt mondja meg, hány
+    // fájlt kellett tényleg visszaállítani.
+    let current_hashes = current_files
+        .iter()
+        .map(|file| (file.relative_path.as_str(), file.sha256.as_str()))
+        .collect::<std::collections::HashMap<_, _>>();
     let mut restored_files = 0_usize;
     for file in target_files {
+        if current_hashes.get(file.relative_path.as_str()) == Some(&file.sha256.as_str()) {
+            continue;
+        }
         let source = directory
             .join(source_directory)
             .join(guard_relative_path(&file.relative_path)?);
@@ -1768,7 +2046,7 @@ fn agent_diff_preview_at(
         };
         let after_bytes = if after.is_some() {
             Some(
-                fs::read(directory.join("post-files").join(&relative))
+                fs::read(post_guard_file_path(&directory, &manifest, &path)?)
                     .map_err(|error| format!("A diff post-fájlja nem olvasható: {error}"))?,
             )
         } else {
@@ -1951,6 +2229,7 @@ fn rebase_agent_snapshot_at(
 ) -> Result<AgentRebaseResult, String> {
     let (directory, mut manifest) = read_guard_manifest(snapshot_root, snapshot_id)?;
     let root = validate_guard_root(&manifest, allowed_root)?;
+    let _workspace = lock_workspace_guard(&root)?;
     if matches!(
         manifest.last_action.as_deref(),
         Some("discarded") | Some("rolled_back")
@@ -2018,12 +2297,8 @@ fn rebase_agent_snapshot_at(
         };
         let agent_bytes = if agent.is_some() {
             Some(
-                fs::read(
-                    directory
-                        .join("post-files")
-                        .join(guard_relative_path(&path)?),
-                )
-                .map_err(|error| format!("A merge agent-fájlja nem olvasható: {error}"))?,
+                fs::read(post_guard_file_path(&directory, &manifest, &path)?)
+                    .map_err(|error| format!("A merge agent-fájlja nem olvasható: {error}"))?,
             )
         } else {
             None
@@ -2077,6 +2352,10 @@ fn rebase_agent_snapshot_at(
     let merged_hash = guard_manifest_hash(&merged_files)?;
     copy_guard_files(&root, &current_files, &directory.join("apply-base-files"))?;
     write_snapshot_bytes(&directory, "post-files", &merged_bytes)?;
+    // A merge minden fájlt kiír, tehát a `post-files` innentől teljes: a
+    // szűkített lista nem érvényes rá többé, és a base-re visszaeső olvasás a
+    // merge eredményét hagyná ki.
+    manifest.post_changed_paths = None;
     manifest.apply_base_hash = Some(current_hash.clone());
     manifest.apply_base_files = Some(current_files);
     manifest.post_hash = Some(merged_hash.clone());
@@ -2103,6 +2382,7 @@ fn restore_snapshot_base_preserving_manifest(
 ) -> Result<bool, String> {
     let (directory, manifest) = read_guard_manifest(snapshot_root, snapshot_id)?;
     let root = validate_guard_root(&manifest, allowed_root)?;
+    let _workspace = lock_workspace_guard(&root)?;
     let current_files = collect_guard_files_for_manifest(&root, &manifest)?;
     let current_hash = guard_manifest_hash(&current_files)?;
     if current_hash == manifest.base_hash {
@@ -2187,6 +2467,7 @@ fn apply_agent_snapshot_at(
 ) -> Result<AgentApplyResult, String> {
     let (directory, mut manifest) = read_guard_manifest(snapshot_root, snapshot_id)?;
     let root = validate_guard_root(&manifest, allowed_root)?;
+    let _workspace = lock_workspace_guard(&root)?;
     if matches!(
         manifest.last_action.as_deref(),
         Some("discarded") | Some("rolled_back")
@@ -2219,10 +2500,20 @@ fn apply_agent_snapshot_at(
         .collect::<std::collections::HashSet<_>>();
     let apply_result = (|| {
         let mut applied_files = 0_usize;
+        let current_hashes = current_files
+            .iter()
+            .map(|file| (file.relative_path.as_str(), file.sha256.as_str()))
+            .collect::<std::collections::HashMap<_, _>>();
         for file in post_files {
-            let source = directory
-                .join("post-files")
-                .join(guard_relative_path(&file.relative_path)?);
+            // Ami a munkaterületen már bitre ez a tartalom, azt nem írjuk felül:
+            // az apply utáni post-hash ellenőrzés így is ugyanazt méri, viszont
+            // egy nagy projekten ez a kör is teljes másolás volt.
+            if current_hashes.get(file.relative_path.as_str())
+                == Some(&file.sha256.as_str())
+            {
+                continue;
+            }
+            let source = post_guard_file_path(&directory, &manifest, &file.relative_path)?;
             let target = safe_guard_target(&root, &file.relative_path)?;
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)
@@ -2373,8 +2664,17 @@ fn rollback_agent_snapshot_at(
         .iter()
         .map(|file| file.relative_path.as_str())
         .collect::<std::collections::HashSet<_>>();
+    let current_hashes = current_files
+        .iter()
+        .map(|file| (file.relative_path.as_str(), file.sha256.as_str()))
+        .collect::<std::collections::HashMap<_, _>>();
     let mut restored_files = 0_usize;
     for file in &manifest.base_files {
+        // Ugyanaz, mint a staging visszaállításban: a már azonos tartalmú
+        // fájlt nem másoljuk vissza.
+        if current_hashes.get(file.relative_path.as_str()) == Some(&file.sha256.as_str()) {
+            continue;
+        }
         let relative = guard_relative_path(&file.relative_path)?;
         let source = directory.join("files").join(&relative);
         let target = root.join(&relative);
@@ -2770,6 +3070,8 @@ fn stage_agent_snapshot(
     snapshot: &AgentSnapshot,
     mut report: AgentGuardReport,
 ) -> Result<AgentGuardReport, String> {
+    // Beágyazottan visszaállít, ezért a zár ugyanezen a szálon újra fogható.
+    let _workspace = lock_workspace_guard(&snapshot.root)?;
     let snapshot_root = snapshot
         .directory
         .parent()
@@ -4137,6 +4439,7 @@ mod sync_tests {
             apply_base_hash: None,
             apply_base_files: None,
             rebased: false,
+            post_changed_paths: None,
         };
 
         let initial = collect_guard_files_for_manifest(&root, &manifest)
@@ -4331,6 +4634,287 @@ mod sync_tests {
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(snapshot_root);
+    }
+
+    #[test]
+    fn one_workspace_serializes_guard_work_and_nests_on_one_thread() {
+        let root = std::env::temp_dir()
+            .join(format!("min-agent-lock-root-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("lock fixture");
+        let root = root.canonicalize().expect("canonical lock fixture");
+
+        // Ugyanazon a szálon a beágyazott foglalás nem vár magamagára: a staging
+        // belül visszaállít, és az is ezt a zárat kéri.
+        {
+            let outer = lock_workspace_guard(&root).expect("outer lock");
+            let inner = lock_workspace_guard(&root).expect("nested lock");
+            drop(inner);
+            drop(outer);
+        }
+
+        // Külön szálon viszont várnia kell, amíg az első el nem engedi.
+        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_while_held =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = lock_workspace_guard(&root).expect("first lock");
+        held.store(true, std::sync::atomic::Ordering::SeqCst);
+        let waiter = {
+            let root = root.clone();
+            let held = held.clone();
+            let observed_while_held = observed_while_held.clone();
+            std::thread::spawn(move || {
+                let _second = lock_workspace_guard(&root).expect("second lock");
+                if held.load(std::sync::atomic::Ordering::SeqCst) {
+                    observed_while_held.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        held.store(false, std::sync::atomic::Ordering::SeqCst);
+        drop(guard);
+        waiter.join().expect("waiter thread");
+        assert!(
+            !observed_while_held.load(std::sync::atomic::Ordering::SeqCst),
+            "a másik szál a zár feloldása előtt jutott be"
+        );
+
+        // Két külön munkaterület nem zárja ki egymást.
+        let other = std::env::temp_dir()
+            .join(format!("min-agent-lock-other-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&other).expect("other fixture");
+        let other = other.canonicalize().expect("canonical other fixture");
+        let first = lock_workspace_guard(&root).expect("root lock");
+        let second = lock_workspace_guard(&other).expect("other lock");
+        drop(second);
+        drop(first);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn a_restoring_snapshot_does_not_break_a_snapshot_starting_beside_it() {
+        // Ez a stop utáni gyors prompt esete: a megszakított futás visszaállítja
+        // a munkaterületet, miközben az új futás base-snapshotja beolvassa
+        // ugyanazokat a fájlokat. Zár nélkül az olvasás egy eltűnt fájlon hasal el.
+        let root =
+            std::env::temp_dir().join(format!("min-agent-race-root-{}", uuid::Uuid::new_v4()));
+        let snapshot_root =
+            std::env::temp_dir().join(format!("min-agent-race-snaps-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("race fixture");
+        for index in 0..150 {
+            std::fs::write(root.join(format!("base-{index:03}.txt")), "base")
+                .expect("race base file");
+        }
+
+        let snapshot =
+            create_agent_snapshot_at(&root, &snapshot_root).expect("race base snapshot");
+        // A megszakított futás "részleges" írásai: ezeket a staging eltávolítja.
+        for index in 0..150 {
+            std::fs::write(root.join(format!("agent-{index:03}.txt")), "agent")
+                .expect("race agent file");
+        }
+        finalize_agent_snapshot(&snapshot).expect("race finalize");
+
+        // A megszakított futás lezárása: a base visszaállítása írja és törli a
+        // munkaterület fájljait — ez ütközött az új futás beolvasásával.
+        let restoring = {
+            let snapshot_root = snapshot_root.clone();
+            let snapshot_id = snapshot.id.clone();
+            std::thread::spawn(move || {
+                restore_snapshot_base_preserving_manifest(&snapshot_root, &snapshot_id, None)
+            })
+        };
+        let starting = {
+            let root = root.clone();
+            let snapshot_root = snapshot_root.clone();
+            std::thread::spawn(move || create_agent_snapshot_at(&root, &snapshot_root))
+        };
+
+        restoring
+            .join()
+            .expect("restoring thread")
+            .expect("the restore succeeds");
+        let fresh = starting
+            .join()
+            .expect("starting thread")
+            .expect("a new snapshot must not fail beside a restore");
+        // A sorosítás iránya nincs rögzítve; az a lényeg, hogy egyik se hasaljon el,
+        // és a friss snapshot önmagával konzisztens legyen.
+        assert_eq!(
+            fresh.manifest.base_hash,
+            guard_manifest_hash(&fresh.manifest.base_files).expect("fresh hash"),
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&snapshot_root);
+    }
+
+    #[test]
+    fn a_workspace_past_the_parallel_threshold_hashes_deterministically() {
+        // A többi teszt tucatnyi fájllal dolgozik, tehát a soros ágon marad. Ez
+        // átviszi a küszöböt: a sorrendnek, a hash-eknek és a másolatnak
+        // ugyanannak kell lennie, mint egy szálon.
+        let root = std::env::temp_dir()
+            .join(format!("min-agent-parallel-root-{}", uuid::Uuid::new_v4()));
+        let snapshot_root = std::env::temp_dir().join(format!(
+            "min-agent-parallel-snapshots-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("nested/deeper")).expect("parallel fixture");
+        for index in 0..120 {
+            let directory = match index % 3 {
+                0 => root.clone(),
+                1 => root.join("nested"),
+                _ => root.join("nested/deeper"),
+            };
+            std::fs::write(
+                directory.join(format!("file-{index:03}.txt")),
+                format!("content {index}"),
+            )
+            .expect("parallel fixture file");
+        }
+
+        let snapshot =
+            create_agent_snapshot_at(&root, &snapshot_root).expect("create parallel snapshot");
+        let files = &snapshot.manifest.base_files;
+        assert_eq!(files.len(), 120);
+        // Rendezett, tehát a szálak befutási sorrendje nem látszik.
+        let mut sorted = files.clone();
+        sorted.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        assert_eq!(&sorted, files);
+        // És a hash tartalomhelyes, nem csak konzisztens.
+        let expected = sha256_hex(b"content 0");
+        let first = files
+            .iter()
+            .find(|file| file.relative_path == "file-000.txt")
+            .expect("first file in manifest");
+        assert_eq!(first.sha256, expected);
+        // A base másolat is teljes (ez a másik párhuzamosított kör).
+        for file in files {
+            assert!(snapshot
+                .directory
+                .join("files")
+                .join(&file.relative_path)
+                .exists());
+        }
+
+        // Ugyanaz a munkaterület, ugyanaz az eredmény.
+        let second = collect_guard_files_for_manifest(&root, &snapshot.manifest)
+            .expect("second scan");
+        assert_eq!(&second, files);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&snapshot_root);
+    }
+
+    #[test]
+    fn only_changed_files_reach_post_files_and_apply_still_lands() {
+        let root = std::env::temp_dir()
+            .join(format!("min-agent-changed-root-{}", uuid::Uuid::new_v4()));
+        let snapshot_root = std::env::temp_dir().join(format!(
+            "min-agent-changed-snapshots-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("nested")).expect("changed root fixture");
+        std::fs::write(root.join("main.txt"), "before").expect("changed base file");
+        std::fs::write(root.join("nested/keep.txt"), "untouched").expect("unchanged base file");
+
+        let snapshot =
+            create_agent_snapshot_at(&root, &snapshot_root).expect("create snapshot");
+        std::fs::write(root.join("main.txt"), "after").expect("agent edit");
+        std::fs::write(root.join("new.txt"), "new").expect("agent added file");
+        finalize_agent_snapshot(&snapshot).expect("finalize snapshot");
+
+        // A változatlan fájl nem másolódik le még egyszer; a másik kettő igen.
+        let post_files = snapshot.directory.join("post-files");
+        assert!(post_files.join("main.txt").exists());
+        assert!(post_files.join("new.txt").exists());
+        assert!(!post_files.join("nested/keep.txt").exists());
+        let (_, staged_manifest) =
+            read_guard_manifest(&snapshot_root, &snapshot.id).expect("staged manifest");
+        let changed = staged_manifest
+            .post_changed_paths
+            .clone()
+            .expect("changed path list");
+        assert_eq!(changed.len(), 2);
+        assert!(!changed.iter().any(|path| path.contains("keep.txt")));
+        // A teljes post-manifest viszont továbbra is minden fájlt felsorol.
+        assert_eq!(staged_manifest.post_files.as_ref().unwrap().len(), 3);
+
+        // A diff a base-ből olvasva is pontosan a két változást látja.
+        let preview = agent_diff_preview_at(&snapshot_root, &snapshot.id, None)
+            .expect("diff preview");
+        assert_eq!(preview.files.len(), 2);
+
+        restore_snapshot_base_preserving_manifest(&snapshot_root, &snapshot.id, None)
+            .expect("restore base");
+        assert_eq!(
+            std::fs::read_to_string(root.join("main.txt")).expect("restored base"),
+            "before"
+        );
+
+        let applied = apply_agent_snapshot_at(&snapshot_root, &snapshot.id, None)
+            .expect("apply snapshot");
+        assert_eq!(applied.applied_files, 2);
+        assert_eq!(
+            std::fs::read_to_string(root.join("main.txt")).expect("applied main"),
+            "after"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("new.txt")).expect("applied new"),
+            "new"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("nested/keep.txt")).expect("untouched file"),
+            "untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&snapshot_root);
+    }
+
+    #[test]
+    fn a_legacy_snapshot_with_every_file_copied_still_applies() {
+        let root =
+            std::env::temp_dir().join(format!("min-agent-legacy-root-{}", uuid::Uuid::new_v4()));
+        let snapshot_root = std::env::temp_dir().join(format!(
+            "min-agent-legacy-snapshots-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("legacy root fixture");
+        std::fs::write(root.join("main.txt"), "before").expect("legacy base file");
+        std::fs::write(root.join("keep.txt"), "untouched").expect("legacy unchanged file");
+
+        let snapshot =
+            create_agent_snapshot_at(&root, &snapshot_root).expect("create legacy snapshot");
+        std::fs::write(root.join("main.txt"), "after").expect("legacy agent edit");
+        finalize_agent_snapshot(&snapshot).expect("finalize legacy snapshot");
+
+        // A régi formátum: minden post-fájl lemásolva, és a manifest nem tud a
+        // szűkített halmazról. Ilyen snapshotok ott vannak a lemezen.
+        std::fs::copy(
+            root.join("keep.txt"),
+            snapshot.directory.join("post-files").join("keep.txt"),
+        )
+        .expect("legacy full copy");
+        let (directory, mut manifest) =
+            read_guard_manifest(&snapshot_root, &snapshot.id).expect("legacy manifest");
+        manifest.post_changed_paths = None;
+        write_guard_manifest(&directory, &manifest).expect("legacy manifest write");
+
+        restore_snapshot_base_preserving_manifest(&snapshot_root, &snapshot.id, None)
+            .expect("restore legacy base");
+        let applied = apply_agent_snapshot_at(&snapshot_root, &snapshot.id, None)
+            .expect("apply legacy snapshot");
+        assert_eq!(applied.applied_files, 1);
+        assert_eq!(
+            std::fs::read_to_string(root.join("main.txt")).expect("legacy applied main"),
+            "after"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&snapshot_root);
     }
 
     #[test]

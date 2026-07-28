@@ -333,6 +333,9 @@ const revealPanelBottom = (panel: Element | null) => {
 /** The composed answer tab, which is not one of the chain's stages. */
 const PIPELINE_ANSWER_TAB = -1;
 
+/** Where a running re-run draws itself: in its own panel, not below them all. */
+const LIVE_RERUN_SLOT = "__live-rerun-slot__";
+
 const STAGE_ROLE_LABELS: Record<string, string> = {
   plan: "TERV",
   code: "KÓD",
@@ -6894,6 +6897,8 @@ function App() {
   // running and never will in this pass; without this the strip would draw the
   // carried-over plan as a phase still waiting its turn.
   const [liveRunResume, setLiveRunResume] = useState<{
+    /** Which panel is re-running, so the run draws itself where it belongs. */
+    chainKey: string;
     startStage: number;
     iteration: number;
     carried: Record<number, string>;
@@ -12989,7 +12994,7 @@ function App() {
     isStreamingRef.current = true;
     setIsStreaming(true);
     setLiveStageChoice(null);
-    setLiveRunResume({ startStage, iteration, carried });
+    setLiveRunResume({ chainKey, startStage, iteration, carried });
     try {
       const run = await invoke<PipelineRunResult>("pipeline_send", {
         request: {
@@ -13618,6 +13623,14 @@ function App() {
         shownStage?.stageIndex !== stage.stageIndex)
     )
       return null;
+    // Past the deduplication above, so exactly one entry of the chain stands
+    // in for it. A re-run belongs to the panel it was started from, not to the
+    // bottom of the conversation; the live card is assembled further down the
+    // file, so this leaves a marker and the card is dropped in afterwards —
+    // cheaper than hoisting half the render above the timeline.
+    if (stage && liveRunResume?.chainKey === chainKey && pipelineProgress) {
+      return LIVE_RERUN_SLOT;
+    }
     // The verdict of the version being read, not of the newest one: a reader
     // who went back to v1 is looking at what v1 concluded.
     const runVerdict = stageForVersion(chain, selectedVersion, lastStageIndex);
@@ -14017,6 +14030,14 @@ Javítsd ki, majd futtasd le újra a teszteket.`
         )}
       </div>
     );
+  // A re-run draws itself inside the panel it belongs to; everything else
+  // still streams below the conversation, where a new answer belongs.
+  const rerunInPlace = Boolean(liveRunResume && pipelineProgress);
+  const timelineWithLiveRerun = rerunInPlace
+    ? timelineContent.map((node) =>
+        node === LIVE_RERUN_SLOT ? liveTurnContent : node,
+      )
+    : timelineContent.filter((node) => node !== LIVE_RERUN_SLOT);
   const generalLiveTurnContent =
     activeMode === "general" && isStreaming && liveAnswer ? (
       <div className="general-live-answer">
@@ -14742,8 +14763,12 @@ Javítsd ki, majd futtasd le újra a teszteket.`
                   <p>Kérdezz bármit — ez a min mindennapi beszélgetős módja.</p>
                 </div>
               )}
-            {timelineContent}
-            {activeMode === "general" ? generalLiveTurnContent : liveTurnContent}
+            {timelineWithLiveRerun}
+            {activeMode === "general"
+              ? generalLiveTurnContent
+              : rerunInPlace
+                ? null
+                : liveTurnContent}
             {isStreaming && !isAtBottom && (
               <button
                 type="button"

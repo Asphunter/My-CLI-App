@@ -66,6 +66,17 @@ import {
   describeAgentError,
   describeThrownAgentError,
 } from "./agentError";
+import {
+  AppDialogOverlay,
+  ClaudeApprovalOverlay,
+  ClaudeQuestionOverlay,
+  CommandPaletteOverlay,
+  ImagePreviewOverlay,
+  type AppDialog,
+  type ClaudeApprovalRequest,
+  type ClaudeQuestionRequest,
+  type SelectionQuote,
+} from "./components/overlays";
 
 type Message = {
   id?: string;
@@ -104,13 +115,6 @@ type FileActionMenuState = {
   path: string;
   x: number;
   y: number;
-};
-
-type SelectionQuote = {
-  text: string;
-  x: number;
-  y: number;
-  anchorId: string;
 };
 
 type QuoteReference = {
@@ -597,45 +601,8 @@ type CodexModel = {
   supportedReasoningEfforts: string[];
   defaultReasoningEffort: string | null;
 };
-type ClaudeApprovalRequest = {
-  approvalId: string;
-  requestId: string;
-  toolName: string;
-  input: Record<string, unknown>;
-  title: string | null;
-  reason: string | null;
-  displayName: string | null;
-  description: string | null;
-};
-type ClaudeQuestionRequest = {
-  questionId: string;
-  requestId: string;
-  questions: Array<{
-    question?: string;
-    header?: string;
-    multiSelect?: boolean;
-    options?: Array<{ label?: string; description?: string }>;
-  }>;
-};
 type ModelFamily = { key: string; label: string; models: CodexModel[] };
 type OpenMenu = { kind: "project" | "thread" | "general"; key: string } | null;
-type AppDialog =
-  | {
-      kind: "input";
-      title: string;
-      label: string;
-      value: string;
-      confirmLabel: string;
-      onConfirm: (value: string) => boolean | void;
-    }
-  | {
-      kind: "confirm";
-      title: string;
-      message: string;
-      confirmLabel: string;
-      danger?: boolean;
-      onConfirm: () => boolean | void;
-    };
 
 const isTauri =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -5165,8 +5132,6 @@ function PlanProgressCard({
   );
 }
 
-const PREVIEW_MIN_SCALE = 0.2;
-const PREVIEW_MAX_SCALE = 12;
 
 /**
  * Full-size preview for an agent-generated image.
@@ -5175,174 +5140,6 @@ const PREVIEW_MAX_SCALE = 12;
  * toward the pointer and pans by dragging. The image is rendered from a data
  * URL, which keeps SVG inert: no scripts, no network access.
  */
-function ImagePreviewOverlay({
-  path,
-  source,
-  error,
-  onClose,
-  onOpenExternal,
-}: {
-  path: string;
-  source: string | null;
-  error: string | null;
-  onClose: () => void;
-  onOpenExternal: () => void;
-}) {
-  const [scale, setScale] = useState(1);
-  const [offset, setOffset] = useState({ x: 0, y: 0 });
-  const viewportRef = useRef<HTMLDivElement | null>(null);
-  const dragRef = useRef<{ x: number; y: number; ox: number; oy: number } | null>(null);
-
-  const reset = () => {
-    setScale(1);
-    setOffset({ x: 0, y: 0 });
-  };
-
-  // A new image should never inherit the previous one's zoom.
-  useEffect(() => {
-    reset();
-  }, [path]);
-
-  useEffect(() => {
-    const onKey = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-      if (event.key === "0") reset();
-      if (event.key === "+" || event.key === "=") setScale((s) => Math.min(PREVIEW_MAX_SCALE, s * 1.25));
-      if (event.key === "-") setScale((s) => Math.max(PREVIEW_MIN_SCALE, s / 1.25));
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
-  // Attached manually because a passive React wheel handler cannot stop the
-  // page from scrolling behind the overlay.
-  useEffect(() => {
-    const viewport = viewportRef.current;
-    if (!viewport) return;
-    const onWheel = (event: globalThis.WheelEvent) => {
-      event.preventDefault();
-      const rect = viewport.getBoundingClientRect();
-      const pointerX = event.clientX - rect.left - rect.width / 2;
-      const pointerY = event.clientY - rect.top - rect.height / 2;
-      setScale((previous) => {
-        const next = Math.min(
-          PREVIEW_MAX_SCALE,
-          Math.max(PREVIEW_MIN_SCALE, previous * (event.deltaY < 0 ? 1.15 : 1 / 1.15)),
-        );
-        // Keep the point under the cursor fixed while the scale changes.
-        const ratio = next / previous;
-        setOffset((current) => ({
-          x: pointerX - (pointerX - current.x) * ratio,
-          y: pointerY - (pointerY - current.y) * ratio,
-        }));
-        return next;
-      });
-    };
-    viewport.addEventListener("wheel", onWheel, { passive: false });
-    return () => viewport.removeEventListener("wheel", onWheel);
-  }, []);
-
-  const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (event.button !== 0) return;
-    dragRef.current = { x: event.clientX, y: event.clientY, ox: offset.x, oy: offset.y };
-    event.currentTarget.setPointerCapture(event.pointerId);
-  };
-  const onPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
-    const drag = dragRef.current;
-    if (!drag) return;
-    setOffset({
-      x: drag.ox + (event.clientX - drag.x),
-      y: drag.oy + (event.clientY - drag.y),
-    });
-  };
-  const endDrag = () => {
-    dragRef.current = null;
-  };
-
-  return (
-    <div
-      className="agent-interaction-overlay"
-      role="presentation"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
-    >
-      <section
-        className="image-preview-card"
-        role="dialog"
-        aria-modal="true"
-        aria-label={`Előnézet: ${path}`}
-      >
-        <div className="image-preview-header">
-          <div>
-            <span className="approval-eyebrow">ELŐNÉZET</span>
-            <h2>{path}</h2>
-          </div>
-          <div className="image-preview-actions">
-            <button
-              type="button"
-              className="settings-compact-button"
-              onClick={() => setScale((s) => Math.max(PREVIEW_MIN_SCALE, s / 1.25))}
-              aria-label="Kicsinyítés"
-            >
-              −
-            </button>
-            <button type="button" className="settings-compact-button" onClick={reset}>
-              {Math.round(scale * 100)}%
-            </button>
-            <button
-              type="button"
-              className="settings-compact-button"
-              onClick={() => setScale((s) => Math.min(PREVIEW_MAX_SCALE, s * 1.25))}
-              aria-label="Nagyítás"
-            >
-              +
-            </button>
-            <button type="button" className="settings-compact-button" onClick={onOpenExternal}>
-              Külső program
-            </button>
-            <button
-              type="button"
-              className="inline-code-diff-close"
-              onClick={onClose}
-              aria-label="Előnézet bezárása"
-            >
-              ×
-            </button>
-          </div>
-        </div>
-        <div
-          className="image-preview-body"
-          ref={viewportRef}
-          onPointerDown={onPointerDown}
-          onPointerMove={onPointerMove}
-          onPointerUp={endDrag}
-          onPointerCancel={endDrag}
-          onDoubleClick={reset}
-          style={{ cursor: dragRef.current ? "grabbing" : "grab" }}
-        >
-          {error ? (
-            <p className="image-preview-error">{error}</p>
-          ) : source ? (
-            <img
-              src={source}
-              alt={path}
-              draggable={false}
-              style={{
-                transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})`,
-              }}
-            />
-          ) : (
-            <p className="image-preview-error">Betöltés…</p>
-          )}
-        </div>
-        <p className="image-preview-hint">
-          Görgetés: nagyítás · húzás: mozgatás · dupla kattintás vagy 0: alaphelyzet · Esc: bezárás
-        </p>
-      </section>
-    </div>
-  );
-}
 
 /** Files the preview overlay can render; everything else stays plain text. */
 const PREVIEWABLE_IMAGE_EXTENSIONS = ["svg", "png", "jpg", "jpeg", "webp"];
@@ -15997,219 +15794,54 @@ Javítsd ki, majd futtasd le újra a teszteket.`
       )}
 
       {appDialog && (
-        <div
-          className="app-dialog-overlay"
-          role="presentation"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget) setAppDialog(null);
-          }}
-        >
-          <form
-            className={`app-dialog${appDialog.kind === "confirm" && appDialog.danger ? " is-danger" : ""}`}
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="app-dialog-title"
-            onSubmit={(event) => {
-              event.preventDefault();
-              submitAppDialog();
-            }}
-          >
-            <div className="app-dialog-header">
-              <div>
-                <span className="approval-eyebrow">Min</span>
-                <h2 id="app-dialog-title">{appDialog.title}</h2>
-              </div>
-              <button
-                type="button"
-                className="app-dialog-close"
-                onClick={() => setAppDialog(null)}
-                aria-label="Ablak bezárása"
-              >
-                ×
-              </button>
-            </div>
-            {appDialog.kind === "input" ? (
-              <label className="app-dialog-field">
-                <span>{appDialog.label}</span>
-                <input
-                  autoFocus
-                  value={appDialog.value}
-                  onChange={(event) =>
-                    setAppDialog((current) =>
-                      current?.kind === "input"
-                        ? { ...current, value: event.target.value }
-                        : current,
-                    )
-                  }
-                />
-              </label>
-            ) : (
-              <p className="app-dialog-message">{appDialog.message}</p>
-            )}
-            <div className="app-dialog-actions">
-              <button
-                type="button"
-                className="app-dialog-cancel"
-                onClick={() => setAppDialog(null)}
-              >
-                Mégse
-              </button>
-              <button type="submit" className="app-dialog-confirm">
-                {appDialog.confirmLabel}
-              </button>
-            </div>
-          </form>
-        </div>
+        <AppDialogOverlay
+          dialog={appDialog}
+          onChangeValue={(value) =>
+            setAppDialog((current) =>
+              current?.kind === "input" ? { ...current, value } : current,
+            )
+          }
+          onSubmit={submitAppDialog}
+          onClose={() => setAppDialog(null)}
+        />
       )}
       {pendingClaudeApproval && (
-        <div className="agent-interaction-overlay" role="presentation">
-          <section className="agent-interaction-card" role="dialog" aria-modal="true" aria-labelledby="claude-approval-title">
-            <span className="approval-eyebrow">CLAUDE JÓVÁHAGYÁS</span>
-            <h2 id="claude-approval-title">
-              {pendingClaudeApproval.title || `${pendingClaudeApproval.toolName} futtatása`}
-            </h2>
-            {pendingClaudeApproval.description && <p>{pendingClaudeApproval.description}</p>}
-            {pendingClaudeApproval.reason && <p className="agent-interaction-reason">{pendingClaudeApproval.reason}</p>}
-            <pre className="agent-interaction-preview">
-              {JSON.stringify(pendingClaudeApproval.input, null, 2)}
-            </pre>
-            <div className="agent-interaction-actions">
-              <button type="button" onClick={() => void respondClaudeApproval("decline", "A felhasználó elutasította a műveletet.")}>Tiltás</button>
-              {/* The grant outlives the turn now, so the label says what it
-                  actually does: it is remembered for this project until the
-                  approvals file is cleared. */}
-              <button type="button" onClick={() => void respondClaudeApproval("acceptForSession")}>Engedélyezés ebben a projektben</button>
-              <button type="button" className="agent-interaction-primary" onClick={() => void respondClaudeApproval("accept")}>Engedélyezés egyszer</button>
-            </div>
-          </section>
-        </div>
+        <ClaudeApprovalOverlay
+          request={pendingClaudeApproval}
+          onRespond={(decision, reason) =>
+            void respondClaudeApproval(decision, reason)
+          }
+        />
       )}
-      {pendingClaudeQuestion && (() => {
-        const question = pendingClaudeQuestion.questions[0];
-        if (!question) return null;
-        // The Agent SDK keys the answers record by the question's full text.
-        // Using the short header instead makes the SDK drop the answer and tell
-        // the model "no answer provided", losing the selection silently.
-        const answerKey = question.question || question.header || "answer";
-        const options = question.options ?? [];
-        const multiSelect = question.multiSelect === true;
-        const selected = multiSelect
-          ? claudeQuestionSelections
-          : claudeQuestionDraft
-            ? [claudeQuestionDraft]
-            : [];
-        return (
-          <div className="agent-interaction-overlay" role="presentation">
-            <section className="agent-interaction-card" role="dialog" aria-modal="true" aria-labelledby="claude-question-title">
-              <span className="approval-eyebrow">CLAUDE KÉRDÉS</span>
-              <h2 id="claude-question-title">{question.question || question.header || "Válassz egy lehetőséget"}</h2>
-              <div className="agent-question-options">
-                {options.map((option) => {
-                  const label = option.label || "Választás";
-                  const active = selected.includes(label);
-                  return (
-                    <button
-                      type="button"
-                      className={active ? "is-selected" : ""}
-                      key={label}
-                      onClick={() => {
-                        if (multiSelect) {
-                          setClaudeQuestionSelections((current) =>
-                            current.includes(label)
-                              ? current.filter((item) => item !== label)
-                              : [...current, label],
-                          );
-                        } else {
-                          setClaudeQuestionDraft(label);
-                        }
-                      }}
-                    >
-                      <strong>{label}</strong>
-                      {option.description && <small>{option.description}</small>}
-                    </button>
-                  );
-                })}
-              </div>
-              <input
-                className="agent-question-free-text"
-                value={multiSelect ? claudeQuestionDraft : claudeQuestionDraft}
-                onChange={(event) => setClaudeQuestionDraft(event.target.value)}
-                placeholder="Saját válasz…"
-                aria-label="Saját válasz"
-              />
-              <div className="agent-interaction-actions">
-                <button type="button" onClick={() => void respondClaudeQuestion({ [answerKey]: "" })}>Mégse</button>
-                <button
-                  type="button"
-                  className="agent-interaction-primary"
-                  disabled={selected.length === 0 && !claudeQuestionDraft.trim()}
-                  onClick={() => {
-                    const answer = claudeQuestionDraft.trim() || (multiSelect ? selected : selected[0]);
-                    void respondClaudeQuestion({ [answerKey]: answer });
-                  }}
-                >
-                  Válasz küldése
-                </button>
-              </div>
-            </section>
-          </div>
-        );
-      })()}
+      {pendingClaudeQuestion && (
+        <ClaudeQuestionOverlay
+          request={pendingClaudeQuestion}
+          draft={claudeQuestionDraft}
+          selections={claudeQuestionSelections}
+          onDraftChange={setClaudeQuestionDraft}
+          onSelectionsChange={setClaudeQuestionSelections}
+          onRespond={(answerKey, answer) =>
+            void respondClaudeQuestion({ [answerKey]: answer })
+          }
+        />
+      )}
       {toast && (
         <div className="toast is-visible" role="status">
           {toast}
         </div>
       )}
       {commandsOpen && (
-        <div
-          className="command-overlay"
-          onClick={(event) => {
-            if (event.target === event.currentTarget) setCommandsOpen(false);
+        <CommandPaletteOverlay
+          onClose={() => setCommandsOpen(false)}
+          onNewConversation={newConversation}
+          onOpenSettings={() => setSettingsOpen(true)}
+          onFindProject={() => notify("Projekt keresése hamarosan")}
+          onOpenWorkCard={() => {
+            const key = latestWorkLogKeyRef.current;
+            if (key)
+              setExpandedWorkLogs((current) => ({ ...current, [key]: true }));
           }}
-        >
-          <div className="command-modal">
-            <div className="command-search">
-              <span>⌕</span>
-              <input autoFocus placeholder="Parancs keresése…" />
-            </div>
-            <button onClick={newConversation}>
-              <kbd>N</kbd>
-              <span>Új beszélgetés</span>
-            </button>
-            <button
-              onClick={() => {
-                setCommandsOpen(false);
-                notify("Projekt keresése hamarosan");
-              }}
-            >
-              <kbd>P</kbd>
-              <span>Projekt keresése</span>
-            </button>
-            <button
-              onClick={() => {
-                setCommandsOpen(false);
-                setSettingsOpen(true);
-              }}
-            >
-              <kbd>A</kbd>
-              <span>Olvasási beállítások</span>
-            </button>
-            <button
-              onClick={() => {
-                setCommandsOpen(false);
-                const key = latestWorkLogKeyRef.current;
-                if (key)
-                  setExpandedWorkLogs((current) => ({
-                    ...current,
-                    [key]: true,
-                  }));
-              }}
-            >
-              <kbd>G</kbd>
-              <span>Kódolási kártya megnyitása</span>
-            </button>
-          </div>
-        </div>
+        />
       )}
       </div>
     </FileActionContext.Provider>

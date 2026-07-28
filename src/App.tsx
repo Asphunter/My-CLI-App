@@ -7320,18 +7320,6 @@ function App() {
   }, []);
 
   const messageKeyRef = useRef(threadKey);
-  // Which conversation the running turn belongs to.
-  //
-  // The live trace writes into one shared set of state — messages, plan, work
-  // items — that always describes "the conversation on screen". That is why
-  // switching away used to be forbidden outright: leave, and the running
-  // turn's stream would pour into whatever you opened next. Naming the owner
-  // means every write can ask whether it is still talking to it.
-  const liveRunThreadKeyRef = useRef<string | null>(null);
-  /** True while the view still shows the conversation the run belongs to. */
-  const viewingLiveRun = () =>
-    !liveRunThreadKeyRef.current ||
-    liveRunThreadKeyRef.current === messageKeyRef.current;
   const workLogKeyRef = useRef<string | null>(null);
   const projectsRef = useRef(projects);
   const activeModeRef = useRef(activeMode);
@@ -7460,83 +7448,6 @@ function App() {
 
   const messagesForThread = (key: string) =>
     localConversationCacheRef.current[key]?.messages ?? loadThreadMessages(key);
-
-  /**
-   * Writes into the conversation that owns the change, wherever the reader is.
-   *
-   * `messages` describes the conversation on screen, so a run that finishes
-   * while you read something else has nowhere to put its answer. On screen the
-   * update takes the normal path; off screen it goes straight into that
-   * conversation's cache entry — which is exactly what the view loads when you
-   * come back, and what the next save writes to disk.
-   */
-  const commitMessagesForThread = (
-    key: string,
-    next: (current: Message[]) => Message[],
-  ) => {
-    if (messageKeyRef.current === key) {
-      commitMessages(next);
-      return;
-    }
-    // Off screen this is a best-effort patch of a cache that may already be
-    // behind. It is not what makes the answer survive — the turn is on disk,
-    // and opening the conversation reads it back from there.
-    const existing = localConversationCacheRef.current[key];
-    if (!existing) return;
-    const updated = {
-      ...existing,
-      messages: next(existing.messages ?? []),
-      updatedAt: new Date().toISOString(),
-    };
-    localConversationCacheRef.current = {
-      ...localConversationCacheRef.current,
-      [key]: updated,
-    };
-    setLocalConversationCache(localConversationCacheRef.current);
-  };
-
-  /**
-   * Rebuilds one conversation from the store, the way a restart does.
-   *
-   * What the view holds is a cache, and a run that finished while the reader
-   * was elsewhere — or a sync pull that landed mid-turn — can leave it behind
-   * the truth on disk. Merging the stored conversation back in is what makes
-   * the question and its answer both survive a walk to another project.
-   */
-  const refreshThreadFromStore = async (
-    key: string,
-    projectId: string | null | undefined,
-    title: string,
-  ) => {
-    if (!isTauri || !projectId) return;
-    const snapshot = await invoke<LocalStoreSnapshot>("local_store_load").catch(
-      () => null,
-    );
-    if (!snapshot) return;
-    const stored = normalizeLocalStoreSnapshot(snapshot).conversations[
-      syncConversationKey(projectId, title)
-    ];
-    if (!stored) return;
-    const existing = localConversationCacheRef.current[key];
-    const merged: SyncConversation = {
-      ...(existing ?? stored),
-      ...stored,
-      messages: mergeMessages(stored.messages ?? [], existing?.messages ?? []),
-      workItems: mergeWorkItems(
-        stored.workItems ?? [],
-        existing?.workItems ?? [],
-      ),
-    };
-    localConversationCacheRef.current = {
-      ...localConversationCacheRef.current,
-      [key]: merged,
-    };
-    setLocalConversationCache(localConversationCacheRef.current);
-    if (messageKeyRef.current === key) {
-      commitMessages(merged.messages ?? []);
-      setCodeActivity(merged.workItems ?? []);
-    }
-  };
   const workItemsForThread = (key: string) =>
     localConversationCacheRef.current[key]?.workItems ??
     loadThreadWorkItems(key);
@@ -10435,12 +10346,6 @@ function App() {
       // view. Late notifications from a completed/cancelled request must not
       // leak into a conversation selected afterwards.
       if (!activeRequestIdRef.current) return;
-      // The reader has walked into another conversation. The turn carries on —
-      // it is a background process, not a screen — but its stream stops here:
-      // every write below lands in "the conversation on screen", and that is
-      // no longer the one that asked. What it produces is stored by the
-      // runtime either way, and arrives when the reader comes back.
-      if (!viewingLiveRun()) return;
       const codexEvent = normalizeCodexEvent(value);
       if (!codexEvent) return;
       // A chain stage's final events — the complete assistant message that
@@ -11744,32 +11649,20 @@ function App() {
   };
 
   const selectThread = (project: Project, thread: string) => {
-    // Reading elsewhere is not a mutation. The run keeps going in the conversation
-    // that owns it; its stream simply stops writing while you are not looking.
+    if (blockConversationMutationDuringStream()) return;
     activeModeRef.current = "coding";
     localStorage.setItem(ACTIVE_MODE_STORAGE_KEY, "coding");
     setActiveMode("coding");
     setActiveProject(project.name);
     setActiveThread(thread);
-    // Clicking the conversation already on screen is not a switch. Loading the
-    // cache over it would drop whatever the open turn has produced since the
-    // last save — the question included, while its answer is still coming.
-    if (messageKeyRef.current !== `${project.path}/${thread}`) {
-      commitMessages(messagesForThread(`${project.path}/${thread}`));
-      setCodeActivity(workItemsForThread(`${project.path}/${thread}`));
-      setCodeStatus(
-        workItemsForThread(`${project.path}/${thread}`).length > 0
-          ? "kész"
-          : "készen",
-      );
-      setExpandedWorkLogs({});
-    }
-    // What is in memory is a cache of the conversation, and it can be behind:
-    // a run that finished off screen, or a sync pull that landed mid-turn,
-    // both leave the newest rows only on disk. Opening a conversation reads
-    // the stored copy back, which is why a restart used to be the only way to
-    // see a question again.
-    void refreshThreadFromStore(`${project.path}/${thread}`, project.id, thread);
+    commitMessages(messagesForThread(`${project.path}/${thread}`));
+    setCodeActivity(workItemsForThread(`${project.path}/${thread}`));
+    setCodeStatus(
+      workItemsForThread(`${project.path}/${thread}`).length > 0
+        ? "kész"
+        : "készen",
+    );
+    setExpandedWorkLogs({});
     notify(`Megnyitva: ${thread}`);
   };
 
@@ -11819,8 +11712,7 @@ function App() {
   };
 
   const selectGeneralConversation = (conversationId: string) => {
-    // Reading elsewhere is not a mutation. The run keeps going in the conversation
-    // that owns it; its stream simply stops writing while you are not looking.
+    if (blockConversationMutationDuringStream()) return;
     const key = generalConversationCacheKey(conversationId);
     const conversation = localConversationCacheRef.current[key];
     if (!conversation) return;
@@ -11960,7 +11852,6 @@ function App() {
         ),
       );
       settleActivePlan("error");
-      liveRunThreadKeyRef.current = null;
       isStreamingRef.current = false;
       setIsStreaming(false);
       setIsCancelling(false);
@@ -12429,7 +12320,6 @@ function App() {
     preparingRequestIdRef.current = requestId;
     activeRequestIdRef.current = requestId;
     activeLiveMessageIdRef.current = liveMessageId;
-    liveRunThreadKeyRef.current = requestThreadKey;
     setIsStreaming(true);
     setIsCancelling(false);
     setCodeStatus("dolgozik");
@@ -12622,11 +12512,7 @@ function App() {
           // The outer request has a live bubble of its own, and the first
           // stage's stream filled it. Left in place it became a second,
           // badge-less copy of the plan sitting above the run panel.
-          //
-          // Into the conversation that asked, even if the reader has walked
-          // off to another one: writing into `messages` would put this chain's
-          // answers wherever the eye happens to be.
-          commitMessagesForThread(requestThreadKey, (current) => {
+          setMessages((current) => {
             // Every stage streamed into a live bubble of its own, and the
             // runner hands back the stored, badged copy of each. Dropping only
             // the outer bubble left both in state under the same turn id: two
@@ -12682,7 +12568,6 @@ function App() {
           // a chain. Without this the composer stayed "busy" for good: the
           // send button looked ready and silently dropped every next message
           // until the app was restarted.
-          liveRunThreadKeyRef.current = null;
           isStreamingRef.current = false;
           setIsStreaming(false);
           setIsCancelling(false);
@@ -12788,10 +12673,7 @@ function App() {
           }));
         }
       }
-      // Into the conversation that asked, not into whatever is on screen: one
-      // conversation's answer must never land inside another, and a reader who
-      // walked away must still find it waiting when they come back.
-      commitMessagesForThread(requestThreadKey, (current) => {
+      commitMessages((current) => {
         const targetIndex = current.findIndex(
           (message) => message.id === liveMessageId,
         );
@@ -12965,7 +12847,6 @@ function App() {
     } finally {
       setAgentStatusRevision((current) => current + 1);
       if (activeRequestIdRef.current === requestId) {
-        liveRunThreadKeyRef.current = null;
         isStreamingRef.current = false;
         setIsStreaming(false);
         setIsCancelling(false);
@@ -13111,7 +12992,6 @@ function App() {
       (_, index) => `${requestId}-stage-${index}`,
     );
     isStreamingRef.current = true;
-    liveRunThreadKeyRef.current = threadKey;
     setIsStreaming(true);
     setLiveStageChoice(null);
     setLiveRunResume({ chainKey, startStage, iteration, carried });
@@ -13197,7 +13077,7 @@ function App() {
           verdictSummary: stageResult.review?.summary,
         },
       }));
-      commitMessagesForThread(threadKey, (current) => {
+      setMessages((current) => {
         // The same swap as the first run: the re-run's stages streamed into
         // live bubbles, and these are the stored copies of them.
         const stagePrefix = `request:${requestId}-stage-`;
@@ -13239,7 +13119,6 @@ function App() {
     } finally {
       setPipelineProgress(null);
       setLiveRunResume(null);
-      liveRunThreadKeyRef.current = null;
       isStreamingRef.current = false;
       setIsStreaming(false);
       setIsCancelling(false);
@@ -13346,8 +13225,7 @@ function App() {
   };
 
   const selectProject = (project: Project) => {
-    // Reading elsewhere is not a mutation. The run keeps going in the conversation
-    // that owns it; its stream simply stops writing while you are not looking.
+    if (blockConversationMutationDuringStream()) return;
     activeModeRef.current = "coding";
     localStorage.setItem(ACTIVE_MODE_STORAGE_KEY, "coding");
     setActiveMode("coding");
@@ -13361,20 +13239,15 @@ function App() {
           );
     setActiveProject(project.name);
     setActiveThread(thread);
-    // Same as above: re-picking the conversation on screen is not a switch.
-    if (messageKeyRef.current !== `${project.path}/${thread}`) {
-      commitMessages(messagesForThread(`${project.path}/${thread}`));
-      setCodeActivity(workItemsForThread(`${project.path}/${thread}`));
-      setCodeStatus(
-        workItemsForThread(`${project.path}/${thread}`).length > 0
-          ? "kész"
-          : "készen",
-      );
-      setExpandedWorkLogs({});
-    }
+    commitMessages(messagesForThread(`${project.path}/${thread}`));
+    setCodeActivity(workItemsForThread(`${project.path}/${thread}`));
+    setCodeStatus(
+      workItemsForThread(`${project.path}/${thread}`).length > 0
+        ? "kész"
+        : "készen",
+    );
+    setExpandedWorkLogs({});
     setOpenProjects((current) => ({ ...current, [project.path]: true }));
-    // Same as opening the conversation directly: read the stored copy back.
-    void refreshThreadFromStore(`${project.path}/${thread}`, project.id, thread);
   };
 
   const workGroupHasVisibleTrace = (group: WorkLogGroup) =>
@@ -14143,15 +14016,9 @@ Javítsd ki, majd futtasd le újra a teszteket.`
   // going. The result was the whole answer blinking out of existence for a few
   // seconds at every hand-off. A chain is one panel from its first second to
   // its last, so a stage boundary is not a reason to take it down.
-  // A run is drawn where it was asked, and nowhere else. `isStreaming` says
-  // only that the app is busy; on its own it painted a "thinking" panel into
-  // whatever conversation the reader opened next, as if they had asked it.
-  const liveRunShowsHere =
-    !liveRunThreadKeyRef.current || liveRunThreadKeyRef.current === threadKey;
   const liveTurnContent =
     activeMode === "coding" &&
     isStreaming &&
-    liveRunShowsHere &&
     (!activeTurnHasCompleted || Boolean(pipelineProgress)) && (
       <div className="live-turn-anchor">
         {liveFinishedStagePanel ? (
@@ -14212,7 +14079,7 @@ Javítsd ki, majd futtasd le újra a teszteket.`
       )
     : timelineContent.filter((node) => node !== LIVE_RERUN_SLOT);
   const generalLiveTurnContent =
-    activeMode === "general" && isStreaming && liveRunShowsHere && liveAnswer ? (
+    activeMode === "general" && isStreaming && liveAnswer ? (
       <div className="general-live-answer">
         <MessageRow
           message={liveAnswer}

@@ -3605,53 +3605,78 @@ pub fn run_project_file(cwd: &str, path: &str) -> Result<(), String> {
     #[cfg(windows)]
     {
         let target_string = target.to_string_lossy().to_string();
-        let mut command = match extension.as_str() {
-            "bat" | "cmd" => {
-                let mut command = Command::new("cmd.exe");
+        // Each entry is one way to start the file.  Most kinds have exactly
+        // one; Python has several because which launcher exists depends on
+        // how Python was installed.  `py` ships with the python.org
+        // installer, `python`/`python3` with the Store build, and a machine
+        // may well have only one of them — so try them in turn instead of
+        // betting on `py` and failing the whole action when it is absent.
+        let attempts: Vec<(String, Vec<String>)> = match extension.as_str() {
+            "bat" | "cmd" => vec![(
+                "cmd.exe".to_string(),
                 // Pass `call` and the script path as separate Windows command
                 // arguments.  Supplying `call \"path\"` as one Rust argument
                 // makes CommandLineToArgvW quote the whole /C payload again;
                 // cmd.exe then receives a malformed command and exits without
                 // running the script (while spawn() still reports success).
-                command.args(["/D", "/C", "call", target_string.as_str()]);
-                command
-            }
-            "ps1" => {
-                let mut command = Command::new("powershell.exe");
-                command.args([
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                    target_string.as_str(),
-                ]);
-                command
-            }
-            "py" => {
-                let mut command = Command::new("py");
-                command.arg(&target);
-                command
-            }
-            "exe" => Command::new(&target),
-            _ => {
-                let mut command = Command::new("explorer.exe");
-                command.arg(&target);
-                command
-            }
+                vec![
+                    "/D".to_string(),
+                    "/C".to_string(),
+                    "call".to_string(),
+                    target_string.clone(),
+                ],
+            )],
+            "ps1" => vec![(
+                "powershell.exe".to_string(),
+                vec![
+                    "-NoLogo".to_string(),
+                    "-NoProfile".to_string(),
+                    "-ExecutionPolicy".to_string(),
+                    "Bypass".to_string(),
+                    "-File".to_string(),
+                    target_string.clone(),
+                ],
+            )],
+            "py" => ["py", "python", "python3"]
+                .iter()
+                .map(|launcher| (launcher.to_string(), vec![target_string.clone()]))
+                .collect(),
+            "exe" => vec![(target_string.clone(), Vec::new())],
+            _ => vec![("explorer.exe".to_string(), vec![target_string.clone()])],
         };
-        command.current_dir(parent);
-        // A CMD/BAT action is an explicit user request to run a script, so let
-        // Windows create its normal console window.  Keep helper interpreters
-        // hidden; their output is not useful to the user and can otherwise
-        // flash a console over the app.
-        if matches!(extension.as_str(), "ps1" | "py") {
-            command.creation_flags(CREATE_NO_WINDOW);
+
+        let mut last_error = String::new();
+        for (program, args) in attempts {
+            let mut command = Command::new(&program);
+            command.args(&args);
+            command.current_dir(parent);
+            // A CMD/BAT action is an explicit user request to run a script, so
+            // let Windows create its normal console window.  Keep helper
+            // interpreters hidden; their output is not useful to the user and
+            // can otherwise flash a console over the app.
+            if matches!(extension.as_str(), "ps1" | "py") {
+                command.creation_flags(CREATE_NO_WINDOW);
+            }
+            match command.spawn() {
+                Ok(_) => return Ok(()),
+                // Only a missing launcher is worth trying the next candidate
+                // for.  Anything else (permission, a broken image) is a real
+                // failure of the one way that was supposed to work.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    last_error = format!("{program}: {error}");
+                }
+                Err(error) => {
+                    return Err(format!("A fájl futtatása nem sikerült: {error}"));
+                }
+            }
         }
-        command
-            .spawn()
-            .map_err(|error| format!("A fájl futtatása nem sikerült: {error}"))?;
-        return Ok(());
+        return Err(if extension == "py" {
+            "A Python futtatása nem sikerült: nincs telepítve `py`, `python` \
+             vagy `python3` a PATH-on."
+                .to_string()
+        } else {
+            format!("A fájl futtatása nem sikerült: {last_error}")
+        });
     }
 
     #[cfg(not(windows))]

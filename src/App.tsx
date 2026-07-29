@@ -7604,6 +7604,10 @@ function App() {
   const commitAnswerDelta = (run: RunHandle, delta: string) => {
     const meta = run.answerStream.meta;
     if (!delta || !meta) return;
+    // Élő buborék nélküli futás (lánc-újrafuttatás): a szakasz szövegét a
+    // runner adja vissza kész sorként. Cél nélkül ez egy jelöletlen, második
+    // másolatot írna a beszélgetésbe.
+    if (!run.liveMessageId) return;
     writeOwnedMessages(run.ownerConversationId, (current) =>
       appendCodexDelta(current, { ...meta, delta }, run.liveMessageId),
     );
@@ -14247,6 +14251,23 @@ function App() {
     // answer tab has no stage of its own, so the last one hosts it. Matched on
     // the run as well as the slot: two versions own the same slot, and without
     // the run id both of them would draw the panel.
+    // Past the deduplication above, so exactly one entry of the chain stands
+    // in for it. A re-run belongs to the panel it was started from, not to the
+    // bottom of the conversation; the live card is assembled further down the
+    // file, so this leaves a marker and the card is dropped in afterwards —
+    // cheaper than hoisting half the render above the timeline.
+    //
+    // Ez a verzió-szűrés ELŐTT van, és ez lényeges: a futó újrafuttatásnak még
+    // nincs kész szakasza, tehát a szűrő eldobná a csoportot — és vele a
+    // panel egyetlen helyét. Aki v2-re kattintott egy futó lánc közben,
+    // pontosan ezért látta eltűnni az egészet.
+    if (stage && liveRunResume?.chainKey === chainKey) {
+      return LIVE_RERUN_SLOT;
+    }
+    // Only the chosen phase draws itself; the others are one click away. The
+    // answer tab has no stage of its own, so the last one hosts it. Matched on
+    // the run as well as the slot: two versions own the same slot, and without
+    // the run id both of them would draw the panel.
     const shownStage = stage
       ? stageForVersion(
           chain,
@@ -14260,19 +14281,6 @@ function App() {
         shownStage?.stageIndex !== stage.stageIndex)
     )
       return null;
-    // Past the deduplication above, so exactly one entry of the chain stands
-    // in for it. A re-run belongs to the panel it was started from, not to the
-    // bottom of the conversation; the live card is assembled further down the
-    // file, so this leaves a marker and the card is dropped in afterwards —
-    // cheaper than hoisting half the render above the timeline.
-    // Deliberately not waiting for `pipelineProgress`: that arrives with the
-    // first stage, and until then the card would render at the bottom and then
-    // jump into place — which is exactly the "it started a new conversation"
-    // moment this is meant to remove. `liveRunResume` is set before the run is
-    // even asked for.
-    if (stage && liveRunResume?.chainKey === chainKey) {
-      return LIVE_RERUN_SLOT;
-    }
     // The verdict of the version being read, not of the newest one: a reader
     // who went back to v1 is looking at what v1 concluded.
     const runVerdict = stageForVersion(chain, selectedVersion, lastStageIndex);
@@ -14697,6 +14705,8 @@ Javítsd ki, majd futtasd le újra a teszteket.`
   // A re-run draws itself inside the panel it belongs to; everything else
   // still streams below the conversation, where a new answer belongs.
   const rerunInPlace = Boolean(liveRunResume && pipelineProgress);
+  const rerunSlotPlaced =
+    rerunInPlace && timelineContent.includes(LIVE_RERUN_SLOT);
   const timelineWithLiveRerun = rerunInPlace
     ? timelineContent.map((node) =>
         node === LIVE_RERUN_SLOT ? liveTurnContent : node,
@@ -14866,7 +14876,7 @@ Javítsd ki, majd futtasd le újra a teszteket.`
             {timelineWithLiveRerun}
             {activeMode === "general"
               ? generalLiveTurnContent
-              : rerunInPlace
+              : rerunInPlace && rerunSlotPlaced
                 ? null
                 : liveTurnContent}
             {viewingActiveRun && !isAtBottom && (

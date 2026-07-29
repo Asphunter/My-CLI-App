@@ -14045,6 +14045,10 @@ function App() {
     ? `request:${liveRunOuterRequestId}-stage-`
     : null;
 
+  // A futó újrafuttatás panelje pontosan egy helyet kap. A verzió-szűrés
+  // korábban ezt mellékesen biztosította (csak a kiválasztott verzió rajzolt);
+  // mivel a jelölő most a szűrés előtt kerül ki, a „csak egy" kimondva kell.
+  const rerunSlotEmitted = new Set<string>();
   const timelineContent = timelineEntries
     .filter((entry) => activeMode === "coding" || entry.kind === "message")
     .map((entry) => {
@@ -14262,6 +14266,8 @@ function App() {
     // panel egyetlen helyét. Aki v2-re kattintott egy futó lánc közben,
     // pontosan ezért látta eltűnni az egészet.
     if (stage && liveRunResume?.chainKey === chainKey) {
+      if (rerunSlotEmitted.has(chainKey)) return null;
+      rerunSlotEmitted.add(chainKey);
       return LIVE_RERUN_SLOT;
     }
     // Only the chosen phase draws itself; the others are one click away. The

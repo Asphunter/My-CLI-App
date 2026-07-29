@@ -509,6 +509,12 @@ type RunHandle = {
       carried: Record<number, string>;
     } | null;
   };
+  /**
+   * A terv-szakasz végleges szövege. A TERV kártya minden nézete (RAW,
+   * DETAIL, lépéslista) ebből él — nem a külső buborékból, amit későbbi
+   * szakaszok szövege érhet el.
+   */
+  planText?: string;
   /** A gördülékeny kiírás puffere. */
   answerStream: {
     meta: Omit<CodexDelta, "delta"> | null;
@@ -5616,16 +5622,20 @@ function TurnProgressCard({
   // Terv-fázison a számozott pontok maguk a lépések. A tervfrissítésből
   // született lista erősebb; ez csak akkor lép be, ha az elmaradt.
   const derivedPlanSteps =
-    isPlanStage && plannedSteps.length === 0 && answer?.text
+    isPlanStage && answer?.text
       ? numberedPlanSteps(answer.text).map((step) => ({
           ...step,
           status: (streaming ? "pending" : "completed") as PlanStep["status"],
         }))
       : [];
-  const effectivePlannedSteps =
-    plannedSteps.length === 0 && derivedPlanSteps.length >= 2
+  // A terv kártyáján a terv pontjai a lépések — a tervező menet közbeni
+  // munkafolyamat-todo-i nem. Amíg a szövegben nincs két számozott pont,
+  // a lista „készül".
+  const effectivePlannedSteps = isPlanStage
+    ? derivedPlanSteps.length >= 2
       ? derivedPlanSteps
-      : plannedSteps;
+      : []
+    : plannedSteps;
   const steps =
     effectivePlannedSteps.length === 0 ? [fallbackStep] : effectivePlannedSteps;
   const prePlanDisplayStepId = plannedSteps[0]?.id ?? fallbackStep.id;
@@ -9258,9 +9268,11 @@ function App() {
         // miközben a terv tíz lépést vett fel — a lista sosem látszott.
         const carriedPlanText =
           progress.role === "code"
-            ? messagesRef.current.find(
+            ? chainRun.planText ??
+              messagesRef.current.find(
                 (message) => message.id === chainRun.liveMessageId,
-              )?.text ?? ""
+              )?.text ??
+              ""
             : "";
         const carriedSteps = numberedPlanSteps(carriedPlanText).map(
           (step, index) => ({
@@ -11373,10 +11385,27 @@ function App() {
           // Lánc-szakasz nem cserélheti le a ≥2 lépéses listát egyetlen
           // todo-ra: ez tüntette el a terv 10 pontját, és lett belőle
           // „1/1 kész". Egy teljes (≥2 lépéses) todo-lista viszont nyer.
+          const carriedListActive = current.steps.some((step) =>
+            step.id.startsWith("carried-plan-"),
+          );
+          const normalized = (value: string) =>
+            value.toLowerCase().replace(/[^a-z0-9áéíóöőúüű]+/g, " ").trim();
+          const matchesCarried =
+            carriedListActive &&
+            snapshot.steps.filter((incoming) =>
+              current.steps.some((step) => {
+                const a = normalized(step.step).slice(0, 40);
+                const b = normalized(incoming.step).slice(0, 40);
+                return a && b && (a.includes(b) || b.includes(a));
+              }),
+            ).length * 2 >= snapshot.steps.length;
           if (
             !isActiveRequest &&
-            snapshot.steps.length < 2 &&
-            current.steps.length >= 2
+            ((snapshot.steps.length < 2 && current.steps.length >= 2) ||
+              // A KÓD listája a tervé. A kódoló saját munkafolyamat-todo-i
+              // („projektfájlok ellenőrzése…") nem válthatják le a terv
+              // pontjait — csak olyan lista, ami tényleg azokat tükrözi.
+              (carriedListActive && !matchesCarried))
           ) {
             setCodeStatus("terv frissítve");
           } else {
@@ -11637,9 +11666,13 @@ function App() {
         markLocalMutation();
         if (
           !isActiveRequest &&
-          run.plan.steps.length === 0 &&
+          run.chain?.progress?.role === "plan" &&
           checkpointAnswerText.trim()
         ) {
+          // A terv kész: a szövege a futásé, a számozott pontjai pedig a
+          // hivatalos lépéslista — a tervező saját munkafolyamat-todo-it
+          // ezek váltják le a tárban is. (Ez volt a „3 pont a 6 helyett".)
+          run.planText = checkpointAnswerText;
           const bornSteps = numberedPlanSteps(checkpointAnswerText);
           if (bornSteps.length >= 2) {
             updateOwnedPlanState(ownerConversationId, {
@@ -15008,6 +15041,7 @@ Javítsd ki, majd futtasd le újra a teszteket.`
         expanded={expanded}
         transport={null}
         watchdogMessage=""
+        stageRole={groupAnswer.pipeline?.stageRole}
         answer={groupAnswer}
         quoteRefs={allQuoteRefs}
         quoteAnchorPrefix={`trace:${entry.group.key}`}
@@ -15211,7 +15245,10 @@ Javítsd ki, majd futtasd le újra a teszteket.`
         watchdogMessage=""
         onToggle={() => {}}
         answer={(() => {
-          const text = liveFinishedStageText(liveShownStage);
+          const text =
+            (liveRunStages[liveShownStage]?.role === "plan"
+              ? viewedRun?.planText
+              : undefined) ?? liveFinishedStageText(liveShownStage);
           return text.trim()
             ? {
                 role: "assistant" as const,

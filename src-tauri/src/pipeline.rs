@@ -66,7 +66,9 @@ impl StageRole {
             }
             Self::Code => {
                 "Te vagy a kódoló. Hajtsd végre a fenti tervet. Mielőtt bármihez nyúlnál, \
-                 vedd fel a terv számozott lépéseit todo-listaként, és munka közben \
+                 vedd fel a terv számozott lépéseit todo-listaként — az elemek szövege \
+                 szó szerint a terv lépéseinek címe legyen, ne a saját munkafolyamatod \
+                 fázisai —, és munka közben \
                  tartsd karban: mindig az a lépés legyen folyamatban, amin dolgozol, \
                  a befejezettet jelöld késznek — a felület ebből mutatja a \
                  felhasználónak, hol tartasz. Ha a terv egy lépése hibás \

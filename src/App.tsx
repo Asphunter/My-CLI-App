@@ -6182,6 +6182,10 @@ function TurnProgressCard({
                     role="tab"
                     className={`trace-view-option${traceView === "answer" ? " is-active" : ""}`}
                     aria-selected={traceView === "answer"}
+                    // Amíg nincs válasz, a fül üres panelre vinne. Ott marad,
+                    // hogy a váltó ne ugráljon, de nem kattintható.
+                    disabled={!hasAnswer}
+                    title={hasAnswer ? undefined : "A válasz még készül"}
                     onClick={() => selectTraceView("answer")}
                   >
                     VÁLASZ
@@ -14845,14 +14849,27 @@ Javítsd ki, majd futtasd le újra a teszteket.`
           aria-hidden="true"
           style={{ transform: `translateX(${(liveShownStage + 1) * 100}%)` }}
         />
-        <button type="button" className="pipeline-run-tab" disabled>
+        <button
+          type="button"
+          className="pipeline-run-tab"
+          disabled
+          title="A válasz a lánc végén készül el"
+        >
           VÁLASZ
         </button>
         {liveRunStages.map((stage) => {
+          // A szakasz akkor „fut", ha elindult és még nem jelentett vissza.
+          // A `phase` eddig sehol nem számított, ezért egy befejezett kódolás
+          // a következő szakasz indulásáig futóként látszott — a köztes
+          // várakozás így nem hazudik többé.
+          const stageStarted = stage.index === pipelineProgress.stageIndex;
+          const stageSettled =
+            stageStarted && pipelineProgress.phase !== "started";
           const done =
             stage.index < pipelineProgress.stageIndex ||
-            stage.index < (liveRunResume?.startStage ?? 0);
-          const running = stage.index === pipelineProgress.stageIndex;
+            stage.index < (liveRunResume?.startStage ?? 0) ||
+            stageSettled;
+          const running = stageStarted && !stageSettled;
           return (
             <button
               key={stage.index}
@@ -14860,7 +14877,16 @@ Javítsd ki, majd futtasd le újra a teszteket.`
               role="tab"
               aria-selected={stage.index === liveShownStage}
               disabled={!done && !running}
-              className={`pipeline-run-tab${stage.index === liveShownStage ? " is-active" : ""}${running ? " is-running" : ""}`}
+              className={`pipeline-run-tab${stage.index === liveShownStage ? " is-active" : ""}${running ? " is-running" : ""}${stageSettled && pipelineProgress.phase === "failed" ? " is-failed" : ""}`}
+              title={
+                running
+                  ? "Ez a szakasz dolgozik"
+                  : stageSettled
+                    ? pipelineProgress.phase === "failed"
+                      ? "Ez a szakasz hibára futott"
+                      : "Kész; a következő szakasz indulására vár"
+                    : undefined
+              }
               onClick={() =>
                 setLiveStageChoice(running ? null : stage.index)
               }

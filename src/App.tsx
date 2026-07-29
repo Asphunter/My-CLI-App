@@ -2222,6 +2222,16 @@ const mergeMessages = (
           existing.changeSummary && existing.changeSummary.length > 0
             ? existing.changeSummary
             : message.changeSummary,
+        // A szakasz-címke a sor identitásának része. A journal hozhat
+        // címkézés ELŐTTI példányt ugyanarról a sorról; ha az kerül előre, a
+        // spread nélküle hagyta volna a sort — a lánc-panel erre esett szét
+        // különálló kártyákra projektváltás után. A verdiktes példány a
+        // teljesebb: a címke a lánc végén, a verdikt ismeretében készül.
+        pipeline:
+          (existing.pipeline?.verdict ? existing.pipeline : undefined) ??
+          (message.pipeline?.verdict ? message.pipeline : undefined) ??
+          existing.pipeline ??
+          message.pipeline,
       };
     },
   );
@@ -6428,7 +6438,7 @@ function TurnProgressCard({
               {(isPlanStage && effectivePlannedSteps.length === 0
                 ? []
                 : steps
-              ).map((step) => {
+              ).map((step, stepIndex) => {
                 const disabled =
                   streaming &&
                   step.status === "pending" &&
@@ -6448,8 +6458,13 @@ function TurnProgressCard({
                       disabled={disabled}
                       aria-pressed={selectedStep.id === step.id}
                     >
-                      <span className="trace-step-marker" aria-hidden="true">
-                        {stepIndicator(step)}
+                      {/* A terv pontjai nem munkafázisok: sorszámuk van, nem
+                          állapotuk. Az intenzitás-sáv a KÓD kártyáé marad. */}
+                      <span
+                        className={`trace-step-marker${isPlanStage ? " is-numbered" : ""}`}
+                        aria-hidden="true"
+                      >
+                        {isPlanStage ? `${stepIndex + 1}.` : stepIndicator(step)}
                       </span>
                       <span className="trace-step-name">{step.step}</span>
                       {elapsed && <span className="trace-step-elapsed">{elapsed}</span>}
@@ -15121,28 +15136,19 @@ Javítsd ki, majd futtasd le újra a teszteket.`
   // már nem „live", és a panel néhány másodpercre kiürült — a LÉPÉSEK
   // visszaesett a „terv készítése" placeholderre, a RAW meg arra, hogy a terv
   // még nem kezdett íródni. A kész szöveg ugyanezé a szakaszé, csak máshol
-  // van; a váltás ideje alatt onnan olvasunk.
-  const settledStageText =
-    pipelineProgress && pipelineProgress.phase !== "started"
-      ? ((pipelineProgress.role === "plan" ? viewedRun?.planText : undefined) ??
-        messages.find(
-          (message) =>
-            message.role === "assistant" &&
-            message.turnId === `request:${pipelineProgress.requestId}`,
-        )?.text ??
-        messages.find(
-          (message) =>
-            message.role === "assistant" &&
-            message.turnId === `request:${liveRunOuterRequestId}` &&
-            !message.live,
-        )?.text)
-      : undefined;
-  const liveAnswer = pipelineProgress
+  // van; a lyuk ideje alatt onnan olvasunk. A `phase` erre nem jó jel: a
+  // `finished` csak a szakasz-záró munka (guard, másolás) UTÁN érkezik, a lyuk
+  // meg pont az — a szakasz saját, lezárt szövege viszont már az első
+  // pillanatában megvan.
+  const liveStageTurnId = pipelineProgress
+    ? `request:${pipelineProgress.requestId}`
+    : "";
+  const liveStreamingAnswer = pipelineProgress
     ? messages.find(
         (message) =>
           message.role === "assistant" &&
           message.live &&
-          message.turnId === `request:${pipelineProgress.requestId}`,
+          message.turnId === liveStageTurnId,
       ) ??
       // A lánc első szakasza a futás külső élő buborékába streamel — az is
       // ennek a futásnak a szövege, ne legyen láthatatlan.
@@ -15151,7 +15157,33 @@ Javítsd ki, majd futtasd le újra a teszteket.`
           message.role === "assistant" &&
           message.live &&
           message.id === viewedRun?.liveMessageId,
-      ) ??
+      )
+    : undefined;
+  const settledStageText = pipelineProgress
+    ? ((pipelineProgress.role === "plan" ? viewedRun?.planText : undefined) ??
+      messages.find(
+        (message) =>
+          message.role === "assistant" &&
+          !message.live &&
+          message.turnId === liveStageTurnId,
+      )?.text ??
+      // A külső buborék szövege csak a szakasz lejelentése után egyértelmű —
+      // előtte még az előző szakaszé lehetne.
+      (pipelineProgress.phase !== "started"
+        ? messages.find(
+            (message) =>
+              message.role === "assistant" &&
+              message.turnId === `request:${liveRunOuterRequestId}` &&
+              !message.live,
+          )?.text
+        : undefined))
+    : undefined;
+  // A szakasz „ül": a saját szövege lezárult, és már senki nem streamel.
+  const liveStageSettled = Boolean(
+    pipelineProgress && !liveStreamingAnswer && settledStageText?.trim(),
+  );
+  const liveAnswer = pipelineProgress
+    ? liveStreamingAnswer ??
       (settledStageText?.trim()
         ? {
             role: "assistant" as const,
@@ -15159,7 +15191,7 @@ Javítsd ki, majd futtasd le újra a teszteket.`
             time: "kész",
             live: false,
             final: true,
-            turnId: `request:${pipelineProgress.requestId}`,
+            turnId: liveStageTurnId,
           }
         : undefined)
     : [...messages]
@@ -15381,9 +15413,7 @@ Javítsd ki, majd futtasd le újra a teszteket.`
           // streamelőnek mondtuk, a lépései félkésznek látszottak a váltás
           // néhány másodpercében.
           streaming={
-            viewingActiveRun &&
-            !activeTurnHasCompleted &&
-            !(pipelineProgress && pipelineProgress.phase !== "started")
+            viewingActiveRun && !activeTurnHasCompleted && !liveStageSettled
           }
           expanded={liveExpanded}
           transport={transportStatus}

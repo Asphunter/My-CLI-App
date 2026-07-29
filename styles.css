@@ -340,7 +340,10 @@ button { color: inherit; border: 0; cursor: pointer; }
    kifejezés maga nem törhet meg. */
 .inline-math { display: inline-block; vertical-align: baseline; }
 .inline-math .katex { font-size: 1.02em; color: #e8efe9; }
-.inline-math.is-display { display: block; overflow-x: auto; overflow-y: hidden; max-width: 100%; margin: 6px 0; padding-bottom: 2px; white-space: normal; }
+/* A KaTeX törtjeinek tintája ~0.25em-mel a sordoboz fölé nyúlik, és az
+   overflow-y: hidden pont a tört tetejét csípte le. A párnázás mérten fedi:
+   em-ben, hogy nagyobb betűnél is elég maradjon. */
+.inline-math.is-display { display: block; overflow-x: auto; overflow-y: hidden; max-width: 100%; margin: 6px 0; padding: .45em 0 .4em; white-space: normal; }
 .inline-math.is-display .katex-display { margin: 0; text-align: left; }
 .inline-math.is-raw { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .94em; color: #d69d72; white-space: pre-wrap; }
 .inline-file-link { display: inline; margin: 0; padding: 1px 4px; border: 1px solid #496050; border-radius: 4px; background: rgba(25, 58, 45, .72); color: #b8efd0; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .94em; text-decoration: underline; text-decoration-color: rgba(184, 239, 208, .45); text-underline-offset: 2px; }
@@ -962,6 +965,10 @@ textarea::placeholder { color: var(--faint); }
 .trace-step-row.is-disabled { background: rgba(35, 40, 46, .35); color: var(--faint); opacity: .52; cursor: default; }
 .trace-step-row.is-disabled:hover, .trace-step-row.is-disabled:focus-visible { border-color: transparent; }
 .trace-step-marker { display: flex; width: 24px; min-height: 19px; align-items: center; justify-content: flex-start; color: transparent; font-size: 12px; line-height: 1; }
+/* A terv pontjának sorszáma — az alap szabály color: transparent-je alatt a
+   szám láthatatlan lenne. */
+.trace-step-marker.is-numbered { color: var(--faint); font-size: 10px; font-variant-numeric: tabular-nums; }
+.trace-step-row.is-selected .trace-step-marker.is-numbered { color: var(--accent); }
 .trace-step-name { min-width: 0; max-width: 100%; color: inherit; font-size: 10px; overflow-wrap: anywhere; white-space: normal; }
 .trace-step-intensity { display: flex; flex-direction: column; align-items: flex-start; justify-content: center; gap: 1px; min-height: 18px; }
 .trace-step-intensity-line { display: block; width: 7px; height: 2px; border-radius: 2px; background: var(--accent); box-shadow: 0 0 3px rgba(123, 217, 171, .28); }

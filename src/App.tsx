@@ -510,21 +510,6 @@ type RunHandle = {
   completedTerminalTurns: Set<string>;
   /** Lánc esetén a szakaszok saját kérés-azonosítói. */
   chainRequestIds: Set<string>;
-  /**
-   * A lánc állapota — a szakasz-jelző és az újrafuttatás kerete.
-   *
-   * Két külön projektben két lánc futhat egyszerre; egy globális
-   * „épp melyik szakasznál tartunk" a másik panelére hazudna.
-   */
-  chain?: {
-    progress?: PipelineProgressEvent | null;
-    resume?: {
-      chainKey: string;
-      startStage: number;
-      iteration: number;
-      carried: Record<number, string>;
-    } | null;
-  };
   /** A gördülékeny kiírás puffere. */
   answerStream: {
     meta: Omit<CodexDelta, "delta"> | null;
@@ -6991,6 +6976,20 @@ function App() {
   // számláló csak arra kell, hogy a tábla változása rendert kérjen: a Map ref,
   // és a React magától nem venné észre.
   const [runsRevision, setRunsRevision] = useState(0);
+  // A lánc szakasz-jelzője. Egy projektben egy lánc futhat, és a panel a
+  // nézett beszélgetéshez tartozik — ezért ez globális állapot maradhat.
+  const [pipelineProgress, setPipelineProgress] =
+    useState<PipelineProgressEvent | null>(null);
+  const pipelineProgressRef = useRef<PipelineProgressEvent | null>(null);
+  pipelineProgressRef.current = pipelineProgress;
+  // Újrafuttatás közben: a `startStage` előtti szakaszok ebben a körben nem
+  // futnak, enélkül a sáv úgy rajzolná őket, mintha még sorra kerülnének.
+  const [liveRunResume, setLiveRunResume] = useState<{
+    chainKey: string;
+    startStage: number;
+    iteration: number;
+    carried: Record<number, string>;
+  } | null>(null);
   // Mely beszélgetésekben vár egy Enter a futás végére. Beszélgetésenként,
   // különben az A-ban sorba tett üzenet a B futásának végén indulna el.
   const [queuedSendConversations, setQueuedSendConversations] = useState<
@@ -7605,7 +7604,7 @@ function App() {
     const meta = run.answerStream.meta;
     if (!delta || !meta) return;
     // Élő buborék nélküli futás (lánc-újrafuttatás): a szakasz szövegét a
-    // runner adja vissza kész sorként. Cél nélkül ez egy jelöletlen, második
+    // runner adja vissza kész sorként. Cél nélkül ez jelöletlen, második
     // másolatot írna a beszélgetésbe.
     if (!run.liveMessageId) return;
     writeOwnedMessages(run.ownerConversationId, (current) =>
@@ -7706,10 +7705,6 @@ function App() {
 
   /** A képernyőn álló beszélgetés futása, ha van neki. */
   const viewedRun = runForConversation(activeConversationId);
-  // A lánc-jelzők a *nézett* futásé: egy másik projektben futó lánc szakaszai
-  // nem rajzolhatnak ide panelt.
-  const pipelineProgress = viewedRun?.chain?.progress ?? null;
-  const liveRunResume = viewedRun?.chain?.resume ?? null;
   // Amit a felület mutat: a nézett futás üzenete, ha van futás; különben a
   // nézet saját alapállapota. Egy másik beszélgetés köre nem üzenhet ide.
   const codeStatus = viewedRun?.statusLabel ?? viewCodeStatus;
@@ -7754,7 +7749,7 @@ function App() {
   ) => {
     // A chain is one answer as far as the room is concerned. Chiming after
     // every stage turned a single question into three announcements.
-    const progress = run?.chain?.progress;
+    const progress = pipelineProgressRef.current;
     if (progress && progress.stageIndex + 1 < progress.stageCount) return;
     const played = completionSoundRequestsRef.current;
     if (played.has(requestOrTurnId)) return;
@@ -8825,15 +8820,7 @@ function App() {
     // trace attribute those events to the turn that is actually running.
     const unlisten = listen<PipelineProgressEvent>("pipeline-progress", (event) => {
       const progress = event.payload;
-      const progressRun =
-        runForEvent({ requestId: progress.requestId }) ??
-        (runsRef.current.values().next().value as RunHandle | undefined);
-      if (progressRun) {
-        progressRun.chain = { ...progressRun.chain, progress };
-        // A szakasz sávja a lánc sajátja: a nézet-választás csak addig él,
-        // amíg ugyanaz a szakasz fut.
-        setRunsRevision((revision) => revision + 1);
-      }
+      setPipelineProgress(progress);
       if (progress.phase === "started") {
         // A szakasz a saját láncának futásához tartozik: a kérés-azonosítója
         // oda kerül be, és onnantól az eseményei is odatalálnak.
@@ -11013,7 +11000,7 @@ function App() {
                   id: "client-pre-plan",
                   // During a chain the running stage names the placeholder;
                   // outside one this falls back to the plan wording.
-                  step: prePlanStepLabel(run.chain?.progress?.role),
+                  step: prePlanStepLabel(pipelineProgressRef.current?.role),
                   status: "inProgress" as const,
                 },
               ];
@@ -13116,8 +13103,7 @@ function App() {
             }).catch(() => undefined);
           }, 2500);
         } finally {
-          runHandle.chain = undefined;
-          setRunsRevision((revision) => revision + 1);
+          setPipelineProgress(null);
           // A chain runs under one request id per stage, so the shared reset
           // at the end of this function — which only fires when the active
           // request id is still the one it started with — never matches after
@@ -13567,6 +13553,7 @@ function App() {
       return;
     }
     setLiveStageChoice(null);
+    setLiveRunResume({ chainKey, startStage, iteration, carried });
 
     // A re-run is a chain, and a chain is read in the detailed layout: the
     // panel it draws has phases. Without this the composer still showed the
@@ -13599,9 +13586,6 @@ function App() {
       processedEvents: new Set(),
       completedTerminalTurns: new Set(),
       chainRequestIds: new Set(stageRequestIds),
-      // A `startStage` előtti szakaszok ebben a körben nem futnak: enélkül a
-      // sáv úgy rajzolná őket, mintha még sorra kerülnének.
-      chain: { resume: { chainKey, startStage, iteration, carried } },
       answerStream: { meta: null, pending: "", frame: null },
       status: "streaming",
       cancelled: false,
@@ -13729,8 +13713,8 @@ function App() {
         `A lánc újrafuttatása nem sikerült: ${error instanceof Error ? error.message : String(error)}`,
       );
     } finally {
-      rerunRun.chain = undefined;
-      setRunsRevision((revision) => revision + 1);
+      setPipelineProgress(null);
+      setLiveRunResume(null);
       setRunStatus(rerunRun, { cancelling: false });
       endRun(requestId);
       releaseQueuedSend(rerunConversationId);
@@ -14045,10 +14029,6 @@ function App() {
     ? `request:${liveRunOuterRequestId}-stage-`
     : null;
 
-  // A futó újrafuttatás panelje pontosan egy helyet kap. A verzió-szűrés
-  // korábban ezt mellékesen biztosította (csak a kiválasztott verzió rajzolt);
-  // mivel a jelölő most a szűrés előtt kerül ki, a „csak egy" kimondva kell.
-  const rerunSlotEmitted = new Set<string>();
   const timelineContent = timelineEntries
     .filter((entry) => activeMode === "coding" || entry.kind === "message")
     .map((entry) => {
@@ -14255,25 +14235,6 @@ function App() {
     // answer tab has no stage of its own, so the last one hosts it. Matched on
     // the run as well as the slot: two versions own the same slot, and without
     // the run id both of them would draw the panel.
-    // Past the deduplication above, so exactly one entry of the chain stands
-    // in for it. A re-run belongs to the panel it was started from, not to the
-    // bottom of the conversation; the live card is assembled further down the
-    // file, so this leaves a marker and the card is dropped in afterwards —
-    // cheaper than hoisting half the render above the timeline.
-    //
-    // Ez a verzió-szűrés ELŐTT van, és ez lényeges: a futó újrafuttatásnak még
-    // nincs kész szakasza, tehát a szűrő eldobná a csoportot — és vele a
-    // panel egyetlen helyét. Aki v2-re kattintott egy futó lánc közben,
-    // pontosan ezért látta eltűnni az egészet.
-    if (stage && liveRunResume?.chainKey === chainKey) {
-      if (rerunSlotEmitted.has(chainKey)) return null;
-      rerunSlotEmitted.add(chainKey);
-      return LIVE_RERUN_SLOT;
-    }
-    // Only the chosen phase draws itself; the others are one click away. The
-    // answer tab has no stage of its own, so the last one hosts it. Matched on
-    // the run as well as the slot: two versions own the same slot, and without
-    // the run id both of them would draw the panel.
     const shownStage = stage
       ? stageForVersion(
           chain,
@@ -14287,6 +14248,19 @@ function App() {
         shownStage?.stageIndex !== stage.stageIndex)
     )
       return null;
+    // Past the deduplication above, so exactly one entry of the chain stands
+    // in for it. A re-run belongs to the panel it was started from, not to the
+    // bottom of the conversation; the live card is assembled further down the
+    // file, so this leaves a marker and the card is dropped in afterwards —
+    // cheaper than hoisting half the render above the timeline.
+    // Deliberately not waiting for `pipelineProgress`: that arrives with the
+    // first stage, and until then the card would render at the bottom and then
+    // jump into place — which is exactly the "it started a new conversation"
+    // moment this is meant to remove. `liveRunResume` is set before the run is
+    // even asked for.
+    if (stage && liveRunResume?.chainKey === chainKey) {
+      return LIVE_RERUN_SLOT;
+    }
     // The verdict of the version being read, not of the newest one: a reader
     // who went back to v1 is looking at what v1 concluded.
     const runVerdict = stageForVersion(chain, selectedVersion, lastStageIndex);
@@ -14711,8 +14685,6 @@ Javítsd ki, majd futtasd le újra a teszteket.`
   // A re-run draws itself inside the panel it belongs to; everything else
   // still streams below the conversation, where a new answer belongs.
   const rerunInPlace = Boolean(liveRunResume && pipelineProgress);
-  const rerunSlotPlaced =
-    rerunInPlace && timelineContent.includes(LIVE_RERUN_SLOT);
   const timelineWithLiveRerun = rerunInPlace
     ? timelineContent.map((node) =>
         node === LIVE_RERUN_SLOT ? liveTurnContent : node,
@@ -14882,7 +14854,7 @@ Javítsd ki, majd futtasd le újra a teszteket.`
             {timelineWithLiveRerun}
             {activeMode === "general"
               ? generalLiveTurnContent
-              : rerunInPlace && rerunSlotPlaced
+              : rerunInPlace
                 ? null
                 : liveTurnContent}
             {viewingActiveRun && !isAtBottom && (

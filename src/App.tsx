@@ -13425,6 +13425,11 @@ function App() {
     // nézet-óra is így lássa, különben az első két címzett írás — a kérdés és
     // a terv — a tárba menne ugyan, de a képernyőn nem jelenne meg.
     messageKeyRef.current = requestThreadKey;
+    // Az első üzenet átnevezi a beszélgetést, tehát a render-kulcs változik —
+    // a szerkesztő eddig ezt beszélgetés-váltásnak nézte, és mindent
+    // kiürített: a Részletes kapcsolót, a képeket, az idézeteket. Ugyanaz a
+    // beszélgetés, csak új néven; a szerkesztő hatóköre vele költözik.
+    composerScopeRef.current = requestThreadKey;
     updateOwnedPlanState(runConversationId, initialPlan);
     writeOwnedMessages(runConversationId, () => nextMessages);
     inputDraftRef.current = "";

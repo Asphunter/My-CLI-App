@@ -1680,7 +1680,30 @@ textarea::placeholder { color: var(--faint); }
 .trace-card.is-verdict-accepted::before { background: #6fc08c !important; }
 .trace-card.is-verdict-changes::before { background: #d08a6a !important; }
 .pipeline-run-tab:disabled { opacity: .38; cursor: default; }
+/* A futó szakasz eddig egy árnyalatnyi színkülönbség volt — tíz percig nézve
+   megkülönböztethetetlen a késztől. Ez a fény körbejár a buborékon, amíg a
+   szakasz tényleg dolgozik: ha megáll, azt is látni. */
 .pipeline-run-tab.is-running { color: var(--accent-strong); }
+.pipeline-run-tab.is-running::after {
+  content: ""; position: absolute; inset: -1px; z-index: 0; pointer-events: none;
+  border-radius: 4px; padding: 1px;
+  background: conic-gradient(from var(--stage-sweep, 0turn), transparent 0turn, transparent .62turn, var(--accent-strong) .88turn, transparent 1turn);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  animation: stage-sweep 1.8s linear infinite;
+}
+@property --stage-sweep { syntax: "<angle>"; inherits: false; initial-value: 0turn; }
+@keyframes stage-sweep { to { --stage-sweep: 1turn; } }
+@media (prefers-reduced-motion: reduce) {
+  .pipeline-run-tab.is-running::after { animation: none; opacity: .6; }
+}
+/* Hibára futott szakasz: nem fut, de nem is „kész". */
+.pipeline-run-tab.is-failed { color: #d99b86; }
+/* A VÁLASZ fül a lánc végéig nem visz sehová. */
+.trace-view-option:disabled { opacity: .4; cursor: default; }
+.trace-view-option:disabled:hover { color: var(--faint); }
 .live-turn-anchor .pipeline-run-header { margin-top: 0; }
 
 .pipeline-answer-next {

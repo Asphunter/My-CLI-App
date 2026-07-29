@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "frontend:deliver": "node scripts/frontend_deliver.cjs",
     "test:timeline": "node --test tests/*.test.ts",
     "test:claude-bridge": "node --test agent-bridge/*.test.mjs",
     "claude:bridge": "node agent-bridge/main.mjs",

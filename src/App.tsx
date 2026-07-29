@@ -5598,6 +5598,8 @@ function TurnProgressCard({
           (hasMeaningfulPlanTiming && step.status === "completed")
         );
       });
+  // A terv-fázis kártyája nem naplót mutat, hanem magát a tervet.
+  const isPlanStage = stageRole === "plan";
   const fallbackStep: PlanStep = {
     id: "client-pre-plan",
     step: prePlanStepLabel(stageRole ?? answer?.pipeline?.stageRole),
@@ -5611,7 +5613,21 @@ function TurnProgressCard({
   // model plan arrives. Once real plan steps exist, attach unassigned
   // preparation notes to the first real step instead of rendering a separate
   // synthetic `0. Terv...` row with a misleading 0:00 duration.
-  const steps = plannedSteps.length === 0 ? [fallbackStep] : plannedSteps;
+  // Terv-fázison a számozott pontok maguk a lépések. A tervfrissítésből
+  // született lista erősebb; ez csak akkor lép be, ha az elmaradt.
+  const derivedPlanSteps =
+    isPlanStage && plannedSteps.length === 0 && answer?.text
+      ? numberedPlanSteps(answer.text).map((step) => ({
+          ...step,
+          status: (streaming ? "pending" : "completed") as PlanStep["status"],
+        }))
+      : [];
+  const effectivePlannedSteps =
+    plannedSteps.length === 0 && derivedPlanSteps.length >= 2
+      ? derivedPlanSteps
+      : plannedSteps;
+  const steps =
+    effectivePlannedSteps.length === 0 ? [fallbackStep] : effectivePlannedSteps;
   const prePlanDisplayStepId = plannedSteps[0]?.id ?? fallbackStep.id;
   const commentaryStepId = (body: string) => {
     const match = body.match(/\b(\d+)\.\s*lépés\b/i);
@@ -5673,14 +5689,17 @@ function TurnProgressCard({
   // A terv-fázis GONDOLKODÁS MENETE panelje nem naplót mutat, hanem magát a
   // tervet: RAW = a teljes szöveg (élőben streamelve), DETAIL = a kiválasztott
   // lépés szelete.
-  const isPlanStage = stageRole === "plan";
   const [planContentView, setPlanContentView] = useState<"raw" | "detail">(
     "raw",
   );
   useEffect(() => {
-    if (isPlanStage && plannedSteps.length === 0 && planContentView === "detail")
+    if (
+      isPlanStage &&
+      effectivePlannedSteps.length === 0 &&
+      planContentView === "detail"
+    )
       setPlanContentView("raw");
-  }, [isPlanStage, planContentView, plannedSteps.length]);
+  }, [isPlanStage, planContentView, effectivePlannedSteps.length]);
   const [inlineDiff, setInlineDiff] = useState<InlineCodeDiff | null>(null);
   const followActiveStepRef = useRef(true);
 
@@ -6345,7 +6364,7 @@ function TurnProgressCard({
             <div className="trace-panel-heading">
               <strong>LÉPÉSEK</strong>
               <span>
-                {isPlanStage && plannedSteps.length === 0
+                {isPlanStage && effectivePlannedSteps.length === 0
                   ? "készül"
                   : `${completedStepCount}/${steps.length} kész`}
               </span>
@@ -6355,13 +6374,16 @@ function TurnProgressCard({
               data-quote-selectable="true"
               role="list"
             >
-              {isPlanStage && plannedSteps.length === 0 && (
+              {isPlanStage && effectivePlannedSteps.length === 0 && (
                 <span className="trace-thinking-empty-text">
                   A lépések a terv elkészültekor jönnek létre — a születő terv
                   a RAW nézetben olvasható.
                 </span>
               )}
-              {(isPlanStage && plannedSteps.length === 0 ? [] : steps).map((step) => {
+              {(isPlanStage && effectivePlannedSteps.length === 0
+                ? []
+                : steps
+              ).map((step) => {
                 const disabled =
                   streaming &&
                   step.status === "pending" &&
@@ -6429,9 +6451,9 @@ function TurnProgressCard({
                     // Lépések nélkül a DETAIL-nek nincs mit szeletelnie: a
                     // váltó az első sornál ragadna. A lista a terv végén
                     // születik meg, addig a RAW él.
-                    disabled={plannedSteps.length === 0}
+                    disabled={effectivePlannedSteps.length === 0}
                     title={
-                      plannedSteps.length === 0
+                      effectivePlannedSteps.length === 0
                         ? "A lépések a terv elkészültekor jönnek létre"
                         : undefined
                     }
@@ -15067,7 +15089,10 @@ Javítsd ki, majd futtasd le újra a teszteket.`
     // Mid-run the only settled copy the frontend has is the outer bubble, and
     // it holds the phase that finished last. Anything older is not in memory
     // yet, so say that instead of showing the wrong phase.
-    if (pipelineProgress && index === 0)
+    if (
+      pipelineProgress &&
+      (index === 0 || index === pipelineProgress.stageIndex - 1)
+    )
       return (
         messages.find(
           (message) =>

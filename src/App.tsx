@@ -9128,19 +9128,23 @@ function App() {
         const stageSteps =
           carriedSteps.length >= 2
             ? carriedSteps
-            : [
-                {
-                  id: "client-pre-plan",
-                  step: prePlanStepLabel(progress.role),
-                  status: "inProgress" as const,
-                },
-              ];
+            : progress.role === "plan"
+              ? []
+              : [
+                  {
+                    id: "client-pre-plan",
+                    step: prePlanStepLabel(progress.role),
+                    status: "inProgress" as const,
+                  },
+                ];
         updateOwnedPlanState(chainRun.ownerConversationId, {
           turnId: `request:${progress.requestId}`,
           explanation: "",
           steps: stageSteps,
           startedAt: stageStartedAt,
-          stepTimes: { [stageSteps[0].id]: { startedAt: stageStartedAt } },
+          stepTimes: stageSteps.length
+            ? { [stageSteps[0].id]: { startedAt: stageStartedAt } }
+            : {},
         });
       }
     });
@@ -11350,7 +11354,15 @@ function App() {
               message.live &&
               message.turnId === uiTurnId,
           );
-          const answerIndex = targetIndex >= 0 ? targetIndex : fallbackIndex;
+          // Lánc-szakasz: a saját (turn-azonosítójú) élő buboréka zárul le.
+          // A külső buborék az első szakasz szövegét őrzi — azt egy későbbi
+          // szakasz lezárása nem írhatja felül.
+          const answerIndex =
+            !isActiveRequest && fallbackIndex >= 0
+              ? fallbackIndex
+              : targetIndex >= 0
+                ? targetIndex
+                : fallbackIndex;
           if (answerIndex >= 0) {
             return current.map((message, index) => {
               if (index !== answerIndex) return message;
@@ -14858,7 +14870,7 @@ Javítsd ki, majd futtasd le újra a teszteket.`
     // Mid-run the only settled copy the frontend has is the outer bubble, and
     // it holds the phase that finished last. Anything older is not in memory
     // yet, so say that instead of showing the wrong phase.
-    if (pipelineProgress && index === pipelineProgress.stageIndex - 1)
+    if (pipelineProgress && index === 0)
       return (
         messages.find(
           (message) =>
@@ -14937,15 +14949,56 @@ Javítsd ki, majd futtasd le újra a teszteket.`
       )}
     </div>
   ) : undefined;
+  const liveFinishedStageTurnId = `request:${liveRunOuterRequestId}-stage-${liveShownStage}`;
   const liveFinishedStagePanel =
     pipelineProgress && liveShownStage !== pipelineProgress.stageIndex ? (
-      <article className="trace-card in-run is-run-end pipeline-answer-card">
-        <div className="pipeline-answer-body">
-          {answerParagraphs(
-            textWithoutCodeBlocks(liveFinishedStageText(liveShownStage)),
-          )}
-        </div>
-      </article>
+      <TurnProgressCard
+        runPosition="end"
+        stageRole={liveRunStages[liveShownStage]?.role || undefined}
+        plan={
+          planHistory[liveFinishedStageTurnId] ??
+          (liveShownStage === 0
+            ? planHistory[`request:${liveRunOuterRequestId}`]
+            : undefined) ?? {
+            turnId: liveFinishedStageTurnId,
+            explanation: "",
+            steps: [],
+          }
+        }
+        activities={codeActivity.filter(
+          (activity) =>
+            activity.turnId === liveFinishedStageTurnId ||
+            (liveShownStage === 0 &&
+              activity.turnId === `request:${liveRunOuterRequestId}`),
+        )}
+        commentary={commentaryEntries.filter(
+          (entry) =>
+            entry.turnId === liveFinishedStageTurnId ||
+            (liveShownStage === 0 &&
+              entry.turnId === `request:${liveRunOuterRequestId}`),
+        )}
+        status="kész"
+        streaming={false}
+        expanded
+        transport={null}
+        watchdogMessage=""
+        onToggle={() => {}}
+        answer={(() => {
+          const text = liveFinishedStageText(liveShownStage);
+          return text.trim()
+            ? {
+                role: "assistant" as const,
+                text,
+                time: "kész",
+                live: false,
+                final: true,
+                turnId: liveFinishedStageTurnId,
+              }
+            : undefined;
+        })()}
+        quoteAnchorPrefix={`live-stage:${liveFinishedStageTurnId}`}
+        onQuoteJump={jumpToQuote}
+      />
     ) : null;
   // A chain finishes a turn per stage, so between two stages the completed
   // request is still the active one and this panel used to unmount -- while the

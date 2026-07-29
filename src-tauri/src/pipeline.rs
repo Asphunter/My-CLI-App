@@ -65,7 +65,11 @@ impl StageRole {
                  Ne írd meg a kódot, csak a tervet."
             }
             Self::Code => {
-                "Te vagy a kódoló. Hajtsd végre a fenti tervet. Ha a terv egy lépése hibás \
+                "Te vagy a kódoló. Hajtsd végre a fenti tervet. Mielőtt bármihez nyúlnál, \
+                 vedd fel a terv számozott lépéseit todo-listaként, és munka közben \
+                 tartsd karban: mindig az a lépés legyen folyamatban, amin dolgozol, \
+                 a befejezettet jelöld késznek — a felület ebből mutatja a \
+                 felhasználónak, hol tartasz. Ha a terv egy lépése hibás \
                  vagy megvalósíthatatlan, térj el tőle, és a végén írd meg, miben és miért. \
                  Futtasd le az érintett teszteket, és az eredményt írd bele az \
                  összefoglalóba. A végén röviden foglald össze, mit változtattál."

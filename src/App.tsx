@@ -9105,18 +9105,42 @@ function App() {
         chainRun.turnId = `request:${progress.requestId}`;
         syncRunAliases();
         const stageStartedAt = Date.now();
+        // A kódoló szakasz lépéslistája maga a terv: a terv-szakasz számozott
+        // fő pontjai. Enélkül a KÓD alatt egy „0. lépés" placeholder állt,
+        // miközben a terv tíz lépést vett fel — a lista sosem látszott.
+        const carriedPlanText =
+          progress.role === "code"
+            ? messagesRef.current.find(
+                (message) => message.id === chainRun.liveMessageId,
+              )?.text ?? ""
+            : "";
+        const carriedSteps = carriedPlanText
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter((line) => /^\d+[.)]\s+\S/.test(line))
+          .slice(0, 12)
+          .map((line, index) => ({
+            id: `carried-plan-${index}`,
+            step: line.replace(/^\d+[.)]\s+/, "").replace(/[`*]/g, ""),
+            status:
+              index === 0 ? ("inProgress" as const) : ("pending" as const),
+          }));
+        const stageSteps =
+          carriedSteps.length >= 2
+            ? carriedSteps
+            : [
+                {
+                  id: "client-pre-plan",
+                  step: prePlanStepLabel(progress.role),
+                  status: "inProgress" as const,
+                },
+              ];
         updateOwnedPlanState(chainRun.ownerConversationId, {
           turnId: `request:${progress.requestId}`,
           explanation: "",
-          steps: [
-            {
-              id: "client-pre-plan",
-              step: prePlanStepLabel(progress.role),
-              status: "inProgress",
-            },
-          ],
+          steps: stageSteps,
           startedAt: stageStartedAt,
-          stepTimes: { "client-pre-plan": { startedAt: stageStartedAt } },
+          stepTimes: { [stageSteps[0].id]: { startedAt: stageStartedAt } },
         });
       }
     });
@@ -14786,6 +14810,14 @@ Javítsd ki, majd futtasd le újra a teszteket.`
           message.role === "assistant" &&
           message.live &&
           message.turnId === `request:${pipelineProgress.requestId}`,
+      ) ??
+      // A lánc első szakasza a futás külső élő buborékába streamel — az is
+      // ennek a futásnak a szövege, ne legyen láthatatlan.
+      messages.find(
+        (message) =>
+          message.role === "assistant" &&
+          message.live &&
+          message.id === viewedRun?.liveMessageId,
       )
     : [...messages]
         .reverse()
@@ -14939,7 +14971,7 @@ Javítsd ki, majd futtasd le újra a teszteket.`
           plan={activePlan}
           activities={
             pipelineProgress && liveTurnId
-              ? (liveWorkGroup?.activities ?? []).filter(
+              ? codeActivity.filter(
                   (activity) => activity.turnId === liveTurnId,
                 )
               : liveWorkGroup?.activities ?? []

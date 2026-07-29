@@ -9100,6 +9100,20 @@ function App() {
         // naming it here makes the live bubble and the stored row one row.
         chainRun.turnId = `request:${progress.requestId}`;
         syncRunAliases();
+        const stageStartedAt = Date.now();
+        updateOwnedPlanState(chainRun.ownerConversationId, {
+          turnId: `request:${progress.requestId}`,
+          explanation: "",
+          steps: [
+            {
+              id: "client-pre-plan",
+              step: prePlanStepLabel(progress.role),
+              status: "inProgress",
+            },
+          ],
+          startedAt: stageStartedAt,
+          stepTimes: { "client-pre-plan": { startedAt: stageStartedAt } },
+        });
       }
     });
     return () => {
@@ -11278,7 +11292,11 @@ function App() {
         setCodeStatus("dolgozik");
       } else if (codexEvent.eventType === "turn/completed") {
         settleAnswerStream(run);
-        const completedRequestId = run.requestId;
+        // Szakasz-lezárásnál a szakasz kérése zárul le, nem a lánc külső
+        // kérése — a checkpoint és a „kész" könyvelés is az övé.
+        const completedRequestId = isActiveRequest
+          ? run.requestId
+          : (codexEvent.requestId ?? run.requestId);
         const completedAt = Date.now();
         const completedAnswerText = firstString(
           params.finalText,
@@ -11379,9 +11397,11 @@ function App() {
         // not re-run the persistence effect when the stream already flushed
         // its provisional empty assistant row.
         markLocalMutation();
-        run.turnCompleted = true;
-        syncRunAliases();
-        setTurnCompletedRequestId(completedRequestId);
+        if (isActiveRequest) {
+          run.turnCompleted = true;
+          syncRunAliases();
+          setTurnCompletedRequestId(completedRequestId);
+        }
         const completedSteps = run.plan.steps.map((step) =>
           step.status === "inProgress"
             ? { ...step, status: "completed" as const }
@@ -14891,10 +14911,19 @@ Javítsd ki, majd futtasd le újra a teszteket.`
           runHeader={liveRunHeader}
           stageRole={pipelineProgress?.role}
           plan={activePlan}
-          activities={liveWorkGroup?.activities ?? []}
+          activities={
+            pipelineProgress && liveTurnId
+              ? (liveWorkGroup?.activities ?? []).filter(
+                  (activity) => activity.turnId === liveTurnId,
+                )
+              : liveWorkGroup?.activities ?? []
+          }
           commentary={
             liveWorkGroup
-              ? commentaryForWorkGroup(liveWorkGroup)
+              ? commentaryForWorkGroup(
+                  liveWorkGroup,
+                  pipelineProgress && liveTurnId ? liveTurnId : undefined,
+                )
               : commentaryEntries.filter((commentary) =>
                   Boolean(liveTurnId && commentary.turnId === liveTurnId),
                 )

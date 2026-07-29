@@ -290,6 +290,14 @@ function permissionUpdateFor(toolName) {
   }];
 }
 
+/** Az Anthropic átmeneti túlterhelése: érdemes megvárni, nem elbukni. */
+const MAX_OVERLOAD_RETRIES = 3;
+
+function isTransientOverload(message) {
+  const text = String(message ?? "").toLowerCase();
+  return /529|overloaded|temporarily unavailable|503/.test(text);
+}
+
 async function canUseToolForTurn(turn, toolName, input, options) {
   const cwd = turn.cwd;
   if (options?.signal?.aborted) return deny("A Claude-kérés megszakadt.");
@@ -766,6 +774,7 @@ async function runLiveTurn(request) {
   try {
     let finalResult = null;
     let resumeForQuery = initialResume;
+    let overloadRetries = 0;
     while (true) {
       try {
         const stream = query({
@@ -833,7 +842,39 @@ async function runLiveTurn(request) {
         turn.sawText = false;
         turn.assistantTexts = [];
         turn.toolMeta.clear();
+        continue;
       }
+      // Az Anthropic átmeneti túlterhelése (529) eddig megölte a szakaszt,
+      // pedig percek munkája veszett vele, és a következő próbálkozás
+      // rendszerint sikerül. Rövid, növekvő várakozás — csak erre az egy
+      // hibafajtára, hogy egy valódi hiba továbbra is azonnal kiderüljön.
+      if (finalResult && finalResult.subtype !== "success") {
+        const failureText = Array.isArray(finalResult.errors)
+          ? finalResult.errors.filter((item) => typeof item === "string").join("; ")
+          : "";
+        if (isTransientOverload(failureText) && overloadRetries < MAX_OVERLOAD_RETRIES) {
+          overloadRetries += 1;
+          const waitMs = 4000 * overloadRetries;
+          diagnostic("transient overload; retrying the turn", {
+            requestId: request.requestId,
+            attempt: overloadRetries,
+            waitMs,
+          });
+          emitAgentEvent(request, turn.sessionId, "item/agentMessage/delta", {
+            delta: `A szolgáltatás túlterhelt. Újrapróbálom ${waitMs / 1000} másodperc múlva (${overloadRetries}/${MAX_OVERLOAD_RETRIES}).`,
+            itemId: `overload-${overloadRetries}`,
+            phase: "commentary",
+            item: { type: "reasoning", phase: "commentary" },
+          });
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+          if (abortController.signal.aborted) break;
+          finalResult = null;
+          turn.sawText = false;
+          turn.assistantTexts = [];
+          continue;
+        }
+      }
+      break;
     }
     if (!finalResult) throw new Error("A Claude bridge nem adott turn eredményt.");
     if (finalResult.subtype !== "success") {

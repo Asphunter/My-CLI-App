@@ -5677,6 +5677,10 @@ function TurnProgressCard({
   const [planContentView, setPlanContentView] = useState<"raw" | "detail">(
     "raw",
   );
+  useEffect(() => {
+    if (isPlanStage && plannedSteps.length === 0 && planContentView === "detail")
+      setPlanContentView("raw");
+  }, [isPlanStage, planContentView, plannedSteps.length]);
   const [inlineDiff, setInlineDiff] = useState<InlineCodeDiff | null>(null);
   const followActiveStepRef = useRef(true);
 
@@ -6422,6 +6426,15 @@ function TurnProgressCard({
                     role="tab"
                     className={`trace-view-option${planContentView === "detail" ? " is-active" : ""}`}
                     aria-selected={planContentView === "detail"}
+                    // Lépések nélkül a DETAIL-nek nincs mit szeletelnie: a
+                    // váltó az első sornál ragadna. A lista a terv végén
+                    // születik meg, addig a RAW él.
+                    disabled={plannedSteps.length === 0}
+                    title={
+                      plannedSteps.length === 0
+                        ? "A lépések a terv elkészültekor jönnek létre"
+                        : undefined
+                    }
                     onClick={() => setPlanContentView("detail")}
                   >
                     DETAIL
@@ -11408,7 +11421,8 @@ function App() {
           run.chainRequestIds.has(codexEvent.requestId) &&
           run.plan.steps.length >= 2
         ) {
-          const inferencePath = extractFilePath(codexEvent.payload);
+          const inferencePath =
+            extractFilePath(codexEvent.payload) ?? activity.detail;
           const baseName = inferencePath
             ?.split(/[\/]/)
             .pop()
@@ -11599,6 +11613,23 @@ function App() {
         // not re-run the persistence effect when the stream already flushed
         // its provisional empty assistant row.
         markLocalMutation();
+        if (
+          !isActiveRequest &&
+          run.plan.steps.length === 0 &&
+          checkpointAnswerText.trim()
+        ) {
+          const bornSteps = numberedPlanSteps(checkpointAnswerText);
+          if (bornSteps.length >= 2) {
+            updateOwnedPlanState(ownerConversationId, {
+              turnId: uiTurnId,
+              explanation: "",
+              steps: bornSteps.map((step) => ({
+                ...step,
+                status: "completed" as const,
+              })),
+            });
+          }
+        }
         if (isActiveRequest) {
           run.turnCompleted = true;
           syncRunAliases();

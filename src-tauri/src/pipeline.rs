@@ -415,6 +415,11 @@ pub struct PipelineRunRequest {
     pub conversation_context: Option<String>,
     #[serde(default)]
     pub max_budget_usd: Option<f64>,
+    /// Hova írja a futtató a terv-szakasz kimenetét (relatív út a cwd alatt).
+    /// A frontend nevezi el (dátum + beszélgetéscím + kör); a tervező modell
+    /// maga read-only marad — a fájlt a futtató materializálja.
+    #[serde(default)]
+    pub plan_file: Option<String>,
     /// Per-stage model and reasoning chosen in the GUI. Indexed by stage, and
     /// only the fields the user actually set override the preset -- a stage
     /// left alone keeps what the recipe recommends.

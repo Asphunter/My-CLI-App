@@ -250,6 +250,28 @@ fn claim_project_root(
     Ok(ProjectClaim { root })
 }
 
+/// A terv-szakasz kimenetének kiírása a projekt alá.
+///
+/// Csak relatív, `..`-mentes utat fogad: a fájl a munkaterületen belül marad,
+/// bárhonnan is jött a kérés.
+fn write_plan_file(cwd: &str, plan_file: &str, text: &str) -> Result<(), String> {
+    let relative = std::path::Path::new(plan_file);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(format!("A terv-fájl útvonala nem megengedett: {plan_file}"));
+    }
+    let target = std::path::Path::new(cwd).join(relative);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("A tervek mappája nem hozható létre: {error}"))?;
+    }
+    std::fs::write(&target, text)
+        .map_err(|error| format!("A terv-fájl nem írható: {error}"))
+}
+
 /// Frees the project when the turn ends, however it ends.
 struct ProjectClaim {
     root: std::path::PathBuf,
@@ -540,6 +562,31 @@ async fn pipeline_send(
                         ),
                     );
                     let response = result?;
+                    // A terv fájlként is megmarad: a projekt része, gitelhető,
+                    // és a diffben is látszik. A tervező modell read-only —
+                    // a fájlt itt, a futtató írja ki, a szakasz végén, egyben.
+                    // A hiba nem-fatális: a lánc nem halhat bele abba, hogy a
+                    // tervek mappája épp nem írható.
+                    if execution.stage.role == pipeline::StageRole::Plan {
+                        if let (Some(cwd), Some(plan_file)) =
+                            (request.cwd.as_deref(), request.plan_file.as_deref())
+                        {
+                            if let Err(error) =
+                                write_plan_file(cwd, plan_file, &response.text)
+                            {
+                                let _ = codex::emit_main_window(
+                                    &app,
+                                    "codex-transport",
+                                    &serde_json::json!({
+                                        "requestId": request_id,
+                                        "stage": "plan-file-error",
+                                        "detail": error,
+                                        "threadId": null,
+                                    }),
+                                );
+                            }
+                        }
+                    }
                     let mut changed_files = response.guard.changed_files.clone();
                     changed_files.extend(response.guard.added_files.iter().cloned());
                     changed_files.extend(response.guard.removed_files.iter().cloned());
@@ -1352,6 +1399,27 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A terv-fájl a munkaterületen belül marad — kifelé mutató út nem írható.
+    #[test]
+    fn a_plan_file_stays_inside_the_workspace() {
+        let root = std::env::temp_dir().join(format!("min-plan-file-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("plan file fixture");
+        let cwd = root.to_string_lossy().to_string();
+
+        write_plan_file(&cwd, "tervek/2026-07-29-smith-v1.md", "## Terv")
+            .expect("relative plan file writes");
+        assert_eq!(
+            std::fs::read_to_string(root.join("tervek/2026-07-29-smith-v1.md"))
+                .expect("plan file readable"),
+            "## Terv"
+        );
+
+        assert!(write_plan_file(&cwd, "../kifele.md", "x").is_err());
+        assert!(write_plan_file(&cwd, "C:/abszolut.md", "x").is_err());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     /// A project may be claimed once at a time, and the claim frees itself.
     ///

@@ -875,6 +875,48 @@ const quoteBacklinkButtons = (
  * like a whole empty row of text. Splitting on the blank line and letting CSS
  * set the gap keeps the structure and drops the hole.
  */
+/**
+ * A terv szövegének az a szelete, ami az adott sorszámú ponthoz tartozik: a
+ * számozott sorától a következő számozott sorig (vagy a szöveg végéig).
+ */
+const planStepSlice = (text: string, stepIndex: number) => {
+  const lines = text.split(/\r?\n/);
+  const starts: number[] = [];
+  lines.forEach((line, index) => {
+    if (/^\d+[.)]\s+\S/.test(line.trim())) starts.push(index);
+  });
+  if (stepIndex < 0 || stepIndex >= starts.length) return "";
+  const from = starts[stepIndex];
+  const to = stepIndex + 1 < starts.length ? starts[stepIndex + 1] : lines.length;
+  return lines.slice(from, to).join("\n").trim();
+};
+
+/** A terv számozott fő pontjai — a LÉPÉS lista közös forrása. */
+const numberedPlanSteps = (text: string) =>
+  text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^\d+[.)]\s+\S/.test(line))
+    .slice(0, 12)
+    .map((line, index) => ({
+      id: `carried-plan-${index}`,
+      step: line.replace(/^\d+[.)]\s+/, "").replace(/[`*]/g, ""),
+    }));
+
+/** `tervek/ÉÉÉÉ-HH-NN-<téma>-v<kör>.md` — a terv-fájl neve. */
+const planFileNameFor = (title: string, iteration: number) => {
+  const slug =
+    title
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 48) || "terv";
+  const date = new Date().toISOString().slice(0, 10);
+  return `tervek/${date}-${slug}-v${iteration}.md`;
+};
+
 const answerParagraphs = (text: string) =>
   text
     .split(/\n{2,}/)
@@ -5628,6 +5670,13 @@ function TurnProgressCard({
       [...steps].reverse().find((step) => step.status === "completed") ??
       steps[0]);
   const [selectedStepId, setSelectedStepId] = useState(activeStep.id);
+  // A terv-fázis GONDOLKODÁS MENETE panelje nem naplót mutat, hanem magát a
+  // tervet: RAW = a teljes szöveg (élőben streamelve), DETAIL = a kiválasztott
+  // lépés szelete.
+  const isPlanStage = stageRole === "plan";
+  const [planContentView, setPlanContentView] = useState<"raw" | "detail">(
+    "raw",
+  );
   const [inlineDiff, setInlineDiff] = useState<InlineCodeDiff | null>(null);
   const followActiveStepRef = useRef(true);
 
@@ -5851,10 +5900,7 @@ function TurnProgressCard({
   }, [orderedActivities, stepActivities, stepCommentary]);
   const [expandedInternalEntryId, setExpandedInternalEntryId] =
     useState<string | null>(null);
-  const [essentialTraceOnly, setEssentialTraceOnly] = useState(false);
-  const visibleThinkingEntries = essentialTraceOnly
-    ? thinkingEntries.filter((entry) => entry.kind !== "internal")
-    : thinkingEntries;
+  const visibleThinkingEntries = thinkingEntries;
   const thinkingListRef = useRef<HTMLUListElement>(null);
   const inferredStartedAtRef = useRef<number | undefined>(plan.startedAt);
   const [clockNow, setClockNow] = useState(() => Date.now());
@@ -5959,7 +6005,10 @@ function TurnProgressCard({
     wasStreamingRef.current = streaming;
     if (enteredStreaming || leftStreaming) manualTraceViewRef.current = false;
     if (manualTraceViewRef.current) return;
-    if (streaming) {
+    if (isPlanStage) {
+      // A terv-fázis a lépés-nézetben él: a RAW mutatja a születő tervet.
+      setTraceView("steps");
+    } else if (streaming) {
       setTraceView(hasAnswer ? "answer" : "steps");
     } else if (hasAnswer) {
       // Recovery can populate the answer after the first render. Do not leave
@@ -5970,7 +6019,7 @@ function TurnProgressCard({
     }
   }, [expanded, hasAnswer, streaming]);
   useEffect(() => {
-    if (!streaming) return;
+    if (!streaming || isPlanStage) return;
     const nextView: TraceView = hasAnswer ? "answer" : "steps";
     setTraceView(nextView);
     // Keep the durable expansion choice in sync so the completed card does
@@ -6183,9 +6232,16 @@ function TurnProgressCard({
                     className={`trace-view-option${traceView === "answer" ? " is-active" : ""}`}
                     aria-selected={traceView === "answer"}
                     // Amíg nincs válasz, a fül üres panelre vinne. Ott marad,
-                    // hogy a váltó ne ugráljon, de nem kattintható.
-                    disabled={!hasAnswer}
-                    title={hasAnswer ? undefined : "A válasz még készül"}
+                    // hogy a váltó ne ugráljon, de nem kattintható. A terv-
+                    // fázison a RAW nézet vette át a szerepét.
+                    disabled={!hasAnswer || isPlanStage}
+                    title={
+                      isPlanStage
+                        ? "A terv a LÉPÉSEK nézet RAW füle alatt olvasható"
+                        : hasAnswer
+                          ? undefined
+                          : "A válasz még készül"
+                    }
                     onClick={() => selectTraceView("answer")}
                   >
                     VÁLASZ
@@ -6284,14 +6340,24 @@ function TurnProgressCard({
           <section className="trace-steps-panel" aria-label="Lépések listája">
             <div className="trace-panel-heading">
               <strong>LÉPÉSEK</strong>
-              <span>{completedStepCount}/{steps.length} kész</span>
+              <span>
+                {isPlanStage && plannedSteps.length === 0
+                  ? "készül"
+                  : `${completedStepCount}/${steps.length} kész`}
+              </span>
             </div>
             <div
               className="trace-step-list"
               data-quote-selectable="true"
               role="list"
             >
-              {steps.map((step) => {
+              {isPlanStage && plannedSteps.length === 0 && (
+                <span className="trace-thinking-empty-text">
+                  A lépések a terv elkészültekor jönnek létre — a születő terv
+                  a RAW nézetben olvasható.
+                </span>
+              )}
+              {(isPlanStage && plannedSteps.length === 0 ? [] : steps).map((step) => {
                 const disabled =
                   streaming &&
                   step.status === "pending" &&
@@ -6336,18 +6402,67 @@ function TurnProgressCard({
           >
             <div className="trace-panel-heading trace-panel-heading-thinking">
               <strong>GONDOLKODÁS MENETE</strong>
-              <div className="trace-panel-actions">
-                <button
-                  type="button"
-                  className="trace-panel-action"
-                  aria-pressed={essentialTraceOnly}
-                  onClick={() => setEssentialTraceOnly((current) => !current)}
+              {isPlanStage && (
+                <div
+                  className="trace-view-switch"
+                  role="tablist"
+                  aria-label="Terv nézete"
                 >
-                  {essentialTraceOnly ? "Minden részlet" : "Csak lényeges"}
-                </button>
-              </div>
+                  <button
+                    type="button"
+                    role="tab"
+                    className={`trace-view-option${planContentView === "raw" ? " is-active" : ""}`}
+                    aria-selected={planContentView === "raw"}
+                    onClick={() => setPlanContentView("raw")}
+                  >
+                    RAW
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    className={`trace-view-option${planContentView === "detail" ? " is-active" : ""}`}
+                    aria-selected={planContentView === "detail"}
+                    onClick={() => setPlanContentView("detail")}
+                  >
+                    DETAIL
+                  </button>
+                </div>
+              )}
             </div>
-            {visibleThinkingEntries.length > 0 ? (
+            {isPlanStage ? (
+              // A terv-fázisban a panel magát a tervet mutatja. RAW: a teljes
+              // szöveg, élőben streamelve; DETAIL: a kiválasztott lépés
+              // szelete a számozott pontok határai mentén.
+              <div className="trace-thinking-list trace-plan-content">
+                {(() => {
+                  const planText = answer?.text ?? "";
+                  if (!planText.trim())
+                    return (
+                      <div className="trace-thinking-empty">
+                        <span className="trace-thinking-empty-text">
+                          A terv még nem kezdett íródni.
+                        </span>
+                      </div>
+                    );
+                  if (planContentView === "raw")
+                    return answerParagraphs(planText);
+                  const stepIndex = steps.findIndex(
+                    (step) => step.id === selectedStep.id,
+                  );
+                  const slice = planStepSlice(planText, stepIndex);
+                  return slice
+                    ? answerParagraphs(slice)
+                    : (
+                        <div className="trace-thinking-empty">
+                          <span className="trace-thinking-empty-text">
+                            Ehhez a lépéshez nem találtam részletet a tervben —
+                            a RAW nézetben a teljes terv olvasható.
+                          </span>
+                        </div>
+                      );
+                })()}
+              </div>
+            ) : visibleThinkingEntries.length > 0 ? (
               <ul className="trace-thinking-list" ref={thinkingListRef}>
                 {visibleThinkingEntries.map((entry) => (
                   <li
@@ -6423,9 +6538,7 @@ function TurnProgressCard({
               <div className="trace-thinking-empty">
                 {!streaming && (
                   <span className="trace-thinking-empty-text">
-                    {essentialTraceOnly
-                      ? "A részletes belső naplósorok el vannak rejtve."
-                      : "Ehhez a lépéshez nem érkezett külön gondolkodási napló."}
+                    Ehhez a lépéshez nem érkezett külön gondolkodási napló.
                   </span>
                 )}
               </div>
@@ -9114,17 +9227,31 @@ function App() {
                 (message) => message.id === chainRun.liveMessageId,
               )?.text ?? ""
             : "";
-        const carriedSteps = carriedPlanText
-          .split(/\r?\n/)
-          .map((line) => line.trim())
-          .filter((line) => /^\d+[.)]\s+\S/.test(line))
-          .slice(0, 12)
-          .map((line, index) => ({
-            id: `carried-plan-${index}`,
-            step: line.replace(/^\d+[.)]\s+/, "").replace(/[`*]/g, ""),
+        const carriedSteps = numberedPlanSteps(carriedPlanText).map(
+          (step, index) => ({
+            ...step,
             status:
               index === 0 ? ("inProgress" as const) : ("pending" as const),
+          }),
+        );
+        // A TERV kártya lépéslistája is most születik meg: ugyanezek a
+        // pontok, kész státusszal — a terv-fázis alatt a lista üres volt,
+        // mert a dump közben még nem léteztek a pontok.
+        if (progress.role === "code" && carriedSteps.length >= 2) {
+          const outerRequestId = progress.requestId.replace(/-stage-\d+$/, "");
+          const planStageTurnId = `request:${outerRequestId}-stage-${progress.stageIndex - 1}`;
+          setPlanHistory((current) => ({
+            ...current,
+            [planStageTurnId]: {
+              turnId: planStageTurnId,
+              explanation: "",
+              steps: carriedSteps.map((step) => ({
+                ...step,
+                status: "completed" as const,
+              })),
+            },
           }));
+        }
         const stageSteps =
           carriedSteps.length >= 2
             ? carriedSteps
@@ -11208,6 +11335,16 @@ function App() {
         );
         if (snapshot) {
           const current = run.plan;
+          // Lánc-szakasz nem cserélheti le a ≥2 lépéses listát egyetlen
+          // todo-ra: ez tüntette el a terv 10 pontját, és lett belőle
+          // „1/1 kész". Egy teljes (≥2 lépéses) todo-lista viszont nyer.
+          if (
+            !isActiveRequest &&
+            snapshot.steps.length < 2 &&
+            current.steps.length >= 2
+          ) {
+            setCodeStatus("terv frissítve");
+          } else {
           const next = planWithTiming(
             {
               ...current,
@@ -11226,6 +11363,7 @@ function App() {
           updateOwnedPlanState(ownerConversationId, next);
           setWatchdogMessage("");
           setCodeStatus("terv frissítve");
+          }
         }
       } else if (
         codexEvent.eventType === "item/plan/delta" ||
@@ -11260,8 +11398,32 @@ function App() {
         uiTurnId,
       );
       if (activity) {
+        // Tartalék-léptetés a lánc alatt: ha a kódoló nem vezet todo-t, a
+        // lépésben megnevezett fájl írása lépteti a listát — az első még nem
+        // kész, egyező lépésre. A todo-frissítés (planStepIdOverride) erősebb.
+        let inferredStepId: string | undefined;
+        if (
+          !planStepIdOverride &&
+          codexEvent.requestId &&
+          run.chainRequestIds.has(codexEvent.requestId) &&
+          run.plan.steps.length >= 2
+        ) {
+          const inferencePath = extractFilePath(codexEvent.payload);
+          const baseName = inferencePath
+            ?.split(/[\/]/)
+            .pop()
+            ?.toLowerCase();
+          if (baseName && baseName.includes(".")) {
+            inferredStepId = run.plan.steps.find(
+              (step) =>
+                step.status !== "completed" &&
+                step.step.toLowerCase().includes(baseName),
+            )?.id;
+          }
+        }
         const planStepId =
           planStepIdOverride ??
+          inferredStepId ??
           run.plan.steps.find((step) => step.status === "inProgress")?.id ??
           run.plan.steps[0]?.id;
         const activityWithStep = { ...activity, planStepId };
@@ -13306,6 +13468,9 @@ function App() {
               recipeId: activePipelineRecipe.id,
               prompt: codexPrompt,
               conversationId: requestConversationId,
+              // A terv fájlként is megmarad a projektben; a futtató írja ki
+              // a terv-szakasz végén.
+              planFile: planFileNameFor(activeThread, 1),
               requestIds: stageRequestIds,
               placeholderRequestId: requestId,
               images: storedImages,
@@ -13942,6 +14107,7 @@ function App() {
           recipeId: activePipelineRecipe.id,
           prompt: originalPrompt,
           conversationId: activeConversationId,
+          planFile: planFileNameFor(activeThread, iteration),
           requestIds: stageRequestIds,
           placeholderRequestId: null,
           images: [],

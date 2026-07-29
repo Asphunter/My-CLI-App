@@ -17,6 +17,13 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import katex from "katex";
+import { mathPattern, parseMath } from "./mathText";
+import {
+  numberedPlanLines,
+  numberedPlanSteps,
+  planStepSlice,
+} from "./planText";
 import {
   buildWorkLogGroups,
   findActiveWorkGroup,
@@ -873,42 +880,6 @@ const quoteBacklinkButtons = (
   );
 };
 
-/**
- * An answer as paragraphs rather than one `pre-wrap` block.
- *
- * A model separates paragraphs with a blank line, and `pre-wrap` renders that
- * blank line as a full line box — which is why every paragraph break looked
- * like a whole empty row of text. Splitting on the blank line and letting CSS
- * set the gap keeps the structure and drops the hole.
- */
-/**
- * A terv szövegének az a szelete, ami az adott sorszámú ponthoz tartozik: a
- * számozott sorától a következő számozott sorig (vagy a szöveg végéig).
- */
-const planStepSlice = (text: string, stepIndex: number) => {
-  const lines = text.split(/\r?\n/);
-  const starts: number[] = [];
-  lines.forEach((line, index) => {
-    if (/^\d+[.)]\s+\S/.test(line.trim())) starts.push(index);
-  });
-  if (stepIndex < 0 || stepIndex >= starts.length) return "";
-  const from = starts[stepIndex];
-  const to = stepIndex + 1 < starts.length ? starts[stepIndex + 1] : lines.length;
-  return lines.slice(from, to).join("\n").trim();
-};
-
-/** A terv számozott fő pontjai — a LÉPÉS lista közös forrása. */
-const numberedPlanSteps = (text: string) =>
-  text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => /^\d+[.)]\s+\S/.test(line))
-    .slice(0, 12)
-    .map((line, index) => ({
-      id: `carried-plan-${index}`,
-      step: line.replace(/^\d+[.)]\s+/, "").replace(/[`*]/g, ""),
-    }));
-
 /** `tervek/ÉÉÉÉ-HH-NN-<téma>-v<kör>.md` — a terv-fájl neve. */
 const planFileNameFor = (title: string, iteration: number) => {
   const slug =
@@ -923,6 +894,14 @@ const planFileNameFor = (title: string, iteration: number) => {
   return `tervek/${date}-${slug}-v${iteration}.md`;
 };
 
+/**
+ * An answer as paragraphs rather than one `pre-wrap` block.
+ *
+ * A model separates paragraphs with a blank line, and `pre-wrap` renders that
+ * blank line as a full line box — which is why every paragraph break looked
+ * like a whole empty row of text. Splitting on the blank line and letting CSS
+ * set the gap keeps the structure and drops the hole.
+ */
 const answerParagraphs = (text: string) =>
   text
     .split(/\n{2,}/)
@@ -3829,8 +3808,45 @@ const localFileExtensions = new Set([
   "zip",
 ]);
 
-const inlineMarkdownPattern =
-  /(`[^`\n]+`|\*\*[^*\n]+\*\*|\[[^\]]+\]\([^\)]+\)|(?:[A-Za-z]:[\\/]|\.{1,2}[\\/])[^<>\n`]*?\.[A-Za-z0-9]{1,12}\b|(?:[A-Za-z]:[\\/]|\.{1,2}[\\/]|\\\\)?[\w.-]+(?:[\\/][\w.-]+)*\.[A-Za-z0-9]{1,12}\b)/g;
+const inlineTextPattern =
+  /`[^`\n]+`|\*\*[^*\n]+\*\*|\[[^\]]+\]\([^\)]+\)|(?:[A-Za-z]:[\\/]|\.{1,2}[\\/])[^<>\n`]*?\.[A-Za-z0-9]{1,12}\b|(?:[A-Za-z]:[\\/]|\.{1,2}[\\/]|\\\\)?[\w.-]+(?:[\\/][\w.-]+)*\.[A-Za-z0-9]{1,12}\b/;
+
+// A képlet előbb áll, mint a hivatkozás-minta: a `\[ ... \]` egy karakterrel
+// korábban kezdődik, mint a benne látszó `[ ... ]`, és a korábbi találat nyer.
+const inlineMarkdownPattern = new RegExp(
+  `(${mathPattern.source}|${inlineTextPattern.source})`,
+  "g",
+);
+
+const mathHtmlCache = new Map<string, string | null>();
+
+/**
+ * Egy TeX-kifejezés HTML-je. A streamelés minden képkockán újrarendereli a
+ * szöveget, ezért a KaTeX kimenete gyorsítótárba megy — enélkül minden képlet
+ * újra-parse-olódna másodpercenként hatvanszor.
+ */
+const renderMathHtml = (tex: string, display: boolean) => {
+  const key = `${display ? "d" : "i"}|${tex}`;
+  const cached = mathHtmlCache.get(key);
+  if (cached !== undefined) return cached;
+  let html: string | null = null;
+  try {
+    html = katex.renderToString(tex, {
+      displayMode: display,
+      throwOnError: false,
+      strict: false,
+      trust: false,
+      // Csak HTML: a MathML-lel együtt minden képlet kétszer került a
+      // kijelölésbe, és az idézetek duplán vették volna át.
+      output: "html",
+    });
+  } catch {
+    html = null;
+  }
+  if (mathHtmlCache.size > 400) mathHtmlCache.clear();
+  mathHtmlCache.set(key, html);
+  return html;
+};
 
 const normalizeFileReference = (value: string) => {
   let candidate = value
@@ -3900,7 +3916,26 @@ const renderInlineMarkdown = (
     const value = match[0];
     const index = match.index ?? 0;
     if (index > cursor) parts.push(text.slice(cursor, index));
-    if (value.startsWith("`") && value.endsWith("`")) {
+    const math = parseMath(value);
+    if (math) {
+      const html = renderMathHtml(math.tex, math.display);
+      parts.push(
+        html ? (
+          <span
+            key={`math-${index}`}
+            className={`inline-math${math.display ? " is-display" : ""}`}
+            role="math"
+            aria-label={math.tex}
+            dangerouslySetInnerHTML={{ __html: html }}
+          />
+        ) : (
+          // Ha a KaTeX nem érti, a nyers TeX olvashatóbb, mint egy hibajelzés.
+          <span className="inline-math is-raw" key={`math-raw-${index}`}>
+            {value}
+          </span>
+        ),
+      );
+    } else if (value.startsWith("`") && value.endsWith("`")) {
       const code = value.slice(1, -1);
       parts.push(
         fileButton(code, code, `file-inline-${index}`) ?? (
@@ -11479,10 +11514,18 @@ function App() {
             .pop()
             ?.toLowerCase();
           if (baseName && baseName.includes(".")) {
+            // A lista címeket mutat, a fájlnév viszont a pont magyarázatában
+            // szerepel — a keresés ezért a terv teljes sorát nézi, és csak
+            // annak hiányában a rövid címet.
+            const planLines = run.planText
+              ? numberedPlanLines(run.planText)
+              : [];
             inferredStepId = run.plan.steps.find(
-              (step) =>
+              (step, index) =>
                 step.status !== "completed" &&
-                step.step.toLowerCase().includes(baseName),
+                (planLines[index] ?? step.step)
+                  .toLowerCase()
+                  .includes(baseName),
             )?.id;
           }
         }
@@ -15074,6 +15117,26 @@ Javítsd ki, majd futtasd le újra a teszteket.`
   // and the newest "live" row can then be a leftover from an earlier run --
   // which is how the panel came to show a verdict while the coder was working.
   // While a chain runs, only the running stage's own bubble counts.
+  // A szakasz lezárult, de a következő még nem indult el: a buborék ilyenkor
+  // már nem „live", és a panel néhány másodpercre kiürült — a LÉPÉSEK
+  // visszaesett a „terv készítése" placeholderre, a RAW meg arra, hogy a terv
+  // még nem kezdett íródni. A kész szöveg ugyanezé a szakaszé, csak máshol
+  // van; a váltás ideje alatt onnan olvasunk.
+  const settledStageText =
+    pipelineProgress && pipelineProgress.phase !== "started"
+      ? ((pipelineProgress.role === "plan" ? viewedRun?.planText : undefined) ??
+        messages.find(
+          (message) =>
+            message.role === "assistant" &&
+            message.turnId === `request:${pipelineProgress.requestId}`,
+        )?.text ??
+        messages.find(
+          (message) =>
+            message.role === "assistant" &&
+            message.turnId === `request:${liveRunOuterRequestId}` &&
+            !message.live,
+        )?.text)
+      : undefined;
   const liveAnswer = pipelineProgress
     ? messages.find(
         (message) =>
@@ -15088,7 +15151,17 @@ Javítsd ki, majd futtasd le újra a teszteket.`
           message.role === "assistant" &&
           message.live &&
           message.id === viewedRun?.liveMessageId,
-      )
+      ) ??
+      (settledStageText?.trim()
+        ? {
+            role: "assistant" as const,
+            text: settledStageText,
+            time: "kész",
+            live: false,
+            final: true,
+            turnId: `request:${pipelineProgress.requestId}`,
+          }
+        : undefined)
     : [...messages]
         .reverse()
         .find((message) => message.role === "assistant" && message.live);
@@ -15304,7 +15377,14 @@ Javítsd ki, majd futtasd le újra a teszteket.`
                 )
           }
           status={codeStatus}
-          streaming={viewingActiveRun && !activeTurnHasCompleted}
+          // A lezárt szakasz nem „ír" — a következő indulására vár. Amíg
+          // streamelőnek mondtuk, a lépései félkésznek látszottak a váltás
+          // néhány másodpercében.
+          streaming={
+            viewingActiveRun &&
+            !activeTurnHasCompleted &&
+            !(pipelineProgress && pipelineProgress.phase !== "started")
+          }
           expanded={liveExpanded}
           transport={transportStatus}
           watchdogMessage={watchdogMessage}

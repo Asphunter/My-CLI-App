@@ -58,6 +58,17 @@ lépéses frissítés nem írhatja felül. (2) tartalék: az aktivitás fájlnev
 lépés-szövegekhez illesztve — az első nem-kész, egyező lépésre lépünk
 (`markOwnedPlanStepStarted` végzi a korábbi lezárását).
 
+## Kiegészítés — 2026-07-30 (a futás utáni három észrevétel)
+
+| észrevétel | döntés |
+|---|---|
+| A TERV LÉPÉS listája a RAW szó szerinti másolata volt | A listába a pont **címe** kerül (vastag fej, vagy az első gondolatjelig/kettőspontig) — ugyanaz, amit a KÓD is mutat. A magyarázat a RAW-ban és a DETAIL szeletében marad. A lista továbbra is a szöveggel együtt nő. |
+| Két szakasz között pár másodpercre kiürült a panel | A lezárt szakasz szövege a kész buborékból (tervnél a futás `planText`-jéből) él tovább, amíg a következő szakasz elindul; a lezárt szakasz nem „streamel", tehát a lépései sem látszanak félkésznek. |
+| Képletek nyersen látszottak (`\(Z_0=100\,\Omega\)`) | KaTeX. A `\(...\)`, `\[...\]`, `$$...$$` és a TeX-jelet tartalmazó `$...$` mindenhol kirendelődik, ahol szöveget írunk ki (válasz, TERV RAW/DETAIL, gondolkodás menete). A kétszer escape-elt vezérjel (`\\Omega`) visszaáll egyre. |
+
+A lépés-címek és a képlet-felismerés külön modulba kerültek (`src/planText.ts`,
+`src/mathText.ts`), tesztekkel — eddig egyik sem volt gépileg ellenőrizhető.
+
 ## Ellenőrzés
 
 Gépi: `cargo test` (169+), `tsc -b`, 50 frontend-teszt, build.

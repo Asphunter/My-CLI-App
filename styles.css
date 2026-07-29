@@ -335,6 +335,14 @@ button { color: inherit; border: 0; cursor: pointer; }
 .message-body a { color: #8bd8b0; text-decoration: underline; text-decoration-color: rgba(139, 216, 176, .4); text-underline-offset: 2px; }
 .message-body a:hover { color: #c1f4d6; }
 .inline-code { padding: 1px 4px; border: 1px solid #303134; border-radius: 4px; background: #151618; color: #d69d72; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .94em; }
+/* A képletek a szöveg betűjéhez simulnak: a KaTeX alapból 1.21em-mel nagyobb,
+   ami a sűrű panelekben kilógott a sorból. A `pre-wrap` sortörése miatt a
+   kifejezés maga nem törhet meg. */
+.inline-math { display: inline-block; vertical-align: baseline; }
+.inline-math .katex { font-size: 1.02em; color: #e8efe9; }
+.inline-math.is-display { display: block; overflow-x: auto; overflow-y: hidden; max-width: 100%; margin: 6px 0; padding-bottom: 2px; white-space: normal; }
+.inline-math.is-display .katex-display { margin: 0; text-align: left; }
+.inline-math.is-raw { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .94em; color: #d69d72; white-space: pre-wrap; }
 .inline-file-link { display: inline; margin: 0; padding: 1px 4px; border: 1px solid #496050; border-radius: 4px; background: rgba(25, 58, 45, .72); color: #b8efd0; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .94em; text-decoration: underline; text-decoration-color: rgba(184, 239, 208, .45); text-underline-offset: 2px; }
 .inline-file-link:hover, .inline-file-link:focus-visible { border-color: var(--accent); background: #1c3b2b; color: #e0ffe9; outline: 0; }
 .user-message .message-body { padding: 3px 5px; border: 1px solid var(--user-border); border-radius: 3px; background: var(--user-message); color: #d3e9df; }

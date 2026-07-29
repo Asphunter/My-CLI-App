@@ -139,6 +139,41 @@ hívható egység.
 más néven nevezett modul. Nem szentírás-szám, hanem mérce: ha egy lépés után
 nem csökken, a lépés rossz volt.
 
+## Állapot — 2026-07-29 éjszaka
+
+`App.tsx`: **16 224 → 14 744 sor**. Minden lépés külön commit, mindegyik után
+`tsc -b` + 50 frontend-teszt + build zöld; a Rust érintetlen (169/169).
+
+| lépés | commit | eredmény |
+|---|---|---|
+| A1–A6 takarítás | `023e958` | a `syncRunAliases()` és hét alias-ref megszűnt; a `codeStatus`/`transport`/`watchdog`/`cancelling`, a futás munkakönyvtára és a megszakítás-bit a `RunHandle`-be költözött |
+| B1 overlay-k | `b96a420` | `src/components/overlays.tsx` (492 sor) — képnagyító, párbeszéd, Claude jóváhagyás/kérdés, parancspaletta + a hozzájuk tartozó négy típus |
+| B2 beállítások | `bc5ade8` | `src/components/SettingsPanel.tsx` (100 sor) |
+| B3 oldalsáv | `43d2d53` | `src/components/Sidebar.tsx` (760 sor) + `src/syncFormat.ts` + `src/components/runMarks.tsx` |
+
+**A7 elmaradt** (az `activePlanRef` átnevezése) — kozmetika, nem sürgős.
+
+### B4 (composer) — megkezdve, visszavéve
+
+A szerkesztő nem olyan levél, mint a többi: a lánc-szakasz beállítói
+(`activePipelineRecipe`, `cycleStageValue`, `stageValue`, `stageProvider`),
+a `ModelPicker`, a `STAGE_ROLE_LABELS`/`FALLBACK_EFFORTS`/`shortModelLabel`
+segédek és a jóváhagyás-jelző (`pendingClaudeApproval`/`Question`) mind
+átnyúlnak rajta. Ez ~30 további prop és két segédmodul, nem egy fogás.
+
+**Javasolt bontás a következő menetre:**
+
+1. **B4a** — a modellválasztó és a lánc-beállítók külön:
+   `src/components/ModelPicker.tsx` (a meglévő komponens + `shortModelLabel`,
+   `FALLBACK_EFFORTS`) és `src/components/StageSettings.tsx`
+   (`STAGE_ROLE_LABELS` + a szakasz-gombok). Mindkettő zárt, kevés proppal.
+2. **B4b** — a maradék composer (idézetek, képek, textarea, küldés gomb) a
+   két kész komponensre támaszkodva. A refek (`inputRef`, `imageInputRef`,
+   `quoteInputRefs`, `quoteInstructionDraftsRef`, `inputDraftRef`) propként
+   mennek be — **a beviteli mező kontrollálatlan marad**.
+
+A B5 (timeline) és a C szakasz változatlanul áll a fenti terv szerint.
+
 ## Amihez NEM nyúlunk
 
 - Rust modulok, stílusréteg, viselkedés — semmi.

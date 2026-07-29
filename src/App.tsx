@@ -54,6 +54,12 @@ import {
 import { ensureCanonicalConversationId } from "./conversationIdentity";
 import { agentAnswerMessageId } from "./deterministicId";
 import {
+  formatSyncHealthTime,
+  syncHealthStatusLabel,
+  syncTombstoneProjectContext,
+  syncTombstoneTypeLabel,
+} from "./syncFormat";
+import {
   conversationIdForKey,
   conversationKeyIndex,
   conversationKeysMatch,
@@ -66,7 +72,8 @@ import {
   describeAgentError,
   describeThrownAgentError,
 } from "./agentError";
-import { SidebarSettingsPanel } from "./components/SettingsPanel";
+import { Sidebar } from "./components/Sidebar";
+import { ThinkingDots } from "./components/runMarks";
 import {
   AppDialogOverlay,
   ClaudeApprovalOverlay,
@@ -1667,38 +1674,6 @@ const formatPromptTime = (timestamp: number | undefined) => {
   }).format(new Date(timestamp));
 };
 
-const formatSyncHealthTime = (value: string | null | undefined) => {
-  if (!value) return "még nincs";
-  const timestamp = Number(value);
-  if (!Number.isFinite(timestamp) || timestamp <= 0) return value;
-  return new Intl.DateTimeFormat("hu-HU", {
-    dateStyle: "short",
-    timeStyle: "medium",
-  }).format(new Date(timestamp));
-};
-
-const syncHealthStatusLabel = (status: string) => {
-  if (status === "healthy") return "Rendben · írható";
-  if (status === "empty") return "Üres journal";
-  if (status === "quarantine") return "Quarantine · csak olvasás";
-  return status;
-};
-
-const syncTombstoneTypeLabel = (entityType: string) =>
-  entityType === "project" ? "Projekt" : "Beszélgetés";
-
-const syncTombstoneProjectContext = (tombstone: SyncTombstone) => {
-  const path = tombstone.relativePath ?? tombstone.pathHint;
-  const projectName = path
-    ?.replace(/[\\/]+$/, "")
-    .split(/[\\/]/)
-    .filter(Boolean)
-    .pop();
-  if (projectName) return `Projekt: ${projectName}`;
-  return tombstone.projectId
-    ? `Projekt ID: ${tombstone.projectId.slice(0, 8)}`
-    : "";
-};
 
 const projectIdentityKey = (project: Pick<Project, "path" | "relativePath">) =>
   project.relativePath?.trim().toLowerCase() || normalizePath(project.path);
@@ -4671,35 +4646,6 @@ const MessageRow = memo(function MessageRow({
  * *után* jön (teljes munkaterület-snapshot), és az nem gondolkodás — külön
  * jelet érdemel, különben úgy néz ki, mintha a modell még dolgozna.
  */
-const TreeRunMark = ({
-  state,
-  idleClassName,
-}: {
-  state: "thinking" | "saving" | null;
-  idleClassName: string;
-}) => {
-  if (state === "thinking")
-    return <ThinkingDots label="Ebben a beszélgetésben épp fut egy válasz" />;
-  if (state === "saving")
-    return (
-      <span
-        className="saving-mark"
-        role="status"
-        aria-label="A munkaterület mentése folyik"
-        title="A válasz kész; a munkaterület mentése folyik"
-      />
-    );
-  return <span className={idleClassName} />;
-};
-
-/** „Gondolkodik" jelzés a fában — a pont helyén, ugyanakkora helyen. */
-const ThinkingDots = ({ label }: { label: string }) => (
-  <span className="thinking-dots" role="status" aria-label={label} title={label}>
-    <span />
-    <span />
-    <span />
-  </span>
-);
 
 type CodeWorkCardProps = {
   expanded: boolean;
@@ -14789,579 +14735,62 @@ Javítsd ki, majd futtasd le újra a teszteket.`
         )}
 
       <main className="workspace">
-        <aside
-          className={`sidebar panel-edge${activeMode === "general" ? " is-general" : ""}`}
-        >
-          <div className="sidebar-heading">
-            <span>Projektek</span>
-            <div className="sidebar-heading-actions">
-              <div className="tree-sort-wrap">
-                <button
-                  type="button"
-                  className="tree-sort-button"
-                  onClick={() => setTreeSortMenuOpen((open) => !open)}
-                  aria-haspopup="menu"
-                  aria-expanded={treeSortMenuOpen}
-                  aria-label="Tree rendezése"
-                  title={`Rendezés: ${treeSortMode === "modified" ? "módosítás szerint" : "idő szerint"}`}
-                >
-                  ↕
-                </button>
-                {treeSortMenuOpen && (
-                  <div className="tree-sort-menu" role="menu">
-                    <button
-                      type="button"
-                      role="menuitemradio"
-                      aria-checked={treeSortMode === "modified"}
-                      className={treeSortMode === "modified" ? "is-selected" : ""}
-                      onClick={() => {
-                        setTreeSortMode("modified");
-                        setTreeSortMenuOpen(false);
-                      }}
-                    >
-                      Módosítás szerint
-                    </button>
-                    <button
-                      type="button"
-                      role="menuitemradio"
-                      aria-checked={treeSortMode === "time"}
-                      className={treeSortMode === "time" ? "is-selected" : ""}
-                      onClick={() => {
-                        setTreeSortMode("time");
-                        setTreeSortMenuOpen(false);
-                      }}
-                    >
-                      Idő szerint
-                    </button>
-                  </div>
-                )}
-              </div>
-              {activeMode === "general" ? (
-              <button
-                type="button"
-                className="new-button"
-                onClick={newGeneralConversation}
-                aria-label="Új beszélgetés"
-                title="Új beszélgetés"
-              >
-                +
-              </button>
-            ) : (
-              <div className="new-project-wrap">
-              <button
-                type="button"
-                className="new-button"
-                onClick={() => setNewProjectMenuOpen((open) => !open)}
-                aria-haspopup="menu"
-                aria-expanded={newProjectMenuOpen}
-                title="Projekt hozzáadása"
-              >
-                +
-              </button>
-              {newProjectMenuOpen && (
-                <div className="new-project-menu" role="menu">
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={() => {
-                      setNewProjectMenuOpen(false);
-                      void addProject();
-                    }}
-                  >
-                    Új projekt
-                  </button>
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={() => {
-                      setNewProjectMenuOpen(false);
-                      void addExistingProject();
-                    }}
-                  >
-                    Meglévő projekt
-                  </button>
-                </div>
-              )}
-              </div>
-            )}
-            </div>
-          </div>
-          <div className="mode-switch" role="tablist" aria-label="Alkalmazasi mod">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={activeMode === "coding"}
-              className={activeMode === "coding" ? "is-active" : ""}
-              onClick={() => selectAppMode("coding")}
-            >
-              CODING
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={activeMode === "general"}
-              className={activeMode === "general" ? "is-active" : ""}
-              onClick={() => selectAppMode("general")}
-            >
-              GENERAL
-            </button>
-          </div>
-          <div className="project-list">
-            {historyHydrating && (
-              <div className="project-list-loading" role="status">
-                Helyi előzmények betöltése…
-              </div>
-            )}
-            {sortedProjects.map((project) => {
-              const isOpen = Boolean(openProjects[project.path]);
-              return (
-                <section
-                  className={`project-group${isOpen ? " is-open" : ""}`}
-                  data-project={project.name}
-                  key={project.path}
-                >
-                  <div className="project-row-wrap">
-                    <button
-                      className="project-row"
-                      onClick={() => {
-                        selectProject(project);
-                        setOpenProjects((current) => ({
-                          ...current,
-                          [project.path]: !isOpen,
-                        }));
-                      }}
-                      aria-expanded={isOpen}
-                      title={project.path}
-                    >
-                      <span className="chevron">{isOpen ? "⌄" : "›"}</span>
-                      <span className="folder-icon">◫</span>
-                      <span className="project-name">{project.name}</span>
-                      {projectIsThinking(project) && !isOpen && (
-                        <ThinkingDots label="Ebben a projektben épp fut egy válasz vagy mentés" />
-                      )}
-                      <span className="project-count">
-                        {project.threads.length}
-                      </span>
-                    </button>
-                    <div className="overflow-menu-wrap">
-                      <button
-                        type="button"
-                        className="overflow-button"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          setOpenMenu(
-                            openMenu?.kind === "project" &&
-                              openMenu.key === project.id
-                              ? null
-                              : { kind: "project", key: project.id },
-                          );
-                        }}
-                        aria-haspopup="menu"
-                        aria-expanded={
-                          openMenu?.kind === "project" &&
-                          openMenu.key === project.id
-                        }
-                        title="Projekt menüje"
-                      >
-                        ⋮
-                      </button>
-                      {openMenu?.kind === "project" &&
-                        openMenu.key === project.id && (
-                          <div className="overflow-menu" role="menu">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setOpenMenu(null);
-                                newConversationForProject(project);
-                              }}
-                            >
-                              Új beszélgetés
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setOpenMenu(null);
-                                renameProject(project);
-                              }}
-                            >
-                              Átnevezés
-                            </button>
-                            <button
-                              type="button"
-                              className="danger-action"
-                              onClick={() => deleteProject(project)}
-                            >
-                              Törlés
-                            </button>
-                          </div>
-                        )}
-                    </div>
-                  </div>
-                  <div className="conversation-list">
-                    {project.threads.map((thread) => {
-                      const menuKey = `${project.id}::${thread}`;
-                      return (
-                        <div className="conversation-row-wrap" key={thread}>
-                          <button
-                            className={`conversation-row${thread === activeThread && project.name === activeProject ? " is-active" : ""}`}
-                            onClick={() => selectThread(project, thread)}
-                            title={thread}
-                          >
-                            <TreeRunMark
-                              state={conversationRunState(
-                                `${project.path}/${thread}`,
-                              )}
-                              idleClassName="conversation-dot"
-                            />
-                            <span>{thread}</span>
-                          </button>
-                          <div className="overflow-menu-wrap">
-                            <button
-                              type="button"
-                              className="overflow-button"
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                setOpenMenu(
-                                  openMenu?.kind === "thread" &&
-                                    openMenu.key === menuKey
-                                    ? null
-                                    : { kind: "thread", key: menuKey },
-                                );
-                              }}
-                              aria-haspopup="menu"
-                              aria-expanded={
-                                openMenu?.kind === "thread" &&
-                                openMenu.key === menuKey
-                              }
-                              title="Beszélgetés menüje"
-                            >
-                              ⋮
-                            </button>
-                            {openMenu?.kind === "thread" &&
-                              openMenu.key === menuKey && (
-                                <div className="overflow-menu" role="menu">
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setOpenMenu(null);
-                                      renameThread(project, thread);
-                                    }}
-                                  >
-                                    Átnevezés
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="danger-action"
-                                    onClick={() =>
-                                      deleteThread(project, thread)
-                                    }
-                                  >
-                                    Törlés
-                                  </button>
-                                </div>
-                              )}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </section>
-              );
-            })}
-          </div>
-          <div className="general-history" aria-label="General beszélgetések">
-            {generalConversations.length === 0 ? (
-              <div className="general-history-empty">
-                A korábbi GENERAL beszélgetések itt jelennek meg.
-              </div>
-            ) : (
-              generalConversations.map(({ conversation }) => {
-                const id = conversation.id ?? "";
-                return (
-                  <div className="general-history-row-wrap" key={id}>
-                    <button
-                      type="button"
-                      className={`general-history-row${id === activeGeneralConversationId ? " is-active" : ""}`}
-                      onClick={() => selectGeneralConversation(id)}
-                      title={conversation.title}
-                    >
-                      <TreeRunMark
-                        state={conversationRunState(
-                          generalConversationCacheKey(id),
-                        )}
-                        idleClassName="general-history-dot"
-                      />
-                      <span>{conversation.title}</span>
-                    </button>
-                    <div className="overflow-menu-wrap">
-                      <button
-                        type="button"
-                        className="overflow-button"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          setOpenMenu(
-                            openMenu?.kind === "general" &&
-                              openMenu.key === id
-                              ? null
-                              : { kind: "general", key: id },
-                          );
-                        }}
-                        aria-haspopup="menu"
-                        aria-expanded={
-                          openMenu?.kind === "general" && openMenu.key === id
-                        }
-                        title="Beszélgetés menüje"
-                      >
-                        ⋮
-                      </button>
-                      {openMenu?.kind === "general" &&
-                        openMenu.key === id && (
-                          <div className="overflow-menu" role="menu">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setOpenMenu(null);
-                                renameGeneralConversation(conversation);
-                              }}
-                            >
-                              Átnevezés
-                            </button>
-                            <button
-                              type="button"
-                              className="danger-action"
-                              onClick={() => deleteGeneralConversation(conversation)}
-                            >
-                              Törlés
-                            </button>
-                          </div>
-                        )}
-                    </div>
-                  </div>
-                );
-              })
-            )}
-          </div>
-          <div className="sidebar-footer">
-            <button
-              type="button"
-              className={`sync-health${syncWriteEnabled ? " is-ready" : " is-quarantine"}`}
-              onClick={() => isTauri && setSyncHealthOpen((open) => !open)}
-              aria-expanded={isTauri ? syncHealthOpen : undefined}
-              aria-controls={isTauri ? "sync-health-panel" : undefined}
-              title="Részletes Sync Health megnyitása"
-            >
-              <span className="status-dot" />
-              <span>Sync · {syncStatus}</span>
-              <span className="sync-health-chevron">
-                {isTauri ? (syncHealthOpen ? "⌃" : "⌄") : ""}
-              </span>
-            </button>
-            {syncHealthOpen && (
-              <div
-                id="sync-health-panel"
-                className="sync-health-popover"
-                role="dialog"
-                aria-label="Sync Health"
-              >
-                <div className="popover-heading">
-                  <span>Sync Health</span>
-                  <span className="popover-hint">
-                    {syncHealth
-                      ? syncHealthStatusLabel(syncHealth.status)
-                      : "nincs adat"}
-                  </span>
-                </div>
-                {syncHealth ? (
-                  <>
-                    <div className="sync-health-grid">
-                      <span>Utolsó ellenőrzés</span>
-                      <strong>
-                        {formatSyncHealthTime(syncHealth.checkedAt)}
-                      </strong>
-                      <span>Utolsó import</span>
-                      <strong>
-                        {formatSyncHealthTime(syncHealth.lastImportAt)}
-                      </strong>
-                      <span>Journal</span>
-                      <strong>
-                        {syncHealth.scannedEvents} fájl ·{" "}
-                        {syncHealth.acceptedEvents} valid
-                      </strong>
-                      <span>Lokális SQLite</span>
-                      <strong>{syncHealth.storedEvents} event</strong>
-                    </div>
-                    <div
-                      className="sync-health-path"
-                      title={syncHealth.journalPath}
-                    >
-                      Journal: {syncHealth.journalPath}
-                    </div>
-                    <div
-                      className="sync-health-path"
-                      title={syncHealth.quarantinePath}
-                    >
-                      Quarantine: {syncHealth.quarantinePath}
-                    </div>
-                    {syncHealth.blockedDevices.length > 0 && (
-                      <div className="sync-health-warning">
-                        <strong>Blokkolt eszközök</strong>
-                        <ul>
-                          {syncHealth.blockedDevices.map((device) => (
-                            <li key={device}>{device}</li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
-                    {syncHealth.warnings.length > 0 && (
-                      <div className="sync-health-warning">
-                        <strong>Figyelmeztetések</strong>
-                        <ul>
-                          {syncHealth.warnings
-                            .slice(0, 3)
-                            .map((warning, index) => (
-                              <li key={`${warning}-${index}`}>{warning}</li>
-                            ))}
-                        </ul>
-                        {syncHealth.warnings.length > 3 && (
-                          <small>
-                            +{syncHealth.warnings.length - 3} további
-                          </small>
-                        )}
-                      </div>
-                    )}
-                    {tombstones.length > 0 && (
-                      <section
-                        className="sync-recovery"
-                        aria-label="Recovery Center"
-                      >
-                        <div className="sync-recovery-heading">
-                          <strong>Recovery Center</strong>
-                          <span>{tombstones.length}</span>
-                        </div>
-                        <div className="sync-recovery-list">
-                          {[...tombstones]
-                            .sort(
-                              (left, right) =>
-                                Date.parse(right.archivedAt) -
-                                Date.parse(left.archivedAt),
-                            )
-                            .slice(0, 8)
-                            .map((tombstone) => {
-                              const label =
-                                tombstone.title ??
-                                tombstone.relativePath ??
-                                tombstone.entityId;
-                              const context =
-                                syncTombstoneProjectContext(tombstone);
-                              const itemBusyKey = `${tombstone.entityType}:${tombstone.entityId}`;
-                              const isThisRestoreBusy =
-                                restoreBusyKey === itemBusyKey;
-                              return (
-                                <div
-                                  className="sync-recovery-item"
-                                  key={`${tombstone.entityType}:${tombstone.entityId}`}
-                                >
-                                  <div className="sync-recovery-main">
-                                    <span className="sync-recovery-type">
-                                      {syncTombstoneTypeLabel(
-                                        tombstone.entityType,
-                                      )}
-                                    </span>
-                                    <strong title={label}>{label}</strong>
-                                    <small>
-                                      {context ? `${context} · ` : ""}
-                                      {formatSyncHealthTime(
-                                        tombstone.archivedAt,
-                                      )}
-                                    </small>
-                                  </div>
-                                  <button
-                                    type="button"
-                                    className="sync-recovery-restore"
-                                    onClick={() => restoreTombstone(tombstone)}
-                                    disabled={
-                                      !syncWriteEnabled ||
-                                      restoreBusyKey !== null
-                                    }
-                                    title={
-                                      isThisRestoreBusy
-                                        ? "A visszaállítás folyamatban van"
-                                        : syncWriteEnabled
-                                          ? "Archivált entitás visszaállítása"
-                                          : "A journal jelenleg csak olvasható"
-                                    }
-                                  >
-                                    {isThisRestoreBusy
-                                      ? "Visszaállítás…"
-                                      : "Visszaállítás"}
-                                  </button>
-                                </div>
-                              );
-                            })}
-                        </div>
-                        {tombstones.length > 8 && (
-                          <small className="sync-recovery-more">
-                            +{tombstones.length - 8} további archivált elem
-                          </small>
-                        )}
-                      </section>
-                    )}
-                    <div className="sync-health-recovery">
-                      {syncHealth.recoveryAction}
-                    </div>
-                    <div className="sync-health-actions">
-                      <button
-                        type="button"
-                        className="footer-action"
-                        onClick={refreshSync}
-                      >
-                        <span>↻</span> Újraellenőrzés
-                      </button>
-                      <button
-                        type="button"
-                        className="footer-action"
-                        onClick={() => setSyncHealthOpen(false)}
-                      >
-                        <span>×</span> Bezárás
-                      </button>
-                    </div>
-                  </>
-                ) : (
-                  <div className="sync-health-empty">
-                    A v2 sync health még nem érkezett meg.
-                  </div>
-                )}
-              </div>
-            )}
-            <button
-              className="footer-action"
-              onClick={() => {
-                if (settingsOpen) {
-                  setReadingSettingsOpen(false);
-                }
-                setSettingsOpen((open) => !open);
-              }}
-              aria-expanded={settingsOpen}
-            >
-              <span>⚙</span> Beállítások
-            </button>
-            {settingsOpen && (
-              <SidebarSettingsPanel
-                fontSize={fontSize}
-                lineHeight={lineHeight}
-                readingSettingsOpen={readingSettingsOpen}
-                canChangeProjectsRoot={isTauri}
-                onToggleReadingSettings={() =>
-                  setReadingSettingsOpen((open) => !open)
-                }
-                onFontSizeChange={setFontSize}
-                onLineHeightChange={setLineHeight}
-                onChangeProjectsRoot={() => void changeProjectsRoot()}
-                onNotify={notify}
-              />
-            )}
-          </div>
-        </aside>
+        <Sidebar
+          activeMode={activeMode}
+          isTauri={isTauri}
+          projects={sortedProjects}
+          openProjects={openProjects}
+          activeProject={activeProject}
+          activeThread={activeThread}
+          generalConversations={generalConversations}
+          activeGeneralConversationId={activeGeneralConversationId}
+          historyHydrating={historyHydrating}
+          tombstones={tombstones}
+          restoreBusyKey={restoreBusyKey}
+          treeSortMode={treeSortMode}
+          treeSortMenuOpen={treeSortMenuOpen}
+          newProjectMenuOpen={newProjectMenuOpen}
+          openMenu={openMenu}
+          settingsOpen={settingsOpen}
+          readingSettingsOpen={readingSettingsOpen}
+          fontSize={fontSize}
+          lineHeight={lineHeight}
+          syncStatus={syncStatus}
+          syncHealth={syncHealth}
+          syncHealthOpen={syncHealthOpen}
+          syncWriteEnabled={syncWriteEnabled}
+          conversationRunState={conversationRunState}
+          projectIsThinking={projectIsThinking}
+          generalConversationCacheKey={generalConversationCacheKey}
+          onSelectAppMode={selectAppMode}
+          onSelectProject={selectProject}
+          onSelectThread={selectThread}
+          onSelectGeneralConversation={selectGeneralConversation}
+          onToggleProjectOpen={setOpenProjects}
+          onOpenMenu={setOpenMenu}
+          onNewConversationForProject={newConversationForProject}
+          onNewGeneralConversation={newGeneralConversation}
+          onRenameProject={renameProject}
+          onDeleteProject={deleteProject}
+          onRenameThread={renameThread}
+          onDeleteThread={deleteThread}
+          onRenameGeneralConversation={renameGeneralConversation}
+          onDeleteGeneralConversation={deleteGeneralConversation}
+          onRestoreTombstone={(tombstone) => void restoreTombstone(tombstone)}
+          onAddProject={addProject}
+          onAddExistingProject={() => void addExistingProject()}
+          onChangeProjectsRoot={() => void changeProjectsRoot()}
+          onRefreshSync={refreshSync}
+          onSetTreeSortMode={setTreeSortMode}
+          onSetTreeSortMenuOpen={setTreeSortMenuOpen}
+          onSetNewProjectMenuOpen={setNewProjectMenuOpen}
+          onSetSettingsOpen={setSettingsOpen}
+          onSetReadingSettingsOpen={setReadingSettingsOpen}
+          onSetSyncHealthOpen={setSyncHealthOpen}
+          onFontSizeChange={setFontSize}
+          onLineHeightChange={setLineHeight}
+          onNotify={notify}
+        />
 
         <section
           className={`chat panel-edge${activeMode === "general" ? " is-general" : ""}`}

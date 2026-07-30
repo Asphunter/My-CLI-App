@@ -297,6 +297,19 @@ pub fn stage_prompt(
             "Set exactly one item in_progress before its first tool call; mark it completed immediately after its work; only then set the next item in_progress. The item text must remain the exact plan/review title so the UI can correlate it. ",
         );
     }
+    // A felület KaTeX-szel renderel, de csak TeX-jelölést ismer fel. A Codex
+    // magától is `\(...\)`-t ír; a Claude Unicode-képleteket adott
+    // (`Γ_L·e^(−2j·EL)`), és azok nyers szövegként jelentek meg a
+    // GONDOLKODÁS MENETE panelen. Ez a szabály minden szerepre szól, mert a
+    // narráció és az összefoglaló is képleteket hordozhat.
+    prompt.push_str(
+        "\n\n[KÉPLETEK]\n\
+         Minden matematikai képletet TeX-jelöléssel írj: szövegközben \\( ... \\), \
+         kiemelten önálló sorban \\[ ... \\]. Unicode-képletet ne írj \
+         (rossz: Γ_L·e^(−2j·EL), jó: \\( \\Gamma_L e^{-j2\\theta} \\)). \
+         A hosszú törteket és a többtagú kifejezéseket \\[ ... \\] blokkba tedd, \
+         ne zsúfold őket szövegközi képletbe.",
+    );
     prompt
 }
 
@@ -872,6 +885,18 @@ mod tests {
             StageToolProfile::Reviewer,
             "the reviewer must be able to run the tests but not to edit"
         );
+    }
+
+    #[test]
+    fn every_stage_prompt_demands_tex_notation_for_formulas() {
+        // A GONDOLKODÁS MENETE KaTeX-szel renderel, és csak TeX-jelölést
+        // ismer fel — a Claude e szabály nélkül Unicode-képleteket írt.
+        for role in [StageRole::Plan, StageRole::Code, StageRole::Review] {
+            let prompt = stage_prompt(role, "Feladat.", &[]);
+            assert!(prompt.contains("[KÉPLETEK]"));
+            assert!(prompt.contains("\\( ... \\)"));
+            assert!(prompt.contains("\\[ ... \\]"));
+        }
     }
 
     #[test]

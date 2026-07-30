@@ -336,9 +336,11 @@ button { color: inherit; border: 0; cursor: pointer; }
 .message-body a:hover { color: #c1f4d6; }
 .inline-code { padding: 1px 4px; border: 1px solid #303134; border-radius: 4px; background: #151618; color: #d69d72; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .94em; }
 /* A képletek a szöveg betűjéhez simulnak: a KaTeX alapból 1.21em-mel nagyobb,
-   ami a sűrű panelekben kilógott a sorból. A `pre-wrap` sortörése miatt a
-   kifejezés maga nem törhet meg. */
-.inline-math { display: inline-block; vertical-align: baseline; }
+   ami a sűrű panelekben kilógott a sorból. Az `overflow-wrap: normal` itt
+   pajzs: több panel `anywhere`-rel tördel (pl. .trace-plan-content), és az
+   öröklődve a képlet belsejét is bárhol törhetné — így a tört csak a KaTeX
+   saját határain (=, + után) eshet új sorba, a közepén nem. */
+.inline-math { display: inline-block; max-width: 100%; vertical-align: baseline; overflow-wrap: normal; word-break: normal; }
 .inline-math .katex { font-size: 1.02em; color: #e8efe9; }
 /* A KaTeX törtjeinek tintája ~0.25em-mel a sordoboz fölé nyúlik, és az
    overflow-y: hidden pont a tört tetejét csípte le. A párnázás mérten fedi:

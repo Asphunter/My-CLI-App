@@ -6065,11 +6065,21 @@ function TurnProgressCard({
   const [inlineDiff, setInlineDiff] = useState<InlineCodeDiff | null>(null);
   const followActiveStepRef = useRef(true);
 
+  // A kézi lépésválasztás csak az épp aktív lépés idejére szól: amikor a
+  // futás új lépésre ugrik, a panel újra követ. Enélkül egy visszakattintás
+  // után a nézet a régi lépésen ragadt, miközben a munka már máshol járt.
+  const lastFollowTargetRef = useRef(activeStep.id);
   useEffect(() => {
     if (!steps.some((step) => step.id === selectedStepId))
       setSelectedStepId(activeStep.id);
+    if (activeStep.id !== lastFollowTargetRef.current) {
+      lastFollowTargetRef.current = activeStep.id;
+      // Terv-fázisban az „aktív" pont csak az utolsó megszületett sor; egy
+      // olvasás közbeni kézi választást nem rángat el minden új pont.
+      if (!isPlanStage) followActiveStepRef.current = true;
+    }
     if (followActiveStepRef.current) setSelectedStepId(activeStep.id);
-  }, [activeStep.id, selectedStepId, steps, streaming]);
+  }, [activeStep.id, isPlanStage, selectedStepId, steps, streaming]);
 
   useEffect(() => {
     if (!inlineDiff) return;

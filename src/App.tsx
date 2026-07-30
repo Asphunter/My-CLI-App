@@ -321,13 +321,22 @@ const MAX_CHAIN_ITERATIONS = 3;
  * same click means something different in each column.
  */
 const PIPELINE_MODELS: Record<"anthropic" | "codex", string[]> = {
-  anthropic: ["claude-opus-5", "claude-fable-5"],
+  anthropic: [
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-fable-5",
+  ],
   codex: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
 };
 
 /** Short enough that every cell fits one fixed width. */
 const PIPELINE_MODEL_LABELS: Record<string, string> = {
   "claude-opus-5": "Opus 5",
+  "claude-opus-4-8": "Opus 4.8",
+  "claude-opus-4-7": "Opus 4.7",
+  "claude-opus-4-6": "Opus 4.6",
   "claude-fable-5": "Fable 5",
   // The generation is already implied by the vendor cell above, and carrying
   // it here forced every cell to the width of "5.6 Terra".
@@ -454,13 +463,30 @@ type WorkItemStatus = "running" | "done" | "error";
 type PlanStepStatus = "pending" | "inProgress" | "completed" | "error";
 type PlanStep = { id: string; step: string; status: PlanStepStatus };
 type PlanStepTiming = { startedAt?: number; completedAt?: number };
+type PlanSource =
+  | "codex-native"
+  | "claude-task"
+  | "claude-todo"
+  | "carried-plan"
+  | "fallback";
 type PlanSnapshot = {
   turnId: string | null;
   explanation: string;
   steps: PlanStep[];
+  /** Provider-declared active step. `null` means explicitly unassigned. */
+  activeStepId?: string | null;
+  /** Origin of the snapshot; used to avoid guessing Claude's progress. */
+  source?: PlanSource | string;
   startedAt?: number;
   completedAt?: number;
   stepTimes?: Record<string, PlanStepTiming>;
+};
+const planTrackingDiagnosticsEnabled = () => {
+  try {
+    return localStorage.getItem("min.planTrackingDiagnostics") === "1";
+  } catch {
+    return false;
+  }
 };
 /**
  * Egyszerre ennyi válasz futhat.
@@ -507,6 +533,8 @@ type RunHandle = {
   completedTerminalTurns: Set<string>;
   /** Lánc esetén a szakaszok saját kérés-azonosítói. */
   chainRequestIds: Set<string>;
+  /** Provider task/plan id -> the carried plan step it represents in KOD. */
+  planTaskToCarriedStep: Record<string, string>;
   /**
    * A lánc állapota — a szakasz-jelző és az újrafuttatás kerete.
    *
@@ -730,7 +758,7 @@ const fallbackModels: CodexModel[] = [
 /**
  * The Claude side of the picker.
  *
- * The same two models a chain stage may run, so "Opus 5" means one thing in
+ * The same models a chain stage may run, so "Opus 5" means one thing in
  * this app rather than one thing per menu. Auth is the Claude Code
  * subscription, not an API key — the old description said otherwise and was
  * the last place in the UI still claiming it.
@@ -740,6 +768,27 @@ const claudeCodingModels: CodexModel[] = [
     id: "claude-opus-5",
     displayName: "Opus 5",
     description: "A legerősebb Claude coding modell.",
+    supportedReasoningEfforts: FALLBACK_EFFORTS,
+    defaultReasoningEffort: DEFAULT_CLAUDE_EFFORT,
+  },
+  {
+    id: "claude-opus-4-8",
+    displayName: "Opus 4.8",
+    description: "Claude Opus 4.8 coding modell.",
+    supportedReasoningEfforts: FALLBACK_EFFORTS,
+    defaultReasoningEffort: DEFAULT_CLAUDE_EFFORT,
+  },
+  {
+    id: "claude-opus-4-7",
+    displayName: "Opus 4.7",
+    description: "Claude Opus 4.7 coding modell.",
+    supportedReasoningEfforts: FALLBACK_EFFORTS,
+    defaultReasoningEffort: DEFAULT_CLAUDE_EFFORT,
+  },
+  {
+    id: "claude-opus-4-6",
+    displayName: "Opus 4.6",
+    description: "Claude Opus 4.6 coding modell.",
     supportedReasoningEfforts: FALLBACK_EFFORTS,
     defaultReasoningEffort: DEFAULT_CLAUDE_EFFORT,
   },
@@ -2734,11 +2783,28 @@ const normalizePlanSnapshot = (
     typeof raw.completedAt === "number" && Number.isFinite(raw.completedAt)
       ? raw.completedAt
       : undefined;
+  const hasActiveStepId =
+    Object.prototype.hasOwnProperty.call(raw, "activeStepId") ||
+    Object.prototype.hasOwnProperty.call(raw, "active_step_id");
+  const rawActiveStepId = Object.prototype.hasOwnProperty.call(
+    raw,
+    "activeStepId",
+  )
+    ? raw.activeStepId
+    : raw.active_step_id;
+  const activeStepId = hasActiveStepId
+    ? rawActiveStepId === null
+      ? null
+      : firstString(rawActiveStepId)
+    : undefined;
+  const source = firstString(raw.source);
   return {
     turnId: firstString(raw.turnId, raw.turn_id) ?? fallbackTurnId,
     explanation:
       firstString(raw.explanation, raw.explanationText, raw.reason) ?? "",
     steps,
+    ...(activeStepId !== undefined ? { activeStepId } : {}),
+    ...(source !== undefined ? { source } : {}),
     startedAt,
     completedAt,
     stepTimes: Object.keys(stepTimes).length > 0 ? stepTimes : undefined,
@@ -2851,6 +2917,10 @@ const loadThreadPlan = (key: string): PlanSnapshot => {
       turnId: firstString(raw.turnId, raw.turn_id) ?? null,
       explanation: firstString(raw.explanation) ?? "",
       steps,
+      ...(normalized?.activeStepId !== undefined
+        ? { activeStepId: normalized.activeStepId }
+        : {}),
+      ...(normalized?.source !== undefined ? { source: normalized.source } : {}),
       startedAt: normalized?.startedAt,
       completedAt: normalized?.completedAt,
       stepTimes: normalized?.stepTimes,
@@ -5877,9 +5947,8 @@ function TurnProgressCard({
     stepId === fallbackStep.id ||
     stepId.startsWith("client-fallback");
   // The preparation row is a client-side placeholder used only until a real
-  // model plan arrives. Once real plan steps exist, attach unassigned
-  // preparation notes to the first real step instead of rendering a separate
-  // synthetic `0. Terv...` row with a misleading 0:00 duration.
+  // model plan arrives. Once real plan steps exist, unassigned preparation
+  // work is attached to the first real step; it is not a checklist step.
   // Terv-fázison a számozott pontok maguk a lépések. A tervfrissítésből
   // született lista erősebb; ez csak akkor lép be, ha az elmaradt.
   const derivedPlanSteps =
@@ -5897,6 +5966,10 @@ function TurnProgressCard({
       ? derivedPlanSteps
       : []
     : plannedSteps;
+  // Unassigned preparation/tool events are kept honest by attaching them to
+  // the first real step once a real checklist exists. They must not become a
+  // synthetic extra checklist item: that row was permanently selected by the
+  // earliest Read/Grep event and made an 8-step stage render as 8+1.
   const steps =
     effectivePlannedSteps.length === 0 ? [fallbackStep] : effectivePlannedSteps;
   const prePlanDisplayStepId = plannedSteps[0]?.id ?? fallbackStep.id;
@@ -5933,8 +6006,7 @@ function TurnProgressCard({
     activities.some(
       (activity) =>
         activityBelongsToStep(activity, stepId) &&
-        activity.kind === "reasoning" &&
-        Boolean(activity.body?.trim()),
+        (activity.kind !== "reasoning" || Boolean(activity.body?.trim())),
     ) ||
     commentary.some(
       (entry) =>
@@ -5944,8 +6016,7 @@ function TurnProgressCard({
     activities.some(
       (activity) =>
         isUnassignedStepId(activity.planStepId) &&
-        activity.kind === "reasoning" &&
-        Boolean(activity.body?.trim()),
+        (activity.kind !== "reasoning" || Boolean(activity.body?.trim())),
     ) ||
     commentary.some(
       (entry) => isUnassignedStepId(entry.stepId) && Boolean(entry.body.trim()),
@@ -5956,6 +6027,9 @@ function TurnProgressCard({
   const lastTracedStep = [...steps]
     .reverse()
     .find((step) => hasTraceForStep(step.id));
+  const explicitActiveStep = plan.activeStepId
+    ? steps.find((step) => step.id === plan.activeStepId)
+    : undefined;
   const activeStep = isPlanStage
     ? // A terv pontjai nem munkafázisok: nincs köztük „épp ez fut", és a lista
       // vége sem jelent haladást. Írás közben az utolsó megszületett pontnál
@@ -5964,9 +6038,10 @@ function TurnProgressCard({
       // utolsóra, mert azt hitte, ott tart a munka.
       (streaming ? (steps[steps.length - 1] ?? steps[0]) : steps[0])
     : streaming
-      ? (steps.find((step) => step.status === "inProgress") ??
-        steps.find((step) => step.status === "pending") ??
+      ? (explicitActiveStep ??
         lastTracedStep ??
+        steps.find((step) => step.status === "inProgress") ??
+        steps[0] ??
         steps[steps.length - 1])
       : (lastTracedStep ??
         (hasUnassignedTrace ? steps[0] : undefined) ??
@@ -6403,11 +6478,13 @@ function TurnProgressCard({
   const displayStatus = (step: PlanStep) =>
     !planDrafting &&
     streaming &&
+    plan.activeStepId != null &&
     step.id === activeStep.id &&
     step.status === "pending"
       ? "inProgress"
       : step.status;
-  const completedStepCount = steps.filter(
+  const countableSteps = steps;
+  const completedStepCount = countableSteps.filter(
     (step) => displayStatus(step) === "completed",
   ).length;
   const reasoningCountFor = (stepId: string) =>
@@ -6725,7 +6802,7 @@ function TurnProgressCard({
                     a fejléc sem számol el belőlük semmit. */}
                 {planDrafting || (isPlanStage && effectivePlannedSteps.length === 0)
                   ? "készül"
-                  : `${completedStepCount}/${steps.length} kész`}
+                  : `${completedStepCount}/${countableSteps.length} kész`}
               </span>
             </div>
             <div
@@ -8661,6 +8738,7 @@ function App() {
     return {
       ...current,
       steps: nextSteps,
+      activeStepId: stepId,
       startedAt: current.startedAt ?? now,
       stepTimes,
     };
@@ -9678,10 +9756,11 @@ function App() {
               ""
             : "";
         const carriedSteps = numberedPlanSteps(carriedPlanText).map(
-          (step, index) => ({
+          (step) => ({
             ...step,
-            status:
-              index === 0 ? ("inProgress" as const) : ("pending" as const),
+            // A carried plan is a description, not a claim that step 1 has
+            // started. Claude must explicitly announce the active task.
+            status: "pending" as const,
           }),
         );
         // A TERV kártya lépéslistája is most születik meg: ugyanezek a
@@ -9718,8 +9797,10 @@ function App() {
           turnId: `request:${progress.requestId}`,
           explanation: "",
           steps: stageSteps,
+          activeStepId: null,
+          source: carriedSteps.length >= 2 ? "carried-plan" : "fallback",
           startedAt: stageStartedAt,
-          stepTimes: stageSteps.length
+          stepTimes: stageSteps.length && carriedSteps.length < 2
             ? { [stageSteps[0].id]: { startedAt: stageStartedAt } }
             : {},
         });
@@ -11697,9 +11778,17 @@ function App() {
               phase,
             });
           } else {
-            const stepId =
-              run.plan.steps.find((step) => step.status === "inProgress")?.id ??
-              run.plan.steps[0]?.id;
+            const hasExplicitActiveStep = Object.prototype.hasOwnProperty.call(
+              run.plan,
+              "activeStepId",
+            );
+            const stepId = hasExplicitActiveStep
+              ? run.plan.activeStepId ?? undefined
+              : run.plan.source === "claude-task" ||
+                  run.plan.source === "claude-todo" ||
+                  run.plan.source === "carried-plan"
+                ? undefined
+                : run.plan.steps.find((step) => step.status === "inProgress")?.id;
             writeOwnedCommentary(ownerConversationId, (current) => {
               const existingIndex = itemId
                 ? current.findIndex((entry) => entry.itemId === itemId)
@@ -11791,78 +11880,152 @@ function App() {
           const carriedListActive = current.steps.some((step) =>
             step.id.startsWith("carried-plan-"),
           );
-          const normalized = (value: string) =>
-            value.toLowerCase().replace(/[^a-z0-9áéíóöőúüű]+/g, " ").trim();
-          const matchesCarried =
-            carriedListActive &&
-            snapshot.steps.filter((incoming) =>
-              current.steps.some((step) => {
-                const a = normalized(step.step).slice(0, 40);
-                const b = normalized(incoming.step).slice(0, 40);
-                return a && b && (a.includes(b) || b.includes(a));
-              }),
-            ).length * 2 >= snapshot.steps.length;
+          const isClaudePlan =
+            snapshot.source === "claude-task" ||
+            snapshot.source === "claude-todo" ||
+            snapshot.steps.some(
+              (step) =>
+                step.id.startsWith("claude-task:") ||
+                step.id.startsWith("todo-"),
+            );
+          const canonicalTitle = (value: string) =>
+            value
+              .toLocaleLowerCase("hu-HU")
+              .replace(/^\s*\d+[.)]\s*/, "")
+              .replace(/[\u0060*_]/g, "")
+              .replace(/[^\p{L}\p{N}]+/gu, " ")
+              .trim();
+          const titlesMatch = (left: string, right: string) => {
+            const a = canonicalTitle(left);
+            const b = canonicalTitle(right);
+            if (!a || !b) return false;
+            return (
+              a === b ||
+              (Math.min(a.length, b.length) >= 12 &&
+                (a.startsWith(b) || b.startsWith(a)))
+            );
+          };
+          const mapIncomingTasksToCarried = () => {
+            const mapping = { ...run.planTaskToCarriedStep };
+            const used = new Set(Object.values(mapping));
+            const carried = current.steps.filter((step) =>
+              step.id.startsWith("carried-plan-"),
+            );
+            for (const incoming of snapshot.steps) {
+              if (mapping[incoming.id]) continue;
+              // New Claude tasks arrive in creation order. Only the next
+              // unused carried step may claim a new task; a title mismatch is
+              // left unassigned instead of pairing a later similar title.
+              const next = carried.find((step) => !used.has(step.id));
+              if (next && titlesMatch(next.step, incoming.step)) {
+                mapping[incoming.id] = next.id;
+                used.add(next.id);
+              }
+            }
+            run.planTaskToCarriedStep = mapping;
+            return mapping;
+          };
           if (
             !isActiveRequest &&
-            ((snapshot.steps.length < 2 && current.steps.length >= 2) ||
-              // A KÓD listája a tervé. A kódoló saját munkafolyamat-todo-i
-              // („projektfájlok ellenőrzése…") nem válthatják le a terv
-              // pontjait — csak olyan lista, ami tényleg azokat tükrözi.
-              (carriedListActive && !matchesCarried))
+            snapshot.steps.length < 2 &&
+            current.steps.length >= 2 &&
+            !isClaudePlan
           ) {
             setCodeStatus("terv frissítve");
-          } else if (carriedListActive && matchesCarried) {
+          } else if (carriedListActive) {
             // A kódoló a terv pontjait veszi fel checklistként, méghozzá
             // elemenként: nyolc hívás, nyolc egyre hosszabb lista. Ha ezeket
             // beengednénk, a KÓD lépéslistája újra „kiíródna" fentről lefelé,
             // ahogy a TERV-ben — pedig ugyanaz a lista, csak most már halad.
             // A hordozott lista marad, és csak az állapotokat vesszük át róla.
-            const statusFor = (step: PlanStep) =>
-              snapshot.steps.find((incoming) => {
-                const a = normalized(step.step).slice(0, 40);
-                const b = normalized(incoming.step).slice(0, 40);
-                return a && b && (a.includes(b) || b.includes(a));
-              })?.status;
+            const mapping = mapIncomingTasksToCarried();
             const merged = current.steps.map((step) => {
-              const status = statusFor(step);
-              return status && status !== step.status ? { ...step, status } : step;
+              const incoming = snapshot.steps.find(
+                (candidate) => mapping[candidate.id] === step.id,
+              );
+              return incoming && incoming.status !== step.status
+                ? { ...step, status: incoming.status }
+                : step;
             });
+            const hasExplicitSnapshotActive = Object.prototype.hasOwnProperty.call(
+              snapshot,
+              "activeStepId",
+            );
+            const incomingActiveStepId = hasExplicitSnapshotActive
+              ? snapshot.activeStepId
+              : snapshot.steps.find((step) => step.status === "inProgress")?.id;
+            const mappedActiveStepId =
+              incomingActiveStepId === null
+                ? isClaudePlan
+                  ? current.activeStepId ?? null
+                  : null
+                : incomingActiveStepId
+                  ? mapping[incomingActiveStepId] ?? null
+                  : isClaudePlan
+                    ? current.activeStepId ?? null
+                    : null;
+            if (planTrackingDiagnosticsEnabled() && isClaudePlan) {
+              console.debug("[plan-tracking] carried mapping", {
+                requestId: run.requestId,
+                source:
+                  snapshot.source ??
+                  (isClaudePlan ? "claude-task" : "codex-native"),
+                tasks: snapshot.steps.map((step) => step.id),
+                mapping,
+                activeStepId: mappedActiveStepId,
+              });
+            }
             const changed = merged.some(
               (step, index) => step.status !== current.steps[index].status,
-            );
-            if (changed) {
+            ) || mappedActiveStepId !== (current.activeStepId ?? null);
+            if (changed || snapshot.source !== current.source) {
               const next = planWithTiming(
-                { ...current, turnId: current.turnId ?? uiTurnId },
+                {
+                  ...current,
+                  turnId: current.turnId ?? uiTurnId,
+                  source:
+                    snapshot.source ??
+                    (isClaudePlan ? "claude-task" : "codex-native"),
+                  activeStepId: mappedActiveStepId,
+                  explanation: snapshot.explanation || current.explanation,
+                },
                 merged,
                 Date.now(),
               );
-              const targetStep = next.steps.find(
-                (step) => step.status === "inProgress",
-              );
-              if (targetStep) planStepIdOverride = targetStep.id;
+              planStepIdOverride = mappedActiveStepId ?? undefined;
               updateOwnedPlanState(ownerConversationId, next);
               setWatchdogMessage("");
             }
             setCodeStatus("terv frissítve");
           } else {
-          const next = planWithTiming(
-            {
-              ...current,
-              turnId: current.turnId ?? uiTurnId,
-              explanation: snapshot.explanation || current.explanation,
-            },
-            snapshot.steps,
-            Date.now(),
-          );
-          const targetStep =
-            next.steps.find((step) => step.status === "inProgress") ??
-            next.steps[0];
-          if (targetStep) {
-            planStepIdOverride = targetStep.id;
-          }
-          updateOwnedPlanState(ownerConversationId, next);
-          setWatchdogMessage("");
-          setCodeStatus("terv frissítve");
+            const hasExplicitSnapshotActive = Object.prototype.hasOwnProperty.call(
+              snapshot,
+              "activeStepId",
+            );
+            const activeStepId = hasExplicitSnapshotActive
+              ? snapshot.activeStepId === null && isClaudePlan
+                ? current.activeStepId ?? null
+                : snapshot.activeStepId ?? undefined
+              : snapshot.steps.find((step) => step.status === "inProgress")?.id;
+            const next = planWithTiming(
+              {
+                ...current,
+                turnId: current.turnId ?? uiTurnId,
+                source:
+                  snapshot.source ??
+                  (isClaudePlan
+                    ? "claude-todo"
+                    : current.source ?? "codex-native"),
+                activeStepId: activeStepId ?? null,
+                explanation: snapshot.explanation || current.explanation,
+              },
+              snapshot.steps,
+              Date.now(),
+            );
+            planStepIdOverride = activeStepId ?? undefined;
+            updateOwnedPlanState(ownerConversationId, next);
+            setWatchdogMessage("");
+            setCodeStatus("terv frissítve");
           }
         }
       } else if (
@@ -11904,6 +12067,9 @@ function App() {
         let inferredStepId: string | undefined;
         if (
           !planStepIdOverride &&
+          run.plan.source !== "claude-task" &&
+          run.plan.source !== "claude-todo" &&
+          run.plan.source !== "carried-plan" &&
           codexEvent.requestId &&
           run.chainRequestIds.has(codexEvent.requestId) &&
           run.plan.steps.length >= 2
@@ -11930,11 +12096,38 @@ function App() {
             )?.id;
           }
         }
+        const hasExplicitActiveStep = Object.prototype.hasOwnProperty.call(
+          run.plan,
+          "activeStepId",
+        );
+        const statusActiveStepId =
+          !hasExplicitActiveStep &&
+          run.plan.source !== "claude-task" &&
+          run.plan.source !== "claude-todo" &&
+          run.plan.source !== "carried-plan"
+            ? run.plan.steps.find((step) => step.status === "inProgress")?.id
+            : undefined;
+        const explicitActiveStepId = hasExplicitActiveStep
+          ? run.plan.activeStepId ?? undefined
+          : statusActiveStepId;
         const planStepId =
           planStepIdOverride ??
-          inferredStepId ??
-          run.plan.steps.find((step) => step.status === "inProgress")?.id ??
-          run.plan.steps[0]?.id;
+          explicitActiveStepId ??
+          inferredStepId;
+        if (planTrackingDiagnosticsEnabled() && run.provider === "anthropic") {
+          console.debug("[plan-tracking] activity assignment", {
+            requestId: run.requestId,
+            eventType: codexEvent.eventType,
+            planStepId: planStepId ?? null,
+            assignmentSource: planStepIdOverride
+              ? "plan-update"
+              : explicitActiveStepId
+                ? "explicit-active"
+                : inferredStepId
+                  ? "filename-fallback"
+                  : "unassigned",
+          });
+        }
         const activityWithStep = { ...activity, planStepId };
         markOwnedPlanStepStarted(ownerConversationId, planStepId, Date.now());
         writeOwnedWorkItems(ownerConversationId, (current) =>
@@ -12140,7 +12333,7 @@ function App() {
             : step,
         );
         const completedPlan = planWithTiming(
-          run.plan,
+          { ...run.plan, activeStepId: null },
           completedSteps,
           completedAt,
           completedAt,
@@ -13900,6 +14093,7 @@ function App() {
       processedEvents: new Set(),
       completedTerminalTurns: new Set(),
       chainRequestIds: new Set(),
+      planTaskToCarriedStep: {},
       answerStream: { meta: null, pending: "", frame: null },
       status: "preparing",
       turnCompleted: false,
@@ -14620,6 +14814,7 @@ function App() {
       processedEvents: new Set(),
       completedTerminalTurns: new Set(),
       chainRequestIds: new Set(stageRequestIds),
+      planTaskToCarriedStep: {},
       // A `startStage` előtti szakaszok ebben a körben nem futnak: enélkül a
       // sáv úgy rajzolná őket, mintha még sorra kerülnének.
       chain: { resume: { chainKey, startStage, iteration, carried } },

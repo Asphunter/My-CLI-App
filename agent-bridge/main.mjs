@@ -13,6 +13,7 @@ import {
   PLAN_TOOLS,
   planFromTasks,
   planFromTodos,
+  taskKeyForUpdate,
   toolsForProfile,
 } from "./policy.mjs";
 import { collectProjectInstructions } from "./instructions.mjs";
@@ -406,9 +407,14 @@ async function canUseToolForTurn(turn, toolName, input, options) {
     if (toolName === "TodoWrite") {
       const plan = planFromTodos(input);
       if (plan.length > 0) {
+        const activeStepId = plan.find((step) =>
+          /^(in_progress|inprogress|running|active)$/i.test(String(step.status)),
+        )?.id ?? null;
         emitAgentEvent(turn.request, turn.sessionId, "turn/plan/updated", {
           turnId: turn.sessionId ?? turn.request.requestId,
           plan,
+          source: "claude-todo",
+          activeStepId,
         });
       }
     }
@@ -529,6 +535,7 @@ function planFromChecklistCall(turn, toolName, input, toolUseId) {
   if (toolName === "TaskCreate") {
     const key = toolUseId ?? randomUUID();
     turn.tasks.set(key, {
+      planId: `claude-task:${key}`,
       subject: text(input?.subject),
       activeForm: text(input?.activeForm),
       status: "pending",
@@ -537,17 +544,43 @@ function planFromChecklistCall(turn, toolName, input, toolUseId) {
   }
   if (toolName === "TaskUpdate") {
     const taskId = text(input?.taskId);
-    const key = turn.taskKeyById.get(taskId) ?? taskId;
-    if (!key) return [];
-    const existing = turn.tasks.get(key) ?? { subject: "", activeForm: "", status: "pending" };
+    const key = taskKeyForUpdate(turn.tasks, turn.taskKeyById, taskId);
+    // Do not create a new task for an id that the bridge cannot tie to a
+    // TaskCreate. That would produce a phantom checklist row and make the UI
+    // lose the real active task.
+    if (!key) return planFromTasks(turn.tasks);
+    const existing = turn.tasks.get(key) ?? {
+      planId: `claude-task:${key}`,
+      subject: "",
+      activeForm: "",
+      status: "pending",
+    };
+    const status = text(input?.status) || existing.status;
     turn.tasks.set(key, {
+      planId: existing.planId ?? `claude-task:${key}`,
       subject: text(input?.subject) || existing.subject,
       activeForm: text(input?.activeForm) || existing.activeForm,
-      status: text(input?.status) || existing.status,
+      status,
     });
+    if (/^(in_progress|inprogress|running|active)$/i.test(status))
+      turn.lastActiveTaskKey = key;
     return planFromTasks(turn.tasks);
   }
   return [];
+}
+
+/** The one explicit active Claude task, if the model has declared one. */
+function activePlanStepId(turn, plan) {
+  const lastActive = turn.lastActiveTaskKey
+    ? turn.tasks.get(turn.lastActiveTaskKey)
+    : null;
+  if (lastActive?.status && /^(in_progress|inprogress|running|active)$/i.test(lastActive.status))
+    return lastActive.planId ?? null;
+  const active = [...turn.tasks.values()]
+    .reverse()
+    .find((task) => task?.status === "in_progress");
+  if (active?.planId) return active.planId;
+  return plan.find((step) => /^(in_progress|inprogress|running|active)$/i.test(String(step.status)))?.id ?? null;
 }
 
 /** A `TaskCreate` eredményéből a task azonosítója, ha kiolvasható. */
@@ -582,9 +615,22 @@ function emitToolStarted(turn, block) {
   if (classifyTool(toolName) === "plan") {
     const plan = planFromChecklistCall(turn, toolName, input, block?.id);
     if (plan.length > 0) {
+      const activeStepId = activePlanStepId(turn, plan);
+      diagnostic("plan transition", {
+        requestId: request.requestId,
+        operation: toolName,
+        taskId: typeof input?.taskId === "string" ? input.taskId : null,
+        activeStepId,
+        activeTaskIds: plan
+          .filter((step) => /^(in_progress|inprogress|running|active)$/i.test(String(step.status)))
+          .map((step) => step.id),
+        plan: plan.map((step) => ({ id: step.id, status: step.status })),
+      });
       emitAgentEvent(request, sessionId, "turn/plan/updated", {
         turnId: sessionId ?? request.requestId,
         plan,
+        source: toolName === "TodoWrite" ? "claude-todo" : "claude-task",
+        activeStepId,
       });
     }
     return;
@@ -921,6 +967,7 @@ async function runLiveTurn(request) {
     // köti ide, mert a `TaskUpdate` csak azt ismeri.
     tasks: new Map(),
     taskKeyById: new Map(),
+    lastActiveTaskKey: null,
   };
   activeRequests.set(request.requestId, turn);
   // Without an explicit systemPrompt the SDK uses a minimal prompt that omits

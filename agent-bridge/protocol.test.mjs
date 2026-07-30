@@ -14,6 +14,7 @@ import {
   ENABLED_TOOLS,
   planFromTasks,
   planFromTodos,
+  taskKeyForUpdate,
   toolsForProfile,
 } from "./policy.mjs";
 import { collectProjectInstructions } from "./instructions.mjs";
@@ -290,6 +291,38 @@ test("the task tools are the checklist too, and build the same plan shape", () =
     planFromTasks(new Map([["use-1", { subject: "", activeForm: "", status: "pending" }]])),
     [],
   );
+});
+
+test("task plan ids stay stable when a task disappears", () => {
+  const tasks = new Map([
+    ["use-1", { planId: "claude-task:use-1", subject: "First", status: "completed" }],
+    ["use-2", { planId: "claude-task:use-2", subject: "Second", status: "pending" }],
+  ]);
+  assert.deepEqual(planFromTasks(tasks).map((step) => step.id), [
+    "claude-task:use-1",
+    "claude-task:use-2",
+  ]);
+  tasks.delete("use-1");
+  assert.deepEqual(planFromTasks(tasks), [
+    { id: "claude-task:use-2", step: "Second", status: "pending" },
+  ]);
+});
+
+test("numeric TaskUpdate ids resolve to TaskCreate order without phantom tasks", () => {
+  const tasks = new Map([
+    ["use-1", { planId: "claude-task:use-1", subject: "First", status: "pending" }],
+    ["use-2", { planId: "claude-task:use-2", subject: "Second", status: "pending" }],
+  ]);
+  const taskKeyById = new Map();
+
+  assert.equal(taskKeyForUpdate(tasks, taskKeyById, "1"), "use-1");
+  assert.equal(taskKeyForUpdate(tasks, taskKeyById, "2"), "use-2");
+  assert.equal(taskKeyById.get("1"), "use-1");
+  assert.equal(taskKeyForUpdate(tasks, taskKeyById, "unknown"), null);
+  assert.deepEqual(planFromTasks(tasks).map((step) => step.id), [
+    "claude-task:use-1",
+    "claude-task:use-2",
+  ]);
 });
 
 test("a malformed or empty checklist produces no plan update", () => {

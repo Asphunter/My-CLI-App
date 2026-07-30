@@ -122,9 +122,48 @@ export function planFromTasks(tasks) {
     .map((task, index) => {
       const step = (task.subject || task.activeForm || "").trim();
       if (!step) return null;
-      return { id: `task-${index}`, step, status: task.status ?? "pending" };
+      // The Map index is not an identity: deleting a task would otherwise
+      // renumber every later row and make its timing/trace jump to another
+      // step. The bridge assigns planId from the tool-use key once, before
+      // the SDK result supplies the model-facing task id.
+      return {
+        id: task.planId ?? `task-${index}`,
+        step,
+        status: task.status ?? "pending",
+      };
     })
     .filter(Boolean);
+}
+
+/**
+ * Resolves the id used by TaskUpdate back to the stable TaskCreate key.
+ *
+ * The native Claude build currently returns a short ordinal ("1", "2", ...)
+ * in TaskUpdate, while the preceding TaskCreate is keyed by its tool-use id.
+ * Prefer the explicit result mapping when it exists, then fall back to the
+ * one-based creation order. Returning null for an unknown id is important:
+ * inventing a new task here creates a phantom checklist row and loses the
+ * active-step link for every subsequent tool call.
+ */
+export function taskKeyForUpdate(tasks, taskKeyById, taskId) {
+  if (typeof taskId !== "string" || !taskId.trim()) return null;
+  const normalized = taskId.trim();
+  const mapped = taskKeyById?.get(normalized);
+  if (mapped) return mapped;
+
+  if (/^\d+$/.test(normalized)) {
+    const ordinal = Number(normalized);
+    if (Number.isSafeInteger(ordinal) && ordinal > 0) {
+      const keys = [...tasks.keys()];
+      const key = keys[ordinal - 1];
+      if (key) {
+        taskKeyById?.set(normalized, key);
+        return key;
+      }
+    }
+  }
+
+  return null;
 }
 
 /**

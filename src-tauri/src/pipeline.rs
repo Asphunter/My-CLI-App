@@ -277,6 +277,26 @@ pub fn stage_prompt(
 
     prompt.push_str("[SZEREP]\n");
     prompt.push_str(role.instruction());
+    prompt.push_str("\n\n[STRICT STEP TRACKING PROTOCOL]\n");
+    match role {
+        StageRole::Code => prompt.push_str(
+            "Before the first workspace action, create the complete checklist from the numbered plan. ",
+        ),
+        StageRole::Review => prompt.push_str(
+            "Create the complete review checklist before the first inspection. Keep exactly one item in_progress at a time, "
+        ),
+        StageRole::Plan => prompt.push_str(
+            "Do not present internal work as completed plan steps; the numbered plan is the output, not a progress claim. "
+        ),
+    }
+    if matches!(role, StageRole::Code | StageRole::Review) {
+        prompt.push_str(
+            "then update that same item before moving to the next one. Do not jump ahead, go back, or replace the checklist with a different set of work phases. ",
+        );
+        prompt.push_str(
+            "Set exactly one item in_progress before its first tool call; mark it completed immediately after its work; only then set the next item in_progress. The item text must remain the exact plan/review title so the UI can correlate it. ",
+        );
+    }
     prompt
 }
 
@@ -381,6 +401,9 @@ pub fn stage_agent_label(stage: &RecipeStage) -> String {
     };
     let pretty = match model {
         "claude-opus-5" => "Opus 5",
+        "claude-opus-4-8" => "Opus 4.8",
+        "claude-opus-4-7" => "Opus 4.7",
+        "claude-opus-4-6" => "Opus 4.6",
         "claude-fable-5" => "Fable 5",
         "claude-sonnet-5" => "Sonnet 5",
         other => other,
@@ -852,6 +875,17 @@ mod tests {
     }
 
     #[test]
+    fn coding_and_review_prompts_require_ordered_explicit_step_tracking() {
+        let code = stage_prompt(StageRole::Code, "Feladat.", &[]);
+        let review = stage_prompt(StageRole::Review, "Feladat.", &[]);
+        for prompt in [code, review] {
+            assert!(prompt.contains("STRICT STEP TRACKING PROTOCOL"));
+            assert!(prompt.contains("exact plan/review title"));
+            assert!(prompt.contains("one item in_progress at a time") || prompt.contains("complete checklist"));
+        }
+    }
+
+    #[test]
     fn the_original_task_is_always_first_and_verbatim() {
         let prompt = stage_prompt(
             StageRole::Review,
@@ -927,6 +961,22 @@ mod tests {
     fn a_missing_verdict_is_not_an_error() {
         assert!(parse_review_verdict("Szerintem jó lett.").is_none());
         assert!(parse_review_verdict("VERDIKT: talán").is_none());
+    }
+
+    #[test]
+    fn opus_4_variants_have_the_same_short_labels_as_the_picker() {
+        let mut stage = recipe_by_id("plan_code_review")
+            .expect("preset")
+            .stages
+            .remove(0);
+        for (model, label) in [
+            ("claude-opus-4-8", "Claude · Opus 4.8 · medium"),
+            ("claude-opus-4-7", "Claude · Opus 4.7 · medium"),
+            ("claude-opus-4-6", "Claude · Opus 4.6 · medium"),
+        ] {
+            stage.model = Some(model.to_string());
+            assert_eq!(stage_agent_label(&stage), label);
+        }
     }
 
     #[test]

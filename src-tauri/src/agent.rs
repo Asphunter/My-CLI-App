@@ -389,17 +389,41 @@ pub fn runtime_catalog() -> Vec<AgentRuntimeDescriptor> {
                 images: true,
                 cancellation: true,
             },
-            models: vec![AgentModelDescriptor {
-                id: "claude-sonnet-5".to_string(),
-                display_name: "Claude Sonnet 5".to_string(),
-                description: "Balanced Claude coding model.".to_string(),
-                supported_efforts: vec![
-                    "low".to_string(),
-                    "medium".to_string(),
-                    "high".to_string(),
-                ],
+            models: [
+                (
+                    "claude-opus-5",
+                    "Claude Opus 5",
+                    "The strongest Claude coding model.",
+                ),
+                (
+                    "claude-opus-4-8",
+                    "Claude Opus 4.8",
+                    "Claude Opus 4.8 coding model.",
+                ),
+                (
+                    "claude-opus-4-7",
+                    "Claude Opus 4.7",
+                    "Claude Opus 4.7 coding model.",
+                ),
+                (
+                    "claude-opus-4-6",
+                    "Claude Opus 4.6",
+                    "Claude Opus 4.6 coding model.",
+                ),
+                ("claude-fable-5", "Claude Fable 5", "Fast Claude coding model."),
+            ]
+            .into_iter()
+            .map(|(id, display_name, description)| AgentModelDescriptor {
+                id: id.to_string(),
+                display_name: display_name.to_string(),
+                description: description.to_string(),
+                supported_efforts: ["low", "medium", "high", "xhigh", "max"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
                 default_effort: Some("low".to_string()),
-            }],
+            })
+            .collect(),
         },
     ]
 }
@@ -453,7 +477,24 @@ mod tests {
         assert_eq!(catalog.len(), 2);
         assert_eq!(catalog[0].provider, AgentProvider::Codex);
         assert_eq!(catalog[1].provider, AgentProvider::Anthropic);
-        assert_eq!(catalog[1].models[0].id, "claude-sonnet-5");
+        assert_eq!(
+            catalog[1]
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "claude-opus-5",
+                "claude-opus-4-8",
+                "claude-opus-4-7",
+                "claude-opus-4-6",
+                "claude-fable-5",
+            ]
+        );
+        assert!(catalog[1].models.iter().all(|model| {
+            model.supported_efforts == ["low", "medium", "high", "xhigh", "max"]
+                && model.default_effort.as_deref() == Some("low")
+        }));
     }
 
     #[test]

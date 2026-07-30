@@ -3044,7 +3044,7 @@ fn spawn_app_server(app: &tauri::AppHandle) -> Result<Child, String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|error| format!("Nem indÃ­thatÃ³ a Codex app-server ({:?}): {error}", binary))
+        .map_err(|error| format!("Nem indítható a Codex app-server ({:?}): {error}", binary))
 }
 
 fn initialize_app_server(
@@ -5329,11 +5329,11 @@ pub fn list_models(app: tauri::AppHandle) -> Result<Vec<CodexModel>, String> {
         let mut stdin = child
             .stdin
             .take()
-            .ok_or_else(|| "A Codex stdin nem Ã©rhetÅ‘ el.".to_string())?;
+            .ok_or_else(|| "A Codex stdin nem érhető el.".to_string())?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| "A Codex stdout nem Ã©rhetÅ‘ el.".to_string())?;
+            .ok_or_else(|| "A Codex stdout nem érhető el.".to_string())?;
         let mut reader = BufReader::new(stdout);
 
         initialize_app_server(&mut stdin, &mut reader)?;
@@ -5348,7 +5348,7 @@ pub fn list_models(app: tauri::AppHandle) -> Result<Vec<CodexModel>, String> {
         let response = read_response(&mut reader, 2)?;
         let data = response["result"]["data"]
             .as_array()
-            .ok_or_else(|| "A Codex nem adott vissza modellkatalÃ³gust.".to_string())?;
+            .ok_or_else(|| "A Codex nem adott vissza modellkatalógust.".to_string())?;
 
         Ok(data
             .iter()

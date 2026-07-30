@@ -1775,7 +1775,7 @@ fn validate_payload(event_type: &str, entity_id: &str, payload: &Value) -> Resul
             let id = payload
                 .get("id")
                 .and_then(Value::as_str)
-                .ok_or_else(|| "Az agent session event ID-ja hiÃ¡nyzik.".to_string())?;
+                .ok_or_else(|| "Az agent session event ID-ja hiányzik.".to_string())?;
             if format!("agent-session:{id}") != entity_id
                 || payload
                     .get("conversationId")
@@ -1790,14 +1790,14 @@ fn validate_payload(event_type: &str, entity_id: &str, payload: &Value) -> Resul
                     .unwrap_or_default()
                     .is_empty()
             {
-                return Err("Az agent session event identityje vagy tartalma hibÃ¡s.".to_string());
+                return Err("Az agent session event identityje vagy tartalma hibás.".to_string());
             }
         }
         AGENT_SESSION_ENTRY_APPEND => {
             let id = payload
                 .get("id")
                 .and_then(Value::as_str)
-                .ok_or_else(|| "Az agent session entry event ID-ja hiÃ¡nyzik.".to_string())?;
+                .ok_or_else(|| "Az agent session entry event ID-ja hiányzik.".to_string())?;
             if format!("agent-entry:{id}") != entity_id
                 || payload
                     .get("session")
@@ -1806,7 +1806,7 @@ fn validate_payload(event_type: &str, entity_id: &str, payload: &Value) -> Resul
                     .is_none()
                 || payload.get("body").is_none()
             {
-                return Err("Az agent session entry event tartalma hibÃ¡s.".to_string());
+                return Err("Az agent session entry event tartalma hibás.".to_string());
             }
         }
         _ => return Err(format!("Ismeretlen v2 event type: {event_type}")),

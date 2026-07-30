@@ -7008,7 +7008,12 @@ function TurnProgressCard({
                               data-quote-selectable="true"
                             >
                               {entry.internalHistory.map((line, index) => (
-                                <div key={`${entry.id}-history-${index}`}>{line}</div>
+                                // A gondolkodás képleteket és kód-chipeket is
+                                // hordoz; nyers szövegként ellentmondana a
+                                // panel többi sorának.
+                                <div key={`${entry.id}-history-${index}`}>
+                                  <InlineMarkdown text={line} />
+                                </div>
                               ))}
                             </div>
                           )}
@@ -9689,9 +9694,18 @@ function App() {
     // trace attribute those events to the turn that is actually running.
     const unlisten = listen<PipelineProgressEvent>("pipeline-progress", (event) => {
       const progress = event.payload;
-      const progressRun =
-        runForEvent({ requestId: progress.requestId }) ??
-        (runsRef.current.values().next().value as RunHandle | undefined);
+      // A szakasz requestId-je a külső kérés-azonosító + `-stage-N`; ha a
+      // stage-id-t egyik run sem ismeri (pl. straggler egy lezárt lánctól), a
+      // külső azonosító még köthető. Az „első run" fallback csak egyetlen
+      // futás mellett jogos — két párhuzamos projektnél a B lánc kósza
+      // eseménye az A szakasz-sávját írta át.
+      const runForProgress = (requestId: string) =>
+        runForEvent({ requestId }) ??
+        runForRequest(requestId.replace(/-stage-\d+$/, "")) ??
+        (runsRef.current.size === 1
+          ? (runsRef.current.values().next().value as RunHandle)
+          : undefined);
+      const progressRun = runForProgress(progress.requestId);
       if (progressRun) {
         progressRun.chain = { ...progressRun.chain, progress };
         // A szakasz sávja a lánc sajátja: a nézet-választás csak addig él,
@@ -9737,9 +9751,7 @@ function App() {
       if (progress.phase === "started") {
         // A szakasz a saját láncának futásához tartozik: a kérés-azonosítója
         // oda kerül be, és onnantól az eseményei is odatalálnak.
-        const chainRun =
-          runForEvent({ requestId: progress.requestId }) ??
-          (runsRef.current.values().next().value as RunHandle | undefined);
+        const chainRun = runForProgress(progress.requestId);
         if (!chainRun) return;
         chainRun.chainRequestIds.add(progress.requestId);
         // Named, not cleared. Clearing it left the stage's first event to fall
@@ -10739,7 +10751,7 @@ function App() {
           messageKeyRef.current = selectedKey;
           workLogKeyRef.current = selectedKey;
           setSyncWriteEnabled(result.canWrite);
-          setSyncStatus(result.canWrite ? "szinkronizÃ¡lva" : "karantÃ©n Â· olvasÃ¡s");
+          setSyncStatus(result.canWrite ? "szinkronizálva" : "karantén · olvasás");
           setSyncReady(true);
           return;
         }
@@ -13320,7 +13332,7 @@ function App() {
     const workItems = conversation?.workItems ?? loadThreadWorkItems(key);
     commitMessages(conversation?.messages ?? loadThreadMessages(key));
     setCodeActivity(workItems);
-    setCodeStatus(workItems.length ? "kÃ©sz" : "kÃ©szen");
+    setCodeStatus(workItems.length ? "kész" : "készen");
     const cachedHistory = conversation?.planHistory ?? {};
     const history =
       Object.keys(cachedHistory).length > 0
@@ -13804,7 +13816,7 @@ function App() {
     const requestId = createRequestId();
     const fallbackTurnId = `request:${requestId}`;
     const requestStartedAt = Date.now();
-    const promptText = text || "VizsgÃ¡ld meg a csatolt kÃ©pet vagy kÃ©peket.";
+    const promptText = text || "Vizsgáld meg a csatolt képet vagy képeket.";
     let requestThreadKey = isGeneralMode
       ? activeGeneralConversationIdRef.current
         ? generalConversationCacheKey(activeGeneralConversationIdRef.current)
@@ -15178,7 +15190,7 @@ function App() {
     if (candidates.length > 0) return candidates[candidates.length - 1].message;
     // A trace without a user bucket has no reliable owner. Never attach the
     // nearest answer to it: stale plan metadata would otherwise render an
-    // orphaned VÃLASZ card before the first visible user message.
+    // orphaned VÁLASZ card before the first visible user message.
     return undefined;
   };
   const workGroupForMessage = (message: Message, messageIndex: number) =>

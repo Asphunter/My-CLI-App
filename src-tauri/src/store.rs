@@ -792,7 +792,7 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
         })?;
     } else if version == 4 {
         let transaction = connection.transaction().map_err(|error| {
-            format!("A lokÃ¡lis SQLite v5 migrÃ¡ciÃ³ nem indÃ­thatÃ³ el: {error}")
+            format!("A lokális SQLite v5 migráció nem indítható el: {error}")
         })?;
         transaction
             .execute_batch(
@@ -800,9 +800,9 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
                  ALTER TABLE work_items ADD COLUMN origin_device_id TEXT REFERENCES devices(id);
                  PRAGMA user_version = 5;",
             )
-            .map_err(|error| format!("A lokÃ¡lis SQLite v5 migrÃ¡ciÃ³ sikertelen: {error}"))?;
+            .map_err(|error| format!("A lokális SQLite v5 migráció sikertelen: {error}"))?;
         transaction.commit().map_err(|error| {
-            format!("A lokÃ¡lis SQLite v5 migrÃ¡ciÃ³ commitja sikertelen: {error}")
+            format!("A lokális SQLite v5 migráció commitja sikertelen: {error}")
         })?;
     }
     let migrated_version = read_schema_version(connection)?;
@@ -1470,7 +1470,7 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
     let migrated_version = read_schema_version(connection)?;
     if migrated_version == 19 {
         let transaction = connection.transaction().map_err(|error| {
-            format!("A lokÃ¡lis SQLite v20 migrÃ¡ciÃ³ nem indÃ­thatÃ³ el: {error}")
+            format!("A lokális SQLite v20 migráció nem indítható el: {error}")
         })?;
         transaction
             .execute_batch(
@@ -1486,18 +1486,18 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
                  );",
             )
             .map_err(|error| {
-                format!("A v20 turns alapstruktÃºrÃ¡ja nem hozhatÃ³ lÃ©tre: {error}")
+                format!("A v20 turns alapstruktúrája nem hozható létre: {error}")
             })?;
         let ensure_column = |table: &str, column: &str, definition: &str| -> Result<(), String> {
             let has_column = {
                 let mut statement = transaction
                     .prepare(&format!("PRAGMA table_info({table})"))
-                    .map_err(|error| format!("A v20 {table} schema nem olvashatÃ³: {error}"))?;
+                    .map_err(|error| format!("A v20 {table} schema nem olvasható: {error}"))?;
                 let columns = statement
                     .query_map([], |row| row.get::<_, String>(1))
-                    .map_err(|error| format!("A v20 {table} oszloplista nem olvashatÃ³: {error}"))?
+                    .map_err(|error| format!("A v20 {table} oszloplista nem olvasható: {error}"))?
                     .collect::<Result<HashSet<_>, _>>()
-                    .map_err(|error| format!("A v20 {table} schema hibÃ¡s: {error}"))?;
+                    .map_err(|error| format!("A v20 {table} schema hibás: {error}"))?;
                 columns.contains(column)
             };
             if !has_column {
@@ -1506,7 +1506,7 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
                         "ALTER TABLE {table} ADD COLUMN {column} {definition};"
                     ))
                     .map_err(|error| {
-                        format!("A v20 {table}.{column} oszlop nem hozhatÃ³ lÃ©tre: {error}")
+                        format!("A v20 {table}.{column} oszlop nem hozható létre: {error}")
                     })?;
             }
             Ok(())
@@ -1580,10 +1580,10 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
                  PRAGMA user_version = 20;",
             )
             .map_err(|error| {
-                format!("A v20 agent/session tÃ¡blÃ¡k lÃ©trehozÃ¡sa sikertelen: {error}")
+                format!("A v20 agent/session táblák létrehozása sikertelen: {error}")
             })?;
         transaction.commit().map_err(|error| {
-            format!("A lokÃ¡lis SQLite v20 migrÃ¡ciÃ³ commitja sikertelen: {error}")
+            format!("A lokális SQLite v20 migráció commitja sikertelen: {error}")
         })?;
     }
     let migrated_version = read_schema_version(connection)?;
@@ -1822,7 +1822,7 @@ pub(crate) fn record_agent_turn_start(
             |row| row.get::<_, i64>(0),
         )
         .map_err(|error| {
-            format!("Az agent conversation lÃ©tezÃ©se nem ellenÅ‘rizhetÅ‘: {error}")
+            format!("Az agent conversation létezése nem ellenőrizhető: {error}")
         })?
         != 0;
     if !conversation_exists {
@@ -1889,7 +1889,7 @@ pub(crate) fn record_agent_turn_start(
                 conversation_id,
             ],
         )
-        .map_err(|error| format!("Az agent conversation metadata nem menthetÅ‘: {error}"))?;
+        .map_err(|error| format!("Az agent conversation metadata nem menthető: {error}"))?;
     store
         .connection
         .execute(
@@ -1920,7 +1920,7 @@ pub(crate) fn record_agent_turn_start(
                 now,
             ],
         )
-        .map_err(|error| format!("Az agent turn indulÃ¡si metadata nem menthetÅ‘: {error}"))?;
+        .map_err(|error| format!("Az agent turn indulási metadata nem menthető: {error}"))?;
     Ok(())
 }
 
@@ -2278,7 +2278,7 @@ pub(crate) fn record_agent_turn_terminal(
                     .filter(|value| !value.trim().is_empty()),
             ],
         )
-        .map_err(|error| format!("Az agent turn lezÃ¡rÃ¡si metadata nem menthetÅ‘: {error}"))?;
+        .map_err(|error| format!("Az agent turn lezárási metadata nem menthető: {error}"))?;
     store
         .connection
         .execute(
@@ -2289,7 +2289,7 @@ pub(crate) fn record_agent_turn_terminal(
             params![response.session_id, now, conversation_id],
         )
         .map_err(|error| {
-            format!("Az agent conversation lezÃ¡rÃ¡si metadata nem menthetÅ‘: {error}")
+            format!("Az agent conversation lezárási metadata nem menthető: {error}")
         })?;
     if let Some(provider_session_id) = response.session_id.as_deref() {
         store
@@ -2523,7 +2523,7 @@ fn session_key_value(payload: &serde_json::Value, name: &str) -> Result<String, 
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| format!("A Claude SessionStore key {name} mezÅ‘je hiÃ¡nyzik."))
+        .ok_or_else(|| format!("A Claude SessionStore key {name} mezője hiányzik."))
 }
 
 fn session_subpath(payload: &serde_json::Value) -> String {
@@ -2563,7 +2563,7 @@ fn ensure_agent_session(
                                    THEN agent_sessions.updated_at ELSE excluded.updated_at END",
             params![id, conversation_id, project_key, provider_session_id, now],
         )
-        .map_err(|error| format!("Az agent session nem menthetÅ‘: {error}"))?;
+        .map_err(|error| format!("Az agent session nem menthető: {error}"))?;
     Ok(id)
 }
 
@@ -2574,12 +2574,12 @@ pub(crate) fn agent_session_store_rpc(
     let conversation_id = conversation_id
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
-            "A Claude SessionStore kÃ©rÃ©sbÅ‘l hiÃ¡nyzik a conversationId.".to_string()
+            "A Claude SessionStore kérésből hiányzik a conversationId.".to_string()
         })?;
     let operation = payload
         .get("operation")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "A Claude SessionStore mÅ±velete hiÃ¡nyzik.".to_string())?;
+        .ok_or_else(|| "A Claude SessionStore művelete hiányzik.".to_string())?;
     let project_key = normalize_project_key(&session_key_value(payload, "projectKey")?);
     let subpath = session_subpath(payload);
     let now = now_millis();
@@ -2587,7 +2587,7 @@ pub(crate) fn agent_session_store_rpc(
     let transaction = store
         .connection
         .transaction()
-        .map_err(|error| format!("A SessionStore tranzakciÃ³ja nem indÃ­thatÃ³: {error}"))?;
+        .map_err(|error| format!("A SessionStore tranzakciója nem indítható: {error}"))?;
     let session_id = if matches!(operation, "listSessions" | "listSessionSummaries") {
         None
     } else {
@@ -2604,14 +2604,14 @@ pub(crate) fn agent_session_store_rpc(
         "append" => {
             let session_id = session_id
                 .as_deref()
-                .ok_or_else(|| "Az agent session azonosÃ­tÃ³ja hiÃ¡nyzik.".to_string())?;
+                .ok_or_else(|| "Az agent session azonosítója hiányzik.".to_string())?;
             let entries = payload
                 .get("entries")
                 .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| "A SessionStore append entries mezÅ‘je hiÃ¡nyzik.".to_string())?;
+                .ok_or_else(|| "A SessionStore append entries mezője hiányzik.".to_string())?;
             for entry in entries {
                 let body_json = serde_json::to_string(entry).map_err(|error| {
-                    format!("A Claude session entry nem szerializÃ¡lhatÃ³: {error}")
+                    format!("A Claude session entry nem szerializálható: {error}")
                 })?;
                 let entry_uuid = entry
                     .get("uuid")
@@ -2636,7 +2636,7 @@ pub(crate) fn agent_session_store_rpc(
                         |row| row.get(0),
                     )
                     .map_err(|error| {
-                        format!("A Claude session entry sorrendje nem olvashatÃ³: {error}")
+                        format!("A Claude session entry sorrendje nem olvasható: {error}")
                     })?;
                 transaction
                     .execute(
@@ -2648,20 +2648,20 @@ pub(crate) fn agent_session_store_rpc(
                             entry_id, session_id, subpath, entry_uuid, sequence, body_json, now
                         ],
                     )
-                    .map_err(|error| format!("A Claude session entry nem menthetÅ‘: {error}"))?;
+                    .map_err(|error| format!("A Claude session entry nem menthető: {error}"))?;
             }
             transaction
                 .execute(
                     "UPDATE agent_sessions SET updated_at = ?1 WHERE id = ?2 AND status <> 'deleted'",
                     params![now, session_id],
                 )
-                .map_err(|error| format!("A Claude session frissÃ­tÃ©se sikertelen: {error}"))?;
+                .map_err(|error| format!("A Claude session frissítése sikertelen: {error}"))?;
             serde_json::Value::Null
         }
         "load" => {
             let session_id = session_id
                 .as_deref()
-                .ok_or_else(|| "Az agent session azonosÃ­tÃ³ja hiÃ¡nyzik.".to_string())?;
+                .ok_or_else(|| "Az agent session azonosítója hiányzik.".to_string())?;
             let status: Option<String> = transaction
                 .query_row(
                     "SELECT status FROM agent_sessions WHERE id = ?1",
@@ -2669,7 +2669,7 @@ pub(crate) fn agent_session_store_rpc(
                     |row| row.get(0),
                 )
                 .optional()
-                .map_err(|error| format!("A Claude session Ã¡llapota nem olvashatÃ³: {error}"))?;
+                .map_err(|error| format!("A Claude session állapota nem olvasható: {error}"))?;
             if status.as_deref() == Some("deleted") || status.is_none() {
                 serde_json::Value::Null
             } else {
@@ -2679,19 +2679,19 @@ pub(crate) fn agent_session_store_rpc(
                          WHERE agent_session_id = ?1 AND subpath = ?2
                          ORDER BY sequence, id",
                     )
-                    .map_err(|error| format!("A Claude session entryk nem olvashatÃ³k: {error}"))?;
+                    .map_err(|error| format!("A Claude session entryk nem olvashatók: {error}"))?;
                 let rows = statement
                     .query_map(params![session_id, subpath], |row| row.get::<_, String>(0))
-                    .map_err(|error| format!("A Claude session entry lista hibÃ¡s: {error}"))?
+                    .map_err(|error| format!("A Claude session entry lista hibás: {error}"))?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|error| {
-                        format!("A Claude session entry lista nem olvashatÃ³: {error}")
+                        format!("A Claude session entry lista nem olvasható: {error}")
                     })?;
                 let entries = rows
                     .into_iter()
                     .map(|body| {
                         serde_json::from_str(&body).map_err(|error| {
-                            format!("A Claude session entry JSON-ja hibÃ¡s: {error}")
+                            format!("A Claude session entry JSON-ja hibás: {error}")
                         })
                     })
                     .collect::<Result<Vec<serde_json::Value>, _>>()?;
@@ -2709,7 +2709,7 @@ pub(crate) fn agent_session_store_rpc(
                      WHERE project_key = ?1 AND provider = 'anthropic' AND status <> 'deleted'
                      ORDER BY updated_at DESC, provider_session_id",
                 )
-                .map_err(|error| format!("A Claude sessionlista nem olvashatÃ³: {error}"))?;
+                .map_err(|error| format!("A Claude sessionlista nem olvasható: {error}"))?;
             let rows = statement
                 .query_map(params![project_key], |row| {
                     let session_id: String = row.get(0)?;
@@ -2719,9 +2719,9 @@ pub(crate) fn agent_session_store_rpc(
                         "mtime": mtime_text.parse::<i64>().unwrap_or_default()
                     }))
                 })
-                .map_err(|error| format!("A Claude sessionlista hibÃ¡s: {error}"))?
+                .map_err(|error| format!("A Claude sessionlista hibás: {error}"))?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| format!("A Claude sessionlista nem gyÅ±jthetÅ‘: {error}"))?;
+                .map_err(|error| format!("A Claude sessionlista nem gyűjthető: {error}"))?;
             serde_json::Value::Array(rows)
         }
         "listSessionSummaries" => {
@@ -2732,7 +2732,7 @@ pub(crate) fn agent_session_store_rpc(
                      ORDER BY updated_at DESC, provider_session_id",
                 )
                 .map_err(|error| {
-                    format!("A Claude session summary lista nem olvashatÃ³: {error}")
+                    format!("A Claude session summary lista nem olvasható: {error}")
                 })?;
             let rows = statement
                 .query_map(params![project_key], |row| {
@@ -2744,51 +2744,51 @@ pub(crate) fn agent_session_store_rpc(
                         "data": {}
                     }))
                 })
-                .map_err(|error| format!("A Claude session summary lista hibÃ¡s: {error}"))?
+                .map_err(|error| format!("A Claude session summary lista hibás: {error}"))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| {
-                    format!("A Claude session summary lista nem gyÅ±jthetÅ‘: {error}")
+                    format!("A Claude session summary lista nem gyűjthető: {error}")
                 })?;
             serde_json::Value::Array(rows)
         }
         "listSubkeys" => {
             let session_id = session_id
                 .as_deref()
-                .ok_or_else(|| "Az agent session azonosÃ­tÃ³ja hiÃ¡nyzik.".to_string())?;
+                .ok_or_else(|| "Az agent session azonosítója hiányzik.".to_string())?;
             let mut statement = transaction
                 .prepare(
                     "SELECT DISTINCT subpath FROM agent_session_entries
                      WHERE agent_session_id = ?1 AND subpath <> '' ORDER BY subpath",
                 )
                 .map_err(|error| {
-                    format!("A Claude session subpath lista nem olvashatÃ³: {error}")
+                    format!("A Claude session subpath lista nem olvasható: {error}")
                 })?;
             let rows = statement
                 .query_map(params![session_id], |row| row.get::<_, String>(0))
-                .map_err(|error| format!("A Claude session subpath lista hibÃ¡s: {error}"))?
+                .map_err(|error| format!("A Claude session subpath lista hibás: {error}"))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| {
-                    format!("A Claude session subpath lista nem gyÅ±jthetÅ‘: {error}")
+                    format!("A Claude session subpath lista nem gyűjthető: {error}")
                 })?;
             serde_json::Value::Array(rows.into_iter().map(serde_json::Value::String).collect())
         }
         "delete" => {
             let session_id = session_id
                 .as_deref()
-                .ok_or_else(|| "Az agent session azonosÃ­tÃ³ja hiÃ¡nyzik.".to_string())?;
+                .ok_or_else(|| "Az agent session azonosítója hiányzik.".to_string())?;
             transaction
                 .execute(
                     "UPDATE agent_sessions SET status = 'deleted', updated_at = ?1 WHERE id = ?2",
                     params![now, session_id],
                 )
-                .map_err(|error| format!("A Claude session tÃ¶rlÃ©se sikertelen: {error}"))?;
+                .map_err(|error| format!("A Claude session törlése sikertelen: {error}"))?;
             serde_json::Value::Null
         }
-        other => return Err(format!("Ismeretlen Claude SessionStore mÅ±velet: {other}")),
+        other => return Err(format!("Ismeretlen Claude SessionStore művelet: {other}")),
     };
     transaction
         .commit()
-        .map_err(|error| format!("A SessionStore tranzakciÃ³ commitja sikertelen: {error}"))?;
+        .map_err(|error| format!("A SessionStore tranzakció commitja sikertelen: {error}"))?;
     Ok(result)
 }
 
@@ -3036,7 +3036,7 @@ pub(crate) fn export_agent_session_events_from_connection(
                     head_turn_id, status, created_at, updated_at, origin_device_id, hlc
              FROM agent_sessions ORDER BY id",
         )
-        .map_err(|error| format!("Az agent session export nem olvashatÃ³: {error}"))?;
+        .map_err(|error| format!("Az agent session export nem olvasható: {error}"))?;
     let sessions = session_statement
         .query_map([], |row| {
             Ok((
@@ -3053,9 +3053,9 @@ pub(crate) fn export_agent_session_events_from_connection(
                 row.get::<_, Option<String>>(10)?,
             ))
         })
-        .map_err(|error| format!("Az agent session export listÃ¡ja hibÃ¡s: {error}"))?
+        .map_err(|error| format!("Az agent session export listája hibás: {error}"))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("Az agent session export nem gyÅ±jthetÅ‘: {error}"))?;
+        .map_err(|error| format!("Az agent session export nem gyűjthető: {error}"))?;
     let mut events = Vec::new();
     for (
         id,
@@ -3122,7 +3122,7 @@ pub(crate) fn export_agent_session_events_from_connection(
                  FROM agent_session_entries
                  WHERE agent_session_id = ?1 ORDER BY subpath, sequence, id",
             )
-            .map_err(|error| format!("Az agent session entry export nem olvashatÃ³: {error}"))?;
+            .map_err(|error| format!("Az agent session entry export nem olvasható: {error}"))?;
         let entries = entry_statement
             .query_map(params![id], |row| {
                 Ok((
@@ -3134,12 +3134,12 @@ pub(crate) fn export_agent_session_events_from_connection(
                     row.get::<_, String>(5)?,
                 ))
             })
-            .map_err(|error| format!("Az agent session entry export listÃ¡ja hibÃ¡s: {error}"))?
+            .map_err(|error| format!("Az agent session entry export listája hibás: {error}"))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Az agent session entry export nem gyÅ±jthetÅ‘: {error}"))?;
+            .map_err(|error| format!("Az agent session entry export nem gyűjthető: {error}"))?;
         for (entry_id, subpath, entry_uuid, sequence, body_json, entry_created_at) in entries {
             let body: serde_json::Value = serde_json::from_str(&body_json).map_err(|error| {
-                format!("Az agent session entry export JSON-ja hibÃ¡s: {error}")
+                format!("Az agent session entry export JSON-ja hibás: {error}")
             })?;
             let payload = serde_json::json!({
                 "id": entry_id,
@@ -3173,14 +3173,14 @@ pub(crate) fn apply_agent_sync_event(
             let id = payload
                 .get("id")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "Az agent session sync ID-ja hiÃ¡nyzik.".to_string())?;
+                .ok_or_else(|| "Az agent session sync ID-ja hiányzik.".to_string())?;
             if format!("agent-session:{id}") != entity_id {
-                return Err("Az agent session sync identityje hibÃ¡s.".to_string());
+                return Err("Az agent session sync identityje hibás.".to_string());
             }
             let conversation_id = payload
                 .get("conversationId")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "Az agent session conversationId-ja hiÃ¡nyzik.".to_string())?;
+                .ok_or_else(|| "Az agent session conversationId-ja hiányzik.".to_string())?;
             let project_key = payload
                 .get("projectKey")
                 .and_then(serde_json::Value::as_str)
@@ -3192,7 +3192,7 @@ pub(crate) fn apply_agent_sync_event(
             let provider_session_id = payload
                 .get("providerSessionId")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "Az agent session providerSessionId-ja hiÃ¡nyzik.".to_string())?;
+                .ok_or_else(|| "Az agent session providerSessionId-ja hiányzik.".to_string())?;
             let status = if event_type == "agent_session.tombstone" {
                 "deleted"
             } else {
@@ -3243,24 +3243,24 @@ pub(crate) fn apply_agent_sync_event(
                         event_hlc,
                     ],
                 )
-                .map_err(|error| format!("Az agent session sync mentÃ©se sikertelen: {error}"))?;
+                .map_err(|error| format!("Az agent session sync mentése sikertelen: {error}"))?;
             Ok(())
         }
         "agent_session.entry_append" => {
             let entry_id = payload
                 .get("id")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "Az agent session entry sync ID-ja hiÃ¡nyzik.".to_string())?;
+                .ok_or_else(|| "Az agent session entry sync ID-ja hiányzik.".to_string())?;
             if format!("agent-entry:{entry_id}") != entity_id {
-                return Err("Az agent session entry sync identityje hibÃ¡s.".to_string());
+                return Err("Az agent session entry sync identityje hibás.".to_string());
             }
             let session = payload
                 .get("session")
-                .ok_or_else(|| "Az agent session entry session mezÅ‘je hiÃ¡nyzik.".to_string())?;
+                .ok_or_else(|| "Az agent session entry session mezője hiányzik.".to_string())?;
             let session_id = session
                 .get("id")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "Az agent session entry session ID-ja hiÃ¡nyzik.".to_string())?;
+                .ok_or_else(|| "Az agent session entry session ID-ja hiányzik.".to_string())?;
             let existing_session: Option<(String, Option<String>)> = transaction
                 .query_row(
                     "SELECT status, hlc FROM agent_sessions WHERE id = ?1",
@@ -3269,7 +3269,7 @@ pub(crate) fn apply_agent_sync_event(
                 )
                 .optional()
                 .map_err(|error| {
-                    format!("Az agent session tÃ¶rlÃ©si Ã¡llapota nem olvashatÃ³: {error}")
+                    format!("Az agent session törlési állapota nem olvasható: {error}")
                 })?;
             if existing_session.as_ref().is_some_and(|(status, hlc)| {
                 status == "deleted" && hlc.as_deref().unwrap_or_default() >= event_hlc
@@ -3315,7 +3315,7 @@ pub(crate) fn apply_agent_sync_event(
                     ],
                 )
                 .map_err(|error| {
-                    format!("Az agent session entry gazdasora nem hozhatÃ³ lÃ©tre: {error}")
+                    format!("Az agent session entry gazdasora nem hozható létre: {error}")
                 })?;
             // A newer entry still outranks a stale tombstone, exactly as before:
             // the guard above already returned for a tombstone that is newer.
@@ -3331,14 +3331,14 @@ pub(crate) fn apply_agent_sync_event(
                         params![event_hlc, created_at, session_id],
                     )
                     .map_err(|error| {
-                        format!("Az agent session ÃºjraaktivÃ¡lÃ¡sa sikertelen: {error}")
+                        format!("Az agent session újraaktiválása sikertelen: {error}")
                     })?;
             }
             let entry_body = payload
                 .get("body")
-                .ok_or_else(|| "Az agent session entry body-ja hiÃ¡nyzik.".to_string())?;
+                .ok_or_else(|| "Az agent session entry body-ja hiányzik.".to_string())?;
             let body_json = serde_json::to_string(entry_body).map_err(|error| {
-                format!("Az agent session entry body-ja nem szerializÃ¡lhatÃ³: {error}")
+                format!("Az agent session entry body-ja nem szerializálható: {error}")
             })?;
             transaction
                 .execute(
@@ -3368,7 +3368,7 @@ pub(crate) fn apply_agent_sync_event(
                     ],
                 )
                 .map_err(|error| {
-                    format!("Az agent session entry sync mentÃ©se sikertelen: {error}")
+                    format!("Az agent session entry sync mentése sikertelen: {error}")
                 })?;
             Ok(())
         }
@@ -5076,7 +5076,7 @@ pub(crate) fn save_snapshot_in_connection(
                             )
                             .optional()
                             .map_err(|error| {
-                                format!("A kanonikus agent Ã¼zenet nem olvashatÃ³: {error}")
+                                format!("A kanonikus agent üzenet nem olvasható: {error}")
                             })?
                     } else {
                         None

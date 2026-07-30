@@ -953,10 +953,10 @@ pub fn send(
                     {
                         let mut stdin = writer
                             .lock()
-                            .map_err(|_| "A Claude bridge bemenete zÃ¡rolva maradt.".to_string())?;
+                            .map_err(|_| "A Claude bridge bemenete zárolva maradt.".to_string())?;
                         let stdin = stdin
                             .as_mut()
-                            .ok_or_else(|| "A Claude bridge bemenete lezÃ¡rult.".to_string())?;
+                            .ok_or_else(|| "A Claude bridge bemenete lezárult.".to_string())?;
                         write_bridge_request(
                             stdin,
                             bridge_request_with_context(

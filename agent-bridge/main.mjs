@@ -254,7 +254,7 @@ function resolveSessionStore(payload) {
     });
   }
   if (payload?.ok === false) {
-    pending.reject(new Error(typeof payload.error === "string" ? payload.error : "A SessionStore mÅ±velet sikertelen."));
+    pending.reject(new Error(typeof payload.error === "string" ? payload.error : "A SessionStore művelet sikertelen."));
     return;
   }
   pending.resolve(payload?.result ?? null);
@@ -1173,7 +1173,7 @@ async function runLiveTurn(request) {
       writeMessage({ type: "turn_failed", request, sessionId: turn.sessionId, payload: { code: "turn_failed", errorCode: classifyConnectionError(message), message: safeMessage } });
     }
   } finally {
-    rejectSessionStoreForRequest(request.requestId, "A Claude turn lezÃ¡rult a SessionStore vÃ¡lasza elÅ‘t.");
+    rejectSessionStoreForRequest(request.requestId, "A Claude turn lezárult a SessionStore válasza előt.");
     activeRequests.delete(request.requestId);
   }
 }
@@ -1245,7 +1245,7 @@ input.on("close", async () => {
   for (const turn of activeRequests.values()) turn?.abortController?.abort?.();
   for (const pending of pendingSessionStore.values()) {
     clearTimeout(pending.timeout);
-    pending.reject(new Error("A Claude bridge lezÃ¡rult."));
+    pending.reject(new Error("A Claude bridge lezárult."));
   }
   pendingSessionStore.clear();
   await Promise.allSettled([...dispatchTasks]);

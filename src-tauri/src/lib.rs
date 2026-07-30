@@ -84,7 +84,7 @@ async fn run_agent_turn_inner(
             codex::send(app, codex_request, cancellation)
         })
         .await
-        .map_err(|error| format!("Az agent hÃ¡ttÃ©rfeladat leÃ¡llt: {error}"))?;
+        .map_err(|error| format!("Az agent háttérfeladat leállt: {error}"))?;
         codex::end_request(&request_id);
         result
             .map(|response| {
@@ -884,7 +884,7 @@ async fn agent_models(
         })
         .await
         .map_err(|error| {
-            format!("A provider modellkatalÃ³gus hÃ¡ttÃ©rfeladata leÃ¡llt: {error}")
+            format!("A provider modellkatalógus háttérfeladata leállt: {error}")
         })?,
         agent::AgentProvider::Anthropic => Ok(agent::runtime_catalog()
             .into_iter()
@@ -932,7 +932,7 @@ async fn agent_test_connection(
                 .map(agent::from_claude_connection)
         })
         .await
-        .map_err(|error| format!("A provider kapcsolat-teszt hÃ¡ttÃ©rfeladata leÃ¡llt: {error}"))?,
+        .map_err(|error| format!("A provider kapcsolat-teszt háttérfeladata leállt: {error}"))?,
         agent::AgentProvider::Codex => {
             Err("A Codex kapcsolatát a meglévő app-server transport kezeli.".to_string())
         }
@@ -1111,14 +1111,14 @@ async fn read_code_file(cwd: String, path: String) -> Result<Option<String>, Str
 async fn run_project_file(cwd: String, path: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || codex::run_project_file(&cwd, &path))
         .await
-        .map_err(|error| format!("A fÃ¡jl futtatÃ¡si hÃ¡ttÃ©rfeladata leÃ¡llt: {error}"))?
+        .map_err(|error| format!("A fájl futtatási háttérfeladata leállt: {error}"))?
 }
 
 #[tauri::command(rename_all = "camelCase")]
 async fn open_project_folder(cwd: String, path: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || codex::open_project_folder(&cwd, &path))
         .await
-        .map_err(|error| format!("A mappanyitÃ¡si hÃ¡ttÃ©rfeladata leÃ¡llt: {error}"))?
+        .map_err(|error| format!("A mappanyitási háttérfeladata leállt: {error}"))?
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -1159,14 +1159,14 @@ fn claude_auth_status() -> Result<claude::ClaudeAuthStatus, String> {
 async fn claude_save_api_key(api_key: String) -> Result<claude::ClaudeAuthStatus, String> {
     tauri::async_runtime::spawn_blocking(move || claude::save_api_key(&api_key))
         .await
-        .map_err(|error| format!("A Claude API-kulcs mentési hÃ¡ttÃ©rfeladata leÃ¡llt: {error}"))?
+        .map_err(|error| format!("A Claude API-kulcs mentési háttérfeladata leállt: {error}"))?
 }
 
 #[tauri::command]
 async fn claude_delete_api_key() -> Result<claude::ClaudeAuthStatus, String> {
     tauri::async_runtime::spawn_blocking(claude::delete_api_key)
         .await
-        .map_err(|error| format!("A Claude API-kulcs tÃ¶rlési hÃ¡ttÃ©rfeladata leÃ¡llt: {error}"))?
+        .map_err(|error| format!("A Claude API-kulcs törlési háttérfeladata leállt: {error}"))?
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -1181,7 +1181,7 @@ async fn claude_test_connection(
         claude::test_connection(model, effort, max_budget_usd, max_turns, cwd)
     })
     .await
-    .map_err(|error| format!("A Claude kapcsolat-teszt hÃ¡ttÃ©rfeladata leÃ¡llt: {error}"))?
+    .map_err(|error| format!("A Claude kapcsolat-teszt háttérfeladata leállt: {error}"))?
 }
 
 #[tauri::command]
@@ -1295,7 +1295,7 @@ async fn local_store_load() -> Result<store::LocalStoreSnapshot, String> {
         Ok(snapshot)
     })
     .await
-    .map_err(|error| format!("A lokÃ¡lis snapshot betÃ¶ltÃ©se leÃ¡llt: {error}"))?
+    .map_err(|error| format!("A lokális snapshot betöltése leállt: {error}"))?
 }
 
 #[tauri::command]
@@ -1304,7 +1304,7 @@ async fn local_store_save(
 ) -> Result<store::LocalStoreSnapshot, String> {
     tauri::async_runtime::spawn_blocking(move || store::save_snapshot(snapshot))
         .await
-        .map_err(|error| format!("A lokÃ¡lis snapshot mentÃ©se leÃ¡llt: {error}"))?
+        .map_err(|error| format!("A lokális snapshot mentése leállt: {error}"))?
 }
 
 #[tauri::command]

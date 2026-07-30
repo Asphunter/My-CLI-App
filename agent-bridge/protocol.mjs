@@ -1,7 +1,13 @@
 import { randomUUID } from "node:crypto";
 
 export const PROTOCOL_VERSION = 1;
-export const MAX_LINE_BYTES = 256 * 1024;
+// A session_store_response egyetlen JSONL-sor, és egy Claude-session betöltése
+// az összes entry-t hozza — a store-ban ma is van 4,5 MB-os session. A korábbi
+// 256 KB-os plafon ezeket a sorokat némán eldobta: a függő store-művelet 60
+// másodpercig várt, timeoutolt, a session pedig újként indult újra. A limit
+// célja csak egy elszabadult stream megfogása egy lokális pipe-on; arra a
+// 64 MB is bőven elég.
+export const MAX_LINE_BYTES = 64 * 1024 * 1024;
 
 export function makeEnvelope({
   type,

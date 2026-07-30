@@ -964,6 +964,9 @@ textarea::placeholder { color: var(--faint); }
 .trace-step-row.is-selected:not(.trace-step-row-inProgress) { border-color: var(--accent); background: rgba(123, 217, 171, .09); color: var(--text); }
 .trace-step-row.is-disabled { background: rgba(35, 40, 46, .35); color: var(--faint); opacity: .52; cursor: default; }
 .trace-step-row.is-disabled:hover, .trace-step-row.is-disabled:focus-visible { border-color: transparent; }
+/* Az íródó terv pontjai: sima sorok, kiemelés és halványítás nélkül. */
+.trace-step-row.is-plain { background: rgba(48, 55, 62, .28); color: var(--muted); opacity: 1; cursor: default; }
+.trace-step-row.is-plain:hover, .trace-step-row.is-plain:focus-visible { border-color: transparent; color: var(--muted); }
 .trace-step-marker { display: flex; width: 24px; min-height: 19px; align-items: center; justify-content: flex-start; color: transparent; font-size: 12px; line-height: 1; }
 /* A terv pontjának sorszáma — az alap szabály color: transparent-je alatt a
    szám láthatatlan lenne. */
@@ -998,6 +1001,27 @@ textarea::placeholder { color: var(--faint); }
 .trace-thinking-empty-text { font-size: 10px; line-height: 1.45; color: var(--faint); }
 /* A stage that only wrote text: one honest sentence instead of an empty two-pane frame. */
 .trace-empty-note { grid-column: 1 / -1; margin: 0; padding: 14px 13px; color: var(--faint); font-size: 11px; line-height: 1.5; }
+/* A terv RAW nézete képleteket is hoz (`Z0_LINE*(Z_L + j*Z0_LINE*tan(θ/2))/…`),
+   és egy ilyen, szóköz nélküli chip nem tud törni: a kártya emiatt a viewporton
+   túlra feszült, a jobb kerettel és a RAW/DETAIL váltóval együtt. */
+.trace-thinking-panel { min-width: 0; }
+.trace-plan-content { min-width: 0; }
+.trace-plan-content p { overflow-wrap: anywhere; }
+.trace-plan-content .inline-code { white-space: normal; overflow-wrap: anywhere; }
+
+/* A `##` fejezetcímek a válaszban és a terv RAW nézetében: cím, nem szöveg. */
+.answer-heading { color: var(--text); font-weight: 700; letter-spacing: .02em; }
+.answer-heading-1, .answer-heading-2 { padding-bottom: 3px; border-bottom: 1px solid var(--border-soft); font-size: 1.15em; }
+.answer-heading-3 { font-size: 1.06em; }
+.answer-heading-4 { font-size: 1em; }
+.pipeline-answer-body p + .answer-heading,
+.turn-progress-answer-body p + .answer-heading,
+.trace-plan-content p + .answer-heading { margin-top: 12px; }
+
+/* A terv első másodperceiben nincs mit két panelbe rendezni: csak a jelzés —
+   ott, ahol a lépéslista is kezdődik, nem a panel közepén. */
+.trace-plan-waiting { display: grid; grid-column: 1 / -1; min-height: 46px; place-items: center start; padding-left: 6px; }
+.trace-plan-waiting .trace-answer-spinner { width: 14px; height: 14px; flex: 0 0 14px; margin: 0; }
 .trace-total-elapsed { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 5px 10px 7px; border-top: 1px solid var(--border-soft); color: var(--faint); font-size: 9px; }
 .trace-total-elapsed time { color: var(--faint); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 9px; }
 
@@ -1021,6 +1045,10 @@ textarea::placeholder { color: var(--faint); }
 .trace-view-steps .trace-answer-main { grid-column: 1; grid-row: 1; min-width: 0; }
 .trace-view-steps .trace-content { grid-column: 1; grid-row: 2; width: auto; min-width: 0; max-width: none; margin: 0; }
 .trace-view-steps .trace-change-summary { grid-column: 2; grid-row: 1 / span 2; width: auto; min-width: 220px; max-width: none; margin: 8px 10px 8px 0; }
+/* A verdikt-sáv a kártya alja, nem a rács egy hasábja. Rácselemként a jobb
+   oszlopba ült be, és onnan szorította össze a GONDOLKODÁS MENETE panelt —
+   a REVIEW lépéseinél ez volt a feltűnő, mert ott csak egy lépés van. */
+.trace-view-steps > .pipeline-answer-next { grid-column: 1 / -1; grid-row: 3; }
 
 @media (max-width: 720px) {
   .trace-view-steps { display: block; }
@@ -1726,6 +1754,8 @@ textarea::placeholder { color: var(--faint); }
   margin-top: 10px; padding-top: 9px; border-top: 1px solid #7d4436;
   color: #d8bb72; font-size: 10px;
 }
+/* Az elfogadás ugyanez a sor, csak zölden — és felszólítás nélkül. */
+.pipeline-answer-next.is-accepted { border-top-color: #4d8060; color: #8fd6a6; }
 /* The same row on the review card, which has no padding of its own. */
 .trace-card > .pipeline-answer-next,
 .compact-answer-card > .pipeline-answer-next {

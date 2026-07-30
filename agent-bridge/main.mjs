@@ -7,7 +7,14 @@ import { classifyConnectionError } from "./errors.mjs";
 import { budgetOption, hasCredentials, MISSING_CREDENTIALS_MESSAGE } from "./auth.mjs";
 import { hasAnswer, normalizeQuestionAnswers } from "./questions.mjs";
 import { normalizeGuardPath } from "./paths.mjs";
-import { classifyTool, ENABLED_TOOLS, planFromTodos, toolsForProfile } from "./policy.mjs";
+import {
+  classifyTool,
+  ENABLED_TOOLS,
+  PLAN_TOOLS,
+  planFromTasks,
+  planFromTodos,
+  toolsForProfile,
+} from "./policy.mjs";
 import { collectProjectInstructions } from "./instructions.mjs";
 import {
   makeEnvelope,
@@ -23,7 +30,11 @@ const dispatchTasks = new Set();
 const pendingInteractions = new Map();
 const pendingSessionStore = new Map();
 const sessionAllowedTools = new Set();
-const SESSION_STORE_TIMEOUT_MS = 15_000;
+// A store egy nagyra nőtt adatbázison (ellenőrzés, WAL-visszaírás, párhuzamos
+// lánc-írások) másodpercekig is dolgozhat egy-egy műveleten; 15 mp-nél a
+// REVIEW szakasz emiatt halt meg turn közben. A türelem olcsó, a megszakadt
+// szakasz drága.
+const SESSION_STORE_TIMEOUT_MS = 60_000;
 
 /**
  * Tools the user has granted, per workspace.
@@ -89,6 +100,19 @@ function writeMessage({ type, request, payload = {}, sessionId = null }) {
     payload,
   });
   process.stdout.write(`${JSON.stringify(message)}\n`);
+  // Teljes esemény-dump auditra: MIRE fut a GUI, soronként, időbélyeggel.
+  // Csak kérésre él (env), mert mindent tartalmaz, amit a modell írt.
+  const dumpPath = process.env.MIN_AGENT_BRIDGE_DUMP;
+  if (dumpPath && type !== "session_store_request") {
+    try {
+      appendFileSync(
+        dumpPath,
+        `${JSON.stringify({ at: new Date().toISOString(), ...message })}\n`,
+      );
+    } catch {
+      // A dump sosem viheti el a turnt.
+    }
+  }
 }
 
 function diagnostic(message, details = {}) {
@@ -219,6 +243,15 @@ function resolveSessionStore(payload) {
   if (!pending) return;
   pendingSessionStore.delete(operationId);
   clearTimeout(pending.timeout);
+  // A majdnem-timeout is adat: ha egy művelet másodperceket vár, az a napló
+  // mondja meg, mielőtt a következő futás tényleg elakadna rajta.
+  if (pending.startedAt && Date.now() - pending.startedAt > 5_000) {
+    diagnostic("session store slow op", {
+      operation: pending.operation,
+      tookMs: Date.now() - pending.startedAt,
+      pendingOps: pendingSessionStore.size,
+    });
+  }
   if (payload?.ok === false) {
     pending.reject(new Error(typeof payload.error === "string" ? payload.error : "A SessionStore mÅ±velet sikertelen."));
     return;
@@ -237,15 +270,26 @@ function rejectSessionStoreForRequest(requestId, message) {
 
 function sessionStoreRequest(turn, operation, key, extra = {}) {
   const operationId = randomUUID();
+  const startedAt = Date.now();
   const promise = new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       const pending = pendingSessionStore.get(operationId);
       if (!pending) return;
       pendingSessionStore.delete(operationId);
+      // Ki, mit, mennyi függő társsal — enélkül a timeout arca egy általános
+      // hibaüzenet volt, és találgattuk, melyik művelet halt meg.
+      diagnostic("session store timeout", {
+        operation,
+        operationId,
+        waitedMs: Date.now() - startedAt,
+        pendingOps: pendingSessionStore.size,
+      });
       pending.reject(new Error("A Claude SessionStore művelete időtúllépés miatt megszakadt."));
     }, SESSION_STORE_TIMEOUT_MS);
     pendingSessionStore.set(operationId, {
       requestId: turn.request.requestId,
+      operation,
+      startedAt,
       resolve,
       reject,
       timeout,
@@ -260,6 +304,23 @@ function sessionStoreRequest(turn, operation, key, extra = {}) {
   return promise;
 }
 
+/**
+ * A session-mentés a folytathatóság kényelme, nem a turn terméke. Egy elakadt
+ * append miatt eddig a REVIEW szakasz halt meg turn közben — a munka kárba
+ * veszett egy olyan írás miatt, aminek az egyetlen tétje a későbbi resume.
+ * A hiba naplóba kerül, a turn megy tovább; a hiányos session legfeljebb új
+ * sessionként folytatódik, amit a meglévő recovery-út amúgy is kezel.
+ */
+function softenedSessionStoreOp(turn, operation, key, extra, fallback) {
+  return sessionStoreRequest(turn, operation, key, extra).catch((error) => {
+    diagnostic("session store op degraded", {
+      operation,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return fallback;
+  });
+}
+
 function createSessionStore(turn) {
   const key = (sessionKey) => ({
     projectKey: typeof sessionKey?.projectKey === "string" && sessionKey.projectKey.trim()
@@ -269,15 +330,27 @@ function createSessionStore(turn) {
     ...(typeof sessionKey?.subpath === "string" && sessionKey.subpath ? { subpath: sessionKey.subpath } : {}),
   });
   return {
-    append: (sessionKey, entries) => sessionStoreRequest(turn, "append", key(sessionKey), { entries }),
-    load: (sessionKey) => sessionStoreRequest(turn, "load", key(sessionKey)),
-    listSessions: (projectKey) => sessionStoreRequest(turn, "listSessions", { projectKey }),
-    listSessionSummaries: (projectKey) => sessionStoreRequest(turn, "listSessionSummaries", { projectKey }),
-    delete: (sessionKey) => sessionStoreRequest(turn, "delete", key(sessionKey)),
-    listSubkeys: (sessionKey) => sessionStoreRequest(turn, "listSubkeys", {
-      projectKey: sessionKey?.projectKey ?? turn.projectKey,
-      sessionId: sessionKey?.sessionId ?? turn.sessionId,
-    }),
+    append: (sessionKey, entries) =>
+      softenedSessionStoreOp(turn, "append", key(sessionKey), { entries }, null),
+    load: (sessionKey) =>
+      softenedSessionStoreOp(turn, "load", key(sessionKey), {}, null),
+    listSessions: (projectKey) =>
+      softenedSessionStoreOp(turn, "listSessions", { projectKey }, {}, []),
+    listSessionSummaries: (projectKey) =>
+      softenedSessionStoreOp(turn, "listSessionSummaries", { projectKey }, {}, []),
+    delete: (sessionKey) =>
+      softenedSessionStoreOp(turn, "delete", key(sessionKey), {}, null),
+    listSubkeys: (sessionKey) =>
+      softenedSessionStoreOp(
+        turn,
+        "listSubkeys",
+        {
+          projectKey: sessionKey?.projectKey ?? turn.projectKey,
+          sessionId: sessionKey?.sessionId ?? turn.sessionId,
+        },
+        {},
+        [],
+      ),
   };
 }
 
@@ -327,12 +400,17 @@ async function canUseToolForTurn(turn, toolName, input, options) {
   // built to show, so every write is forwarded as a plan update before the tool
   // runs. The panel already renders this event shape for the Codex runtime.
   if (kind === "plan") {
-    const plan = planFromTodos(input);
-    if (plan.length > 0) {
-      emitAgentEvent(turn.request, turn.sessionId, "turn/plan/updated", {
-        turnId: turn.sessionId ?? turn.request.requestId,
-        plan,
-      });
+    // A listát az assistant tool_use blokkja vezeti (csak ott van azonosító,
+    // amivel a TaskUpdate visszatalál) — itt csak a teljes listát hozó
+    // TodoWrite mehet ki, hogy egy auto-jóváhagyott hívás se maradjon le.
+    if (toolName === "TodoWrite") {
+      const plan = planFromTodos(input);
+      if (plan.length > 0) {
+        emitAgentEvent(turn.request, turn.sessionId, "turn/plan/updated", {
+          turnId: turn.sessionId ?? turn.request.requestId,
+          plan,
+        });
+      }
     }
     return allow();
   }
@@ -342,27 +420,12 @@ async function canUseToolForTurn(turn, toolName, input, options) {
     if (commandAppearsOutsideWorkspace(command, cwd)) {
       return deny("A parancs védett belső állapotot vagy a kiválasztott workspace-en kívüli útvonalat érint.");
     }
-    const result = await waitForInteraction(
-      turn.request,
-      "approval",
-      {
-        toolName,
-        input,
-        title: options?.title ?? "Claude parancs futtatását kéri",
-        reason: options?.decisionReason ?? null,
-        displayName: options?.displayName ?? "Bash",
-        description: options?.description ?? null,
-      },
-      options?.signal,
-    );
-    const decision = result?.decision;
-    if (decision === "acceptForSession") {
-      sessionAllowedTools.add(toolName);
-      rememberGrantedTool(cwd, toolName);
-      return allow(undefined, permissionUpdateFor(toolName));
-    }
-    if (decision === "accept") return allow();
-    return deny(result?.reason || "A felhasználó nem engedélyezte a parancsot.");
+    // Ugyanaz a modell, mint a Codex futtatónál: a parancs kérdés nélkül fut,
+    // a védelem a munkaterület-határ — kifelé mutató útvonal, .git/.min fentebb
+    // már tiltva. A jóváhagyó dialógus minden új projektben minden parancsra
+    // újra megjelent, miközben a Codex oldalon ugyanez némán futott; a kettő
+    // közti különbségnek nem volt indoka.
+    return allow();
   }
 
   if (kind === "question") {
@@ -450,17 +513,74 @@ function toolItemFor(toolName, input, id, cwd) {
   };
 }
 
+/**
+ * A checklist-hívásból a panel lépéslistája.
+ *
+ * `TodoWrite` a teljes listát hozza, tehát elég leképezni. A natív build
+ * `TaskCreate`/`TaskUpdate` párosánál egy hívás egy elemet érint, ezért a futó
+ * listát a híd vezeti: az új elem a saját tool_use-azonosítója alatt kerül be
+ * (a task azonosítóját csak az eszköz *eredménye* hozza meg), a `TaskUpdate`
+ * pedig azon keresztül talál rá. A lekérdező hívások (`TaskList`, `TaskGet`)
+ * nem módosítanak semmit.
+ */
+function planFromChecklistCall(turn, toolName, input, toolUseId) {
+  if (toolName === "TodoWrite") return planFromTodos(input);
+  const text = (value) => (typeof value === "string" && value.trim() ? value.trim() : "");
+  if (toolName === "TaskCreate") {
+    const key = toolUseId ?? randomUUID();
+    turn.tasks.set(key, {
+      subject: text(input?.subject),
+      activeForm: text(input?.activeForm),
+      status: "pending",
+    });
+    return planFromTasks(turn.tasks);
+  }
+  if (toolName === "TaskUpdate") {
+    const taskId = text(input?.taskId);
+    const key = turn.taskKeyById.get(taskId) ?? taskId;
+    if (!key) return [];
+    const existing = turn.tasks.get(key) ?? { subject: "", activeForm: "", status: "pending" };
+    turn.tasks.set(key, {
+      subject: text(input?.subject) || existing.subject,
+      activeForm: text(input?.activeForm) || existing.activeForm,
+      status: text(input?.status) || existing.status,
+    });
+    return planFromTasks(turn.tasks);
+  }
+  return [];
+}
+
+/** A `TaskCreate` eredményéből a task azonosítója, ha kiolvasható. */
+function createdTaskId(content) {
+  const raw = typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content.map((part) => (typeof part?.text === "string" ? part.text : "")).join("\n")
+      : "";
+  if (!raw.trim()) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    const id = parsed?.task?.id ?? parsed?.id;
+    if (typeof id === "string" && id.trim()) return id;
+  } catch {
+    // Nem JSON: marad a szöveges kiolvasás.
+  }
+  const match = raw.match(/"id"\s*:\s*"([^"]+)"/);
+  return match ? match[1] : null;
+}
+
 function emitToolStarted(turn, block) {
   const request = turn.request;
   const sessionId = turn.sessionId;
   const toolName = typeof block?.name === "string" ? block.name : "tool";
   const input = block?.input && typeof block.input === "object" ? block.input : {};
 
-  // The checklist is a plan, not a tool card. Claude Code auto-approves
-  // TodoWrite, so the permission callback may never see it — the assistant's
-  // tool_use block is the one place every update reliably passes through.
+  // The checklist is a plan, not a tool card. Claude Code auto-approves it, so
+  // the permission callback may never see it — the assistant's tool_use block
+  // is the one place every update reliably passes through, and the only one
+  // that carries the call's id.
   if (classifyTool(toolName) === "plan") {
-    const plan = planFromTodos(input);
+    const plan = planFromChecklistCall(turn, toolName, input, block?.id);
     if (plan.length > 0) {
       emitAgentEvent(request, sessionId, "turn/plan/updated", {
         turnId: sessionId ?? request.requestId,
@@ -492,6 +612,14 @@ function emitToolStarted(turn, block) {
 function emitToolCompleted(turn, block) {
   const id = typeof block?.tool_use_id === "string" ? block.tool_use_id : null;
   if (!id) return;
+  // A `TaskCreate` eredménye hozza meg a task azonosítóját; a későbbi
+  // `TaskUpdate` ezen keresztül talál vissza a listaelemre. Checklist-hívásnak
+  // nincs kártyája, ezért itt véget is ér az útja.
+  if (turn.tasks.has(id)) {
+    const created = createdTaskId(block?.content);
+    if (created) turn.taskKeyById.set(created, id);
+    return;
+  }
   const meta = turn.toolMeta.get(id);
   if (!meta) return;
   const rawContent = block?.content;
@@ -540,7 +668,12 @@ function handleSdkEvent(turn, event) {
       turn.sawText = true;
       emitAgentEvent(request, turn.sessionId, "item/agentMessage/delta", {
         delta: delta.text,
-        itemId: raw.index != null ? `assistant-${raw.index}` : "assistant",
+        // Az azonosítóban benne van, hányadik üzenetről van szó: két külön
+        // üzenet szövege így nem ragad egybe („…(folyamatban).7. lépés…"),
+        // hanem bekezdéshatárt kap a felületen.
+        itemId: raw.index != null
+          ? `assistant-${turn.assistantTexts.length}-${raw.index}`
+          : `assistant-${turn.assistantTexts.length}`,
         turnId: turn.sessionId,
         phase: "final_answer",
         item: { type: "agentMessage", phase: "final_answer" },
@@ -564,6 +697,23 @@ function handleSdkEvent(turn, event) {
   }
   if (event?.type === "assistant") {
     const blocks = Array.isArray(event.message?.content) ? event.message.content : [];
+    // Egy korábbi üzenet szövege attól a pillanattól biztosan nem a végső
+    // válasz, hogy egy újabb assistant-üzenet érkezett utána — mehet a
+    // kommentár-sávra, élőben. A Claude a narrációt külön, csak-szöveges
+    // üzenetben küldi, és csak a következőben hívja az eszközt, ezért nem volt
+    // elég a tool_use-t is tartalmazó üzenetekre szűrni: a magyar gondolatok
+    // így a szakasz legvégéig láthatatlanok maradtak.
+    for (let index = 0; index < turn.assistantTexts.length; index += 1) {
+      if (turn.liveCommentary.has(index)) continue;
+      turn.liveCommentary.add(index);
+      emitAgentEvent(request, turn.sessionId, "item/agentMessage/delta", {
+        delta: turn.assistantTexts[index],
+        itemId: `commentary-${index}`,
+        turnId: turn.sessionId,
+        phase: "commentary",
+        item: { type: "agentMessage", phase: "commentary" },
+      });
+    }
     const textParts = [];
     for (const [index, block] of blocks.entries()) {
       if (block?.type === "tool_use") {
@@ -584,7 +734,22 @@ function handleSdkEvent(turn, event) {
         });
       }
     }
-    if (textParts.length > 0) turn.assistantTexts.push(textParts.join("\n\n"));
+    if (textParts.length > 0) {
+      turn.assistantTexts.push(textParts.join("\n\n"));
+      // Aki eszközt is hív ugyanabban az üzenetben, arról itt helyben eldőlt,
+      // hogy narráció: nem kell megvárni a következő üzenetet.
+      if (blocks.some((block) => block?.type === "tool_use")) {
+        const index = turn.assistantTexts.length - 1;
+        turn.liveCommentary.add(index);
+        emitAgentEvent(request, turn.sessionId, "item/agentMessage/delta", {
+          delta: turn.assistantTexts[index],
+          itemId: `commentary-${index}`,
+          turnId: turn.sessionId,
+          phase: "commentary",
+          item: { type: "agentMessage", phase: "commentary" },
+        });
+      }
+    }
     return;
   }
   if (event?.type === "user") {
@@ -748,6 +913,14 @@ async function runLiveTurn(request) {
     // separators, which is where the "tests.32/32 teszt zöld" artifacts came
     // from — so the answer is reconstructed from here instead.
     assistantTexts: [],
+    // Indexes of assistantTexts already emitted as live commentary, so the
+    // turn-end sweep does not append the same narration a second time.
+    liveCommentary: new Set(),
+    // A checklist futó listája: kulcs a `TaskCreate` tool_use-azonosítója,
+    // érték a listaelem. A `taskKeyById` az eszköz által adott task-azonosítót
+    // köti ide, mert a `TaskUpdate` csak azt ismeri.
+    tasks: new Map(),
+    taskKeyById: new Map(),
   };
   activeRequests.set(request.requestId, turn);
   // Without an explicit systemPrompt the SDK uses a minimal prompt that omits
@@ -793,7 +966,16 @@ async function runLiveTurn(request) {
               ...(projectInstructions.text ? { append: projectInstructions.text } : {}),
             },
             tools: stageTools,
-            allowedTools: [],
+            // A natív build a `tools` listából nem minden eszközt regisztrál
+            // (a d.ts maga mondja: „List Grep/Glob here or in allowedTools to
+            // get them") — a TodoWrite is így hiányzott, a kódoló kétszer is
+            // leírta, hogy nem kapta meg, és a LÉPÉSEK csak a fájlnév-alapú
+            // tartalék-léptetésből mozgott. Az itt felsoroltak jóváhagyás
+            // nélkül futnak, ezért csak a lemezt nem író eszközök: a todo-
+            // frissítést az assistant tool_use blokkja így is a panelre viszi.
+            allowedTools: [...PLAN_TOOLS, "Grep", "Glob"].filter((tool) =>
+              stageTools.includes(tool),
+            ),
             permissionMode: "default",
             persistSession: true,
             sessionStore: createSessionStore(turn),
@@ -825,6 +1007,9 @@ async function runLiveTurn(request) {
             turn.sessionId = null;
             turn.sawText = false;
             turn.assistantTexts = [];
+            turn.liveCommentary = new Set();
+            turn.tasks = new Map();
+            turn.taskKeyById = new Map();
             turn.toolMeta.clear();
             continue;
           }
@@ -841,6 +1026,9 @@ async function runLiveTurn(request) {
         turn.sessionId = null;
         turn.sawText = false;
         turn.assistantTexts = [];
+        turn.liveCommentary = new Set();
+        turn.tasks = new Map();
+        turn.taskKeyById = new Map();
         turn.toolMeta.clear();
         continue;
       }
@@ -871,6 +1059,9 @@ async function runLiveTurn(request) {
           finalResult = null;
           turn.sawText = false;
           turn.assistantTexts = [];
+          turn.liveCommentary = new Set();
+          turn.tasks = new Map();
+          turn.taskKeyById = new Map();
           continue;
         }
       }
@@ -898,6 +1089,9 @@ async function runLiveTurn(request) {
         ? turn.assistantTexts[turn.assistantTexts.length - 1]
         : gluedText;
     for (const [index, commentaryText] of turn.assistantTexts.slice(0, -1).entries()) {
+      // Ami élőben már kiment, azt a lezárás nem ismételheti: a GUI itemId
+      // szerint fűzi a deltákat, és a második példány duplázta a szöveget.
+      if (turn.liveCommentary.has(index)) continue;
       emitAgentEvent(request, turn.sessionId, "item/agentMessage/delta", {
         delta: commentaryText,
         itemId: `commentary-${index}`,

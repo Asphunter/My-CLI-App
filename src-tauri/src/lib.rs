@@ -272,6 +272,64 @@ fn write_plan_file(cwd: &str, plan_file: &str, text: &str) -> Result<(), String>
         .map_err(|error| format!("A terv-fájl nem írható: {error}"))
 }
 
+/// Hozzáír a terv-fájl végéhez, létrehozza, ha még nincs.
+///
+/// Egy kérdés = egy fájl: a terv után a bíráló kifogása kerül oda, egy újabb
+/// körnél pedig annak a feladata és bírálata is. Ez napló — a modellek
+/// továbbra is a promptból dolgoznak —, a haszna a gitben olvasható előzmény.
+fn append_plan_file(cwd: &str, plan_file: &str, text: &str) -> Result<(), String> {
+    use std::io::Write;
+    let relative = std::path::Path::new(plan_file);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(format!("A terv-fájl útvonala nem megengedett: {plan_file}"));
+    }
+    let target = std::path::Path::new(cwd).join(relative);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("A tervek mappája nem hozható létre: {error}"))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&target)
+        .map_err(|error| format!("A terv-fájl nem nyitható hozzáírásra: {error}"))?;
+    file.write_all(text.as_bytes())
+        .map_err(|error| format!("A terv-fájl nem írható: {error}"))
+}
+
+/// A lezárult kör naplóbejegyzése: mit kért a bíráló, és mire jutott ez a kör.
+fn plan_journal_entry(
+    iteration: i64,
+    retry_feedback: Option<&str>,
+    stages: &[pipeline::PipelineStageResult],
+) -> String {
+    let mut journal = String::new();
+    // Az első kör feladata maga a terv, ami már a fájlban van; egy újabb körnek
+    // viszont a kifogás a feladata, és csak itt marad meg írásban.
+    if iteration > 1 {
+        if let Some(feedback) = retry_feedback
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            journal.push_str(&format!("\n\n## v{iteration} feladat\n\n{feedback}\n"));
+        }
+    }
+    if let Some(review) = stages
+        .iter()
+        .find(|stage| stage.role == pipeline::StageRole::Review && stage.succeeded)
+    {
+        let text = review.text.trim();
+        if !text.is_empty() {
+            journal.push_str(&format!("\n\n## v{iteration} bírálat\n\n{text}\n"));
+        }
+    }
+    journal
+}
+
 /// Frees the project when the turn ends, however it ends.
 struct ProjectClaim {
     root: std::path::PathBuf,
@@ -658,6 +716,30 @@ async fn pipeline_send(
     }
     let status = outcome.status;
     let run_error = outcome.error;
+
+    // A kör lefolyása a terv mellé, ugyanabba a fájlba: a bírálat (és egy újabb
+    // körnél az azt kiváltó kifogás) a terv szövege után olvasható. A hiba nem
+    // fatális, ahogy a terv kiírásánál sem: a lánc nem halhat bele abba, hogy a
+    // tervek mappája épp nem írható.
+    if let (Some(cwd), Some(plan_file)) =
+        (request.cwd.as_deref(), request.plan_file.as_deref())
+    {
+        let journal = plan_journal_entry(iteration, request.retry_feedback.as_deref(), &stages);
+        if !journal.is_empty() {
+            if let Err(error) = append_plan_file(cwd, plan_file, &journal) {
+                let _ = codex::emit_main_window(
+                    &app,
+                    "codex-transport",
+                    &serde_json::json!({
+                        "requestId": request.request_ids.first(),
+                        "stage": "plan-file-error",
+                        "detail": error,
+                        "threadId": null,
+                    }),
+                );
+            }
+        }
+    }
 
     if let Some(placeholder) = request.placeholder_request_id.as_deref() {
         let _ = store::forget_pipeline_placeholder_answer(&request.conversation_id, placeholder);
@@ -1418,7 +1500,53 @@ mod tests {
         assert!(write_plan_file(&cwd, "../kifele.md", "x").is_err());
         assert!(write_plan_file(&cwd, "C:/abszolut.md", "x").is_err());
 
+        // A kör naplója ugyanannak a fájlnak a végére kerül, nem egy másolatba.
+        append_plan_file(&cwd, "tervek/2026-07-29-smith-v1.md", "\n\n## v1 bírálat\n")
+            .expect("relative plan file appends");
+        assert_eq!(
+            std::fs::read_to_string(root.join("tervek/2026-07-29-smith-v1.md"))
+                .expect("plan file readable"),
+            "## Terv\n\n## v1 bírálat\n"
+        );
+        assert!(append_plan_file(&cwd, "../kifele.md", "x").is_err());
+
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A napló azt írja le, ami ebben a körben történt: az első körnek a terv a
+    /// feladata (az már a fájlban van), egy újabb körnek a kifogás.
+    #[test]
+    fn the_plan_journal_records_the_objection_and_the_verdict_of_each_round() {
+        let review = |text: &str| pipeline::PipelineStageResult {
+            index: 2,
+            role: pipeline::StageRole::Review,
+            agent_label: "Codex".to_string(),
+            request_id: "request-2".to_string(),
+            succeeded: true,
+            text: text.to_string(),
+            error: None,
+            review: None,
+            session_id: None,
+            answer_message_id: None,
+        };
+
+        let first = plan_journal_entry(1, None, &[review("VERDIKT: JAVÍTANDÓ — hiányzik a rács.")]);
+        assert!(!first.contains("feladat"), "az első kör feladata maga a terv");
+        assert!(first.contains("## v1 bírálat"));
+        assert!(first.contains("hiányzik a rács"));
+
+        let second = plan_journal_entry(
+            2,
+            Some("  a rács hiányzik  "),
+            &[review("VERDIKT: ELFOGAD")],
+        );
+        let task = second.find("## v2 feladat").expect("a kör feladata");
+        let verdict = second.find("## v2 bírálat").expect("a kör bírálata");
+        assert!(task < verdict, "időrendben: előbb a feladat, utána a bírálat");
+        assert!(second.contains("a rács hiányzik"));
+
+        // Bírálat nélkül (megszakadt kör) nincs mit naplózni a verdiktről.
+        assert_eq!(plan_journal_entry(1, None, &[]), "");
     }
 
     /// A project may be claimed once at a time, and the claim frees itself.

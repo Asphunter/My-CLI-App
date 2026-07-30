@@ -511,6 +511,28 @@ fn approvals_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("approved-tools.json"))
 }
 
+/// Ezredmásodperc az epoch óta — a napló sorai így a híd időbélyegeivel
+/// összefésülhetők.
+fn epoch_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or_default()
+}
+
+/// A híd diagnosztikai naplója. A stderr a null-eszközre megy, tehát enélkül
+/// egy turn közbeni elakadásról — mint a SessionStore-timeout — semmilyen nyom
+/// nem marad. A fájl append-only és csak rövid, kulcs-érték sorokat kap.
+fn bridge_log_path() -> PathBuf {
+    crate::store::local_store_path()
+        .map(|path| {
+            path.parent()
+                .map(|directory| directory.join("claude-bridge.log"))
+                .unwrap_or_else(|| PathBuf::from("claude-bridge.log"))
+        })
+        .unwrap_or_else(|_| PathBuf::from("claude-bridge.log"))
+}
+
 fn bridge_cwd(requested: Option<String>) -> Result<PathBuf, String> {
     let requested = requested.filter(|value| !value.trim().is_empty());
     let path = crate::codex::requested_agent_cwd(requested.as_deref())?;
@@ -805,7 +827,8 @@ pub fn send(
             // per turn, so a grant kept only in its memory is forgotten before
             // the next command -- which is why "allow for this session" asked
             // again every single time.
-            .env("MIN_AGENT_APPROVALS_PATH", approvals_path());
+            .env("MIN_AGENT_APPROVALS_PATH", approvals_path())
+            .env("MIN_AGENT_BRIDGE_LOG", bridge_log_path());
         auth.apply(&mut command);
         #[cfg(windows)]
         command.creation_flags(0x0800_0000);
@@ -907,10 +930,12 @@ pub fn send(
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
+                    let rpc_started = std::time::Instant::now();
                     let storage_result = crate::store::agent_session_store_rpc(
                         request.conversation_id.as_deref(),
                         &message.payload,
                     );
+                    let rpc_elapsed = rpc_started.elapsed();
                     let response_payload = match storage_result {
                         Ok(result) => json!({
                             "operationId": operation_id,
@@ -923,22 +948,54 @@ pub fn send(
                             "error": error,
                         }),
                     };
-                    let mut stdin = writer
-                        .lock()
-                        .map_err(|_| "A Claude bridge bemenete zÃ¡rolva maradt.".to_string())?;
-                    let stdin = stdin
-                        .as_mut()
-                        .ok_or_else(|| "A Claude bridge bemenete lezÃ¡rult.".to_string())?;
-                    write_bridge_request(
-                        stdin,
-                        bridge_request_with_context(
-                            &request_id,
-                            request.conversation_id.as_deref(),
-                            session_id.as_deref(),
-                            "session_store_response",
-                            response_payload,
-                        ),
-                    )?;
+                    let response_bytes = response_payload.to_string().len();
+                    let write_started = std::time::Instant::now();
+                    {
+                        let mut stdin = writer
+                            .lock()
+                            .map_err(|_| "A Claude bridge bemenete zÃ¡rolva maradt.".to_string())?;
+                        let stdin = stdin
+                            .as_mut()
+                            .ok_or_else(|| "A Claude bridge bemenete lezÃ¡rult.".to_string())?;
+                        write_bridge_request(
+                            stdin,
+                            bridge_request_with_context(
+                                &request_id,
+                                request.conversation_id.as_deref(),
+                                session_id.as_deref(),
+                                "session_store_response",
+                                response_payload,
+                            ),
+                        )?;
+                    }
+                    // A híd naplójának másik fele. Ha ott timeout áll, innen
+                    // derül ki, melyik szakaszon: a lekérdezés tartott sokáig,
+                    // vagy a (több megabájtos) válasz kiírása a híd bemenetére.
+                    // Csak a lassú eset kerül fájlba, a mérete is.
+                    let write_elapsed = write_started.elapsed();
+                    let slow = std::time::Duration::from_millis(500);
+                    if rpc_elapsed > slow || write_elapsed > slow {
+                        use std::io::Write;
+                        if let Ok(mut file) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(bridge_log_path())
+                        {
+                            let _ = writeln!(
+                                file,
+                                "{} [rust] slow session_store op={} queryMs={} writeMs={} bytes={}",
+                                epoch_millis(),
+                                message
+                                    .payload
+                                    .get("operation")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("?"),
+                                rpc_elapsed.as_millis(),
+                                write_elapsed.as_millis(),
+                                response_bytes,
+                            );
+                        }
+                    }
                 }
                 Some("ready") => {}
                 Some("session_started") => {

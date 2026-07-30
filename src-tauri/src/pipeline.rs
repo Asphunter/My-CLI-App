@@ -61,7 +61,14 @@ impl StageRole {
                 "Te vagy a tervező. Fájlt NEM módosíthatsz és parancsot NEM futtathatsz; \
                  a szerkesztő eszközöket meg sem kaptad. Olvasd el, ami a feladathoz kell, \
                  majd adj számozott lépéslistát: minden lépésnél nevezd meg az érintett \
-                 fájlt és azt, hogy mi változik. A végén sorold fel a kockázatokat. \
+                 fájlt és azt, hogy mi változik. Legfeljebb 8 pont legyen — egy pont egy \
+                 összefüggő munkaegység, ne bontsd apró részlépésekre. \
+                 Az eredeti feladat számszerű követelményeit (tartományok, mértékegységek, \
+                 darabszámok, nevesített értékek) szó szerint tartsd meg, és a tervben is \
+                 ugyanabban a mennyiségben és egységben nevezd meg őket, ahogy a feladat \
+                 kimondta — átváltani szabad, de a feladat szerinti alakot is írd ki. \
+                 Ha bármelyiket mégis átértelmezed, azt `## Eltérés a feladattól` cím alatt, \
+                 tételesen és indoklással írd le. A végén sorold fel a kockázatokat. \
                  Ne írd meg a kódot, csak a tervet."
             }
             Self::Code => {
@@ -78,12 +85,22 @@ impl StageRole {
             }
             Self::Review => {
                 "Te vagy a bíráló, és NEM te írtad ezt a kódot. Fájlt nem módosíthatsz. \
-                 A diff és a tesztek alapján vizsgáld: helyes-e, megvalósult-e minden \
-                 tervezett lépés, van-e nem kezelt hibaút vagy mellékhatás, és szerepel-e \
-                 ugyanez a hiba máshol is. Ha tudsz parancsot futtatni, ellenőrizd a \
-                 teszteket magad, és a megállapításaidat bizonyítékra alapozd, ne \
-                 feltételezésre. Az utolsó sorod pontosan ez legyen: `VERDIKT: ELFOGAD` \
-                 vagy `VERDIKT: JAVÍTANDÓ`, utána egyetlen mondat indoklás."
+                 A munkádat vedd fel todo-listaként (3-5 pont: az eredeti feladat \
+                 követelményeinek ellenőrzése, változások átnézése, tesztek futtatása, \
+                 hibautak vizsgálata, verdikt), és munka közben tartsd karban — a felület \
+                 ebből mutatja, hol tartasz. \
+                 ELŐSZÖR az EREDETI FELADAT ellen ellenőrizz, és csak utána a terv ellen: \
+                 vedd sorra a feladat számszerű követelményeit (tartományok, \
+                 mértékegységek, darabszámok, nevesített értékek), és mindegyiket vesd \
+                 össze azzal, ami ténylegesen megvalósult. Ha a terv tér el a feladattól, \
+                 az is hiba — a terv nem menti fel a megvalósítást. \
+                 Ezután a diff és a tesztek alapján vizsgáld: helyes-e, megvalósult-e \
+                 minden tervezett lépés, van-e nem kezelt hibaút vagy mellékhatás, és \
+                 szerepel-e ugyanez a hiba máshol is. Ha tudsz parancsot futtatni, \
+                 ellenőrizd a teszteket magad, és a megállapításaidat bizonyítékra \
+                 alapozd, ne feltételezésre. Az utolsó sorod pontosan ez legyen: \
+                 `VERDIKT: ELFOGAD` vagy `VERDIKT: JAVÍTANDÓ`, utána egyetlen mondat \
+                 indoklás."
             }
         }
     }
@@ -711,7 +728,14 @@ where
                 &artifacts,
                 (index == start_index).then_some(feedback.as_deref()).flatten(),
             ),
-            session_id: session_by_runtime.get(&runtime_key).cloned(),
+            // A bíráló nem folytatja a kódoló menetét. Két okból: aki a kódot
+            // írta, annak a session-je nem független szem, a bírálandó munkát
+            // pedig az artifact-blokk amúgy is átadja. Mellékhatásként a
+            // szakasz nem várja meg a kódoló megnőtt session-jének betöltését
+            // sem — a Claude-hídnál ez percenkénti nagyságrendű állás volt.
+            session_id: (stage.role != StageRole::Review)
+                .then(|| session_by_runtime.get(&runtime_key).cloned())
+                .flatten(),
             // The user's attachments and conversation context belong to the
             // stage that opens the chain, and a re-run opens nothing: stage 0
             // already carried them on the first pass.
@@ -1002,6 +1026,39 @@ mod tests {
             "the reviewer is another runtime and must never inherit the Claude session"
         );
         assert_ne!(seen[0].stage.model, seen[1].stage.model);
+    }
+
+    /// Ugyanazon a futtatón is friss szemmel bírálunk: a kódoló session-jének
+    /// folytatása nem független ellenőrzés, és a bírálandó munkát az
+    /// artifact-blokk amúgy is átadja.
+    #[test]
+    fn u1c_the_reviewer_starts_a_fresh_session_even_on_its_own_runtime() {
+        let recipe = {
+            let mut recipe = recipe_by_id("plan_code_review").expect("preset");
+            // Mindhárom szakasz ugyanazon a futtatón: enélkül a bíráló azért
+            // nem örökölne session-t, mert más a vendor.
+            recipe.stages[2].provider = recipe.stages[1].provider;
+            recipe.stages[2].runtime = recipe.stages[1].runtime;
+            recipe.stages[2].model = recipe.stages[1].model.clone();
+            recipe
+        };
+        let recorder = Recorder::with(vec![
+            ok("terv", Some("claude-session-1")),
+            ok("kod", Some("claude-session-1")),
+            ok("VERDIKT: ELFOGAD - rendben.", Some("claude-session-1")),
+        ]);
+        recorder.run(&recipe, "Feladat.", None);
+        let seen = recorder.seen.borrow();
+
+        assert_eq!(
+            seen[1].session_id.as_deref(),
+            Some("claude-session-1"),
+            "a kódoló folytatja a tervező menetét"
+        );
+        assert_eq!(
+            seen[2].session_id, None,
+            "a bíráló friss session-nel indul, akkor is, ha ugyanaz a futtató"
+        );
     }
 
     #[test]

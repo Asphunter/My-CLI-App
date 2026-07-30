@@ -1712,11 +1712,49 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
     Ok(())
 }
 
+/// Adatbázisok, amelyek épségét ez a folyamat már ellenőrizte.
+///
+/// A `PRAGMA integrity_check` minden lapot végigolvas: egy néhány száz
+/// megabájtra nőtt store-on ez másodpercekbe kerül, az `open_local_store`
+/// pedig kétszer futtatta le — minden egyes hívásnál. Egy háromszakaszos lánc
+/// tizennyolcszor nyitja meg a store-t, vagyis a futás percekig csak a saját
+/// adatbázisát olvasta újra; a REVIEW után is ezért állt a panel, mielőtt a
+/// végleges szöveget kiírta volna. Sértetlen fájl nem lesz sérült két írás
+/// között, és amit az SQLite nem tud beolvasni, azt az adott utasításon
+/// jelenti — a teljes végigolvasás a folyamat első megnyitásához tartozik
+/// (és a `local_store_health` kézi ellenőrzéséhez), nem minden íráshoz.
+fn verified_store_paths() -> &'static std::sync::Mutex<HashSet<PathBuf>> {
+    static PATHS: std::sync::OnceLock<std::sync::Mutex<HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    PATHS.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+fn store_path_is_verified(path: &Path) -> bool {
+    verified_store_paths()
+        .lock()
+        .map(|paths| paths.contains(path))
+        .unwrap_or(false)
+}
+
+fn remember_verified_store_path(path: &Path) {
+    if let Ok(mut paths) = verified_store_paths().lock() {
+        paths.insert(path.to_path_buf());
+    }
+}
+
 pub fn open_local_store() -> Result<LocalStore, String> {
     let path = local_store_path()?;
-    verify_existing_database(&path).map_err(|error| {
-        format!("A lokális adatbázis karanténban van; automatikus írás nincs engedélyezve. {error}")
-    })?;
+    // Sikertelen ellenőrzés nem kerül a listára: amíg az adatbázis karanténban
+    // van, minden megnyitás újra ellenőrzi — a javított fájl így magától
+    // visszakerül a forgalomba, újraindítás nélkül.
+    let verified = store_path_is_verified(&path);
+    if !verified {
+        verify_existing_database(&path).map_err(|error| {
+            format!(
+                "A lokális adatbázis karanténban van; automatikus írás nincs engedélyezve. {error}"
+            )
+        })?;
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("A lokális min-adattár nem hozható létre: {error}"))?;
@@ -1726,7 +1764,10 @@ pub fn open_local_store() -> Result<LocalStore, String> {
     configure_connection(&connection)?;
     let mut store = LocalStore { path, connection };
     initialize_connection(&mut store.connection)?;
-    check_integrity(&store.connection)?;
+    if !verified {
+        check_integrity(&store.connection)?;
+        remember_verified_store_path(&store.path);
+    }
     Ok(store)
 }
 

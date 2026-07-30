@@ -12,6 +12,7 @@ import { normalizeGuardPath, stripExtendedLengthPrefix } from "./paths.mjs";
 import {
   classifyTool,
   ENABLED_TOOLS,
+  planFromTasks,
   planFromTodos,
   toolsForProfile,
 } from "./policy.mjs";
@@ -259,6 +260,36 @@ test("a TodoWrite payload becomes the plan shape the panel renders", () => {
   ]);
   assert.equal(classifyTool("TodoWrite"), "plan");
   assert.equal(ENABLED_TOOLS.includes("TodoWrite"), true);
+});
+
+test("the task tools are the checklist too, and build the same plan shape", () => {
+  // A natív SDK-build a TodoWrite nevet nem ismeri: a checklist TaskCreate /
+  // TaskUpdate párokból áll össze, és a hídnak kell vezetnie a listát. Ez a
+  // teszt azt rögzíti, hogy mindkét forma ugyanoda érkezik.
+  for (const tool of ["TaskCreate", "TaskUpdate", "TaskList", "TaskGet"]) {
+    assert.equal(classifyTool(tool), "plan", `${tool} a checklist része`);
+  }
+  for (const tool of ["TaskCreate", "TaskUpdate"]) {
+    assert.equal(ENABLED_TOOLS.includes(tool), true, `${tool} nincs felkínálva a modellnek`);
+  }
+
+  const tasks = new Map([
+    ["use-1", { subject: "Terv átnézése", activeForm: "Tervet nézek", status: "completed" }],
+    ["use-2", { subject: "", activeForm: "Teszteket futtatok", status: "in_progress" }],
+    ["use-3", { subject: "Verdikt", activeForm: "", status: "pending" }],
+    ["use-4", { subject: "Elvetett pont", activeForm: "", status: "deleted" }],
+  ]);
+  assert.deepEqual(planFromTasks(tasks), [
+    { id: "task-0", step: "Terv átnézése", status: "completed" },
+    { id: "task-1", step: "Teszteket futtatok", status: "in_progress" },
+    { id: "task-2", step: "Verdikt", status: "pending" },
+  ]);
+  // Törölt elem nem marad a listán, névtelen elem nem kerül rá.
+  assert.deepEqual(planFromTasks(new Map()), []);
+  assert.deepEqual(
+    planFromTasks(new Map([["use-1", { subject: "", activeForm: "", status: "pending" }]])),
+    [],
+  );
 });
 
 test("a malformed or empty checklist produces no plan update", () => {

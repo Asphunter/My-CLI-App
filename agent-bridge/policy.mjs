@@ -22,10 +22,23 @@ export const NETWORK_TOOLS = new Set(["WebSearch", "WebFetch"]);
 export const DELEGATION_TOOLS = new Set(["Agent", "Task"]);
 
 /**
- * The checklist tool. Claude writes and re-writes its task list through it, so
- * every call is a plan update for the LÉPÉSEK panel. It touches nothing else.
+ * The checklist tools. Claude writes and re-writes its task list through them,
+ * so every call is a plan update for the LÉPÉSEK panel. They touch nothing else.
+ *
+ * `TodoWrite` is the older single-call form: one call carries the whole list.
+ * The native build ships `TaskCreate`/`TaskUpdate` instead, where the list is
+ * built up call by call — and a name the build does not know is dropped from
+ * `tools` without a word, which is why every Claude stage reported having no
+ * checklist tool and the LÉPÉSEK list only moved from the filename fallback.
+ * Both forms are accepted; the bridge maps them onto the same plan shape.
  */
-export const PLAN_TOOLS = new Set(["TodoWrite"]);
+export const PLAN_TOOLS = new Set([
+  "TodoWrite",
+  "TaskCreate",
+  "TaskUpdate",
+  "TaskList",
+  "TaskGet",
+]);
 
 /** The full set handed to the SDK. */
 export const ENABLED_TOOLS = [
@@ -39,6 +52,9 @@ export const ENABLED_TOOLS = [
   "WebFetch",
   "Agent",
   "TodoWrite",
+  "TaskCreate",
+  "TaskUpdate",
+  "TaskList",
   "AskUserQuestion",
 ];
 
@@ -88,6 +104,25 @@ export function planFromTodos(input) {
             : "";
       if (!step) return null;
       return { id: `todo-${index}`, step, status: todo?.status ?? "pending" };
+    })
+    .filter(Boolean);
+}
+
+/**
+ * A híd által vezetett task-lista → a panel lépéslistája.
+ *
+ * A `TaskCreate`/`TaskUpdate` páros egy hívásban egy elemet érint, tehát a
+ * listát a hídnak kell összeraknia: a sorrend a létrehozás sorrendje, a
+ * törölt elem pedig kiesik. A kimenet ugyanaz az alak, amit a `TodoWrite`
+ * teljes listája ad, így a felület felé nincs különbség.
+ */
+export function planFromTasks(tasks) {
+  return [...tasks.values()]
+    .filter((task) => task && task.status !== "deleted")
+    .map((task, index) => {
+      const step = (task.subject || task.activeForm || "").trim();
+      if (!step) return null;
+      return { id: `task-${index}`, step, status: task.status ?? "pending" };
     })
     .filter(Boolean);
 }

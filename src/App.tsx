@@ -411,6 +411,12 @@ type ChangeSummaryFile = {
   added: number;
   removed: number;
   binaryOrTruncated?: boolean;
+  /**
+   * A futtató által küldött, teljes útvonal — a `path` a panelre való, rövid
+   * alak. A tooltip és a megnyitás ezt használja, hogy a rövidítés ne vegye el
+   * a fájl elérhetőségét.
+   */
+  sourcePath?: string;
 };
 type CodexResponse = {
   threadId: string;
@@ -558,6 +564,13 @@ type CodeActivity = {
   code?: string;
   beforeCode?: string;
   afterCode?: string;
+  /**
+   * Amit a futtató a fájlműveletről mond (`add`, `update`, `delete`), ha
+   * megmondja. Élő futás közben ez az egyetlen jel arról, hogy a fájl új-e:
+   * a lánc végi guard-jelentés még nincs meg. Csak az események hordozzák, a
+   * lemezre írt sorok nem — a kész kártya addigra a guard listáját mutatja.
+   */
+  changeKind?: string;
   language?: string;
   hlc?: string;
   originDeviceId?: string;
@@ -907,11 +920,26 @@ const answerParagraphs = (text: string) =>
     .split(/\n{2,}/)
     .map((paragraph) => paragraph.trim())
     .filter(Boolean)
-    .map((paragraph, index) => (
-      <p key={`para-${index}`}>
-        <InlineMarkdown text={paragraph} />
-      </p>
-    ));
+    .map((paragraph, index) => {
+      // A `## Cím` sor fejezetcím, nem szöveg: nyers kettőskeresztekkel a terv
+      // RAW nézete olvashatatlan volt. Csak az egysoros bekezdés cím — egy
+      // bekezdés belsejében a # mást jelent (pl. kódkomment).
+      const heading = paragraph.match(/^(#{1,4})\s+(\S[^\n]*)$/);
+      if (heading)
+        return (
+          <p
+            key={`para-${index}`}
+            className={`answer-heading answer-heading-${heading[1].length}`}
+          >
+            <InlineMarkdown text={heading[2]} />
+          </p>
+        );
+      return (
+        <p key={`para-${index}`}>
+          <InlineMarkdown text={paragraph} />
+        </p>
+      );
+    });
 
 const answerWithQuoteBacklinks = (
   text: string,
@@ -3462,6 +3490,62 @@ const workItemLabel = (
   return isCompleted ? "Részfeladat kész" : "Részfeladat";
 };
 
+/** Amit egy futtató a fájlművelet fajtájáról mondhat. */
+const CHANGE_KIND_WORDS = new Set([
+  "add",
+  "added",
+  "create",
+  "created",
+  "new",
+  "update",
+  "updated",
+  "modify",
+  "modified",
+  "change",
+  "changed",
+  "edit",
+  "edited",
+  "delete",
+  "deleted",
+  "remove",
+  "removed",
+]);
+
+/**
+ * A fájlművelet fajtája az eseményből, ha kimondja.
+ *
+ * A Codex `fileChange` eleme a `changes` tömbben adja meg, más alakok a
+ * `kind`/`changeKind` mezőben; ismeretlen alakból nem tippelünk, a hívó
+ * ilyenkor marad az esemény nevénél. Csak fájl-elemre kérdezzük meg, mert a
+ * `kind` szó máshol nem a változásról szól.
+ */
+const extractChangeKind = (
+  params: Record<string, unknown>,
+  item: Record<string, unknown>,
+): string | undefined =>
+  [
+    params.changeKind,
+    item.changeKind,
+    params.changeType,
+    item.changeType,
+    ...[params.changes, item.changes].flatMap((value) =>
+      Array.isArray(value)
+        ? value.flatMap((entry) => {
+            const record = asRecord(entry);
+            return [record.kind, record.changeKind, record.type];
+          })
+        : [],
+    ),
+    asRecord(params.change).kind,
+    asRecord(item.change).kind,
+    params.kind,
+    item.kind,
+  ].find(
+    (value): value is string =>
+      typeof value === "string" &&
+      CHANGE_KIND_WORDS.has(value.trim().toLowerCase()),
+  );
+
 const summarizeCodexWorkEvent = (
   event: CodexEvent,
   id: number,
@@ -3601,6 +3685,8 @@ const summarizeCodexWorkEvent = (
     .pop()
     ?.toLowerCase();
   const language = extension && extension.length <= 8 ? extension : undefined;
+  const changeKind =
+    kind === "file" ? extractChangeKind(params, item) : undefined;
   return {
     id,
     itemId,
@@ -3618,6 +3704,7 @@ const summarizeCodexWorkEvent = (
     code,
     beforeCode,
     afterCode,
+    changeKind,
     language,
   };
 };
@@ -3671,6 +3758,9 @@ const mergeCodeActivity = (current: CodeActivity[], incoming: CodeActivity) => {
     code,
     beforeCode,
     afterCode,
+    // A `started` esemény mondja meg a fájlművelet fajtáját, a `completed`
+    // gyakran már nem; a szétosztott spread különben visszaütné üresre.
+    changeKind: incoming.changeKind ?? existing.changeKind,
     detail: incoming.detail || existing.detail,
   };
   return current
@@ -3711,6 +3801,24 @@ const extractCodeBlocks = (text: string): CodeBlock[] => {
       });
   }
   return blocks;
+};
+
+/**
+ * A záró „VERDIKT: …" sor a gép jele, nem az olvasóé: a kártya alján a színes
+ * sáv mondja ki ugyanazt. Csak akkor kerül le, ha tényleg az utolsó sor — a
+ * szöveg közepén álló említés érv, nem ítélet.
+ */
+const textWithoutVerdictLine = (text: string) => {
+  const lines = text.trimEnd().split("\n");
+  let last = lines.length - 1;
+  while (last >= 0 && !lines[last].trim()) last -= 1;
+  const cleaned = lines[last]
+    ?.trim()
+    .replace(/^[#*_>\s-]+/, "")
+    .toUpperCase();
+  return cleaned?.startsWith("VERDIKT:")
+    ? lines.slice(0, last).join("\n").trimEnd()
+    : text;
 };
 
 const textWithoutCodeBlocks = (text: string) =>
@@ -4096,6 +4204,10 @@ type ThinkingEntry = {
   sequence: number;
   codeActivity?: CodeActivity;
   internalHistory?: string[];
+  /** A sor eredeti szövege szorzó nélkül, hogy az ismétlés felismerhető legyen. */
+  baseBody?: string;
+  /** Hányszor futott egymás után ugyanaz a parancs. */
+  repeat?: number;
 };
 
 const formatElapsed = (milliseconds: number | undefined) => {
@@ -4237,12 +4349,36 @@ const changeSummaryFromGuard = (
   return [...files.values()];
 };
 
+/**
+ * A projekt gyökeréhez képest, ahogy a lánc guard-jelentése is adja.
+ *
+ * A futtató abszolút útvonalat küld, a kész kártya viszont relatívat mutat: az
+ * élő lista fölöslegesen lett volna másfajta ugyanarról a fájlról, és az egész
+ * `C:\Users\…` a panelt is szélesre nyitotta. A gyökér nem mindig ismerhető
+ * fel — a store kanonizált `\\?\C:\…` alakot is ír, a cache simát —, ezért a
+ * ki nem ismert abszolút útvonalból a fájlnév marad; a teljes út a sor
+ * tooltipjében és a megnyitásban továbbra is megvan.
+ */
+const plainPath = (value: string) =>
+  value.trim().replace(/^\\\\\?\\/, "").replaceAll("\\", "/");
+
+const relativeChangePath = (path: string, projectPath?: string) => {
+  const normalized = plainPath(path);
+  const root = projectPath ? plainPath(projectPath).replace(/\/+$/, "") : "";
+  if (root && normalized.toLowerCase().startsWith(`${root.toLowerCase()}/`))
+    return normalized.slice(root.length + 1);
+  return /^([a-zA-Z]:\/|\/)/.test(normalized)
+    ? (normalized.split("/").at(-1) ?? normalized)
+    : normalized;
+};
+
 const changeSummaryFromActivities = (
   activities: CodeActivity[],
+  projectPath?: string,
 ): ChangeSummaryFile[] => {
   const byPath = new Map<string, ChangeSummaryFile>();
   for (const activity of activities) {
-    const path = activity.detail.trim();
+    const path = relativeChangePath(activity.detail, projectPath);
     // A bare tool name ("Read", "Edit") sneaking in as a detail must not
     // become a file row; anything without a separator or an extension is not
     // a path the summary can honestly claim was modified.
@@ -4254,19 +4390,33 @@ const changeSummaryFromActivities = (
     const hasCodeBoundary =
       !readOnlyActivity &&
       (activity.beforeCode !== undefined || activity.afterCode !== undefined);
+    // A fájlművelet neve nem mindig mondja meg, hogy változás történt: az
+    // app-server új protokollja `item/completed`-et küld, és hogy fájlírás
+    // volt, csak az elem típusából derül ki. Ilyenkor a jel az, hogy a
+    // művelet a fájl tartalmát is hordozza, illetve amit a futtató a változás
+    // fajtájáról mond. Enélkül a KÓD szakasz alatt üres volt a fájllista, és
+    // a lánc végi guard-jelentésig semmi nem látszott.
     const looksLikeChange =
       activity.kind === "file" &&
-      /(change|create|delete|remove|write|patch|edit)/i.test(activity.eventType);
+      !readOnlyActivity &&
+      (Boolean(activity.changeKind) ||
+        Boolean(activity.code?.trim()) ||
+        /(change|create|delete|remove|write|patch|edit)/i.test(
+          activity.eventType,
+        ));
     if (!path || !pathLike || (!hasCodeBoundary && !looksLikeChange)) continue;
     const before = activity.beforeCode ?? "";
     const after = activity.afterCode ?? activity.code ?? "";
     const rows = buildInlineDiffRows(before, after);
-    const next = summaryFromDiffRows(
-      path,
-      activity.eventType,
-      rows,
-      !hasCodeBoundary && Boolean(activity.code),
-    );
+    const next = {
+      ...summaryFromDiffRows(
+        path,
+        activity.changeKind ?? activity.eventType,
+        rows,
+        !hasCodeBoundary && Boolean(activity.code),
+      ),
+      sourcePath: plainPath(activity.detail),
+    };
     const previous = byPath.get(path);
     if (!previous) {
       byPath.set(path, next);
@@ -4279,6 +4429,45 @@ const changeSummaryFromActivities = (
     previous.binaryOrTruncated ||= next.binaryOrTruncated;
   }
   return [...byPath.values()];
+};
+
+/**
+ * A Codex escape-elve adja át az exec-parancsot (`"C:\\WINDOWS\\System32\\…"`),
+ * amitől a sor fele fordított törtvonal. Csak akkor bontjuk vissza, ha minden
+ * törtvonal párban áll: egy igazi UNC-útvonal (`\\gép\megosztás`) így
+ * érintetlen marad.
+ */
+const unescapeDoubledBackslashes = (value: string) =>
+  value.includes("\\\\") &&
+  !value.split("\\\\").some((part) => part.includes("\\"))
+    ? value.replaceAll("\\\\", "\\")
+    : value;
+
+/**
+ * A parancs-bullet zaját szedi le: a munkakönyvtárba lépő `cd "…" && ` előtag
+ * minden sor elején ugyanaz volt, két sornyi útvonal nulla információval — a
+ * lényeg, maga a parancs, csak utána kezdődött. A `cd` csak akkor marad, ha
+ * nem az elején áll (ott már a parancs része).
+ */
+const stripLeadingCdPrefix = (value: string) => {
+  const match = value.match(
+    /^cd\s+(?:"[^"]*"|'[^']*'|[^\s"']+)\s*(?:&&|;)\s*/,
+  );
+  return match ? value.slice(match[0].length) : value;
+};
+
+/**
+ * A puszta eszköznév néha semmit nem mond: a Codex node-REPL-je `js`-nek hívja
+ * magát, és a bullet is ennyi volt — maga a hívás a `</>` alatt lapult. A név
+ * mellé az első sora kerül, hogy a lista kattintás nélkül is olvasható legyen.
+ */
+const toolCallBullet = (activity: CodeActivity) => {
+  const detail = activity.detail.trim();
+  const source = (activity.code ?? activity.afterCode ?? "").trim();
+  if (!source || detail.length > 24 || /\s/.test(detail)) return detail;
+  const lines = source.split("\n");
+  const rest = lines.slice(1).some((line) => line.trim());
+  return `${detail} — ${lines[0].trim()}${rest ? " …" : ""}`;
 };
 
 const parseUnifiedInlineDiff = (source: string): InlineDiffRow[] => {
@@ -5456,12 +5645,15 @@ function ChangeSummaryPanel({
       </div>
       <ul className="trace-change-list">
         {files.map((file) => (
-          <li key={`${file.status}:${file.path}`} title={file.path}>
+          <li
+            key={`${file.status}:${file.path}`}
+            title={file.sourcePath ?? file.path}
+          >
             {onPreviewImage && isPreviewableImagePath(file.path) ? (
               <button
                 type="button"
                 className="trace-change-preview"
-                onClick={() => onPreviewImage(file.path)}
+                onClick={() => onPreviewImage(file.sourcePath ?? file.path)}
                 title="Előnézet megnyitása"
               >
                 <code>{file.path}</code>
@@ -5542,6 +5734,18 @@ type TurnProgressCardProps = {
   runFooter?: ReactNode;
   /** Which chain stage this card belongs to; labels the pre-plan step. */
   stageRole?: string;
+  /** A futás projektgyökere: az élő fájllista ehhez képest ír útvonalat. */
+  projectPath?: string;
+  /**
+   * A futás még tart, tehát a kódoló szakasz fájllistája a saját eseményeiből
+   * áll össze. Lezárt futásnál nem szabad: ott a guard-jelentés a hiteles.
+   */
+  liveFiles?: boolean;
+  /**
+   * A futás kezdete. Ha meg van adva, a kártya órája innen jár — egy lánc
+   * szakaszváltásánál nem indul újra a számlálás.
+   */
+  runStartedAt?: number;
 };
 
 function TurnProgressCard({
@@ -5569,6 +5773,9 @@ function TurnProgressCard({
   runHeader,
   runFooter,
   stageRole,
+  projectPath,
+  liveFiles,
+  runStartedAt,
 }: TurnProgressCardProps) {
   const quoteAnchor = (suffix: string) =>
     `${quoteAnchorPrefix}:${suffix}`;
@@ -5646,11 +5853,20 @@ function TurnProgressCard({
           hasMeaningfulTiming ||
           step.status === "error" ||
           step.status === "inProgress" ||
-          (hasMeaningfulPlanTiming && step.status === "completed")
+          (hasMeaningfulPlanTiming && step.status === "completed") ||
+          // A terv hordozott pontja akkor is a terv része, ha a kódoló nem
+          // jelentett róla külön eseményt — kiszűrve a KÓD kártya listája a
+          // futás végén rövidebb lett, mint amit a futás alatt mutatott.
+          step.id.startsWith("carried-plan-")
         );
       });
   // A terv-fázis kártyája nem naplót mutat, hanem magát a tervet.
   const isPlanStage = stageRole === "plan";
+  // Íródó terv: a pontjai között nincs „épp ez fut", és nincs kiválasztott sem
+  // — a lista egyszerűen egymás alá írja őket, ahogy megszületnek. A kiemelés
+  // és a halványítás a kész terven, illetve a többi szakasz lépéslistáján
+  // marad, ahol tényleg egy futó munkafázist jelöl.
+  const planDrafting = isPlanStage && streaming;
   const fallbackStep: PlanStep = {
     id: "client-pre-plan",
     step: prePlanStepLabel(stageRole ?? answer?.pipeline?.stageRole),
@@ -5684,6 +5900,17 @@ function TurnProgressCard({
   const steps =
     effectivePlannedSteps.length === 0 ? [fallbackStep] : effectivePlannedSteps;
   const prePlanDisplayStepId = plannedSteps[0]?.id ?? fallbackStep.id;
+  // Egy szakasz lépéslistája menet közben lecserélődhet: a KÓD a hordozott terv
+  // pontjaival indul, majd a kódoló saját todo-listája veszi át a helyüket, más
+  // azonosítókkal. Az addig megírt kommentár a régi azonosítókra mutat, és
+  // onnantól egyetlen lépés alatt sem látszott — a KÓD első egy-két sora így
+  // tűnt el nyomtalanul, pedig meg volt írva. Az árva bejegyzés ugyanoda kerül,
+  // ahová az előkészítő sorok: az első látható lépés alá.
+  const stepIds = new Set(steps.map((step) => step.id));
+  const isOrphanStepId = (stepId?: string | null) =>
+    Boolean(stepId) && !isPrePlanStepId(stepId) && !stepIds.has(stepId!);
+  const isUnassignedStepId = (stepId?: string | null) =>
+    isPrePlanStepId(stepId) || isOrphanStepId(stepId);
   const commentaryStepId = (body: string) => {
     const match = body.match(/\b(\d+)\.\s*lépés\b/i);
     const index = match ? Number(match[1]) - 1 : -1;
@@ -5694,14 +5921,12 @@ function TurnProgressCard({
   const commentaryBelongsToStep = (entry: CommentaryEntry, stepId: string) => {
     const numberedStepId = commentaryStepId(entry.body);
     if (numberedStepId) return numberedStepId === stepId;
-    return entry.stepId
-      ? isPrePlanStepId(entry.stepId)
-        ? stepId === prePlanDisplayStepId
-        : entry.stepId === stepId
-      : stepId === prePlanDisplayStepId;
+    return isUnassignedStepId(entry.stepId)
+      ? stepId === prePlanDisplayStepId
+      : entry.stepId === stepId;
   };
   const activityBelongsToStep = (activity: CodeActivity, stepId: string) =>
-    isPrePlanStepId(activity.planStepId)
+    isUnassignedStepId(activity.planStepId)
       ? stepId === prePlanDisplayStepId
       : activity.planStepId === stepId;
   const hasTraceForStep = (stepId: string) =>
@@ -5718,12 +5943,12 @@ function TurnProgressCard({
   const hasUnassignedTrace =
     activities.some(
       (activity) =>
-        isPrePlanStepId(activity.planStepId) &&
+        isUnassignedStepId(activity.planStepId) &&
         activity.kind === "reasoning" &&
         Boolean(activity.body?.trim()),
     ) ||
     commentary.some(
-      (entry) => isPrePlanStepId(entry.stepId) && Boolean(entry.body.trim()),
+      (entry) => isUnassignedStepId(entry.stepId) && Boolean(entry.body.trim()),
     );
   // While streaming, follow the active step. Once the turn is complete, keep
   // the last step that actually has trace data selected instead of jumping to
@@ -5731,15 +5956,22 @@ function TurnProgressCard({
   const lastTracedStep = [...steps]
     .reverse()
     .find((step) => hasTraceForStep(step.id));
-  const activeStep = streaming
-    ? (steps.find((step) => step.status === "inProgress") ??
-      steps.find((step) => step.status === "pending") ??
-      lastTracedStep ??
-      steps[steps.length - 1])
-    : (lastTracedStep ??
-      (hasUnassignedTrace ? steps[0] : undefined) ??
-      [...steps].reverse().find((step) => step.status === "completed") ??
-      steps[0]);
+  const activeStep = isPlanStage
+    ? // A terv pontjai nem munkafázisok: nincs köztük „épp ez fut", és a lista
+      // vége sem jelent haladást. Írás közben az utolsó megszületett pontnál
+      // tartunk, kész terven pedig az elsőnél — olvasási sorrendben. Enélkül a
+      // kijelölés végig az elsőn állt, majd a terv elkészültekor átugrott az
+      // utolsóra, mert azt hitte, ott tart a munka.
+      (streaming ? (steps[steps.length - 1] ?? steps[0]) : steps[0])
+    : streaming
+      ? (steps.find((step) => step.status === "inProgress") ??
+        steps.find((step) => step.status === "pending") ??
+        lastTracedStep ??
+        steps[steps.length - 1])
+      : (lastTracedStep ??
+        (hasUnassignedTrace ? steps[0] : undefined) ??
+        [...steps].reverse().find((step) => step.status === "completed") ??
+        steps[0]);
   const [selectedStepId, setSelectedStepId] = useState(activeStep.id);
   // A terv-fázis GONDOLKODÁS MENETE panelje nem naplót mutat, hanem magát a
   // tervet: RAW = a teljes szöveg (élőben streamelve), DETAIL = a kiválasztott
@@ -5836,16 +6068,21 @@ function TurnProgressCard({
     // What the stage actually did, one row per tool call. Without these a
     // coding stage that thought silently showed a single "Kódmódosítás
     // történt." line for four edits and a test run.
+    // A parancs sora nem 110 karakternél ér véget: a Codex a bal oldalra a
+    // teljes értelmezőt írja (`"C:\\WINDOWS\\…\\powershell.exe" -Command "…"`),
+    // így a csonk pont a lényeget, magát a parancsot vágta le. Az előtag-
+    // takarítás (cd, escape) után viszont ami sokáig tart, az tényleg hosszú:
+    // a 400 karakter fölötti rész már nem olvasás, hanem görgetés.
+    const clipBullet = (value: string) =>
+      value.length > 400 ? `${value.slice(0, 400)}…` : value;
     const toolBullet = (activity: CodeActivity) =>
       activity.kind === "command"
-        ? `$ ${
-            activity.detail.length > 110
-              ? `${activity.detail.slice(0, 110)}…`
-              : activity.detail
-          }`
+        ? `$ ${clipBullet(
+            stripLeadingCdPrefix(unescapeDoubledBackslashes(activity.detail)),
+          )}`
         : activity.kind === "file"
           ? `Fájl — ${activity.detail}`
-          : activity.detail;
+          : clipBullet(toolCallBullet(activity));
     const toolRecords = stepActivities
       .filter(
         (activity) =>
@@ -5935,9 +6172,25 @@ function TurnProgressCard({
       flushInternal();
       if (item.kind === "tool") {
         const toolActivity = item.record.activity;
+        const previous = entries[entries.length - 1];
+        // Ugyanaz a parancs kétszer egymás után: a modell újrapróbálta. Két
+        // azonos sor helyett egy sor és egy szorzó — a lista így arról szól,
+        // mi történt, nem arról, hányszor gördült le ugyanaz.
+        if (previous && (previous.baseBody ?? previous.body) === item.record.body) {
+          previous.repeat = (previous.repeat ?? 1) + 1;
+          previous.baseBody = item.record.body;
+          previous.body = `${item.record.body}  (${previous.repeat}×)`;
+          previous.codeActivity =
+            previous.codeActivity ??
+            (toolActivity.code || toolActivity.beforeCode || toolActivity.afterCode
+              ? toolActivity
+              : undefined);
+          continue;
+        }
         entries.push({
           id: `tool-${toolActivity.id}`,
           body: item.record.body,
+          baseBody: item.record.body,
           kind: "commentary",
           sequence: item.record.sequence,
           codeActivity:
@@ -6024,21 +6277,41 @@ function TurnProgressCard({
       ? inferredPlanCompletedAt
       : undefined);
   const elapsedEnd = streaming ? clockNow : completedAtForDisplay;
+  // A futó lánc órája a futás kezdetétől jár. A szakasz saját terve minden
+  // szakasznál újraindul, és az óra ezért nullázódott a TERV → KÓD → REVIEW
+  // váltásoknál — miközben az olvasó azt kérdezi, hogy „mióta megy ez az
+  // egész". A lezárt kártyák a saját szakaszuk idejét mutatják tovább.
+  const elapsedStart = streaming
+    ? (runStartedAt ?? startedAtForDisplay)
+    : startedAtForDisplay;
   const overallElapsed =
-    startedAtForDisplay !== undefined && elapsedEnd !== undefined
-      ? formatElapsed(Math.max(0, elapsedEnd - startedAtForDisplay))
+    elapsedStart !== undefined && elapsedEnd !== undefined
+      ? formatElapsed(Math.max(0, elapsedEnd - elapsedStart))
       : "";
   const hasAnswer = Boolean(answer?.text.trim());
+  // A verdikt a kártya alján, színes sávként hangzik el; a nyers záró sor
+  // ilyenkor kétszer mondaná ugyanazt.
+  const answerBodyText = answer?.pipeline?.verdict
+    ? textWithoutVerdictLine(answer?.text ?? "")
+    : (answer?.text ?? "");
+  // A lánc fájllistája a guard-jelentésből jön, az pedig csak a futás legvégén
+  // készül el — a KÓD kártyáján addig semmi nem látszott, pedig a fájlok ott,
+  // akkor születtek. Amíg a lánc fut, a kódoló szakasz saját fájlműveletei
+  // adják a listát: a munka ilyenkor tényleg a fán van, a lánc csak a végén
+  // állítja vissza a bázist. A tervező és a bíráló kártyáján soha nincs lista
+  // — nem írnak fájlt, és egy „módosítva" kártya abszolút útvonalakkal a
+  // bírálón pontosan ebből lett korábban. Lezárt futásnál a guard a hiteles:
+  // egy leállított lánc munkája visszaáll, ott már nincs mit felsorolni.
+  const filesStageRole = answer?.pipeline?.stageRole ?? stageRole;
+  const filesFromActivities = filesStageRole
+    ? filesStageRole === "code" && liveFiles === true
+    : true;
   const changeSummary =
     answer?.changeSummary && answer.changeSummary.length > 0
       ? answer.changeSummary
-      : answer?.pipeline
-        // A chain's files card comes from the chain guard and sits on the
-        // coding stage's answer. Deriving one from another stage's activities
-        // put a "modified" card with absolute paths on the reviewer, which
-        // never wrote a file.
-        ? []
-        : changeSummaryFromActivities(activities);
+      : filesFromActivities
+        ? changeSummaryFromActivities(activities, projectPath)
+        : [];
   const [copiedAnswer, setCopiedAnswer] = useState(false);
   const copyAnswer = async () => {
     if (!answer?.text.trim()) return;
@@ -6087,7 +6360,7 @@ function TurnProgressCard({
       // A terv-fázis a lépés-nézetben él: a RAW mutatja a születő tervet.
       setTraceView("steps");
     } else if (streaming) {
-      setTraceView(hasAnswer ? "answer" : "steps");
+      setTraceView(stageRole ? "steps" : hasAnswer ? "answer" : "steps");
     } else if (hasAnswer) {
       // Recovery can populate the answer after the first render. Do not leave
       // the user on LÉPÉSEK just because the placeholder initially had no text.
@@ -6098,7 +6371,16 @@ function TurnProgressCard({
   }, [expanded, hasAnswer, streaming]);
   useEffect(() => {
     if (!streaming || isPlanStage) return;
-    const nextView: TraceView = hasAnswer ? "answer" : "steps";
+    // Lánc-szakasz futása közben a LÉPÉSEK a nézet. A Claude a tool-hívások
+    // közti narrációját is a válasz-streambe küldi, és az első ilyen mondat
+    // átdobta a kártyát a VÁLASZ-ra — a szakasz kellős közepén, kész válasz
+    // nélkül, félkész mondatokat mutatva. A VÁLASZ fül kattintható marad, és a
+    // szakasz végén magától az lesz a nézet.
+    const nextView: TraceView = stageRole
+      ? "steps"
+      : hasAnswer
+        ? "answer"
+        : "steps";
     setTraceView(nextView);
     // Keep the durable expansion choice in sync so the completed card does
     // not jump back to LÉPÉSEK after the live card is replaced in the timeline.
@@ -6116,8 +6398,13 @@ function TurnProgressCard({
     followActiveStepRef.current = false;
     setSelectedStepId(stepId);
   };
+  // Az íródó terv pontjai közül egyik sem „fut": a tervező szöveget ír, nem
+  // lépéseket hajt végre. Enélkül az első pont futóként jelent meg, órával.
   const displayStatus = (step: PlanStep) =>
-    streaming && step.id === activeStep.id && step.status === "pending"
+    !planDrafting &&
+    streaming &&
+    step.id === activeStep.id &&
+    step.status === "pending"
       ? "inProgress"
       : step.status;
   const completedStepCount = steps.filter(
@@ -6241,7 +6528,7 @@ function TurnProgressCard({
             {hasAnswer && (
               <p>
                 {answerWithQuoteBacklinks(
-                  textWithoutCodeBlocks(answer?.text ?? ""),
+                  textWithoutCodeBlocks(answerBodyText),
                   answerQuoteRefs,
                   onQuoteJump ?? (() => undefined),
                 )}
@@ -6356,13 +6643,13 @@ function TurnProgressCard({
                     (answerQuoteRefs.length === 0 ? (
                       <div className="trace-answer-text">
                         {answerParagraphs(
-                          textWithoutCodeBlocks(answer?.text ?? ""),
+                          textWithoutCodeBlocks(answerBodyText),
                         )}
                       </div>
                     ) : (
                     <p>
                       {answerWithQuoteBacklinks(
-                        textWithoutCodeBlocks(answer?.text ?? ""),
+                        textWithoutCodeBlocks(answerBodyText),
                         answerQuoteRefs,
                         onQuoteJump ?? (() => undefined),
                       )}
@@ -6398,7 +6685,22 @@ function TurnProgressCard({
         </section>
       )}
 
-      {traceView === "steps" && !streaming &&
+      {traceView === "steps" && isPlanStage && streaming && !hasAnswer ? (
+        // A terv első másodpercei. Ilyenkor még semmi nincs, amit két panelbe
+        // lehetne rendezni: két „még nem kezdődött el" felirat rosszabb, mint
+        // egy pörgő jelzés. Az első betűvel felállnak a panelek, és a szöveg
+        // azonnal ömlik beléjük — a pontok pedig lépésekké válnak, ahogy
+        // megíródnak.
+        <div className="trace-content is-expanded">
+          <div
+            className="trace-plan-waiting"
+            role="status"
+            aria-label="A terv készül"
+          >
+            <span className="trace-answer-spinner" aria-hidden="true" />
+          </div>
+        </div>
+      ) : traceView === "steps" && !streaming &&
         plannedSteps.length === 0 &&
         activities.length === 0 &&
         commentary.every((entry) => !entry.body.trim()) ? (
@@ -6419,7 +6721,9 @@ function TurnProgressCard({
             <div className="trace-panel-heading">
               <strong>LÉPÉSEK</strong>
               <span>
-                {isPlanStage && effectivePlannedSteps.length === 0
+                {/* A készülő terv pontjai nem elvégzett munka: amíg íródik,
+                    a fejléc sem számol el belőlük semmit. */}
+                {planDrafting || (isPlanStage && effectivePlannedSteps.length === 0)
                   ? "készül"
                   : `${completedStepCount}/${steps.length} kész`}
               </span>
@@ -6431,18 +6735,25 @@ function TurnProgressCard({
             >
               {isPlanStage && effectivePlannedSteps.length === 0 && (
                 <span className="trace-thinking-empty-text">
-                  A lépések a terv elkészültekor jönnek létre — a születő terv
-                  a RAW nézetben olvasható.
+                  A lépések a terv számozott pontjaiként születnek meg — a
+                  szöveg a RAW nézetben már olvasható.
                 </span>
               )}
               {(isPlanStage && effectivePlannedSteps.length === 0
                 ? []
                 : steps
               ).map((step, stepIndex) => {
+                // Ami már írt magáról valamit, az olvasható — akkor is, ha a
+                // modell még nem jelölte késznek. A tiltás arra való, hogy egy
+                // el sem kezdett lépés üres panelre ne vigyen; egy nyomot
+                // hagyott lépésnél viszont épp az a dolga a listának, hogy
+                // vissza lehessen rá lépni.
                 const disabled =
-                  streaming &&
-                  step.status === "pending" &&
-                  step.id !== activeStep.id;
+                  planDrafting ||
+                  (streaming &&
+                    step.status === "pending" &&
+                    step.id !== activeStep.id &&
+                    !hasTraceForStep(step.id));
                 const elapsed = stepElapsedFor(step);
                 return (
                   <div
@@ -6453,10 +6764,16 @@ function TurnProgressCard({
                     <button
                       type="button"
                       role="listitem"
-                      className={`trace-step-row trace-step-row-${displayStatus(step)}${selectedStep.id === step.id ? " is-selected" : ""}${disabled ? " is-disabled" : ""}`}
+                      className={
+                        planDrafting
+                          ? "trace-step-row is-plain"
+                          : `trace-step-row trace-step-row-${displayStatus(step)}${selectedStep.id === step.id ? " is-selected" : ""}${disabled ? " is-disabled" : ""}`
+                      }
                       onClick={() => selectStep(step.id)}
                       disabled={disabled}
-                      aria-pressed={selectedStep.id === step.id}
+                      aria-pressed={
+                        planDrafting ? undefined : selectedStep.id === step.id
+                      }
                     >
                       {/* A terv pontjai nem munkafázisok: sorszámuk van, nem
                           állapotuk. Az intenzitás-sáv a KÓD kártyáé marad. */}
@@ -9293,6 +9610,42 @@ function App() {
         // amíg ugyanaz a szakasz fut.
         setRunsRevision((revision) => revision + 1);
       }
+      // A lezárt szakasz sora azonnal megkapja a lánc-metaadatát.
+      //
+      // Eddig csak a futás legvégén kapta meg, és addig egy szakasz-válasz
+      // „sima" asszisztens-sor volt. Ennek két következménye volt: a szakaszok
+      // időrendi határai (amihez a lépések és a kommentár tartoznak) nem
+      // ismerték ezt a szakaszt, így a saját eseményei az *előző kör* utolsó
+      // szakaszához kerültek — és annak a csoportnak a válasza is ez a
+      // metaadat nélküli sor lett. Onnantól a lánc paneljének nem volt
+      // szakasza (fejléc és fülek nélkül rajzolódott, illetve egy
+      // újrafuttatásnál egyáltalán nem), a korábbi kör bírálata pedig
+      // kicsúszott a kártyája alól és nyers üzenetsorként jelent meg. A
+      // verdikt nem itt derül ki, azt továbbra is a futás vége írja rá.
+      if (progress.phase === "finished" && progressRun) {
+        const stageTurnId = `request:${progress.requestId}`;
+        const resume = progressRun.chain?.resume;
+        writeOwnedMessages(progressRun.ownerConversationId, (current) =>
+          current.map((message) =>
+            message.role === "assistant" &&
+            message.turnId === stageTurnId &&
+            !message.pipeline
+              ? {
+                  ...message,
+                  pipeline: {
+                    runId: progress.runId,
+                    chainId: resume?.chainKey ?? progress.runId,
+                    iteration: resume?.iteration ?? 1,
+                    stageIndex: progress.stageIndex,
+                    stageCount: progress.stageCount,
+                    stageRole: progress.role,
+                    stageAgent: progress.agentLabel,
+                  },
+                }
+              : message,
+          ),
+        );
+      }
       if (progress.phase === "started") {
         // A szakasz a saját láncának futásához tartozik: a kérés-azonosítója
         // oda kerül be, és onnantól az eseményei is odatalálnak.
@@ -11458,6 +11811,39 @@ function App() {
               (carriedListActive && !matchesCarried))
           ) {
             setCodeStatus("terv frissítve");
+          } else if (carriedListActive && matchesCarried) {
+            // A kódoló a terv pontjait veszi fel checklistként, méghozzá
+            // elemenként: nyolc hívás, nyolc egyre hosszabb lista. Ha ezeket
+            // beengednénk, a KÓD lépéslistája újra „kiíródna" fentről lefelé,
+            // ahogy a TERV-ben — pedig ugyanaz a lista, csak most már halad.
+            // A hordozott lista marad, és csak az állapotokat vesszük át róla.
+            const statusFor = (step: PlanStep) =>
+              snapshot.steps.find((incoming) => {
+                const a = normalized(step.step).slice(0, 40);
+                const b = normalized(incoming.step).slice(0, 40);
+                return a && b && (a.includes(b) || b.includes(a));
+              })?.status;
+            const merged = current.steps.map((step) => {
+              const status = statusFor(step);
+              return status && status !== step.status ? { ...step, status } : step;
+            });
+            const changed = merged.some(
+              (step, index) => step.status !== current.steps[index].status,
+            );
+            if (changed) {
+              const next = planWithTiming(
+                { ...current, turnId: current.turnId ?? uiTurnId },
+                merged,
+                Date.now(),
+              );
+              const targetStep = next.steps.find(
+                (step) => step.status === "inProgress",
+              );
+              if (targetStep) planStepIdOverride = targetStep.id;
+              updateOwnedPlanState(ownerConversationId, next);
+              setWatchdogMessage("");
+            }
+            setCodeStatus("terv frissítve");
           } else {
           const next = planWithTiming(
             {
@@ -13132,6 +13518,12 @@ function App() {
       setQueuedSendConversations((current) =>
         current.includes(queuedId) ? current : [...current, queuedId],
       );
+      // Némán sorba állni úgy néz ki, mintha az Enter elveszett volna — a
+      // szerkesztőben marad a szöveg, és látszólag nem történik semmi.
+      notify(
+        "Az előző kör még zárul le — a küldés a végén magától elindul.",
+        "notify",
+      );
       return;
     }
     // Egy projektben egy kör: a munkaterület-snapshot közös, két futás
@@ -14256,7 +14648,10 @@ function App() {
           recipeId: activePipelineRecipe.id,
           prompt: originalPrompt,
           conversationId: activeConversationId,
-          planFile: planFileNameFor(activeThread, iteration),
+          // Egy kérdés = egy terv-fájl. Az újrafuttatás nem tervez, csak a
+          // kör naplóját írja a meglévő fájl végére — ezért ugyanazt a nevet
+          // kapja, nem egy `-v2` másodpéldányt.
+          planFile: planFileNameFor(activeThread, 1),
           requestIds: stageRequestIds,
           placeholderRequestId: null,
           images: [],
@@ -14615,10 +15010,20 @@ function App() {
   // Every iteration of one question, in one bucket. A re-run adds later
   // versions of the stages it re-ran, not a second chain.
   const stagesByChain = new Map<string, ChainStage[]>();
-  for (const entry of timelineEntries) {
-    if (entry.kind !== "work") continue;
-    const stage = answerForWorkGroup(entry.group)?.pipeline;
+  // Közvetlenül az üzenetek metaadatából, nem a munkacsoportokon át: a
+  // csoportok a napló hidratálása közben állnak össze, és amíg nem álltak
+  // össze, a fül-sávból hiányzott az a szakasz, amelyiké épp nem volt kész —
+  // hidegindítás után egy lezárt láncról így tűnt el a 3/3 REVIEW fül. A
+  // metaadat viszont az első képkockától teljes.
+  // Ugyanannak a szakasznak több sora is lehet (saját mentés + hidratált
+  // másolat); a sávra egy kerül, a legutóbbi — az hordozza a verdiktet is.
+  const chainStageRows = new Map<string, MessagePipeline>();
+  for (const message of messages) {
+    const stage = message.role === "assistant" ? message.pipeline : undefined;
     if (!stage) continue;
+    chainStageRows.set(`${stage.runId}#${stage.stageIndex}`, stage);
+  }
+  for (const stage of chainStageRows.values()) {
     const key = chainKeyOf(stage);
     const stages = stagesByChain.get(key) ?? [];
     stages.push({
@@ -14871,7 +15276,8 @@ function App() {
       .filter((item): item is ChainStage => Boolean(item));
     const lastStageIndex = chainSlots.at(-1) ?? 0;
     // -1 is the composed answer: what the chain did, in the words of whoever
-    // did it, instead of the reviewer's opinion of the coder.
+    // did it, instead of the reviewer's opinion of the coder. A sávon a
+    // szakaszok után áll, mert a futás is oda ér ki.
     const selectedStage = stage
       ? (selectedStages[chainKey] ?? PIPELINE_ANSWER_TAB)
       : 0;
@@ -14921,18 +15327,18 @@ function App() {
               style={{
                 transform: `translateX(${
                   (selectedStage === PIPELINE_ANSWER_TAB
-                    ? 0
-                    : chainSlots.indexOf(selectedStage) + 1) * 100
+                    ? runStages.length
+                    : Math.max(0, chainSlots.indexOf(selectedStage))) * 100
                 }%)`,
               }}
             />
             {[
-              { key: PIPELINE_ANSWER_TAB, label: "VÁLASZ", agent: "" },
               ...runStages.map((item) => ({
                 key: item.stageIndex,
                 label: `${item.stageIndex + 1}/${stage.stageCount} ${STAGE_ROLE_LABELS[item.role] ?? item.role}`,
                 agent: item.agent,
               })),
+              { key: PIPELINE_ANSWER_TAB, label: "VÁLASZ", agent: "" },
             ].map((item) => (
               <button
                 key={item.key}
@@ -15029,6 +15435,19 @@ Javítsd ki, majd futtasd le újra a teszteket.`
     // concluded, and a call to action there reads as belonging to that phase.
     const footerBelongsHere =
       selectedStage === PIPELINE_ANSWER_TAB || selectedStage === lastStageIndex;
+    // Az elfogadás is a sáv alján hangzik el, a maga zöldjével — a szöveg végi
+    // nyers „VERDIKT: ELFOGAD" sor helyett ez az, amit az olvasó lát.
+    const acceptedFooter =
+      runVerdict?.verdict === "accepted" && footerBelongsHere ? (
+        <div className="pipeline-answer-next is-accepted">
+          <span>
+            {runVerdict.verdictSummary?.trim() &&
+            runVerdict.verdictSummary.trim().toUpperCase() !== "ELFOGAD"
+              ? `A bíráló elfogadta: ${runVerdict.verdictSummary.trim()}`
+              : "A bíráló elfogadta a megoldást."}
+          </span>
+        </div>
+      ) : undefined;
     const runFooter =
       rejected && atNewestVersion && footerBelongsHere ? (
         <div className="pipeline-answer-next">
@@ -15055,7 +15474,7 @@ Javítsd ki, majd futtasd le újra a teszteket.`
             Javíttatom
           </button>
         </div>
-      ) : undefined;
+      ) : acceptedFooter;
     if (stage && selectedStage === PIPELINE_ANSWER_TAB) {
       // Composed here rather than asked of a fourth model: the coder already
       // wrote what changed, and the reviewer already said whether to trust it.
@@ -15100,6 +15519,7 @@ Javítsd ki, majd futtasd le újra a teszteket.`
         transport={null}
         watchdogMessage=""
         stageRole={groupAnswer.pipeline?.stageRole}
+        projectPath={activeProjectPath}
         answer={groupAnswer}
         quoteRefs={allQuoteRefs}
         quoteAnchorPrefix={`trace:${entry.group.key}`}
@@ -15150,14 +15570,32 @@ Javítsd ki, majd futtasd le újra a teszteket.`
           message.live &&
           message.turnId === liveStageTurnId,
       ) ??
-      // A lánc első szakasza a futás külső élő buborékába streamel — az is
-      // ennek a futásnak a szövege, ne legyen láthatatlan.
-      messages.find(
-        (message) =>
-          message.role === "assistant" &&
-          message.live &&
-          message.id === viewedRun?.liveMessageId,
-      )
+      // A lánc minden szakasza a futás külső élő buborékába streamel — az is
+      // ennek a futásnak a szövege, ne legyen láthatatlan. Kivéve, amíg a
+      // buborékban még az ELŐZŐ szakasz lezárt szövege áll: az új szakasz
+      // indulásakor a REVIEW kártyáján így a KÓD válasza ült, és a lépések
+      // helyett azon ragadt a nézet. Ami szóról szóra egyezik egy korábbi
+      // szakasz eltárolt válaszával, az nem ennek a szakasznak a szövege.
+      (() => {
+        const outerBubble = messages.find(
+          (message) =>
+            message.role === "assistant" &&
+            message.live &&
+            message.id === viewedRun?.liveMessageId,
+        );
+        if (!outerBubble) return undefined;
+        const stale =
+          pipelineProgress.stageIndex > 0 &&
+          Boolean(liveRunStagePrefix) &&
+          messages.some(
+            (message) =>
+              message.role === "assistant" &&
+              !message.live &&
+              message.turnId?.startsWith(liveRunStagePrefix!) &&
+              message.text.trim() === outerBubble.text.trim(),
+          );
+        return stale ? undefined : outerBubble;
+      })()
     : undefined;
   const settledStageText = pipelineProgress
     ? ((pipelineProgress.role === "plan" ? viewedRun?.planText : undefined) ??
@@ -15176,6 +15614,22 @@ Javítsd ki, majd futtasd le újra a teszteket.`
               message.turnId === `request:${liveRunOuterRequestId}` &&
               !message.live,
           )?.text
+        : undefined) ??
+      // Utolsó mentsvár a szakaszok KÖZTI lyukra: a lezárt szakasz szövege
+      // marad a képernyőn, amíg a következő el nem indul. Szigorúan csak a
+      // `finished` fázisban — amint az új szakasz elindult (`started`), ez a
+      // kártya már az övé, és az előző szakasz ideragadt válasza pontosan az
+      // a bug volt, hogy a REVIEW alatt a KÓD szövege állt.
+      (pipelineProgress.phase !== "started" && liveRunStagePrefix
+        ? [...messages]
+            .reverse()
+            .find(
+              (message) =>
+                message.role === "assistant" &&
+                !message.live &&
+                Boolean(message.text.trim()) &&
+                message.turnId?.startsWith(liveRunStagePrefix),
+            )?.text
         : undefined))
     : undefined;
   // A szakasz „ül": a saját szövege lezárult, és már senki nem streamel.
@@ -15257,16 +15711,8 @@ Javítsd ki, majd futtasd le újra a teszteket.`
         <span
           className="pipeline-run-slider"
           aria-hidden="true"
-          style={{ transform: `translateX(${(liveShownStage + 1) * 100}%)` }}
+          style={{ transform: `translateX(${liveShownStage * 100}%)` }}
         />
-        <button
-          type="button"
-          className="pipeline-run-tab"
-          disabled
-          title="A válasz a lánc végén készül el"
-        >
-          VÁLASZ
-        </button>
         {liveRunStages.map((stage) => {
           // A szakasz akkor „fut", ha elindult és még nem jelentett vissza.
           // A `phase` eddig sehol nem számított, ezért egy befejezett kódolás
@@ -15305,6 +15751,16 @@ Javítsd ki, majd futtasd le újra a teszteket.`
             </button>
           );
         })}
+        {/* A szakaszok után, mert a futás is oda ér ki — és amíg tart, nincs
+            mit megnyitni alatta. */}
+        <button
+          type="button"
+          className="pipeline-run-tab"
+          disabled
+          title="A válasz a lánc végén készül el"
+        >
+          VÁLASZ
+        </button>
       </span>
       {liveRunResume && liveRunResume.iteration > 1 && (
         // Says which round is running, so a re-run is not mistaken for the
@@ -15321,6 +15777,9 @@ Javítsd ki, majd futtasd le újra a teszteket.`
       <TurnProgressCard
         runPosition="end"
         stageRole={liveRunStages[liveShownStage]?.role || undefined}
+        projectPath={activeProjectPath}
+        liveFiles
+        runStartedAt={viewedRun?.turnTiming?.startedAt}
         plan={
           planHistory[liveFinishedStageTurnId] ??
           (liveShownStage === 0
@@ -15390,6 +15849,9 @@ Javítsd ki, majd futtasd le újra a teszteket.`
           runPosition={pipelineProgress ? "end" : undefined}
           runHeader={liveRunHeader}
           stageRole={pipelineProgress?.role}
+          projectPath={activeProjectPath}
+          liveFiles
+          runStartedAt={viewedRun?.turnTiming?.startedAt}
           plan={activePlan}
           activities={
             pipelineProgress && liveTurnId

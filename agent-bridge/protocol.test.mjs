@@ -18,6 +18,7 @@ import {
   toolsForProfile,
 } from "./policy.mjs";
 import { collectProjectInstructions } from "./instructions.mjs";
+import { streamedStringField } from "./streamingJson.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import nodePath from "node:path";
@@ -423,4 +424,67 @@ test("an unknown or missing profile keeps the full set instead of failing a turn
   assert.deepEqual(toolsForProfile(undefined), ENABLED_TOOLS);
   assert.deepEqual(toolsForProfile("nonsense"), ENABLED_TOOLS);
   assert.deepEqual(toolsForProfile("full"), ENABLED_TOOLS);
+});
+
+/** Ahogy a modell küldi az eszköz bemenetét: darabokban, tetszőleges határokkal. */
+const feedJson = (chunks, field) => {
+  let buffer = "";
+  const seen = [];
+  for (const chunk of chunks) {
+    buffer += chunk;
+    const found = streamedStringField(buffer, field);
+    if (found) seen.push(found.value);
+  }
+  return { final: streamedStringField(buffer, field), seen };
+};
+
+test("the file being written grows with the deltas that carry it", () => {
+  const { final, seen } = feedJson(
+    ['{"file_path":"a.py","content":"pri', "nt(", '1)"}'],
+    "content",
+  );
+  assert.deepEqual(seen, ["pri", "print(", "print(1)"]);
+  assert.deepEqual(final, { value: "print(1)", complete: true });
+});
+
+test("a field that has not started yet is not an error, just nothing to show", () => {
+  assert.equal(streamedStringField('{"file_path":"a', "content"), null);
+  assert.deepEqual(streamedStringField('{"content":"félkész', "content"), {
+    value: "félkész",
+    complete: false,
+  });
+});
+
+test("escapes survive being cut in half by a chunk boundary", () => {
+  // A marker in one chunk, its meaning in the next: until it is whole, the
+  // earlier value is the truth — a half-read `\n` must not reach the panel.
+  assert.deepEqual(feedJson(['{"content":"a\\', 'nb"}'], "content").seen, [
+    "a",
+    "a\nb",
+  ]);
+  assert.deepEqual(feedJson(['{"content":"\\u00', 'e9"}'], "content").seen, [
+    "",
+    "é",
+  ]);
+});
+
+test("an escaped quote does not close the file being streamed", () => {
+  // Without this the rest of the file would be dropped at the first quote in
+  // the source code.
+  assert.deepEqual(streamedStringField('{"content":"a \\" b"}', "content"), {
+    value: 'a " b',
+    complete: true,
+  });
+});
+
+test("the edit's fields are read independently of each other", () => {
+  const buffer = '{"file_path":"src\\\\App.tsx","old_string":"a","new_string":"b';
+  assert.deepEqual(streamedStringField(buffer, "file_path"), {
+    value: "src\\App.tsx",
+    complete: true,
+  });
+  assert.deepEqual(streamedStringField(buffer, "new_string"), {
+    value: "b",
+    complete: false,
+  });
 });

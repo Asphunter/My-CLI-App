@@ -25,6 +25,7 @@ import {
   redactForDiagnostic,
 } from "./protocol.mjs";
 import { shouldStartFreshSession } from "./recovery.mjs";
+import { streamedStringField } from "./streamingJson.mjs";
 
 const activeRequests = new Map();
 const dispatchTasks = new Set();
@@ -654,6 +655,49 @@ function emitToolStarted(turn, block) {
   });
 }
 
+/**
+ * Az élő kódnézet adagja: amit a modell épp beír a fájlba.
+ *
+ * Csak akkor szólal meg, ha már tudjuk, melyik fájlról van szó — a `file_path`
+ * a séma szerint a tartalom előtt érkezik, tehát ez néhány deltán belül
+ * megvan. A tartalom onnantól minden darabbal nő; a felület a *teljes* eddigi
+ * szöveget kapja, nem a különbséget, mert a darabhatárokon átnyúló escape-ek
+ * miatt egy delta önmagában nem is mindig értelmes szöveg.
+ */
+function emitFileWriteDelta(turn, index, partialJson) {
+  if (index == null || typeof partialJson !== "string") return;
+  const write = turn.fileWrites.get(index);
+  if (!write) return;
+  write.json += partialJson;
+  if (!write.path) {
+    const path = streamedStringField(write.json, "file_path");
+    if (!path?.complete) return;
+    write.path = displayPath(path.value, turn.cwd);
+  }
+  // A `Write` a teljes tartalmat adja, az `Edit` a cserélendő és az új
+  // szöveget. A felület mindkettőből fájlt rajzol; a szerkesztésnél a lemezen
+  // álló tartalomra vetíti a foltot.
+  const content = streamedStringField(write.json, "content");
+  const oldString = streamedStringField(write.json, "old_string");
+  const newString = streamedStringField(write.json, "new_string");
+  if (!content && !newString) return;
+  emitAgentEvent(turn.request, turn.sessionId, "item/fileWrite/delta", {
+    itemId: write.id,
+    turnId: turn.sessionId,
+    item: {
+      id: write.id,
+      type: "fileWrite",
+      toolName: write.name,
+      filePath: write.path,
+      mode: content ? "write" : "edit",
+      content: content?.value,
+      oldString: oldString?.complete ? oldString.value : undefined,
+      newString: newString?.value,
+      streaming: !(content ?? newString).complete,
+    },
+  });
+}
+
 /** Turns a tool_result block into the completion of the call that caused it. */
 function emitToolCompleted(turn, block) {
   const id = typeof block?.tool_use_id === "string" ? block.tool_use_id : null;
@@ -739,6 +783,28 @@ function handleSdkEvent(turn, event) {
     // it later. That merge is what kept losing the file path in a chain. The
     // card is emitted once, from the complete assistant message below, which
     // still lands before the tool actually runs.
+    //
+    // A kártya tehát nem innen jön — az élő kódnézet viszont igen. A fájlírás
+    // tartalma pont ezekben a deltákban folyik, és ez az egyetlen hely, ahol
+    // *írás közben* látható. Külön csatornán megy: a munkanapló sorait nem
+    // szaporítja, csak a kódpanel olvassa.
+    if (raw.type === "content_block_start" && raw.content_block?.type === "tool_use") {
+      const name = raw.content_block.name;
+      if (FILE_CHANGE_TOOLS.has(name) && raw.index != null)
+        turn.fileWrites.set(raw.index, {
+          id: raw.content_block.id ?? randomUUID(),
+          name,
+          json: "",
+          path: null,
+        });
+      return;
+    }
+    if (raw.type === "content_block_delta" && delta.type === "input_json_delta") {
+      emitFileWriteDelta(turn, raw.index, delta.partial_json);
+      return;
+    }
+    if (raw.type === "content_block_stop" && raw.index != null)
+      turn.fileWrites.delete(raw.index);
     return;
   }
   if (event?.type === "assistant") {
@@ -968,6 +1034,10 @@ async function runLiveTurn(request) {
     tasks: new Map(),
     taskKeyById: new Map(),
     lastActiveTaskKey: null,
+    // content_block index → a készülő fájlírás: az azonosítója, az eddig
+    // megérkezett nyers JSON és a fájl útvonala, amint kiderül. Ebből él az
+    // élő kódnézet, amíg a hívás tart; a blokk lezárásakor kiürül.
+    fileWrites: new Map(),
   };
   activeRequests.set(request.requestId, turn);
   // Without an explicit systemPrompt the SDK uses a minimal prompt that omits

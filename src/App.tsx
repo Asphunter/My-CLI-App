@@ -21,6 +21,20 @@ import katex from "katex";
 import { mathPattern, parseMath } from "./mathText";
 import { markdownTableAt } from "./markdownTable";
 import {
+  EMPTY_LIVE_FILES,
+  activeLiveFile,
+  applyEditToFile,
+  closeLiveFile,
+  followLiveFiles,
+  openLiveFiles,
+  reopenLiveFiles,
+  selectLiveFile,
+  touchLiveFile,
+  wholeFileHighlight,
+  type LiveFileState,
+  type LiveFileTouch,
+} from "./liveFiles";
+import {
   numberedPlanLines,
   numberedPlanSteps,
   planStepSlice,
@@ -4211,6 +4225,165 @@ const renderInlineMarkdown = (
   return parts;
 };
 
+/**
+ * Az élő kódnézet: amit a modell épp ír, abban a fájlban, ahol írja.
+ *
+ * A fülek gyűlnek — minden érintett fájl fent marad —, és a nézet magától a
+ * dolgozó fájlra áll. Egy kézi fülválasztás megállítja a követést, mert aki
+ * olvas valamit, azt ne rángassa el a következő fájl; a „Követés" gomb
+ * visszaadja. Olvasó nézet: futás közben a fájlt az ügynök írja, nem mi.
+ */
+function LiveCodePanel({
+  state,
+  open,
+  onToggle,
+  onSelect,
+  onClose,
+  onFollow,
+  onReopen,
+}: {
+  state: LiveFileState;
+  open: boolean;
+  onToggle: () => void;
+  onSelect: (path: string) => void;
+  onClose: (path: string) => void;
+  onFollow: () => void;
+  onReopen: () => void;
+}) {
+  const file = activeLiveFile(state);
+  const openFiles = openLiveFiles(state);
+  const hiddenCount = state.files.length - openFiles.length;
+  const codeRef = useRef<HTMLDivElement>(null);
+  const lines = useMemo(
+    // A színezés soronként fut: a fájl végére írt karakter így nem
+    // rajzoltatja újra az egész fájlt, csak az utolsó sorát.
+    () => (file?.content ?? "").split("\n"),
+    [file?.content],
+  );
+  // Írás közben a friss sor legyen a szem előtt — enélkül a panel a fájl
+  // elején állna, miközben a gépelés lent tart.
+  useEffect(() => {
+    if (!open || !file?.streaming) return;
+    const node = codeRef.current;
+    if (node) node.scrollTop = node.scrollHeight;
+  }, [open, file?.streaming, file?.content]);
+  if (state.files.length === 0) return null;
+  const writing = state.files.some((item) => item.streaming);
+  return (
+    <section className={`live-code-panel${open ? " is-open" : ""}`}>
+      <button
+        type="button"
+        className="live-code-toggle"
+        onClick={onToggle}
+        aria-expanded={open}
+      >
+        <span className="live-code-caret" aria-hidden="true">
+          {open ? "▾" : "▸"}
+        </span>
+        <strong>KÓD</strong>
+        <span className="live-code-count">
+          {`${state.files.length} fájl`}
+        </span>
+        {/* A fájl neve a fülön áll; ide az kerül, amit a fül nem mond meg. */}
+        {open && file && (
+          <span className="live-code-mode">
+            {file.mode === "write" ? "új tartalom" : "szerkesztés"}
+          </span>
+        )}
+        {writing && (
+          <span className="live-code-writing">
+            <span className="trace-answer-spinner" aria-hidden="true" />
+            írás…
+          </span>
+        )}
+      </button>
+      {open && (
+        <>
+          <div className="live-code-tabs" role="tablist">
+            {openFiles.map((item) => (
+              <span
+                key={item.path}
+                className={`live-code-tab${item.path === file?.path ? " is-active" : ""}${
+                  item.streaming ? " is-writing" : ""
+                }`}
+              >
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={item.path === file?.path}
+                  title={item.path}
+                  onClick={() => onSelect(item.path)}
+                >
+                  {item.path.split(/[\\/]/).pop()}
+                </button>
+                <button
+                  type="button"
+                  className="live-code-tab-close"
+                  aria-label={`${item.path} bezárása`}
+                  title="Fül bezárása"
+                  onClick={() => onClose(item.path)}
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+            <span className="live-code-tabs-actions">
+              {hiddenCount > 0 && (
+                // A bezárt fül nem törlés: a futás hozzányúlt a fájlhoz, és ez
+                // így is marad. Enélkül az utolsó X-szel a panel elérhetetlenné
+                // vált.
+                <button
+                  type="button"
+                  className="live-code-tab-action"
+                  onClick={onReopen}
+                  title="A bezárt fülek visszahozása"
+                >
+                  {`+${hiddenCount} vissza`}
+                </button>
+              )}
+              {!state.following && openFiles.length > 0 && (
+                // Csak akkor van értelme, ha a nézet tényleg le van horgonyozva.
+                <button
+                  type="button"
+                  className="live-code-tab-action is-follow"
+                  onClick={onFollow}
+                  title="Ugrás arra a fájlra, amelyiken a modell dolgozik"
+                >
+                  Követés
+                </button>
+              )}
+            </span>
+          </div>
+          {file ? (
+            <div className="live-code-lines" ref={codeRef}>
+              {lines.map((line, index) => {
+                const number = index + 1;
+                const changed =
+                  file.highlight &&
+                  number >= file.highlight.from &&
+                  number <= file.highlight.to;
+                return (
+                  <div
+                    key={`${file.path}-${number}`}
+                    className={`live-code-line${changed ? " is-changed" : ""}`}
+                  >
+                    <span className="live-code-number">{number}</span>
+                    <code>{line ? highlightCode(line) : " "}</code>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <p className="live-code-empty">
+              Minden fül be van zárva.
+            </p>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
 function InlineMarkdown({ text }: { text: string }) {
   const onFileClick = useContext(FileActionContext);
   return <>{renderInlineMarkdown(text, onFileClick ?? undefined)}</>;
@@ -7946,6 +8119,24 @@ function App() {
   const [queuedSendConversations, setQueuedSendConversations] = useState<
     string[]
   >([]);
+  // Az élő kódnézet fájljai beszélgetésenként. Nem perzisztál: ez a *munka
+  // közbeni* nézet, a lezárt futás változásait a fájllista és a diff mutatja.
+  const [liveFilesByConversation, setLiveFilesByConversation] = useState<
+    Record<string, LiveFileState>
+  >({});
+  // A szerkesztéshez a lemezen álló tartalom kell, hogy a folt fájlra
+  // vetülhessen. Futásonként egyszer olvassuk be fájlonként — a delták
+  // másodpercenként tucatjával jönnek, és mindegyiknél olvasni a lemezt
+  // értelmetlen. A `null` azt jelenti: olvastuk, nincs ilyen fájl (új fájl).
+  const liveFileBaseRef = useRef<Map<string, string | null>>(new Map());
+  // A delták gyorsabban jönnek, mint ahogy a React festeni tud; a képkockára
+  // adagolt írás ugyanaz a fogás, mint a válasz-stream `drainAnswerStream`-je.
+  const liveFilePendingRef = useRef<Map<string, LiveFileTouch>>(new Map());
+  const liveFileFrameRef = useRef<number | null>(null);
+  // A panel magától nyílik, amikor a modell írni kezd — ez a kérés lényege —,
+  // de a becsukás az olvasóé: ha egyszer összecsukta, a következő fájl nem
+  // nyitja ki újra a háta mögött.
+  const [liveCodeOpen, setLiveCodeOpen] = useState(true);
   const [isCancelling, setIsCancelling] = useState(false);
   // The model turn can be complete while the native command is still
   // finalizing the workspace snapshot. Keep the request locked during that
@@ -11886,6 +12077,24 @@ function App() {
         if (itemId && phase) run.agentMessagePhases[itemId] = phase;
       }
 
+      // Az élő kódnézet csatornája. Külön fut a munkanaplótól: a fájl írása
+      // közben másodpercenként tucatnyi adag érkezik, és ezekből *nem* lesz
+      // naplósor — a napló a műveletet könyveli, a panel a tartalmat mutatja.
+      if (codexEvent.eventType === "item/fileWrite/delta") {
+        const path = firstString(item.filePath, params.filePath);
+        if (path)
+          trackLiveFileWrite(ownerConversationId, {
+            path,
+            mode: firstString(item.mode) === "edit" ? "edit" : "write",
+            content: firstString(item.content),
+            oldString: firstString(item.oldString),
+            newString: firstString(item.newString),
+            streaming: item.streaming !== false,
+            sequence: nextTimelineSequence(),
+          });
+        return;
+      }
+
       if (codexEvent.eventType === "item/agentMessage/delta") {
         const deltaText = firstString(params.delta);
         const itemId = eventItemId(codexEvent, params, item);
@@ -12257,6 +12466,32 @@ function App() {
         writeOwnedWorkItems(ownerConversationId, (current) =>
           mergeCodeActivity(current, activityWithStep),
         );
+        // A ChatGPT nem karakterenként ír: kész foltot ad. Ugyanabba a panelbe
+        // kerül, csak nem gépel — a fül és a fájlnézet ugyanaz. A Claude
+        // fájljait a saját, élő csatornája hozza; itt a lezáró esemény már
+        // csak megerősítené ugyanazt.
+        if (
+          activityWithStep.kind === "file" &&
+          run.provider !== "anthropic" &&
+          (activityWithStep.afterCode?.trim() ||
+            activityWithStep.code?.trim())
+        ) {
+          const livePath = relativeChangePath(
+            activityWithStep.detail,
+            runProjectPathRef.current || activeProjectPathRef.current,
+          );
+          const content =
+            activityWithStep.afterCode ?? activityWithStep.code ?? "";
+          if (livePath)
+            queueLiveFile(ownerConversationId, {
+              path: livePath,
+              content,
+              streaming: false,
+              mode: activityWithStep.beforeCode ? "edit" : "write",
+              highlight: wholeFileHighlight(content),
+              sequence: activityWithStep.id,
+            });
+        }
         const filePath = extractFilePath(codexEvent.payload);
         if (
           !activityWithStep.code &&
@@ -13762,6 +13997,131 @@ function App() {
    * ugyanazon az ajtón megy be, mint a kézi Enter: a csatolmányok, idézetek és a
    * mód is az, ami a szerkesztőben van.
    */
+  /**
+   * Az élő fájlok írása képkockánként.
+   *
+   * Egy fájlnak egy adagja marad függőben: a delta a *teljes* eddigi tartalmat
+   * hozza, tehát az újabb mindig érvényteleníti a régebbit. Így egy 500 soros
+   * fájl gépelése is annyi rendert csinál, ahány képkocka — nem annyit, ahány
+   * karakter.
+   */
+  const flushLiveFiles = () => {
+    liveFileFrameRef.current = null;
+    const pending = [...liveFilePendingRef.current.entries()];
+    liveFilePendingRef.current.clear();
+    if (pending.length === 0) return;
+    setLiveFilesByConversation((current) => {
+      const next = { ...current };
+      for (const [key, touch] of pending) {
+        const [conversationId] = key.split(" ");
+        next[conversationId] = touchLiveFile(
+          next[conversationId] ?? EMPTY_LIVE_FILES,
+          touch,
+        );
+      }
+      return next;
+    });
+  };
+
+  const queueLiveFile = (
+    conversationId: string | null | undefined,
+    touch: LiveFileTouch,
+  ) => {
+    if (!conversationId) return;
+    liveFilePendingRef.current.set(`${conversationId} ${touch.path}`, touch);
+    if (liveFileFrameRef.current === null)
+      liveFileFrameRef.current = window.requestAnimationFrame(flushLiveFiles);
+  };
+
+  /**
+   * Egy fájlművelet vetülete az élő nézetre.
+   *
+   * `Write` esetén a tartalom maga a fájl. `Edit` esetén a modell csak a
+   * cserélendő és az új szöveget adja: a fájlt a lemezről olvassuk hozzá, és
+   * arra illesztjük a foltot — így a fülön a *fájl* áll, nem egy kiszakított
+   * részlet. Ha a keresett szöveg nincs meg a lemezen, a folt önmagában
+   * jelenik meg; félrevezető fájlt nem rajzolunk.
+   */
+  const trackLiveFileWrite = (
+    conversationId: string | null | undefined,
+    write: {
+      path: string;
+      mode: "write" | "edit";
+      content?: string;
+      oldString?: string;
+      newString?: string;
+      streaming: boolean;
+      sequence: number;
+    },
+  ) => {
+    if (!conversationId || !write.path) return;
+    if (write.mode === "write") {
+      const content = write.content ?? "";
+      queueLiveFile(conversationId, {
+        path: write.path,
+        content,
+        streaming: write.streaming,
+        mode: "write",
+        highlight: wholeFileHighlight(content),
+        sequence: write.sequence,
+      });
+      return;
+    }
+    const newString = write.newString ?? "";
+    const showPatch = () =>
+      queueLiveFile(conversationId, {
+        path: write.path,
+        content: newString,
+        streaming: write.streaming,
+        mode: "edit",
+        highlight: wholeFileHighlight(newString),
+        sequence: write.sequence,
+      });
+    // A csere két fele közül a keresett szövegnek teljesnek kell lennie,
+    // különben nincs mire illeszteni; addig a beírt rész önmagában látszik.
+    if (!write.oldString) {
+      showPatch();
+      return;
+    }
+    const baseKey = `${conversationId} ${write.path}`;
+    const known = liveFileBaseRef.current.get(baseKey);
+    const project = (base: string | null) => {
+      const applied =
+        base === null
+          ? null
+          : applyEditToFile(base, write.oldString ?? "", newString);
+      if (!applied) {
+        showPatch();
+        return;
+      }
+      queueLiveFile(conversationId, {
+        path: write.path,
+        content: applied.content,
+        streaming: write.streaming,
+        mode: "edit",
+        highlight: applied.highlight,
+        sequence: write.sequence,
+      });
+    };
+    if (known !== undefined) {
+      project(known);
+      return;
+    }
+    // Amíg a lemez válaszol, a folt látszik — a fülnek nem kell megvárnia.
+    showPatch();
+    void invoke<string | null>("read_code_file", {
+      cwd: runProjectPathRef.current || activeProjectPathRef.current,
+      path: write.path,
+    })
+      .then((base) => {
+        liveFileBaseRef.current.set(baseKey, base ?? null);
+        project(base ?? null);
+      })
+      .catch(() => {
+        liveFileBaseRef.current.set(baseKey, null);
+      });
+  };
+
   const releaseQueuedSend = (conversationId: string | null | undefined) => {
     // Az azonosító nélküli beszélgetés kulcsa az üres füzér — a sorban állás
     // ott is valódi, tehát a feloldásnak is meg kell találnia. A korábbi
@@ -16205,6 +16565,34 @@ Javítsd ki, majd futtasd le újra a teszteket.`
   // going. The result was the whole answer blinking out of existence for a few
   // seconds at every hand-off. A chain is one panel from its first second to
   // its last, so a stage boundary is not a reason to take it down.
+  // Az élő kódnézet a képernyőn álló beszélgetésé — akkor is, ha a futás már
+  // véget ért: a munka végén is jogos megnézni, mi került a fájlokba.
+  const viewedLiveFiles =
+    liveFilesByConversation[activeConversationId ?? ""] ?? EMPTY_LIVE_FILES;
+  const updateViewedLiveFiles = (
+    change: (state: LiveFileState) => LiveFileState,
+  ) => {
+    const id = activeConversationId ?? "";
+    setLiveFilesByConversation((current) => ({
+      ...current,
+      [id]: change(current[id] ?? EMPTY_LIVE_FILES),
+    }));
+  };
+  const liveCodePanel = (
+    <LiveCodePanel
+      state={viewedLiveFiles}
+      open={liveCodeOpen}
+      onToggle={() => setLiveCodeOpen((open) => !open)}
+      onSelect={(path) =>
+        updateViewedLiveFiles((state) => selectLiveFile(state, path))
+      }
+      onClose={(path) =>
+        updateViewedLiveFiles((state) => closeLiveFile(state, path))
+      }
+      onFollow={() => updateViewedLiveFiles(followLiveFiles)}
+      onReopen={() => updateViewedLiveFiles(reopenLiveFiles)}
+    />
+  );
   const liveTurnContent =
     activeMode === "coding" &&
     viewingActiveRun &&
@@ -16275,6 +16663,7 @@ Javítsd ki, majd futtasd le újra a teszteket.`
           }
         />
         )}
+        {liveCodePanel}
       </div>
     );
   // A re-run draws itself inside the panel it belongs to; everything else
@@ -17029,6 +17418,12 @@ Javítsd ki, majd futtasd le újra a teszteket.`
               : rerunInPlace
                 ? null
                 : liveTurnContent}
+            {/* A futás véget ért, de amit írt, az olvasható marad — a panel
+                ilyenkor a saját helyén áll, a lezárt kártya alatt. */}
+            {activeMode === "coding" &&
+              !liveTurnContent &&
+              viewedLiveFiles.files.length > 0 &&
+              liveCodePanel}
             {viewingActiveRun && !isAtBottom && (
               <button
                 type="button"

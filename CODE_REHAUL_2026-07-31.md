@@ -79,6 +79,23 @@ címkét adott — a hiba Claude-kapcsolati problémának álcázta magát.
 elszabadulás-védelem); a classifier felismeri a „maximum number of turns"
 szöveget, a hiba mostantól `turn_limit`-ként jelenik meg.
 
+### C6. A beszámozott Kockázatok pontok lépésként kerültek a LÉPÉSEK listára
+**Hely:** `src/planText.ts` (`numberedPlanLines`, `planStepSlice`,
+`planStepTitle`).
+
+A lista-kinyerő a terv MINDEN számozott sorát lépésnek vette. Amíg a modell a
+Kockázatokat kötőjelezte, ez láthatatlan volt; a 2026-07-31-i futásban viszont
+beszámozta őket, és a 8 lépés mellé 4 kockázat került a KÓD checklistjére
+(„1/12 kész"). Mellékleletek: a `planStepTitle` a szó belseji aláhúzást is
+kiemelésként nyelte le (`smith_tline_anim.py` → „smithtlineanim.py"), és a
+címeken maradt a mondatzáró pont.
+
+**Fix:** csak a leghosszabb, összefüggően (+1-esével) számozott, fejléccel
+meg nem szakított futam számít lépéslistának — a Kockázatok újra 1-ről indul
+és `##` cím előzi meg, tehát külön futam. Az utolsó lépés DETAIL-szelete a
+következő fejlécig tart. A cím csak a szóhatáron álló aláhúzást dobja el, és
+a záró pontot is levágja.
+
 ---
 
 ## KÖZEPES — dokumentálva, nem javítva

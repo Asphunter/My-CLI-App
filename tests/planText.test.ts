@@ -71,3 +71,45 @@ test("egy pont szelete a következő pontig tart", () => {
 test("számozott pont nélkül nincs lista", () => {
   assert.deepEqual(numberedPlanSteps("Csak folyó szöveg, felsorolás nélkül."), []);
 });
+
+// A 2026-07-31-i valódi terv alakja: a modell a Kockázatok pontjait is
+// beszámozta, és a 8 lépés mellé 4 kockázat került a LÉPÉSEK listára
+// („1/12 kész"). A lépés-futam összefüggően számozódik és nem szakítja meg
+// fejléc; a Kockázatok újra 1-ről indul, tehát külön futam.
+const PLAN_WITH_NUMBERED_RISKS = [
+  "## Terv",
+  "",
+  "1. **`smith_tline_anim.py` — váz és paraméterek.** Új fájl.",
+  "2. **`smith_tline_anim.py` — számító réteg.** Tiszta függvények.",
+  "3. **`smith_tline_anim.py` — háttér rajzolása.** Saját függvény.",
+  "4. **`README.md` — rövid használati leírás.** Új fájl.",
+  "",
+  "## Eltérés a feladattól",
+  "",
+  "Nincs.",
+  "",
+  "## Kockázatok",
+  "",
+  "1. **Két körbefordulás meglepetésként.** A helyes eredmény két kör.",
+  "2. **`tan` szingularitás** a negyedhullámnál.",
+  "3. **Mentési függőség**: mp4-hez ffmpeg kell.",
+].join("\n");
+
+test("a beszámozott kockázatok nem lépések", () => {
+  assert.deepEqual(
+    numberedPlanSteps(PLAN_WITH_NUMBERED_RISKS).map((step) => step.step),
+    [
+      "smith_tline_anim.py — váz és paraméterek",
+      "smith_tline_anim.py — számító réteg",
+      "smith_tline_anim.py — háttér rajzolása",
+      "README.md — rövid használati leírás",
+    ],
+  );
+});
+
+test("az utolsó lépés szelete a következő fejlécig tart, nem a kockázatokig", () => {
+  const slice = planStepSlice(PLAN_WITH_NUMBERED_RISKS, 3);
+  assert.ok(slice.startsWith("4. **`README.md`"));
+  assert.ok(!slice.includes("Kockázatok"));
+  assert.ok(!slice.includes("Eltérés"));
+});

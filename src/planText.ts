@@ -6,35 +6,78 @@
  * kódoló szakasz pedig ugyanezt a listát örökli. Egy szöveg, egy lista.
  */
 
-const NUMBERED_LINE = /^\d+[.)]\s+\S/;
+const NUMBERED_LINE = /^(\d+)[.)]\s+\S/;
+const HEADING_LINE = /^#{1,6}\s/;
 
 /** Legfeljebb ennyi pontot vesz át a lista — egy elszabadult felsorolás nem
  *  nyomhatja szét a panelt. */
 const MAX_STEPS = 12;
 
 /**
+ * A terv fő lépés-futamának sorindexei.
+ *
+ * A tervben nem csak a lépések számozottak: a Kockázatok szakasz pontjait is
+ * be szokta számozni a modell, és a „minden számozott sor lépés" olvasat a
+ * 8 lépés mellé 4-6 kockázatot is a LÉPÉSEK listára tett. Egy lépés-futam
+ * összefüggően számozódik (minden sor az előző +1), és nem szakítja meg
+ * fejléc — a Kockázatok újra 1-ről indul és `##` cím előzi meg, tehát külön
+ * futam. A leghosszabb futam a lépéslista; egyenlőségnél a korábbi.
+ */
+const mainStepRun = (lines: string[]): number[] => {
+  type NumberedRow = { index: number; number: number };
+  const runs: NumberedRow[][] = [];
+  let headingSinceLast = false;
+  for (const [index, line] of lines.entries()) {
+    const trimmed = line.trim();
+    if (HEADING_LINE.test(trimmed)) {
+      headingSinceLast = true;
+      continue;
+    }
+    const match = trimmed.match(NUMBERED_LINE);
+    if (!match) continue;
+    const number = Number(match[1]);
+    const current = runs[runs.length - 1];
+    const previous = current?.[current.length - 1];
+    if (previous && !headingSinceLast && number === previous.number + 1) {
+      current.push({ index, number });
+    } else {
+      runs.push([{ index, number }]);
+    }
+    headingSinceLast = false;
+  }
+  let best: NumberedRow[] = [];
+  for (const run of runs) if (run.length > best.length) best = run;
+  return best.slice(0, MAX_STEPS).map((row) => row.index);
+};
+
+/**
  * A terv szövegének az a szelete, ami az adott sorszámú ponthoz tartozik: a
- * számozott sorától a következő számozott sorig (vagy a szöveg végéig).
+ * számozott sorától a futam következő pontjáig; az utolsó pontnál a következő
+ * fejlécig vagy számozott sorig (hogy a Kockázatok ne ragadjon hozzá).
  */
 export const planStepSlice = (text: string, stepIndex: number) => {
   const lines = text.split(/\r?\n/);
-  const starts: number[] = [];
-  lines.forEach((line, index) => {
-    if (NUMBERED_LINE.test(line.trim())) starts.push(index);
-  });
+  const starts = mainStepRun(lines);
   if (stepIndex < 0 || stepIndex >= starts.length) return "";
   const from = starts[stepIndex];
-  const to = stepIndex + 1 < starts.length ? starts[stepIndex + 1] : lines.length;
+  let to = stepIndex + 1 < starts.length ? starts[stepIndex + 1] : lines.length;
+  if (stepIndex + 1 >= starts.length) {
+    for (let index = from + 1; index < lines.length; index += 1) {
+      const trimmed = lines[index].trim();
+      if (HEADING_LINE.test(trimmed) || NUMBERED_LINE.test(trimmed)) {
+        to = index;
+        break;
+      }
+    }
+  }
   return lines.slice(from, to).join("\n").trim();
 };
 
-/** A terv számozott sorai, nyersen — a lépés-következtetés ezekben keres. */
-export const numberedPlanLines = (text: string) =>
-  text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => NUMBERED_LINE.test(line))
-    .slice(0, MAX_STEPS);
+/** A terv lépés-futamának sorai, nyersen — a lépés-következtetés ezekben keres. */
+export const numberedPlanLines = (text: string) => {
+  const lines = text.split(/\r?\n/);
+  return mainStepRun(lines).map((index) => lines[index].trim());
+};
 
 /**
  * Egy terv-pont rövid címe. A pontok `1. **Cím** – hosszú magyarázat` alakúak;
@@ -51,9 +94,15 @@ export const planStepTitle = (line: string) => {
   // Vastag fej nélkül az első gondolatjel vagy kettőspont a cím határa. A
   // kötőjel csak szóközök között választ — a „Smith-chart" egy szó marad.
   const head = bold ? bold[1] : body.split(/\s+[–—]\s+|\s+-\s+|:\s+/)[0];
+  // A szó belseji aláhúzás nem kiemelés, hanem a név része: a
+  // `smith_tline_anim.py`-ból „smithtlineanim.py" lett a listán. Csak a
+  // szóhatáron álló (markdown-kiemelő) aláhúzás esik ki; a záró írásjelek
+  // közé a mondatzáró pont is beletartozik.
   const clean = head
-    .replace(/[`*_]/g, "")
-    .replace(/[\s:–—-]+$/, "")
+    .replace(/[`*]/g, "")
+    .replace(/(^|\s)_+/g, "$1")
+    .replace(/_+(\s|$)/g, "$1")
+    .replace(/[\s:.–—-]+$/, "")
     .trim();
   const title = clean || body.replace(/[`*]/g, "").trim();
   return title.length > 90 ? `${title.slice(0, 88).trimEnd()}…` : title;

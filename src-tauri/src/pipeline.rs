@@ -194,7 +194,11 @@ pub fn builtin_recipes() -> Vec<Recipe> {
             // hibával halt meg, és a kész munka visszagördült. A 120 továbbra
             // is elszabadulás-védelem, nem munkaplafon.
             claude(StageRole::Code, "claude-opus-5", "medium", 120),
-            codex(StageRole::Review, "gpt-5.6-sol", "medium", 15),
+            // A bíráló ugyanúgy checklistet vezet (TaskCreate/TaskUpdate), és
+            // fájlt olvas, tesztet futtat — a 15 kör a könyvelésre is kevés
+            // volt, és a szakasz „Reached maximum number of turns (15)"-tel
+            // halt meg. A limit itt is elszabadulás-védelem, nem munkaplafon.
+            codex(StageRole::Review, "gpt-5.6-sol", "medium", 120),
         ],
     }]
 }

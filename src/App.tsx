@@ -19,6 +19,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import katex from "katex";
 import { mathPattern, parseMath } from "./mathText";
+import { markdownTableAt } from "./markdownTable";
 import {
   numberedPlanLines,
   numberedPlanSteps,
@@ -969,25 +970,69 @@ const answerParagraphs = (text: string) =>
     .split(/\n{2,}/)
     .map((paragraph) => paragraph.trim())
     .filter(Boolean)
-    .map((paragraph, index) => {
+    .flatMap((paragraph, index) => {
       // A `## Cím` sor fejezetcím, nem szöveg: nyers kettőskeresztekkel a terv
       // RAW nézete olvashatatlan volt. Csak az egysoros bekezdés cím — egy
       // bekezdés belsejében a # mást jelent (pl. kódkomment).
       const heading = paragraph.match(/^(#{1,4})\s+(\S[^\n]*)$/);
       if (heading)
-        return (
+        return [
           <p
             key={`para-${index}`}
             className={`answer-heading answer-heading-${heading[1].length}`}
           >
             <InlineMarkdown text={heading[2]} />
-          </p>
+          </p>,
+        ];
+      // A bekezdés tartalmazhat táblát — akár egy bevezető mondat után is.
+      // A tábla sorai táblává állnak össze, a köztük lévő szöveg bekezdés
+      // marad; ha nincs tábla, ez pontosan a régi egy-bekezdés ág.
+      const lines = paragraph.split("\n");
+      const blocks: ReactNode[] = [];
+      let buffer: string[] = [];
+      const flushText = (key: string) => {
+        const body = buffer.join("\n").trim();
+        buffer = [];
+        if (body) blocks.push(<p key={key}><InlineMarkdown text={body} /></p>);
+      };
+      for (let line = 0; line < lines.length; ) {
+        const table = markdownTableAt(lines, line);
+        if (!table) {
+          buffer.push(lines[line]);
+          line += 1;
+          continue;
+        }
+        flushText(`para-${index}-text-${line}`);
+        blocks.push(
+          <div className="answer-table-wrap" key={`para-${index}-table-${line}`}>
+            <table className="answer-table">
+              <thead>
+                <tr>
+                  {table.header.map((cell, cellIndex) => (
+                    <th key={`h-${cellIndex}`}>
+                      <InlineMarkdown text={cell} />
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {table.rows.map((row, rowIndex) => (
+                  <tr key={`r-${rowIndex}`}>
+                    {table.header.map((_, cellIndex) => (
+                      <td key={`c-${cellIndex}`}>
+                        <InlineMarkdown text={row[cellIndex] ?? ""} />
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>,
         );
-      return (
-        <p key={`para-${index}`}>
-          <InlineMarkdown text={paragraph} />
-        </p>
-      );
+        line = table.end;
+      }
+      flushText(`para-${index}`);
+      return blocks;
     });
 
 const answerWithQuoteBacklinks = (
@@ -5816,6 +5861,12 @@ type TurnProgressCardProps = {
    * szakaszváltásánál nem indul újra a számlálás.
    */
   runStartedAt?: number;
+  /**
+   * A futás vége. Lezárt láncnál a fejléc órája eddig mér, így minden szakasz
+   * fülén ugyanaz a teljes futásidő olvasható; a szakasz saját ideje a
+   * LÉPÉSEK lista alján marad.
+   */
+  runCompletedAt?: number;
 };
 
 function TurnProgressCard({
@@ -5846,6 +5897,7 @@ function TurnProgressCard({
   projectPath,
   liveFiles,
   runStartedAt,
+  runCompletedAt,
 }: TurnProgressCardProps) {
   const quoteAnchor = (suffix: string) =>
     `${quoteAnchorPrefix}:${suffix}`;
@@ -6158,8 +6210,16 @@ function TurnProgressCard({
     // így a csonk pont a lényeget, magát a parancsot vágta le. Az előtag-
     // takarítás (cd, escape) után viszont ami sokáig tart, az tényleg hosszú:
     // a 400 karakter fölötti rész már nem olvasás, hanem görgetés.
-    const clipBullet = (value: string) =>
-      value.length > 400 ? `${value.slice(0, 400)}…` : value;
+    // Karakter- és sorplafon együtt: egy többsoros inline-script (python -c,
+    // heredoc) 400 karakterből is tucatnyi rövid sort rak ki, és a panelt a
+    // parancs törzse tölti meg a munka helyett. Az első sorok mutatják, mi
+    // indult; a többi a fájlban van, nem itt.
+    const clipBullet = (value: string) => {
+      const clipped =
+        value.length > 400 ? `${value.slice(0, 400)}…` : value;
+      const lines = clipped.split("\n");
+      return lines.length > 6 ? `${lines.slice(0, 6).join("\n")}\n…` : clipped;
+    };
     const toolBullet = (activity: CodeActivity) =>
       activity.kind === "command"
         ? `$ ${clipBullet(
@@ -6361,17 +6421,23 @@ function TurnProgressCard({
     (!streaming && Number.isFinite(inferredPlanCompletedAt)
       ? inferredPlanCompletedAt
       : undefined);
-  const elapsedEnd = streaming ? clockNow : completedAtForDisplay;
-  // A futó lánc órája a futás kezdetétől jár. A szakasz saját terve minden
-  // szakasznál újraindul, és az óra ezért nullázódott a TERV → KÓD → REVIEW
-  // váltásoknál — miközben az olvasó azt kérdezi, hogy „mióta megy ez az
-  // egész". A lezárt kártyák a saját szakaszuk idejét mutatják tovább.
-  const elapsedStart = streaming
-    ? (runStartedAt ?? startedAtForDisplay)
-    : startedAtForDisplay;
+  // A fejléc órája a futásé: az egész lánc kezdetétől az egész lánc végéig
+  // (élőben mostanáig). A szakaszváltás nem nullázza, és a lezárt kártya
+  // bármelyik fülén ugyanaz a teljes futásidő olvasható — a „mennyi ideig
+  // futott" kérdésre másutt nem volt válasz. A szakasz saját ideje nem vész
+  // el: a LÉPÉSEK lista alján, az Összesen sorban áll.
+  const elapsedEnd = streaming
+    ? clockNow
+    : (runCompletedAt ?? completedAtForDisplay);
+  const elapsedStart = runStartedAt ?? startedAtForDisplay;
   const overallElapsed =
     elapsedStart !== undefined && elapsedEnd !== undefined
       ? formatElapsed(Math.max(0, elapsedEnd - elapsedStart))
+      : "";
+  const stageElapsedEnd = streaming ? clockNow : completedAtForDisplay;
+  const stageElapsed =
+    startedAtForDisplay !== undefined && stageElapsedEnd !== undefined
+      ? formatElapsed(Math.max(0, stageElapsedEnd - startedAtForDisplay))
       : "";
   const hasAnswer = Boolean(answer?.text.trim());
   // A verdikt a kártya alján, színes sávként hangzik el; a nyers záró sor
@@ -6497,12 +6563,37 @@ function TurnProgressCard({
   const completedStepCount = countableSteps.filter(
     (step) => displayStatus(step) === "completed",
   ).length;
-  const reasoningCountFor = (stepId: string) =>
-    orderedActivities.filter(
+  /**
+   * Hány esemény esik erre a lépésre — ez a sávok száma.
+   *
+   * Korábban csak a `reasoning` aktivitások számítottak, és a Claude
+   * gondolkodása nem ilyenként érkezik: a narrációja commentary-ként jön, a
+   * munkája eszközhívásként. A sáv ezért Claude-nál mindig egyetlen vonal
+   * maradt, akkor is, amikor a panelben három sor állt — a ChatGPT-nél meg
+   * rendesen nőtt. A sáv attól sáv, hogy ugyanazt számolja, amit a
+   * GONDOLKODÁS MENETE mutat.
+   */
+  const reasoningCountFor = (stepId: string) => {
+    const stepItems = orderedActivities.filter((activity) =>
+      activityBelongsToStep(activity, stepId),
+    );
+    const thoughts = stepItems.filter(
       (activity) =>
-        activity.kind === "reasoning" &&
-        activityBelongsToStep(activity, stepId),
+        activity.kind === "reasoning" && Boolean(activity.body?.trim()),
     ).length;
+    const tools = stepItems.filter(
+      (activity) =>
+        (activity.kind === "file" ||
+          activity.kind === "command" ||
+          activity.kind === "tool") &&
+        Boolean(activity.detail?.trim()),
+    ).length;
+    const narration = commentary.filter(
+      (entry) =>
+        commentaryBelongsToStep(entry, stepId) && Boolean(entry.body?.trim()),
+    ).length;
+    return thoughts + tools + narration;
+  };
   const stepIndicator = (step: PlanStep) => {
     const currentStatus = displayStatus(step);
     if (currentStatus === "inProgress")
@@ -6877,10 +6968,10 @@ function TurnProgressCard({
                 );
               })}
             </div>
-            {overallElapsed && (
-              <div className="trace-total-elapsed" aria-label="Teljes gondolkodási idő">
+            {stageElapsed && (
+              <div className="trace-total-elapsed" aria-label="A szakasz teljes ideje">
                 <span>Összesen</span>
-                <time>{overallElapsed}</time>
+                <time>{stageElapsed}</time>
               </div>
             )}
           </section>
@@ -8642,8 +8733,19 @@ function App() {
     const timing = run?.turnTiming ?? activeTurnTimingRef.current;
     const startedAt = next.startedAt ?? timing.startedAt;
     const completedAt = next.completedAt ?? timing.completedAt;
-    if (startedAt !== undefined) timing.startedAt = startedAt;
-    if (completedAt !== undefined) timing.completedAt = completedAt;
+    // A futás órája a lánc egészéé: az első indulástól az utolsó zárásig.
+    // Korábban minden szakasz-terv commitja felülírta a kezdőidőt a sajátjával,
+    // ezért a fejléc órája a TERV → KÓD → REVIEW váltásnál nullázódott.
+    if (
+      startedAt !== undefined &&
+      (timing.startedAt === undefined || startedAt < timing.startedAt)
+    )
+      timing.startedAt = startedAt;
+    if (
+      completedAt !== undefined &&
+      (timing.completedAt === undefined || completedAt > timing.completedAt)
+    )
+      timing.completedAt = completedAt;
     return { ...next, startedAt, completedAt };
   };
 
@@ -13661,15 +13763,18 @@ function App() {
    * mód is az, ami a szerkesztőben van.
    */
   const releaseQueuedSend = (conversationId: string | null | undefined) => {
-    const id = conversationId?.trim();
-    if (!id || !queuedSendRef.current.delete(id)) return;
+    // Az azonosító nélküli beszélgetés kulcsa az üres füzér — a sorban állás
+    // ott is valódi, tehát a feloldásnak is meg kell találnia. A korábbi
+    // `if (!id) return` pont ezt a sort hagyta örökre bent.
+    const id = conversationId?.trim() ?? "";
+    if (!queuedSendRef.current.delete(id)) return;
     setQueuedSendConversations((current) =>
       current.filter((candidate) => candidate !== id),
     );
     // A sorban álló üzenet a *saját* beszélgetésében indul el. Ha közben
     // máshol vagyunk, a küldés nem itt történik meg — a szerkesztő tartalma a
     // beszélgetéssel utazik, tehát csak akkor küldhető, ha ott állunk.
-    if (id !== activeConversationIdRef.current) return;
+    if (id !== (activeConversationIdRef.current ?? "")) return;
     window.setTimeout(() => composerFormRef.current?.requestSubmit(), 0);
   };
 
@@ -13781,7 +13886,15 @@ function App() {
       notify("A GENERAL kepfeltoltes meg nincs bekapcsolva.", "notify");
       return;
     }
-    markSubmitBusy(activeConversationId, true);
+    // A zár kulcsa az, ami *most* van: egy első kérdésnél a beszélgetésnek még
+    // nincs azonosítója, tehát a kulcs "". A feloldás viszont a kanonikus
+    // azonosítót nevezte meg, amit csak lentebb kap meg a futás — a "" így
+    // örökre foglalt maradt, és onnantól minden ÚJ beszélgetés első küldése
+    // sorba állt egy rég véget ért futás mögé. A kulcsot végig visszük, és
+    // amint megvan a végleges azonosító, a zár átköltözik rá.
+    let submitBusyKey = activeConversationId;
+    const queuedOriginKey = activeConversationId ?? "";
+    markSubmitBusy(submitBusyKey, true);
     setImagesPreparing(true);
     let storedImages: MessageImageAttachment[] = [
       ...(pendingRegeneration?.source.images ?? []),
@@ -13801,7 +13914,7 @@ function App() {
         );
       }
     } catch (error) {
-      markSubmitBusy(activeConversationId, false);
+      markSubmitBusy(submitBusyKey, false);
       setImagesPreparing(false);
       notify(`A képcsatolmány nem menthető: ${String(error)}`, "notify");
       return;
@@ -13861,6 +13974,14 @@ function App() {
       localConversationCacheRef.current[requestThreadKey]?.id,
       createEntityId,
     );
+    // A zár átköltözik a végleges gazdára. A régi kulcs (első kérdésnél az
+    // üres) itt szabadul fel — különben a futás végi feloldás sosem találná
+    // meg, és a kulcs a következő új beszélgetést zárná ki.
+    if (submitBusyKey !== runConversationId) {
+      markSubmitBusy(submitBusyKey, false);
+      markSubmitBusy(runConversationId, true);
+      submitBusyKey = runConversationId;
+    }
     runProjectPathRef.current = isGeneralMode ? "" : activeProjectData.path;
     const previousMessages = mergeMessages(
       localConversationCacheRef.current[requestThreadKey]?.messages ?? [],
@@ -14657,6 +14778,10 @@ function App() {
       // találnak haza, tehát eldobódnak — nem pedig „mindenhová" írnak.
       endRun(requestId);
       releaseQueuedSend(runConversationId);
+      // Az első kérdés még azonosító nélküli kulcson állt sorba; az a sor is
+      // ezé a futásé, és vele együtt szabadul fel.
+      if (queuedOriginKey !== runConversationId)
+        releaseQueuedSend(queuedOriginKey);
     }
   };
 
@@ -15714,10 +15839,38 @@ Javítsd ki, majd futtasd le újra a teszteket.`
         </Fragment>
       );
     }
+    // Mennyi ideig futott a lánc: a szakaszok terveinek legkorábbi indulása és
+    // legkésőbbi zárása. A fejléc órája ebből mér, így bármelyik fülön ugyanaz
+    // a teljes futásidő áll — a szakasz saját ideje a LÉPÉSEK alján marad.
+    const chainPlans = stage
+      ? messages.flatMap((message, index) => {
+          if (message.role !== "assistant" || !message.pipeline) return [];
+          if (chainKeyOf(message.pipeline) !== chainKey) return [];
+          const group = workGroupForMessage(message, index);
+          const chainPlan = group
+            ? planForWorkGroup(group, message.turnId)
+            : message.turnId
+              ? planHistory[message.turnId]
+              : undefined;
+          return chainPlan ? [chainPlan] : [];
+        })
+      : [];
+    const chainStarts = [plan, ...chainPlans]
+      .map((item) => item.startedAt)
+      .filter((value): value is number => Number.isFinite(value));
+    const chainEnds = [plan, ...chainPlans]
+      .map((item) => item.completedAt)
+      .filter((value): value is number => Number.isFinite(value));
+    const chainStartedAt =
+      stage && chainStarts.length > 0 ? Math.min(...chainStarts) : undefined;
+    const chainCompletedAt =
+      stage && chainEnds.length > 0 ? Math.max(...chainEnds) : undefined;
     return (
       <TurnProgressCard
         key={entry.key}
         runPosition={stage ? "end" : undefined}
+        runStartedAt={chainStartedAt}
+        runCompletedAt={chainCompletedAt}
         runTone={
           groupAnswer.pipeline?.verdict
             ? groupAnswer.pipeline.verdict === "accepted"
@@ -15997,6 +16150,7 @@ Javítsd ki, majd futtasd le újra a teszteket.`
         projectPath={activeProjectPath}
         liveFiles
         runStartedAt={viewedRun?.turnTiming?.startedAt}
+        runCompletedAt={viewedRun?.turnTiming?.completedAt}
         plan={
           planHistory[liveFinishedStageTurnId] ??
           (liveShownStage === 0
@@ -16069,6 +16223,7 @@ Javítsd ki, majd futtasd le újra a teszteket.`
           projectPath={activeProjectPath}
           liveFiles
           runStartedAt={viewedRun?.turnTiming?.startedAt}
+          runCompletedAt={viewedRun?.turnTiming?.completedAt}
           plan={activePlan}
           activities={
             pipelineProgress && liveTurnId

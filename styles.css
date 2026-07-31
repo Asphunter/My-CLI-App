@@ -345,7 +345,7 @@ button { color: inherit; border: 0; cursor: pointer; }
 /* A KaTeX törtjeinek tintája ~0.25em-mel a sordoboz fölé nyúlik, és az
    overflow-y: hidden pont a tört tetejét csípte le. A párnázás mérten fedi:
    em-ben, hogy nagyobb betűnél is elég maradjon. */
-.inline-math.is-display { display: block; overflow-x: auto; overflow-y: hidden; max-width: 100%; margin: 6px 0; padding: .45em 0 .4em; white-space: normal; }
+.inline-math.is-display { display: block; overflow-x: auto; overflow-y: hidden; max-width: 100%; margin: 2px 0; padding: .45em 0 .4em; white-space: normal; }
 .inline-math.is-display .katex-display { margin: 0; text-align: left; }
 .inline-math.is-raw { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .94em; color: #d69d72; white-space: pre-wrap; }
 .inline-file-link { display: inline; margin: 0; padding: 1px 4px; border: 1px solid #496050; border-radius: 4px; background: rgba(25, 58, 45, .72); color: #b8efd0; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .94em; text-decoration: underline; text-decoration-color: rgba(184, 239, 208, .45); text-underline-offset: 2px; }
@@ -1008,8 +1008,22 @@ textarea::placeholder { color: var(--faint); }
    túlra feszült, a jobb kerettel és a RAW/DETAIL váltóval együtt. */
 .trace-thinking-panel { min-width: 0; }
 .trace-plan-content { min-width: 0; }
-.trace-plan-content p { overflow-wrap: anywhere; }
+/* A bekezdés-margó itt a böngésző öröksége volt (1em fent-lent), és a rács
+   8px-es gap-jével összeadódva a sorok — főleg a display-képletek — között
+   aránytalan rés nyílt. A köz a rácsé, a bekezdésé semmi. */
+.trace-plan-content p { margin: 0; overflow-wrap: anywhere; }
 .trace-plan-content .inline-code { white-space: normal; overflow-wrap: anywhere; }
+
+/* Markdown-tábla a válaszban és a terv RAW nézetében. A saját görgetője azért
+   kell, hogy egy széles tábla se feszítse szét a kártyát. */
+.answer-table-wrap { max-width: 100%; overflow-x: auto; margin: 4px 0; scrollbar-width: thin; scrollbar-color: #2b3946 transparent; }
+.answer-table { border-collapse: collapse; width: auto; min-width: min(100%, 320px); font-size: 10px; line-height: 1.45; }
+.answer-table th, .answer-table td { padding: 3px 8px; border: 1px solid var(--border-soft); text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+.answer-table th { background: rgba(48, 55, 62, .38); color: var(--text); font-weight: 650; }
+.answer-table td { color: inherit; }
+.answer-table tbody tr:nth-child(even) td { background: rgba(48, 55, 62, .16); }
+/* A cellában a bekezdés-szabályok (pre-wrap, margó) széttolnák a sort. */
+.answer-table p { margin: 0; white-space: normal; }
 
 /* A `##` fejezetcímek a válaszban és a terv RAW nézetében: cím, nem szöveg. */
 .answer-heading { color: var(--text); font-weight: 700; letter-spacing: .02em; }

@@ -371,6 +371,14 @@ test("connection failures retain provider-specific error classes", () => {
   assert.equal(classifyConnectionError("HTTP 429 rate limit"), "rate_limited");
   assert.equal(classifyConnectionError("max budget exceeded"), "budget_exceeded");
   assert.equal(classifyConnectionError("max_turns reached"), "turn_limit");
+  // Az SDK szó szerinti hibaszövege — connection_failed-ként jelent meg,
+  // és a felhasználó a Claude kapcsolatára gyanakodott a saját limitünk miatt.
+  assert.equal(
+    classifyConnectionError(
+      "Claude Code returned an error result: Reached maximum number of turns (40)",
+    ),
+    "turn_limit",
+  );
   assert.equal(classifyConnectionError("SessionStore timed out"), "timeout");
   assert.equal(classifyConnectionError("request cancelled"), "cancelled");
   assert.equal(classifyConnectionError("Claude bridge closed its stdout"), "bridge_crashed");

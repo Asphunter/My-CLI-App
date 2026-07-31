@@ -63,6 +63,22 @@ Ezek felhasználónak megjelenő hibaüzenetek.
 `Ã­`→`í`, `Ã³`→`ó`, `Ã¶`→`ö`, `Ã¼`→`ü`, `Ãº`→`ú`, `Ã`→`Á` stb.), csak
 string-literálokban.
 
+### C5. A KÓD szakasz 40 körnél kifullad, és „connection_failed"-nek látszik
+**Hely:** `src-tauri/src/pipeline.rs` (recept: `max_turns: 40`),
+`agent-bridge/errors.mjs` (classifier).
+
+Két hiba fedte egymást. (1) A kódoló szakasz plafonja 40 SDK-kör volt, de a
+lépéskövetési protokoll (TaskUpdate minden lépés előtt és után) nyolc lépésnél
+önmagában ~16 kört visz el — valódi feladaton a szakasz rendre elérte a
+plafont, a lánc leállt, a részmunka visszagördült. (2) Az SDK szó szerinti
+hibája („Reached maximum number of turns (40)") a classifier egyik
+`turn_limit` mintájára sem illeszkedett, így a fallback **connection_failed**
+címkét adott — a hiba Claude-kapcsolati problémának álcázta magát.
+
+**Fix:** a KÓD szakasz plafonja 120 (a 200-as hard ceiling alatt, továbbra is
+elszabadulás-védelem); a classifier felismeri a „maximum number of turns"
+szöveget, a hiba mostantól `turn_limit`-ként jelenik meg.
+
 ---
 
 ## KÖZEPES — dokumentálva, nem javítva

@@ -13,7 +13,14 @@ export function classifyConnectionError(message) {
   if (/402|payment|billing|credit|balance/.test(text)) return "billing";
   if (/429|rate.?limit|too many requests/.test(text)) return "rate_limited";
   if (/max[_ -]?budget|budget.?exceed|budget/.test(text)) return "budget_exceeded";
-  if (/max[_ -]?turns|turns?\s+(?:limit|max)|turn[_ -]?limit/.test(text)) {
+  // Az SDK szó szerinti szövege: "Reached maximum number of turns (40)" —
+  // a rövid alakok mellett ezt is fel kell ismerni, különben a fallback
+  // connection_failed-et mond, és a felhasználó a kapcsolatra gyanakszik.
+  if (
+    /max[_ -]?turns|turns?\s+(?:limit|max)|turn[_ -]?limit|maximum number of turns/.test(
+      text,
+    )
+  ) {
     return "turn_limit";
   }
   if (/timeout|timed out|time.?out|idle|id.{0,4}t.{0,6}ll/.test(text)) return "timeout";

@@ -187,7 +187,13 @@ pub fn builtin_recipes() -> Vec<Recipe> {
             // at the same level rather than one straining while the other
             // coasts.
             claude(StageRole::Plan, "claude-opus-5", "medium", 15),
-            claude(StageRole::Code, "claude-opus-5", "medium", 40),
+            // A kódoló körönként eszközt hív: a lépéskövetés (TaskUpdate a
+            // lépés előtt és után) nyolc lépésnél önmagában ~16 kör, mellé az
+            // olvasás, szerkesztés, tesztfuttatás. A 40 valódi feladaton
+            // rendre elfogyott — a szakasz „Reached maximum number of turns"
+            // hibával halt meg, és a kész munka visszagördült. A 120 továbbra
+            // is elszabadulás-védelem, nem munkaplafon.
+            claude(StageRole::Code, "claude-opus-5", "medium", 120),
             codex(StageRole::Review, "gpt-5.6-sol", "medium", 15),
         ],
     }]

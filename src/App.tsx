@@ -79,6 +79,13 @@ import {
 } from "./agentEvent";
 import { ensureCanonicalConversationId } from "./conversationIdentity";
 import { agentAnswerMessageId } from "./deterministicId";
+import CompactAnswersTimeline from "./CompactAnswersTimeline";
+import {
+  buildCompactAnswerTimeline,
+  looksHungarianNarrative,
+  type CompactAnswerBlock,
+  type CompactTraceEvent,
+} from "./compactAnswerTimeline";
 import {
   conversationIdForKey,
   conversationKeyIndex,
@@ -623,6 +630,8 @@ type CommentaryEntry = {
   stepId?: string;
   /** Monotonic client sequence used to merge commentary with internal reasoning. */
   sequence?: number;
+  /** Provider-normalized display lane for compact, non-detailed runs. */
+  channel?: "assistant-output" | "reasoning-summary" | "status";
   body: string;
   status: "running" | "done" | "error";
   time: string;
@@ -1025,7 +1034,7 @@ const answerTextParagraphs = (
     .split(/\n{2,}/)
     .map((paragraph) => paragraph.trim())
     .filter(Boolean)
-    .flatMap((paragraph, index) => {
+    .map((paragraph, index): ReactNode[] => {
       // A `## Cím` sor fejezetcím, nem szöveg: nyers kettőskeresztekkel a terv
       // RAW nézete olvashatatlan volt. Csak az egysoros bekezdés cím — egy
       // bekezdés belsejében a # mást jelent (pl. kódkomment).
@@ -1129,7 +1138,8 @@ const answerTextParagraphs = (
       }
       flushText(`${keyPrefix}-para-${index}`);
       return blocks;
-    });
+    })
+    .flat();
 
 /** Render full answer Markdown without dropping executable instructions. */
 const answerParagraphs = (
@@ -1165,18 +1175,11 @@ const answerParagraphs = (
       return;
     }
     blocks.push(
-      <section
-        className="code-block answer-code-block"
+      <AnswerCodeBlock
+        code={block.code}
+        language={block.language}
         key={`answer-code-${index}`}
-      >
-        <div className="code-header">
-          <span>KÓD</span>
-          <span>{block.language}</span>
-        </div>
-        <pre>
-          <code>{highlightCode(block.code)}</code>
-        </pre>
-      </section>,
+      />,
     );
   });
   const unmatchedQuotes = quoteRefs.filter((quote) =>
@@ -1190,6 +1193,45 @@ const answerParagraphs = (
     );
   return blocks;
 };
+
+function AnswerCodeBlock({
+  code,
+  language,
+}: {
+  code: string;
+  language: string;
+}) {
+  const [copied, setCopied] = useState(false);
+  const copyCode = async () => {
+    try {
+      await writeTextToClipboard(code);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1400);
+    } catch {
+      setCopied(false);
+    }
+  };
+  return (
+    <section className="code-block answer-code-block">
+      <div className="code-header">
+        <span>KÓD</span>
+        <span className="answer-code-language">{language}</span>
+        <button
+          type="button"
+          className="answer-code-copy"
+          aria-label={copied ? "Kód másolva" : "Kód másolása"}
+          title={copied ? "Másolva" : "Kód másolása"}
+          onClick={() => void copyCode()}
+        >
+          <span aria-hidden="true">{copied ? "✓" : "⧉"}</span>
+        </button>
+      </div>
+      <pre>
+        <code>{highlightCode(code)}</code>
+      </pre>
+    </section>
+  );
+}
 
 const answerWithQuoteBacklinks = (
   text: string,
@@ -3228,6 +3270,12 @@ const loadThreadCommentary = (key: string): CommentaryEntry[] => {
               turnId: typeof raw.turnId === "string" ? raw.turnId : undefined,
               stepId: typeof raw.stepId === "string" ? raw.stepId : undefined,
               sequence: Number.isFinite(sequence) ? sequence : undefined,
+              channel:
+                raw.channel === "assistant-output" ||
+                raw.channel === "reasoning-summary" ||
+                raw.channel === "status"
+                  ? raw.channel
+                  : undefined,
               body: raw.body,
               status:
                 raw.status === "done" || raw.status === "error"
@@ -7013,6 +7061,165 @@ function TurnProgressCard({
   const openInlineDiff = (activity: CodeActivity) =>
     setInlineDiff(inlineCodeDiffForActivity(activity));
 
+  const compactTurnId =
+    answer?.turnId ??
+    commentary.find((entry) => entry.turnId)?.turnId ??
+    activities.find((activity) => activity.turnId)?.turnId;
+  const durableReasoningBodies = new Set(
+    activities
+      .filter((activity) => activity.kind === "reasoning")
+      .map((activity) => activity.body?.trim())
+      .filter((body): body is string => Boolean(body)),
+  );
+  const compactTraceCommentary = commentary.filter(
+    (entry) =>
+      entry.body.trim() &&
+      !durableReasoningBodies.has(entry.body.trim()),
+  );
+  const compactOneLine = (value: string, maxLength = 132) => {
+    const normalized = value.replace(/\s+/g, " ").trim();
+    return normalized.length > maxLength
+      ? `${normalized.slice(0, maxLength - 1).trimEnd()}…`
+      : normalized;
+  };
+  const compactTraceText = (activity: CodeActivity) => {
+    if (activity.kind === "reasoning") {
+      // The compact view exposes concise provider summaries, never the raw
+      // extended-thinking transcript. Claude's durable thinking commonly has
+      // bold summary headings; without one the neutral activity label is safer.
+      const summaries = [...(activity.body ?? "").matchAll(/\*\*([^*]+)\*\*/g)]
+        .map((match) => match[1].trim())
+        .filter(Boolean);
+      return summaries.at(-1) ?? activity.label;
+    }
+    if (activity.kind === "command")
+      return `$ ${stripLeadingCdPrefix(
+        unescapeDoubledBackslashes(activity.detail),
+      )}`;
+    if (activity.kind === "file") return `Fájl — ${activity.detail}`;
+    if (activity.kind === "tool") return toolCallBullet(activity);
+    return activity.body?.trim() || activity.detail.trim() || activity.label;
+  };
+  const compactCommandSummary = (activity: CodeActivity) => {
+    let command = stripLeadingCdPrefix(
+      unescapeDoubledBackslashes(activity.detail),
+    ).trim();
+    command = command
+      .replace(/^"[^"]*powershell(?:\.exe)?"\s+-Command\s+/i, "")
+      .replace(/^powershell(?:\.exe)?\s+-Command\s+/i, "")
+      .replace(/^['"]|['"]$/g, "");
+    return `$ ${compactOneLine(command, 116)}`;
+  };
+  const compactActivityPresentation = (activity: CodeActivity) => {
+    const detail = compactTraceText(activity);
+    const presentation: CompactTraceEvent["presentation"] =
+      activity.kind === "reasoning"
+        ? looksHungarianNarrative(detail) && detail !== activity.label
+          ? "narrative"
+          : "reasoning"
+        : activity.kind;
+    const summary =
+      activity.kind === "command"
+        ? compactCommandSummary(activity)
+        : presentation === "narrative"
+          ? detail
+          : compactOneLine(detail);
+    return {
+      presentation,
+      summary,
+      detail:
+        presentation === "reasoning"
+          ? summary
+          : detail.trim() === summary.trim()
+            ? summary
+            : detail,
+      important:
+        activity.status === "error" ||
+        /approval|engedély|jóváhagy|question|kérdés/i.test(
+          `${activity.eventType} ${activity.label}`,
+        ),
+    };
+  };
+  const compactTraceRecords = new Map<
+    string,
+    { activity?: CodeActivity; commentary?: CommentaryEntry }
+  >();
+  const compactTrace: CompactTraceEvent[] = [];
+  for (const activity of activities) {
+    const id = `activity:${activity.id}`;
+    const display = compactActivityPresentation(activity);
+    compactTraceRecords.set(id, { activity });
+    compactTrace.push({
+      id,
+      turnId: activity.turnId,
+      sequence: activity.id,
+      kind: activity.kind === "reasoning" ? "internal" : "activity",
+      ...display,
+    });
+  }
+  compactTraceCommentary.forEach((entry, index) => {
+    const id = `commentary:${entry.id}`;
+    const text = entry.body.trim();
+    const narrative = looksHungarianNarrative(text);
+    const important =
+      entry.status === "error" ||
+      /approval|engedély|jóváhagy|question|kérdés|hiba|failed|error/i.test(text);
+    const summary = narrative ? text : compactOneLine(text);
+    compactTraceRecords.set(id, { commentary: entry });
+    compactTrace.push({
+      id,
+      turnId: entry.turnId,
+      kind:
+        entry.channel === "reasoning-summary" ? "internal" : "activity",
+      presentation: narrative
+        ? "narrative"
+        : entry.channel === "status"
+          ? "status"
+          : "reasoning",
+      summary,
+      detail: narrative || text === summary ? summary : text,
+      important,
+      sequence:
+        entry.sequence ??
+        (activities.at(-1)?.id ?? Date.now()) + (index + 1) / 1000,
+    });
+  });
+  const compactTimeline = buildCompactAnswerTimeline({
+    answers: [],
+    trace: compactTrace,
+    finalAnswer: hasAnswer
+      ? {
+          id: answer!.id ?? answerAnchorId,
+          turnId: answer!.turnId,
+          text: answerBodyText,
+          live: streaming,
+        }
+      : undefined,
+    streaming,
+    turnId: compactTurnId,
+  });
+  const renderCompactTraceAction = (
+    traceItem: CompactTraceEvent,
+  ): ReactNode => {
+    const activity = compactTraceRecords.get(traceItem.id)?.activity;
+    if (
+      !activity ||
+      (!activity.code && !activity.beforeCode && !activity.afterCode)
+    )
+      return null;
+    return (
+      <button
+        type="button"
+        className="trace-code-button"
+        onClick={() => openInlineDiff(activity)}
+        aria-label="Kóddiff megnyitása"
+        title="Kóddiff megnyitása"
+      >
+        &lt;/&gt;
+      </button>
+    );
+  };
+
   const runClasses =
     (runPosition ? ` in-run is-run-${runPosition}` : "") +
     (runTone ? ` is-verdict-${runTone}` : "");
@@ -7020,48 +7227,40 @@ function TurnProgressCard({
     return (
       <>
       {runHeader}
-      <article
-        className={`compact-answer-card${runClasses}`}
-        data-quote-selectable="true"
-        data-quote-anchor={answerAnchorId}
-        aria-label="Válasz"
-      >
-        <div className="compact-answer-header">
-          <strong>VÁLASZ</strong>
-          {stageBadge(answer?.pipeline)}
-          {(streaming || !runPosition) && (
-            <span>{streaming ? "készül" : "kész"}</span>
-          )}
-          {answerActions}
-        </div>
-        <div className="compact-answer-body">
-          <div className="compact-answer-line">
-            {hasAnswer && (
-              <div className="compact-answer-text">
-                {answerParagraphs(
-                  answerBodyText,
-                  answerQuoteRefs,
-                  onQuoteJump,
-                )}
-              </div>
+      <CompactAnswersTimeline
+        className={`compact-answer-card compact-answers-timeline${runClasses}`}
+        quoteAnchor={answerAnchorId}
+        blocks={compactTimeline}
+        streaming={streaming}
+        statusLabel={streaming ? "készül" : "kész"}
+        elapsed={overallElapsed}
+        badge={stageBadge(answer?.pipeline)}
+        actions={answerActions}
+        renderAnswer={(block: CompactAnswerBlock) => (
+          <div className="compact-answer-text">
+            {answerParagraphs(
+              block.text,
+              block.final ? answerQuoteRefs : [],
+              onQuoteJump,
             )}
-            {streaming && (
-              <span className="trace-answer-spinner" aria-label="Válasz készül" />
-            )}
-          </div>
-        </div>
-        {changeSummary.length > 0 && (
-          <div className="compact-answer-changes">
-            <ChangeSummaryPanel
-              files={changeSummary}
-              onRollback={onRollbackChanges}
-              rollbackBusy={rollbackBusy}
-              onPreviewImage={onPreviewImage}
-            />
           </div>
         )}
-        {runFooter}
-      </article>
+        renderTraceText={(text) => <InlineMarkdown text={text} />}
+        renderTraceAction={renderCompactTraceAction}
+        changes={
+          changeSummary.length > 0 ? (
+            <div className="compact-answer-changes">
+              <ChangeSummaryPanel
+                files={changeSummary}
+                onRollback={onRollbackChanges}
+                rollbackBusy={rollbackBusy}
+                onPreviewImage={onPreviewImage}
+              />
+            </div>
+          ) : null
+        }
+        footer={runFooter}
+      />
       </>
     );
   }
@@ -8421,10 +8620,18 @@ function App() {
   const pendingLocalMutationRef = useRef(false);
   const pendingRestoreSelectionRef = useRef<SyncTombstone | null>(null);
   const snapshotWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
+  // A restore mutates the canonical sync state outside React. While it is in
+  // flight, a debounced snapshot captured before the restore must not be
+  // allowed to publish the old tombstone again.
+  const snapshotWriteBlockedRef = useRef(false);
 
-  const markLocalMutation = () => {
+  const invalidatePendingSnapshotWrites = () => {
     projectMutationRevisionRef.current += 1;
     pendingLocalMutationRef.current = true;
+  };
+
+  const markLocalMutation = () => {
+    invalidatePendingSnapshotWrites();
     setLocalMutationRevision((current) => current + 1);
     // Pull must not merge a stale remote snapshot between the user's local
     // mutation and its debounced SQLite/journal write.
@@ -9763,6 +9970,26 @@ function App() {
       });
   };
 
+  const beginSnapshotProtectedSyncMutation = async () => {
+    snapshotWriteBlockedRef.current = true;
+    // Invalidate both a pending debounce timer and a save that is waiting in
+    // the queue. No React state update is triggered here: the old tombstone
+    // must not be captured by a new snapshot while restore is still running.
+    invalidatePendingSnapshotWrites();
+    setSyncReady(false);
+    await snapshotWriteQueueRef.current.catch(() => undefined);
+  };
+
+  const finishSnapshotProtectedSyncMutation = (
+    restoredTombstones?: SyncTombstone[],
+  ) => {
+    if (restoredTombstones) setTombstones(restoredTombstones);
+    snapshotWriteBlockedRef.current = false;
+    // Schedule one snapshot from the post-restore React state. This also
+    // makes a failed restore durable without resurrecting a stale queued one.
+    markLocalMutation();
+  };
+
   const restoreTombstone = async (tombstone: SyncTombstone) => {
     if (!isTauri || syncActionBusyRef.current) return;
     if (anyRunActive()) {
@@ -9801,6 +10028,8 @@ function App() {
     ];
 
     setRestoreBusyKey(busyKey);
+    let snapshotMutationStarted = false;
+    let snapshotMutationFinished = false;
     setSyncStatus("restore dry-run…");
     try {
       const previews: SyncRestorePreview[] = [];
@@ -9847,6 +10076,8 @@ function App() {
       syncActionBusyRef.current = true;
       setSyncStatus("restore…");
       let lastResult: SyncV2Result | null = null;
+      snapshotMutationStarted = true;
+      await beginSnapshotProtectedSyncMutation();
       for (const target of targets) {
         lastResult = await invoke<SyncV2Result>("sync_v2_restore_entity", {
           tombstone: target,
@@ -9856,6 +10087,8 @@ function App() {
         setSyncHealth(lastResult.health);
         setSyncWriteEnabled(lastResult.canWrite);
       }
+      finishSnapshotProtectedSyncMutation(lastResult?.snapshot.tombstones ?? []);
+      snapshotMutationFinished = true;
       pendingRestoreSelectionRef.current = tombstone;
       setSyncHealthOpen(false);
       setRetentionPreview(null);
@@ -9863,6 +10096,8 @@ function App() {
       setSyncReady(false);
       notify("A visszaállítás rögzítve; a Tree frissül…");
     } catch (error) {
+      if (snapshotMutationStarted && !snapshotMutationFinished)
+        finishSnapshotProtectedSyncMutation();
       setSyncStatus("restore hiba");
       markSyncHealthError("A restore dry-run vagy event írása nem sikerült.");
       notify(`A visszaállítás nem sikerült: ${String(error)}`, "notify");
@@ -9876,20 +10111,23 @@ function App() {
   const restoreProjectTombstones = async (
     project: Project,
     restoreConversations = false,
-  ) => {
-    if (!isTauri) return;
+  ): Promise<SyncV2Result | null> => {
+    if (!isTauri) return null;
+    if (syncActionBusyRef.current) return null;
     if (anyRunActive()) {
       setToast("Aktív válasz közben a Recovery restore szünetel.");
-      return;
+      return null;
     }
     const shouldRestore = (tombstone: SyncTombstone) =>
       (tombstone.entityType === "project" || restoreConversations) &&
       tombstoneMatchesProjectScope(tombstone, project);
 
+    let prefetchedResult: SyncV2Result | null = null;
     let candidates = tombstones.filter(shouldRestore);
     if (candidates.length === 0) {
       try {
         const pulled = await invoke<SyncV2Result>("sync_v2_pull");
+        prefetchedResult = pulled;
         setSyncHealth(pulled.health);
         setSyncWriteEnabled(pulled.canWrite);
         candidates = (pulled.snapshot.tombstones ?? []).filter(shouldRestore);
@@ -9897,10 +10135,10 @@ function App() {
         // This is a best-effort resurrection check. The normal sync poll can
         // retry it later without making a successful project creation fail.
         console.warn("Project tombstone check after creation failed", error);
-        return;
+        return null;
       }
     }
-    if (candidates.length === 0) return;
+    if (candidates.length === 0) return prefetchedResult;
 
     const uniqueCandidates = [
       ...new Map(
@@ -9914,25 +10152,38 @@ function App() {
     ];
 
     let restoredEvents = 0;
+    let lastResult: SyncV2Result | null = null;
+    let snapshotMutationStarted = false;
+    let snapshotMutationFinished = false;
+    syncActionBusyRef.current = true;
     try {
+      snapshotMutationStarted = true;
+      await beginSnapshotProtectedSyncMutation();
       for (const tombstone of uniqueCandidates) {
-        const result = await invoke<SyncV2Result>("sync_v2_restore_entity", {
+        lastResult = await invoke<SyncV2Result>("sync_v2_restore_entity", {
           tombstone,
         });
-        setSyncHealth(result.health);
-        setSyncWriteEnabled(result.canWrite);
-        setTombstones(result.snapshot.tombstones ?? []);
-        restoredEvents += result.writtenEvents;
+        setSyncHealth(lastResult.health);
+        setSyncWriteEnabled(lastResult.canWrite);
+        restoredEvents += lastResult.writtenEvents;
       }
+      finishSnapshotProtectedSyncMutation(lastResult?.snapshot.tombstones ?? []);
+      snapshotMutationFinished = true;
       setSyncStatus(restoredEvents > 0 ? "restore · journal" : "visszaállítva");
       setSyncReady(false);
       notify(`Korábbi törlési jelölés feloldva: ${project.name}`);
+      return lastResult ?? prefetchedResult;
     } catch (error) {
+      if (snapshotMutationStarted && !snapshotMutationFinished)
+        finishSnapshotProtectedSyncMutation();
       setSyncStatus("restore hiba");
       notify(
         `A projekt létrejött, de a korábbi törlési jelölés feloldása nem sikerült: ${String(error)}`,
       );
       console.warn("Project tombstone restore failed", error);
+      return null;
+    } finally {
+      syncActionBusyRef.current = false;
     }
   };
 
@@ -9945,13 +10196,18 @@ function App() {
 
   const hydrateProjectFromSync = async (
     fallback: Project,
+    prefetchedResult: SyncV2Result | null = null,
   ): Promise<HydratedProject | null> => {
     let result: SyncV2Result;
-    try {
-      result = await invoke<SyncV2Result>("sync_v2_pull");
-    } catch (error) {
-      console.warn("Existing project sync hydration failed", error);
-      return null;
+    if (prefetchedResult) {
+      result = prefetchedResult;
+    } else {
+      try {
+        result = await invoke<SyncV2Result>("sync_v2_pull");
+      } catch (error) {
+        console.warn("Existing project sync hydration failed", error);
+        return null;
+      }
     }
 
     const fallbackRelativePath =
@@ -11838,12 +12094,14 @@ function App() {
       !workspaceRoot ||
       !localStoreReady ||
       !localStoreWriteEnabled ||
+      snapshotWriteBlockedRef.current ||
       !pendingLocalMutationRef.current
     )
       return;
     const revisionAtSchedule = projectMutationRevisionRef.current;
     const pendingMutationAtSchedule = pendingLocalMutationRef.current;
     const timer = window.setTimeout(() => {
+      if (snapshotWriteBlockedRef.current) return;
       const currentProjects = projectsRef.current;
       const currentActiveProject = activeProjectRef.current;
       const currentActiveThread = activeThreadRef.current;
@@ -11986,7 +12244,11 @@ function App() {
         .then(async () => {
           // A debounced snapshot may have been queued before a newer Tree
           // mutation. Never let that stale snapshot archive the newer state.
-          if (projectMutationRevisionRef.current !== revisionAtSchedule) return;
+          if (
+            snapshotWriteBlockedRef.current ||
+            projectMutationRevisionRef.current !== revisionAtSchedule
+          )
+            return;
           setLocalStoreStatus("mentés…");
           const saved = normalizeLocalStoreSnapshot(
             await invoke<LocalStoreSnapshot>("local_store_save", {
@@ -12374,6 +12636,8 @@ function App() {
       if (codexEvent.eventType === "item/agentMessage/delta") {
         const deltaText = firstString(params.delta);
         const itemId = eventItemId(codexEvent, params, item);
+        const explicitChannel = firstString(params.channel, item.channel);
+        const itemType = firstString(item.type, params.itemType)?.toLowerCase();
         const phase =
           (itemId ? run.agentMessagePhases[itemId] : undefined) ??
           firstString(params.phase, item.phase);
@@ -12398,6 +12662,14 @@ function App() {
                   run.plan.source === "carried-plan"
                 ? undefined
                 : run.plan.steps.find((step) => step.status === "inProgress")?.id;
+            const channel: CommentaryEntry["channel"] =
+              explicitChannel === "assistant-output" ||
+              explicitChannel === "reasoning-summary" ||
+              explicitChannel === "status"
+                ? explicitChannel
+                : itemType === "reasoning"
+                  ? "reasoning-summary"
+                  : "assistant-output";
             writeOwnedCommentary(ownerConversationId, (current) => {
               const existingIndex = itemId
                 ? current.findIndex((entry) => entry.itemId === itemId)
@@ -12413,6 +12685,7 @@ function App() {
                     turnId: uiTurnId,
                     stepId,
                     sequence: sequence!,
+                    channel,
                     body: deltaText,
                     status: "running" as const,
                     time: "most",
@@ -12424,6 +12697,7 @@ function App() {
                       ...entry,
                       body: `${entry.body}${deltaText}`,
                       stepId: entry.stepId ?? stepId,
+                      channel: entry.channel ?? channel,
                     }
                   : entry,
               );
@@ -13906,8 +14180,8 @@ function App() {
           normalizePath(project.path) === normalizePath(selectedPath),
       );
       if (existing) {
-        await restoreProjectTombstones(existing);
-        const hydrated = await hydrateProjectFromSync(existing);
+        const restored = await restoreProjectTombstones(existing);
+        const hydrated = await hydrateProjectFromSync(existing, restored);
         if (hydrated) {
           applyHydratedProject(hydrated);
           notify(`Megnyitva: ${hydrated.selectedThread || hydrated.project.name}`);
@@ -13921,8 +14195,8 @@ function App() {
         projectNameFromPath(selectedPath),
         selectedPath,
       );
-      await restoreProjectTombstones(project);
-      const hydrated = await hydrateProjectFromSync(project);
+      const restored = await restoreProjectTombstones(project);
+      const hydrated = await hydrateProjectFromSync(project, restored);
       if (hydrated) {
         markProjectMutation();
         applyHydratedProject(hydrated);

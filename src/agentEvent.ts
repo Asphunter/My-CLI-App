@@ -102,6 +102,17 @@ export const normalizeAgentEventEnvelope = (
         ? "commentary"
         : "final_answer";
   }
+  if (
+    rawEventType === "assistant/reasoning_delta" &&
+    typeof nextPayload.channel !== "string"
+  )
+    nextPayload.channel = "reasoning-summary";
+  if (
+    rawEventType === "assistant/text_delta" &&
+    nextPayload.phase === "commentary" &&
+    typeof nextPayload.channel !== "string"
+  )
+    nextPayload.channel = "assistant-output";
 
   return {
     requestId:

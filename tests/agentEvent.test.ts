@@ -42,6 +42,21 @@ test("neutral and legacy copies share one sequence identity", () => {
   assert.equal(agentEventIdentity(neutral!), agentEventIdentity(legacy));
 });
 
+test("provider-neutral reasoning is normalized onto the compact trace lane", () => {
+  const event = normalizeAgentEventEnvelope({
+    requestId: "request-1",
+    sessionId: "session-1",
+    eventType: "assistant/reasoning_delta",
+    payload: { delta: "Rövid összefoglaló" },
+  });
+
+  assert.equal((event?.payload as { phase?: string }).phase, "commentary");
+  assert.equal(
+    (event?.payload as { channel?: string }).channel,
+    "reasoning-summary",
+  );
+});
+
 test("agent-event and codex-event terminal copies are exact-once", () => {
   const seen = new Set<string>();
   const terminal = {

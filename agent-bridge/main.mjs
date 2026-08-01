@@ -774,6 +774,7 @@ function handleSdkEvent(turn, event) {
         itemId: raw.index != null ? `thinking-${raw.index}` : "thinking",
         turnId: turn.sessionId,
         phase: "commentary",
+        channel: "reasoning-summary",
         item: { type: "reasoning", phase: "commentary" },
       });
     }
@@ -823,6 +824,7 @@ function handleSdkEvent(turn, event) {
         itemId: `commentary-${index}`,
         turnId: turn.sessionId,
         phase: "commentary",
+        channel: "assistant-output",
         item: { type: "agentMessage", phase: "commentary" },
       });
     }
@@ -858,6 +860,7 @@ function handleSdkEvent(turn, event) {
           itemId: `commentary-${index}`,
           turnId: turn.sessionId,
           phase: "commentary",
+          channel: "assistant-output",
           item: { type: "agentMessage", phase: "commentary" },
         });
       }
@@ -1169,6 +1172,7 @@ async function runLiveTurn(request) {
             delta: `A szolgáltatás túlterhelt. Újrapróbálom ${waitMs / 1000} másodperc múlva (${overloadRetries}/${MAX_OVERLOAD_RETRIES}).`,
             itemId: `overload-${overloadRetries}`,
             phase: "commentary",
+            channel: "status",
             item: { type: "reasoning", phase: "commentary" },
           });
           await new Promise((resolve) => setTimeout(resolve, waitMs));
@@ -1214,6 +1218,7 @@ async function runLiveTurn(request) {
         itemId: `commentary-${index}`,
         turnId: turn.sessionId,
         phase: "commentary",
+        channel: "assistant-output",
         item: { type: "agentMessage", phase: "commentary" },
       });
     }

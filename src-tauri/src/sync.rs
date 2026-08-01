@@ -41,6 +41,9 @@ const MAX_ANSWER_CHECKPOINT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CHECKPOINT_ANSWERS: usize = 512;
 const MAX_RETENTION_AUDIT_ENTRIES: usize = 64;
 const QUARANTINE_SCHEMA_VERSION: i64 = 1;
+const INCREMENTAL_DIRECTORY_CACHE_META_KEY: &str = "sync_incremental_directory_cache_v1";
+const LOCAL_REDUCER_CHECKPOINT_SCHEMA_VERSION: i64 = 1;
+const LOCAL_REDUCER_CHECKPOINT_META_KEY: &str = "sync_local_reducer_checkpoint_v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -413,7 +416,8 @@ struct JournalScan {
     snapshot: Option<CompactionSnapshot>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct EventRank {
     hlc: String,
     device_id: String,
@@ -435,14 +439,16 @@ impl PartialOrd for EventRank {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ProjectAccumulator {
     value: LocalProject,
     rank: EventRank,
     threads: BTreeSet<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ConversationAccumulator {
     value: ConversationEventPayload,
     rank: EventRank,
@@ -452,7 +458,47 @@ struct ConversationAccumulator {
     work_items: BTreeMap<String, (EventRank, LocalWorkItem)>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalReducerTombstoneCheckpoint {
+    rank: EventRank,
+    archived: bool,
+    payload: TombstoneEventPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalReducerCheckpoint {
+    schema_version: i64,
+    store_schema_version: i64,
+    compaction_snapshot_hash: Option<String>,
+    cursors: BTreeMap<String, RetentionCursor>,
+    projects: BTreeMap<String, ProjectAccumulator>,
+    conversations: BTreeMap<String, ConversationAccumulator>,
+    tombstones: Vec<LocalReducerTombstoneCheckpoint>,
+    project_aliases: BTreeMap<String, String>,
+    checkpoint_hash: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalReducerCheckpointHashInput<'a> {
+    schema_version: i64,
+    store_schema_version: i64,
+    compaction_snapshot_hash: &'a Option<String>,
+    cursors: &'a BTreeMap<String, RetentionCursor>,
+    projects: &'a BTreeMap<String, ProjectAccumulator>,
+    conversations: &'a BTreeMap<String, ConversationAccumulator>,
+    tombstones: &'a [LocalReducerTombstoneCheckpoint],
+    project_aliases: &'a BTreeMap<String, String>,
+}
+
 fn append_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn journal_scan_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
@@ -462,15 +508,97 @@ fn answer_checkpoint_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct IncrementalDirectoryStamp {
-    modified: Option<SystemTime>,
+    modified_nanos: Option<u64>,
     max_sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedIncrementalDirectoryCache {
+    root: String,
+    devices: BTreeMap<String, IncrementalDirectoryStamp>,
 }
 
 fn incremental_directory_cache() -> &'static Mutex<HashMap<PathBuf, IncrementalDirectoryStamp>> {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, IncrementalDirectoryStamp>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn system_time_nanos(value: SystemTime) -> Option<u64> {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+}
+
+fn hydrate_incremental_directory_cache(
+    root: &Path,
+    connection: &Connection,
+) -> Result<(), String> {
+    let stored = connection
+        .query_row(
+            "SELECT value FROM store_meta WHERE key = ?1",
+            params![INCREMENTAL_DIRECTORY_CACHE_META_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("A tartós journal-index nem olvasható: {error}"))?;
+    let Some(stored) = stored else {
+        return Ok(());
+    };
+    let Ok(persisted) = serde_json::from_str::<PersistedIncrementalDirectoryCache>(&stored) else {
+        // Ez csak gyorsítótár. Sérült vagy régi formátumnál a teljes, hiteles
+        // journal-szkennelés újraépíti anélkül, hogy a syncet blokkolná.
+        return Ok(());
+    };
+    if PathBuf::from(&persisted.root) != root {
+        return Ok(());
+    }
+    let events_root = root.join("events");
+    let mut cache = incremental_directory_cache()
+        .lock()
+        .map_err(|_| "A journal könyvtárindex memóriája sérült.".to_string())?;
+    for (device_id, stamp) in persisted.devices {
+        if Uuid::parse_str(&device_id).is_ok() {
+            cache.entry(events_root.join(device_id)).or_insert(stamp);
+        }
+    }
+    Ok(())
+}
+
+fn persist_incremental_directory_cache(
+    root: &Path,
+    connection: &Connection,
+) -> Result<(), String> {
+    let events_root = root.join("events");
+    let devices = incremental_directory_cache()
+        .lock()
+        .map_err(|_| "A journal könyvtárindex memóriája sérült.".to_string())?
+        .iter()
+        .filter_map(|(path, stamp)| {
+            if path.parent() != Some(events_root.as_path()) {
+                return None;
+            }
+            let device_id = path.file_name()?.to_str()?.to_string();
+            Some((device_id, stamp.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let value = serde_json::to_string(&PersistedIncrementalDirectoryCache {
+        root: root.to_string_lossy().to_string(),
+        devices,
+    })
+    .map_err(|error| format!("A tartós journal-index nem szerializálható: {error}"))?;
+    connection
+        .execute(
+            "INSERT INTO store_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![INCREMENTAL_DIRECTORY_CACHE_META_KEY, value],
+        )
+        .map_err(|error| format!("A tartós journal-index nem menthető: {error}"))?;
+    Ok(())
 }
 
 fn now_millis() -> u64 {
@@ -2009,7 +2137,7 @@ fn event_filename_sequence(path: &Path) -> Option<u64> {
         .and_then(|(sequence, _)| sequence.parse::<u64>().ok())
 }
 
-fn scan_journal_with_cursor_floor(
+fn scan_journal_with_cursor_floor_unlocked(
     root: &Path,
     importer_id: &str,
     cursor_floor: Option<&BTreeMap<String, RetentionCursor>>,
@@ -2057,9 +2185,10 @@ fn scan_journal_with_cursor_floor(
             }
         }
         let effective_cursor = newer_cursor(compacted_cursor, local_cursor);
-        let directory_modified = fs::metadata(&device_path)
+        let directory_modified_nanos = fs::metadata(&device_path)
             .and_then(|metadata| metadata.modified())
-            .ok();
+            .ok()
+            .and_then(system_time_nanos);
         if cursor_floor.is_some()
             && effective_cursor.is_some_and(|cursor| {
                 incremental_directory_cache()
@@ -2067,7 +2196,7 @@ fn scan_journal_with_cursor_floor(
                     .ok()
                     .and_then(|cache| cache.get(&device_path).cloned())
                     .is_some_and(|stamp| {
-                        stamp.modified == directory_modified
+                        stamp.modified_nanos == directory_modified_nanos
                             && cursor.sequence >= stamp.max_sequence
                     })
             })
@@ -2257,15 +2386,12 @@ fn scan_journal_with_cursor_floor(
             }
             events.insert(event.device_sequence, event);
         }
-        if cursor_floor.is_some()
-            && effective_cursor.is_some_and(|cursor| cursor.sequence >= max_filename_sequence)
-            && !scan.blocked_devices.contains(&source_device)
-        {
+        if cursor_floor.is_some() && !scan.blocked_devices.contains(&source_device) {
             if let Ok(mut cache) = incremental_directory_cache().lock() {
                 cache.insert(
                     device_path,
                     IncrementalDirectoryStamp {
-                        modified: directory_modified,
+                        modified_nanos: directory_modified_nanos,
                         max_sequence: max_filename_sequence,
                     },
                 );
@@ -2329,6 +2455,17 @@ fn scan_journal_with_cursor_floor(
     }
 
     Ok(scan)
+}
+
+fn scan_journal_with_cursor_floor(
+    root: &Path,
+    importer_id: &str,
+    cursor_floor: Option<&BTreeMap<String, RetentionCursor>>,
+) -> Result<JournalScan, String> {
+    let _guard = journal_scan_lock()
+        .lock()
+        .map_err(|_| "A journal-szkennelés zárolása sérült.".to_string())?;
+    scan_journal_with_cursor_floor_unlocked(root, importer_id, cursor_floor)
 }
 
 fn scan_journal(root: &Path, importer_id: &str) -> Result<JournalScan, String> {
@@ -2561,10 +2698,15 @@ fn import_into_store(
     importer_id: &str,
     store: &mut LocalStore,
 ) -> Result<SyncImportReport, String> {
+    let _guard = journal_scan_lock()
+        .lock()
+        .map_err(|_| "A journal-szkennelés zárolása sérült.".to_string())?;
+    hydrate_incremental_directory_cache(root, &store.connection)?;
     let cursors = local_sync_cursors(&store.connection)?;
-    let scan = scan_journal_with_cursor_floor(root, importer_id, Some(&cursors))?;
+    let scan = scan_journal_with_cursor_floor_unlocked(root, importer_id, Some(&cursors))?;
     let accepted_events = scan.accepted.len();
     let imported_events = apply_events_with_cursor_floor(store, &scan, Some(&cursors))?;
+    persist_incremental_directory_cache(root, &store.connection)?;
     let mut blocked_devices = scan.blocked_devices.into_iter().collect::<Vec<_>>();
     blocked_devices.sort();
     Ok(SyncImportReport {
@@ -2672,51 +2814,191 @@ fn read_compaction_snapshot_from_connection(
     }
 }
 
-fn read_events(connection: &Connection) -> Result<Vec<SyncEvent>, String> {
-    let compaction_snapshot = read_compaction_snapshot_from_connection(connection)?;
+fn local_reducer_checkpoint_hash(checkpoint: &LocalReducerCheckpoint) -> Result<String, String> {
+    let bytes = serde_json::to_vec(&LocalReducerCheckpointHashInput {
+        schema_version: checkpoint.schema_version,
+        store_schema_version: checkpoint.store_schema_version,
+        compaction_snapshot_hash: &checkpoint.compaction_snapshot_hash,
+        cursors: &checkpoint.cursors,
+        projects: &checkpoint.projects,
+        conversations: &checkpoint.conversations,
+        tombstones: &checkpoint.tombstones,
+        project_aliases: &checkpoint.project_aliases,
+    })
+    .map_err(|error| format!("A helyi reducer-checkpoint hash-inputja hibás: {error}"))?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn checkpoint_cursor_matches(
+    connection: &Connection,
+    device_id: &str,
+    checkpoint: &RetentionCursor,
+    current: Option<&RetentionCursor>,
+) -> Result<bool, String> {
+    let Some(current) = current else {
+        return Ok(false);
+    };
+    if checkpoint.sequence > current.sequence {
+        return Ok(false);
+    }
+    if checkpoint.sequence == current.sequence {
+        return Ok(checkpoint.event_hash == current.event_hash);
+    }
+    let event_hash = connection
+        .query_row(
+            "SELECT event_hash FROM sync_events WHERE device_id = ?1 AND device_sequence = ?2",
+            params![device_id, checkpoint.sequence as i64],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("A reducer-checkpoint cursorja nem ellenőrizhető: {error}"))?;
+    Ok(event_hash.as_deref() == Some(checkpoint.event_hash.as_str()))
+}
+
+fn read_local_reducer_checkpoint(
+    connection: &Connection,
+    compaction_snapshot_hash: Option<&str>,
+) -> Result<Option<LocalReducerCheckpoint>, String> {
+    let stored = connection
+        .query_row(
+            "SELECT value FROM store_meta WHERE key = ?1",
+            params![LOCAL_REDUCER_CHECKPOINT_META_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("A helyi reducer-checkpoint nem olvasható: {error}"))?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let Ok(checkpoint) = serde_json::from_str::<LocalReducerCheckpoint>(&stored) else {
+        return Ok(None);
+    };
+    if checkpoint.schema_version != LOCAL_REDUCER_CHECKPOINT_SCHEMA_VERSION
+        || checkpoint.store_schema_version != STORE_SCHEMA_VERSION
+        || checkpoint.compaction_snapshot_hash.as_deref() != compaction_snapshot_hash
+        || !is_sha256(&checkpoint.checkpoint_hash)
+        || local_reducer_checkpoint_hash(&checkpoint).ok().as_deref()
+            != Some(checkpoint.checkpoint_hash.as_str())
+    {
+        return Ok(None);
+    }
+    let current = local_sync_cursors(connection)?;
+    for (device_id, cursor) in &checkpoint.cursors {
+        if !checkpoint_cursor_matches(connection, device_id, cursor, current.get(device_id))? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(checkpoint))
+}
+
+fn write_local_reducer_checkpoint(
+    connection: &Connection,
+    compaction_snapshot_hash: Option<String>,
+    projects: &BTreeMap<String, ProjectAccumulator>,
+    conversations: &BTreeMap<String, ConversationAccumulator>,
+    tombstones: &BTreeMap<(String, String), (EventRank, bool, TombstoneEventPayload)>,
+    project_aliases: &HashMap<String, String>,
+) -> Result<(), String> {
+    let mut checkpoint = LocalReducerCheckpoint {
+        schema_version: LOCAL_REDUCER_CHECKPOINT_SCHEMA_VERSION,
+        store_schema_version: STORE_SCHEMA_VERSION,
+        compaction_snapshot_hash,
+        cursors: local_sync_cursors(connection)?,
+        projects: projects.clone(),
+        conversations: conversations.clone(),
+        tombstones: tombstones
+            .values()
+            .map(|(rank, archived, payload)| LocalReducerTombstoneCheckpoint {
+                rank: rank.clone(),
+                archived: *archived,
+                payload: payload.clone(),
+            })
+            .collect(),
+        project_aliases: project_aliases
+            .iter()
+            .map(|(alias, canonical)| (alias.clone(), canonical.clone()))
+            .collect(),
+        checkpoint_hash: String::new(),
+    };
+    checkpoint.checkpoint_hash = local_reducer_checkpoint_hash(&checkpoint)?;
+    let value = serde_json::to_string(&checkpoint)
+        .map_err(|error| format!("A helyi reducer-checkpoint nem szerializálható: {error}"))?;
+    connection
+        .execute(
+            "INSERT INTO store_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![LOCAL_REDUCER_CHECKPOINT_META_KEY, value],
+        )
+        .map_err(|error| format!("A helyi reducer-checkpoint nem menthető: {error}"))?;
+    Ok(())
+}
+
+fn read_events_after_cursors(
+    connection: &Connection,
+    cursor_floor: &BTreeMap<String, RetentionCursor>,
+) -> Result<Vec<SyncEvent>, String> {
+    let mut device_statement = connection
+        .prepare("SELECT DISTINCT device_id FROM sync_events ORDER BY device_id")
+        .map_err(|error| format!("A v2 event-eszközök lekérdezése sikertelen: {error}"))?;
+    let devices = device_statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("A v2 event-eszközök nem járhatók be: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("A v2 event-eszköz rekordja hibás: {error}"))?;
     let mut statement = connection
         .prepare(
             "SELECT event_id, device_id, device_sequence, hlc, entity_id, event_type, payload_json, payload_hash, event_hash, previous_hash
-             FROM sync_events ORDER BY hlc, device_id, device_sequence",
+             FROM sync_events
+             WHERE device_id = ?1 AND device_sequence > ?2
+               AND event_type NOT IN (?3, ?4, ?5)",
         )
         .map_err(|error| format!("A v2 eventek lekérdezése sikertelen: {error}"))?;
-    let rows = statement
-        .query_map([], |row| {
-            let payload_json: String = row.get(6)?;
-            Ok(SyncEvent {
-                schema_version: EVENT_SCHEMA_VERSION,
-                event_id: row.get(0)?,
-                device_id: row.get(1)?,
-                device_sequence: row.get::<_, i64>(2)? as u64,
-                hlc: row.get(3)?,
-                entity_id: row.get(4)?,
-                event_type: row.get(5)?,
-                payload: serde_json::from_str(&payload_json).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        6,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?,
-                payload_hash: row.get(7)?,
-                event_hash: row.get(8)?,
-                previous_hash: row.get(9)?,
-            })
-        })
-        .map_err(|error| format!("A v2 eventek bejárása sikertelen: {error}"))?;
     let mut events = Vec::new();
-    for row in rows {
-        let event = row.map_err(|error| format!("A v2 event rekordja hibás: {error}"))?;
-        validate_event(&event)?;
-        if compaction_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.cursors.get(&event.device_id))
-            .is_some_and(|cursor| event.device_sequence <= cursor.sequence)
-        {
-            continue;
+    for device_id in devices {
+        let floor = cursor_floor
+            .get(&device_id)
+            .map(|cursor| cursor.sequence)
+            .unwrap_or_default();
+        let rows = statement
+            .query_map(
+                params![
+                    device_id,
+                    floor as i64,
+                    AGENT_SESSION_UPSERT,
+                    AGENT_SESSION_ENTRY_APPEND,
+                    AGENT_SESSION_TOMBSTONE
+                ],
+                |row| {
+                    let payload_json: String = row.get(6)?;
+                    Ok(SyncEvent {
+                        schema_version: EVENT_SCHEMA_VERSION,
+                        event_id: row.get(0)?,
+                        device_id: row.get(1)?,
+                        device_sequence: row.get::<_, i64>(2)? as u64,
+                        hlc: row.get(3)?,
+                        entity_id: row.get(4)?,
+                        event_type: row.get(5)?,
+                        payload: serde_json::from_str(&payload_json).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                6,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?,
+                        payload_hash: row.get(7)?,
+                        event_hash: row.get(8)?,
+                        previous_hash: row.get(9)?,
+                    })
+                },
+            )
+            .map_err(|error| format!("A v2 eventek nem járhatók be: {error}"))?;
+        for row in rows {
+            let event = row.map_err(|error| format!("A v2 event rekordja hibás: {error}"))?;
+            validate_event(&event)?;
+            events.push(event);
         }
-        events.push(event);
     }
+    events.sort_by(|left, right| event_rank(left).cmp(&event_rank(right)));
     Ok(events)
 }
 
@@ -3141,52 +3423,102 @@ fn merge_answer_checkpoints(
 }
 
 fn reduce_snapshot(connection: &Connection) -> Result<LocalStoreSnapshot, String> {
-    let events = read_events(connection)?;
-    let mut projects = BTreeMap::<String, ProjectAccumulator>::new();
-    let mut conversations = BTreeMap::<String, ConversationAccumulator>::new();
-    let mut tombstones =
-        BTreeMap::<(String, String), (EventRank, bool, TombstoneEventPayload)>::new();
-    let project_aliases = events
-        .iter()
-        .filter(|event| event.event_type == PROJECT_UPSERT)
-        .filter_map(|event| {
-            serde_json::from_value::<LocalProject>(event.payload.clone())
-                .ok()
-                .map(|project| (project.id.clone(), normalized_project_id(&project)))
-        })
-        .collect::<HashMap<_, _>>();
-
-    if let Some(snapshot) = read_compaction_snapshot_from_connection(connection)? {
-        seed_reducer_from_compaction_snapshot(
-            &snapshot,
-            &mut projects,
-            &mut conversations,
-            &mut tombstones,
-        );
-        // A compaction produced by an older client can already contain the
-        // historical wrong-pair/longer-text corruption. If its cursor proves
-        // that the original immutable user event was part of that compaction,
-        // restore the event payload before applying post-compaction updates.
-        for ((conversation_id, message_id), original) in read_first_written_user_events(connection)?
-        {
-            let included_in_compaction = snapshot
-                .cursors
-                .get(&original.device_id)
-                .is_some_and(|cursor| original.device_sequence <= cursor.sequence);
-            if !included_in_compaction {
-                continue;
+    let compaction_snapshot = read_compaction_snapshot_from_connection(connection)?;
+    let compaction_snapshot_hash = compaction_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.snapshot_hash.clone());
+    let local_checkpoint = read_local_reducer_checkpoint(
+        connection,
+        compaction_snapshot_hash.as_deref(),
+    )?;
+    let used_local_checkpoint = local_checkpoint.is_some();
+    let (mut projects, mut conversations, mut tombstones, mut project_aliases, cursor_floor) =
+        if let Some(checkpoint) = local_checkpoint {
+            let tombstones = checkpoint
+                .tombstones
+                .into_iter()
+                .map(|entry| {
+                    let key = (
+                        entry.payload.entity_type.clone(),
+                        entry.payload.entity_id.clone(),
+                    );
+                    (key, (entry.rank, entry.archived, entry.payload))
+                })
+                .collect::<BTreeMap<_, _>>();
+            (
+                checkpoint.projects,
+                checkpoint.conversations,
+                tombstones,
+                checkpoint.project_aliases.into_iter().collect(),
+                checkpoint.cursors,
+            )
+        } else {
+            let mut projects = BTreeMap::<String, ProjectAccumulator>::new();
+            let mut conversations = BTreeMap::<String, ConversationAccumulator>::new();
+            let mut tombstones = BTreeMap::<
+                (String, String),
+                (EventRank, bool, TombstoneEventPayload),
+            >::new();
+            if let Some(snapshot) = compaction_snapshot.as_ref() {
+                seed_reducer_from_compaction_snapshot(
+                    snapshot,
+                    &mut projects,
+                    &mut conversations,
+                    &mut tombstones,
+                );
             }
-            let Some(conversation) = conversations.get_mut(&conversation_id) else {
-                continue;
-            };
-            let rank = conversation
-                .messages
-                .get(&message_id)
-                .map(|(rank, _)| rank.clone())
-                .unwrap_or_else(compaction_baseline_rank);
-            conversation
-                .messages
-                .insert(message_id, (rank, original.message));
+            (
+                projects,
+                conversations,
+                tombstones,
+                HashMap::new(),
+                compaction_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.cursors.clone())
+                    .unwrap_or_default(),
+            )
+        };
+    let events = read_events_after_cursors(connection, &cursor_floor)?;
+    let checkpoint_needs_refresh = !used_local_checkpoint || !events.is_empty();
+    project_aliases.extend(
+        events
+            .iter()
+            .filter(|event| event.event_type == PROJECT_UPSERT)
+            .filter_map(|event| {
+                serde_json::from_value::<LocalProject>(event.payload.clone())
+                    .ok()
+                    .map(|project| (project.id.clone(), normalized_project_id(&project)))
+            }),
+    );
+
+    if !used_local_checkpoint {
+        if let Some(snapshot) = compaction_snapshot.as_ref() {
+            // A compaction produced by an older client can already contain the
+            // historical wrong-pair/longer-text corruption. If its cursor proves
+            // that the original immutable user event was part of that compaction,
+            // restore the event payload before applying post-compaction updates.
+            for ((conversation_id, message_id), original) in
+                read_first_written_user_events(connection)?
+            {
+                let included_in_compaction = snapshot
+                    .cursors
+                    .get(&original.device_id)
+                    .is_some_and(|cursor| original.device_sequence <= cursor.sequence);
+                if !included_in_compaction {
+                    continue;
+                }
+                let Some(conversation) = conversations.get_mut(&conversation_id) else {
+                    continue;
+                };
+                let rank = conversation
+                    .messages
+                    .get(&message_id)
+                    .map(|(rank, _)| rank.clone())
+                    .unwrap_or_else(compaction_baseline_rank);
+                conversation
+                    .messages
+                    .insert(message_id, (rank, original.message));
+            }
         }
     }
 
@@ -3448,6 +3780,17 @@ fn reduce_snapshot(connection: &Connection) -> Result<LocalStoreSnapshot, String
                 ))
             }
         }
+    }
+
+    if checkpoint_needs_refresh {
+        write_local_reducer_checkpoint(
+            connection,
+            compaction_snapshot_hash,
+            &projects,
+            &conversations,
+            &tombstones,
+            &project_aliases,
+        )?;
     }
 
     let mut project_threads = BTreeMap::<String, BTreeSet<String>>::new();
@@ -5095,16 +5438,22 @@ fn append_pending_events(
             "{}:{}:{}",
             pending.event_type, pending.entity_id, payload_hash
         );
-        if !seen_payloads.insert(duplicate_key) {
-            continue;
-        }
-        if event_exists(
-            &store.connection,
-            &pending.event_type,
-            &pending.entity_id,
-            &payload_hash,
-        )? {
-            continue;
+        // A restore nem állapot-upsert, hanem sorrendérzékeny felhasználói
+        // művelet: restore -> új tombstone -> restore esetén a második restore
+        // payloadja szándékosan azonos lehet az elsővel. Globális payload-
+        // deduplikációval ilyenkor a projekt örökre archiválva maradt.
+        if pending.event_type != ENTITY_RESTORE {
+            if !seen_payloads.insert(duplicate_key) {
+                continue;
+            }
+            if event_exists(
+                &store.connection,
+                &pending.event_type,
+                &pending.entity_id,
+                &payload_hash,
+            )? {
+                continue;
+            }
         }
         sequence = sequence
             .checked_add(1)
@@ -5512,6 +5861,10 @@ pub(crate) fn sync_v2_restore_entity(tombstone: LocalTombstone) -> Result<SyncV2
         reduce_snapshot(&local_store.connection)?,
         read_answer_checkpoints(&root),
     );
+    // A restore is a durable backend mutation, not merely a snapshot returned
+    // to the currently open frontend. Materialize it before returning so an
+    // app close/restart cannot leave the project archived in SQLite.
+    store::save_snapshot_in_connection(&mut local_store.connection, snapshot.clone())?;
     Ok(SyncV2Result {
         device_id,
         snapshot,
@@ -8146,6 +8499,50 @@ mod tests {
     }
 
     #[test]
+    fn incremental_directory_cache_survives_process_memory_reset() {
+        let root = test_root();
+        let device_id = Uuid::new_v4().to_string();
+        let event = test_event(&device_id, 1, None);
+        write_event(&root, &event).expect("write cached event");
+        let mut local_store = test_store();
+        let report = import_into_store(&root, &device_id, &mut local_store)
+            .expect("import and persist directory cache");
+        assert_eq!(report.imported_events, 1);
+
+        let persisted = local_store
+            .connection
+            .query_row(
+                "SELECT value FROM store_meta WHERE key = ?1",
+                params![INCREMENTAL_DIRECTORY_CACHE_META_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("persisted directory cache");
+        let persisted: PersistedIncrementalDirectoryCache =
+            serde_json::from_str(&persisted).expect("valid persisted directory cache");
+        assert_eq!(PathBuf::from(persisted.root), root);
+        assert_eq!(
+            persisted
+                .devices
+                .get(&device_id)
+                .map(|stamp| stamp.max_sequence),
+            Some(1)
+        );
+
+        let device_path = root.join("events").join(&device_id);
+        incremental_directory_cache()
+            .lock()
+            .expect("directory cache lock")
+            .remove(&device_path);
+        hydrate_incremental_directory_cache(&root, &local_store.connection)
+            .expect("restore persisted directory cache");
+        assert!(incremental_directory_cache()
+            .lock()
+            .expect("directory cache lock")
+            .contains_key(&device_path));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn retention_marks_old_entries_but_never_allows_shared_purge() {
         let old = LocalTombstone {
             entity_type: "project".to_string(),
@@ -9048,6 +9445,77 @@ mod tests {
         let restored_snapshot = reduce_snapshot(&local_store.connection).expect("reduce restore");
         assert_eq!(restored_snapshot.conversations.len(), 1);
         assert!(restored_snapshot.tombstones.is_empty());
+        let checkpoint: String = local_store
+            .connection
+            .query_row(
+                "SELECT value FROM store_meta WHERE key = ?1",
+                params![LOCAL_REDUCER_CHECKPOINT_META_KEY],
+                |row| row.get(0),
+            )
+            .expect("incremental reducer checkpoint");
+        let checkpoint: LocalReducerCheckpoint =
+            serde_json::from_str(&checkpoint).expect("valid reducer checkpoint");
+        assert_eq!(checkpoint.cursors[&device_id].sequence, 4);
+
+        // The incremental suffix result must be byte-for-byte identical to a
+        // cold reduction of the complete journal.
+        local_store
+            .connection
+            .execute(
+                "DELETE FROM store_meta WHERE key = ?1",
+                params![LOCAL_REDUCER_CHECKPOINT_META_KEY],
+            )
+            .expect("clear reducer checkpoint");
+        let cold_snapshot = reduce_snapshot(&local_store.connection).expect("cold reduce restore");
+        assert_eq!(
+            serde_json::to_string(&restored_snapshot).expect("incremental snapshot JSON"),
+            serde_json::to_string(&cold_snapshot).expect("cold snapshot JSON")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_identical_restore_can_be_appended_again() {
+        let root = test_root();
+        let device_id = Uuid::new_v4().to_string();
+        let local_store = test_store();
+        let entity_id = stable_id("project", "repeatable-restore");
+        let payload = serde_json::to_value(TombstoneEventPayload {
+            entity_type: "project".to_string(),
+            entity_id: entity_id.clone(),
+            archived_at: "123".to_string(),
+            project_id: None,
+            title: Some("Repeatable".to_string()),
+            relative_path: Some("repeatable-restore".to_string()),
+            path_hint: Some("C:\\repeatable-restore".to_string()),
+            reason: Some("test".to_string()),
+        })
+        .expect("restore payload");
+        let pending = || PendingEvent {
+            entity_id: entity_id.clone(),
+            event_type: ENTITY_RESTORE.to_string(),
+            payload: payload.clone(),
+        };
+
+        assert_eq!(
+            append_pending_events(&root, &device_id, &local_store, vec![pending()])
+                .expect("first restore append"),
+            1
+        );
+        assert_eq!(
+            append_pending_events(&root, &device_id, &local_store, vec![pending()])
+                .expect("second restore append"),
+            1
+        );
+        let scan = scan_journal(&root, &Uuid::new_v4().to_string())
+            .expect("scan repeated restore events");
+        assert_eq!(
+            scan.accepted
+                .iter()
+                .filter(|event| event.event_type == ENTITY_RESTORE)
+                .count(),
+            2
+        );
         let _ = fs::remove_dir_all(root);
     }
 

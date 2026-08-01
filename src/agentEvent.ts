@@ -9,6 +9,18 @@ export type NormalizedAgentEvent = {
   terminalEventId?: string | null;
 };
 
+export type NormalizedAgentInputStatus = {
+  inputId: string;
+  conversationId: string;
+  rootRequestId: string;
+  providerRequestId: string;
+  status: "sending" | "accepted" | "rejected";
+  timestamp: string;
+  code?: string;
+  message?: string;
+  acceptedTarget?: Record<string, unknown>;
+};
+
 const asRecord = (value: unknown): Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -28,6 +40,47 @@ const firstString = (...values: unknown[]) =>
     (value): value is string =>
       typeof value === "string" && value.trim().length > 0,
   );
+
+export const normalizeAgentInputStatus = (
+  value: unknown,
+): NormalizedAgentInputStatus | null => {
+  const event = asRecord(parseEventValue(value));
+  const status = firstString(event.status);
+  const inputId = firstString(event.inputId, event.input_id);
+  const conversationId = firstString(
+    event.conversationId,
+    event.conversation_id,
+  );
+  const rootRequestId = firstString(event.rootRequestId, event.root_request_id);
+  const providerRequestId = firstString(
+    event.providerRequestId,
+    event.provider_request_id,
+  );
+  if (
+    !inputId ||
+    !conversationId ||
+    !rootRequestId ||
+    !providerRequestId ||
+    !status ||
+    !["sending", "accepted", "rejected"].includes(status)
+  )
+    return null;
+  const acceptedTarget = asRecord(
+    event.acceptedTarget ?? event.accepted_target,
+  );
+  return {
+    inputId,
+    conversationId,
+    rootRequestId,
+    providerRequestId,
+    status: status as NormalizedAgentInputStatus["status"],
+    timestamp: firstString(event.timestamp) ?? new Date().toISOString(),
+    code: firstString(event.code),
+    message: firstString(event.message),
+    acceptedTarget:
+      Object.keys(acceptedTarget).length > 0 ? acceptedTarget : undefined,
+  };
+};
 
 const compatibilityEventType = (eventType: string) => {
   switch (eventType) {

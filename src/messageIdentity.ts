@@ -8,6 +8,24 @@ export type MessageIdentityLike = {
   sequence?: number;
   live?: boolean;
   final?: boolean;
+  interrupted?: boolean;
+  interaction?: { kind?: string; inputId?: string };
+};
+
+export const INTERRUPTED_ANSWER_LABEL = "A válasz megszakítva.";
+
+const interruptedAnswerMarkerPattern =
+  /(?:\r?\n\s*){0,2}A válasz megszakítva\.?\s*$/i;
+
+export const hasInterruptedAnswerMarker = (text: string) =>
+  interruptedAnswerMarkerPattern.test(text.trimEnd());
+
+/** Keeps every emitted character and adds exactly one durable stop marker. */
+export const appendInterruptedAnswerMarker = (text: string) => {
+  const partial = text.replace(interruptedAnswerMarkerPattern, "").trimEnd();
+  return partial
+    ? `${partial}\n\n${INTERRUPTED_ANSWER_LABEL}`
+    : INTERRUPTED_ANSWER_LABEL;
 };
 
 const exactRepeatedUnit = (text: string) => {
@@ -112,6 +130,48 @@ export const isNewerSettledAssistantVersion = (
 };
 
 /**
+ * Reconciles the durable stop marker with a cached partial copy of the same
+ * answer. A cancelled turn is commonly persisted twice during shutdown: the
+ * database has the marker while the browser cache still has the last emitted
+ * sentence. Neither copy is complete on its own, so the merge must retain
+ * both pieces. A genuinely newer settled answer still wins.
+ */
+export const mergeInterruptedAssistantVersions = (
+  existing: MessageIdentityLike,
+  incoming: MessageIdentityLike,
+) => {
+  if (existing.role !== "assistant" || incoming.role !== "assistant")
+    return undefined;
+
+  const existingInterrupted = Boolean(
+    existing.interrupted || hasInterruptedAnswerMarker(existing.text),
+  );
+  const incomingInterrupted = Boolean(
+    incoming.interrupted || hasInterruptedAnswerMarker(incoming.text),
+  );
+  if (!existingInterrupted && !incomingInterrupted) return undefined;
+
+  if (
+    !incomingInterrupted &&
+    isNewerSettledAssistantVersion(existing, incoming)
+  )
+    return { text: incoming.text, interrupted: false };
+  if (
+    !existingInterrupted &&
+    isNewerSettledAssistantVersion(incoming, existing)
+  )
+    return { text: existing.text, interrupted: false };
+
+  const partial = [existing.text, incoming.text]
+    .map((text) => text.replace(interruptedAnswerMarkerPattern, "").trimEnd())
+    .sort((left, right) => right.length - left.length)[0];
+  return {
+    text: appendInterruptedAnswerMarker(partial),
+    interrupted: true,
+  };
+};
+
+/**
  * Two settled versions of the same answer. The "longer text wins" heuristic
  * must not decide here: a corrupted copy that glued two answers together is
  * always longer, so it outlived every reload and the correct, shorter text
@@ -141,16 +201,19 @@ const nonEmpty = (value: string | undefined) => value?.trim() || undefined;
  */
 export const messageIdentityKeys = (message: MessageIdentityLike) => {
   const keys: string[] = [];
+  const interactionInputId = nonEmpty(message.interaction?.inputId);
   const turnId = nonEmpty(message.turnId);
   const itemId = nonEmpty(message.itemId);
   const id = nonEmpty(message.id);
 
-  if (turnId) keys.push(`turn:${turnId}:${message.role}`);
+  if (interactionInputId)
+    keys.push(`interaction:${interactionInputId}:${message.role}`);
+  else if (turnId) keys.push(`turn:${turnId}:${message.role}`);
   // An item id only identifies a message inside its own turn. Providers label
   // content blocks positionally, so every first answer block is `assistant-0`;
   // treating that as a global identity merged every answer in a conversation
   // into one and the earlier ones were lost.
-  if (itemId)
+  if (itemId && !interactionInputId)
     keys.push(
       turnId
         ? `turn:${turnId}:item:${itemId}:${message.role}`

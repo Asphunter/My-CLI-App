@@ -15,7 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -147,6 +147,10 @@ struct ActiveClaudeRequest {
     cancelled: Arc<AtomicBool>,
     pid: Option<u32>,
     writer: Arc<Mutex<Option<ChildStdin>>>,
+    provider_turn_id: Option<String>,
+    turn_open: bool,
+    pending_steers: HashMap<String, crate::agent::AgentSteerRequest>,
+    accepted_inputs: HashSet<String>,
 }
 
 static ACTIVE_REQUESTS: OnceLock<Mutex<HashMap<String, ActiveClaudeRequest>>> = OnceLock::new();
@@ -193,21 +197,250 @@ pub fn begin_request(request_id: &str) -> Result<Arc<AtomicBool>, String> {
             cancelled: cancelled.clone(),
             pid: None,
             writer: Arc::new(Mutex::new(None)),
+            provider_turn_id: None,
+            turn_open: false,
+            pending_steers: HashMap::new(),
+            accepted_inputs: HashSet::new(),
         },
     );
     Ok(cancelled)
 }
 
-fn attach_process(request_id: &str, pid: u32, writer: Arc<Mutex<Option<ChildStdin>>>) {
+fn attach_process(
+    request_id: &str,
+    pid: u32,
+    writer: Arc<Mutex<Option<ChildStdin>>>,
+    provider_turn_id: Option<String>,
+) {
     if let Ok(mut requests) = active_requests().lock() {
         if let Some(request) = requests.get_mut(request_id) {
             request.pid = Some(pid);
             request.writer = writer;
+            request.provider_turn_id = provider_turn_id.or_else(|| Some(request_id.to_string()));
+            request.turn_open = true;
             if request.cancelled.load(Ordering::Relaxed) {
                 kill_process_tree(pid);
             }
         }
     }
+}
+
+fn update_provider_turn_id(request_id: &str, provider_turn_id: Option<&str>) {
+    let Some(provider_turn_id) = provider_turn_id.filter(|value| !value.trim().is_empty()) else {
+        return;
+    };
+    if let Ok(mut requests) = active_requests().lock() {
+        if let Some(request) = requests.get_mut(request_id) {
+            request.provider_turn_id = Some(provider_turn_id.to_string());
+        }
+    }
+}
+
+fn emit_input_status(
+    app: &tauri::AppHandle,
+    event: &crate::agent::AgentInputStatusEvent,
+) -> Result<(), String> {
+    emit_main_window(app, "agent-input-status", event)
+}
+
+fn close_steer_gate(
+    app: &tauri::AppHandle,
+    request_id: &str,
+    code: crate::agent::AgentInputErrorCode,
+    message: &str,
+) {
+    let pending = active_requests()
+        .lock()
+        .ok()
+        .and_then(|mut requests| {
+            requests.get_mut(request_id).map(|active| {
+                active.turn_open = false;
+                active
+                    .pending_steers
+                    .drain()
+                    .map(|(_, request)| request)
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_default();
+    for request in pending {
+        let _ = emit_input_status(
+            app,
+            &crate::agent::AgentInputStatusEvent::rejected(
+                &request,
+                code,
+                message.to_string(),
+            ),
+        );
+    }
+}
+
+fn handle_steer_status(
+    app: &tauri::AppHandle,
+    request_id: &str,
+    accepted: bool,
+    payload: &Value,
+) -> Result<(), String> {
+    let input_id = payload
+        .get("inputId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let (pending, provider_turn_id) = {
+        let mut requests = active_requests()
+            .lock()
+            .map_err(|_| "A Claude-kérések állapota zárolva maradt.".to_string())?;
+        let Some(active) = requests.get_mut(request_id) else {
+            return Ok(());
+        };
+        let Some(pending) = active.pending_steers.remove(input_id) else {
+            return Ok(());
+        };
+        if accepted {
+            active.accepted_inputs.insert(input_id.to_string());
+        }
+        (pending, active.provider_turn_id.clone())
+    };
+    if accepted {
+        let target = pending.target(provider_turn_id.clone(), provider_turn_id);
+        crate::record_accepted_pipeline_input(&pending);
+        emit_input_status(
+            app,
+            &crate::agent::AgentInputStatusEvent::accepted(&pending, target),
+        )
+    } else {
+        let code = match payload.get("code").and_then(Value::as_str) {
+            Some("target_changed") => crate::agent::AgentInputErrorCode::TargetChanged,
+            Some("duplicate_input") => crate::agent::AgentInputErrorCode::DuplicateInput,
+            Some("run_cancelled") => crate::agent::AgentInputErrorCode::RunCancelled,
+            Some("transport_closed") => crate::agent::AgentInputErrorCode::TransportClosed,
+            Some("runtime_failed") => crate::agent::AgentInputErrorCode::RuntimeFailed,
+            Some("unsupported_payload") => crate::agent::AgentInputErrorCode::UnsupportedPayload,
+            Some("no_active_run") => crate::agent::AgentInputErrorCode::NoActiveRun,
+            _ => crate::agent::AgentInputErrorCode::NoActiveTurn,
+        };
+        emit_input_status(
+            app,
+            &crate::agent::AgentInputStatusEvent::rejected(
+                &pending,
+                code,
+                payload
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("A Claude nem fogadta el a menet közbeni üzenetet."),
+            ),
+        )
+    }
+}
+
+pub fn steer(
+    app: &tauri::AppHandle,
+    request: crate::agent::AgentSteerRequest,
+) -> Result<crate::agent::AgentSteerQueued, crate::agent::AgentSteerError> {
+    use crate::agent::{AgentInputErrorCode, AgentProvider, AgentSteerError};
+
+    if request.provider != AgentProvider::Anthropic {
+        return Err(AgentSteerError::new(
+            AgentInputErrorCode::TargetChanged,
+            "A célzott futás nem Claude providerhez tartozik.",
+        ));
+    }
+    if request.text.trim().is_empty() {
+        return Err(AgentSteerError::new(
+            AgentInputErrorCode::UnsupportedPayload,
+            "Üres menet közbeni üzenet nem küldhető.",
+        ));
+    }
+    let writer = {
+        let mut requests = active_requests().lock().map_err(|_| {
+            AgentSteerError::new(
+                AgentInputErrorCode::RuntimeFailed,
+                "A Claude-kérések állapota zárolva maradt.",
+            )
+        })?;
+        let active = requests.get_mut(&request.provider_request_id).ok_or_else(|| {
+            AgentSteerError::new(
+                AgentInputErrorCode::NoActiveRun,
+                "A célzott Claude-kérés már nem aktív.",
+            )
+        })?;
+        if active.cancelled.load(Ordering::Acquire) {
+            return Err(AgentSteerError::new(
+                AgentInputErrorCode::RunCancelled,
+                "A célzott Claude-kérést leállították.",
+            ));
+        }
+        if active.accepted_inputs.contains(&request.input_id)
+            || active.pending_steers.contains_key(&request.input_id)
+        {
+            return Err(AgentSteerError::new(
+                AgentInputErrorCode::DuplicateInput,
+                "Ezt a menet közbeni üzenetet a Claude futás már megkapta.",
+            ));
+        }
+        if !active.turn_open {
+            return Err(AgentSteerError::new(
+                AgentInputErrorCode::NoActiveTurn,
+                "A Claude provider turnje már nem fogad inputot.",
+            ));
+        }
+        let active_turn_id = active.provider_turn_id.as_deref().unwrap_or(request.provider_request_id.as_str());
+        if active_turn_id != request.expected_provider_turn_id {
+            return Err(AgentSteerError::new(
+                AgentInputErrorCode::TargetChanged,
+                "A célzott Claude turn közben megváltozott.",
+            ));
+        }
+        active
+            .pending_steers
+            .insert(request.input_id.clone(), request.clone());
+        active.writer.clone()
+    };
+
+    let _ = emit_input_status(app, &crate::agent::AgentInputStatusEvent::sending(&request));
+    let write_result = writer
+        .lock()
+        .map_err(|_| "A Claude bridge bemenete zárolva maradt.".to_string())
+        .and_then(|mut stdin| {
+            let stdin = stdin
+                .as_mut()
+                .ok_or_else(|| "A Claude bridge bemenete már lezárult.".to_string())?;
+            write_bridge_request(
+                stdin,
+                bridge_request_with_context(
+                    &request.provider_request_id,
+                    Some(&request.conversation_id),
+                    Some(&request.expected_provider_turn_id),
+                    "steer_turn",
+                    json!({
+                        "inputId": request.input_id,
+                        "conversationId": request.conversation_id,
+                        "rootRequestId": request.root_request_id,
+                        "expectedProviderTurnId": request.expected_provider_turn_id,
+                        "stageEpoch": request.expected_stage_epoch,
+                        "pipelineRunId": request.pipeline_run_id,
+                        "stageIndex": request.stage_index,
+                        "stageRole": request.stage_role,
+                        "text": request.text,
+                    }),
+                ),
+            )
+        });
+    if let Err(message) = write_result {
+        if let Ok(mut requests) = active_requests().lock() {
+            if let Some(active) = requests.get_mut(&request.provider_request_id) {
+                active.pending_steers.remove(&request.input_id);
+            }
+        }
+        return Err(AgentSteerError::new(
+            AgentInputErrorCode::TransportClosed,
+            message,
+        ));
+    }
+    let queued_at = crate::agent::AgentInputStatusEvent::sending(&request).timestamp;
+    Ok(crate::agent::AgentSteerQueued {
+        input_id: request.input_id,
+        queued_at,
+    })
 }
 
 pub fn cancel_request(request_id: &str) -> Result<(), String> {
@@ -845,7 +1078,12 @@ pub fn send(
             .take()
             .ok_or_else(|| "A Claude bridge stdout csatornája nem nyitható meg.".to_string())?;
         let writer = Arc::new(Mutex::new(Some(stdin)));
-        attach_process(&request_id, spawned.id(), writer.clone());
+        attach_process(
+            &request_id,
+            spawned.id(),
+            writer.clone(),
+            request.session_id.clone(),
+        );
         child = Some(spawned);
 
         emit_main_window(
@@ -921,6 +1159,7 @@ pub fn send(
             }
             if message.session_id.is_some() {
                 session_id = message.session_id.clone();
+                update_provider_turn_id(&request_id, session_id.as_deref());
             }
             match message.message_type.as_deref() {
                 Some("session_store_request") => {
@@ -1066,8 +1305,20 @@ pub fn send(
                 Some("question_requested") => {
                     emit_question(&app, &request_id, &message.payload)?;
                 }
+                Some("steer_accepted") => {
+                    handle_steer_status(&app, &request_id, true, &message.payload)?;
+                }
+                Some("steer_rejected") => {
+                    handle_steer_status(&app, &request_id, false, &message.payload)?;
+                }
                 Some("turn_completed") => {
                     turn_completed.store(true, Ordering::Release);
+                    close_steer_gate(
+                        &app,
+                        &request_id,
+                        crate::agent::AgentInputErrorCode::NoActiveTurn,
+                        "A Claude turn lezárult az input elfogadása előtt.",
+                    );
                     let payload_text = message
                         .payload
                         .get("text")
@@ -1113,6 +1364,20 @@ pub fn send(
                         .get("errorCode")
                         .and_then(Value::as_str)
                         .unwrap_or("turn_failed");
+                    close_steer_gate(
+                        &app,
+                        &request_id,
+                        if error_code == "cancelled" {
+                            crate::agent::AgentInputErrorCode::RunCancelled
+                        } else {
+                            crate::agent::AgentInputErrorCode::RuntimeFailed
+                        },
+                        if error_code == "cancelled" {
+                            "A Claude futást az input elfogadása előtt leállították."
+                        } else {
+                            "A Claude runtime az input elfogadása előtt leállt."
+                        },
+                    );
                     return Err(format!("Claude [{error_code}]: {message_text}"));
                 }
                 Some(other) => {
@@ -1146,6 +1411,23 @@ pub fn send(
             thread_rehydrated: request.session_id.is_some(),
         })
     })();
+
+    if !turn_completed.load(Ordering::Acquire) {
+        close_steer_gate(
+            &app,
+            &request_id,
+            if cancellation.load(Ordering::Acquire) {
+                crate::agent::AgentInputErrorCode::RunCancelled
+            } else {
+                crate::agent::AgentInputErrorCode::RuntimeFailed
+            },
+            if cancellation.load(Ordering::Acquire) {
+                "A Claude futást az input elfogadása előtt leállították."
+            } else {
+                "A Claude runtime az input elfogadása előtt leállt."
+            },
+        );
+    }
 
     if let Some(mut child) = child {
         // The bridge is a persistent JSONL worker, but one `agent_send`

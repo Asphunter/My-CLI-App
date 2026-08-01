@@ -5,6 +5,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useReducer,
   useRef,
   useState,
   type ChangeEvent,
@@ -57,9 +58,12 @@ import {
   collapseAbandonedRegenerationRetries,
   collapseRepeatedAssistantText,
   bothAssistantVersionsAreSettled,
+  appendInterruptedAnswerMarker,
   coalesceMessageIdentities,
+  hasInterruptedAnswerMarker,
   isNewerSettledAssistantVersion,
   isSettledHistoricalAssistant,
+  mergeInterruptedAssistantVersions,
   messagesShareIdentity,
 } from "./messageIdentity";
 import {
@@ -76,6 +80,7 @@ import {
   acceptTerminalAgentEvent,
   agentEventIdentity,
   normalizeAgentEventEnvelope,
+  normalizeAgentInputStatus,
 } from "./agentEvent";
 import { ensureCanonicalConversationId } from "./conversationIdentity";
 import { agentAnswerMessageId } from "./deterministicId";
@@ -99,6 +104,19 @@ import {
   describeAgentError,
   describeThrownAgentError,
 } from "./agentError";
+import {
+  EMPTY_RUN_INPUT_STATE,
+  describeRunInputError,
+  followUpsForConversation,
+  resolveRunInputTarget,
+  runInputReducer,
+  runtimeInputsForConversation,
+  type QueuedFollowUp,
+  type RunInputErrorCode,
+  type RunInputMode,
+  type RunInputPayload,
+  type RunInputTarget,
+} from "./runInput";
 
 type Message = {
   id?: string;
@@ -125,6 +143,20 @@ type Message = {
   changeSummary?: ChangeSummaryFile[];
   /** Which pipeline stage produced this message, when it belongs to a run. */
   pipeline?: MessagePipeline;
+  interaction?: MessageInteraction;
+};
+
+type MessageInteraction = {
+  kind: "steer";
+  inputId: string;
+  parentTurnId: string;
+  targetProvider: "codex" | "anthropic";
+  targetRequestId: string;
+  targetProviderTurnId?: string;
+  pipelineRunId?: string;
+  stageIndex?: number;
+  stageRole?: string;
+  acceptedAt: string;
 };
 
 type MessageImageAttachment = {
@@ -300,7 +332,9 @@ type PipelineProgressEvent = {
   stageCount: number;
   role: "plan" | "plan_review" | "code" | "review";
   agentLabel: string;
+  provider: "codex" | "anthropic";
   requestId: string;
+  stageEpoch: number;
   phase: "started" | "finished" | "failed";
   status: "running" | "completed" | "failed" | "cancelled";
 };
@@ -573,12 +607,14 @@ type RunHandle = {
   ownerConversationKey: string;
   /** Coding: a projekt-zár kulcsa (normalizált path). GENERAL: null. */
   readonly projectPathKey: string | null;
-  readonly provider: "codex" | "anthropic";
+  provider: "codex" | "anthropic";
   readonly clientTurnId: string;
   liveMessageId: string;
   /** A provider szálazonosítója; a requestId nélküli események tartaléka. */
   threadId?: string;
   turnId?: string;
+  providerTurnId?: string;
+  stageEpoch: number;
   turnTiming: PlanStepTiming;
   plan: PlanSnapshot;
   planTextBuffer: Record<string, string>;
@@ -737,6 +773,12 @@ type AppDialog =
       danger?: boolean;
       onConfirm: () => boolean | void;
     };
+
+type DeleteExecutionOptions = {
+  archive?: boolean;
+  skipGuard?: boolean;
+  notification?: string;
+};
 
 const isTauri =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -1494,6 +1536,10 @@ type SyncTombstone = {
   pathHint?: string | null;
   reason?: string | null;
 };
+
+const PERMANENT_DELETE_REASON = "min:permanent-delete:v1";
+const isPermanentSyncTombstone = (tombstone: SyncTombstone) =>
+  tombstone.reason === PERMANENT_DELETE_REASON;
 
 type SyncState = {
   schemaVersion: number;
@@ -2478,11 +2524,16 @@ const mergeMessages = (
       const messageUnavailable = isUnavailablePersistedAssistant(message);
       const preferIncomingSettledAssistant =
         isNewerSettledAssistantVersion(existing, message);
+      const interruptedMerge = mergeInterruptedAssistantVersions(
+        existing,
+        message,
+      );
       // A submitted user payload is immutable. In particular, never let the
       // old "longer text wins" assistant heuristic splice two user turns when
       // a stale cache and a pulled snapshot meet.
       const mergedText =
-        preferIncomingSettledAssistant
+        interruptedMerge?.text ??
+        (preferIncomingSettledAssistant
           ? message.text
           : existing.role === "user"
           ? existing.text
@@ -2494,7 +2545,7 @@ const mergeMessages = (
                 ? existing.text
                 : message.text.trim().length > existing.text.trim().length
                   ? message.text
-                  : existing.text;
+                  : existing.text);
       return {
         ...existing,
         time:
@@ -2512,7 +2563,10 @@ const mergeMessages = (
         // answer by keeping the merged row in the live state forever.
         live: final ? false : Boolean(existing.live || message.live),
         final,
-        interrupted: message.interrupted ?? existing.interrupted,
+        interrupted:
+          interruptedMerge?.interrupted ??
+          message.interrupted ??
+          existing.interrupted,
         id: preferIncomingSettledAssistant
           ? message.id ?? existing.id
           : existing.id ?? message.id,
@@ -2538,6 +2592,7 @@ const mergeMessages = (
               ? existing.quoteRefs
               : message.quoteRefs,
         detailed: existing.detailed ?? message.detailed,
+        interaction: existing.interaction ?? message.interaction,
         changeSummary:
           existing.changeSummary && existing.changeSummary.length > 0
             ? existing.changeSummary
@@ -5380,10 +5435,11 @@ const MessageRow = memo(function MessageRow({
   const promptTimestamp =
     message.role === "user" ? messagePromptTimestamp(message) : undefined;
   const anchorId = messageAnchorId(message);
+  const isSteer = message.interaction?.kind === "steer";
 
   return (
     <article
-      className={`message ${message.role === "user" ? "user-message" : "assistant-message"}${final ? " is-final" : ""}${!showAvatar ? " no-avatar" : ""}`}
+      className={`message ${message.role === "user" ? "user-message" : "assistant-message"}${isSteer ? " is-steer" : ""}${final ? " is-final" : ""}${!showAvatar ? " no-avatar" : ""}`}
     >
       <div className="message-avatar-column">
         <span
@@ -5402,6 +5458,14 @@ const MessageRow = memo(function MessageRow({
         )}
       </div>
       <div className="message-content">
+        {isSteer && (
+          <div className="message-interaction-badge">
+            ⇢ TE · MENET KÖZBEN
+            {message.interaction?.stageRole
+              ? ` → ${STAGE_ROLE_LABELS[message.interaction.stageRole] ?? message.interaction.stageRole}`
+              : ""}
+          </div>
+        )}
         {message.pipeline && (
           // A stage answer often has no trace card of its own, so without this
           // the run's structure would be invisible on the plain row.
@@ -5446,7 +5510,7 @@ const MessageRow = memo(function MessageRow({
             </div>
           )}
         </div>
-        {message.role === "user" && onRevert && (
+        {message.role === "user" && !isSteer && onRevert && (
           // On the prompt rather than on the answer: what you return to is a
           // question you asked, and the state the project was in when you
           // asked it. Beside the bubble, so it never covers the words.
@@ -6821,6 +6885,9 @@ function TurnProgressCard({
       ? formatElapsed(Math.max(0, stageElapsedEnd - startedAtForDisplay))
       : "";
   const hasAnswer = Boolean(answer?.text.trim());
+  const answerInterrupted = Boolean(
+    answer?.interrupted || hasInterruptedAnswerMarker(answer?.text ?? ""),
+  );
   // A verdikt a kártya alján, színes sávként hangzik el; a nyers záró sor
   // ilyenkor kétszer mondaná ugyanazt.
   const answerBodyText = answer?.pipeline?.verdict
@@ -7228,13 +7295,12 @@ function TurnProgressCard({
       <>
       {runHeader}
       <CompactAnswersTimeline
-        className={`compact-answer-card compact-answers-timeline${runClasses}`}
+        className={`compact-answer-card compact-answers-timeline${answerInterrupted ? " is-interrupted" : ""}${runClasses}`}
         quoteAnchor={answerAnchorId}
         blocks={compactTimeline}
         streaming={streaming}
-        statusLabel={streaming ? "készül" : "kész"}
+        interrupted={answerInterrupted}
         elapsed={overallElapsed}
-        badge={stageBadge(answer?.pipeline)}
         actions={answerActions}
         renderAnswer={(block: CompactAnswerBlock) => (
           <div className="compact-answer-text">
@@ -7269,7 +7335,7 @@ function TurnProgressCard({
     <>
       {runHeader}
       <article
-        className={`turn-progress-card trace-card trace-view-${traceView}${streaming ? " is-live" : ""}${runClasses}`}
+        className={`turn-progress-card trace-card trace-view-${traceView}${streaming ? " is-live" : ""}${answerInterrupted ? " is-interrupted" : ""}${runClasses}`}
         aria-label="Lépések és gondolkodás"
       >
       {(hasAnswer || streaming) && (
@@ -7318,8 +7384,14 @@ function TurnProgressCard({
                   </button>
                 </div>
                 {stageBadge(answer?.pipeline)}
-                {(streaming || !runPosition) && (
-                  <span>{streaming ? "készül" : "kész"}</span>
+                {(streaming || !runPosition || answerInterrupted) && (
+                  <span className={answerInterrupted ? "is-interrupted" : undefined}>
+                    {streaming
+                      ? "készül"
+                      : answerInterrupted
+                        ? "megszakítva"
+                        : "kész"}
+                  </span>
                 )}
                 {overallElapsed && <time>{overallElapsed}</time>}
                 {answerActions}
@@ -8536,11 +8608,22 @@ function App() {
   // számláló csak arra kell, hogy a tábla változása rendert kérjen: a Map ref,
   // és a React magától nem venné észre.
   const [runsRevision, setRunsRevision] = useState(0);
-  // Mely beszélgetésekben vár egy Enter a futás végére. Beszélgetésenként,
-  // különben az A-ban sorba tett üzenet a B futásának végén indulna el.
-  const [queuedSendConversations, setQueuedSendConversations] = useState<
-    string[]
-  >([]);
+  const [runInputState, dispatchRunInput] = useReducer(
+    runInputReducer,
+    EMPTY_RUN_INPUT_STATE,
+  );
+  const runInputStateRef = useRef(runInputState);
+  runInputStateRef.current = runInputState;
+  const sessionQueuedFollowUpsRef = useRef<Set<string>>(new Set());
+  const followUpDispatchingRef = useRef<Set<string>>(new Set());
+  const [runInputMode, setRunInputMode] = useState<
+    RunInputMode | "stage_next"
+  >("steer");
+  const [stageInputQueues, setStageInputQueues] = useState<
+    Record<string, RunInputPayload[]>
+  >({});
+  const stageInputQueuesRef = useRef(stageInputQueues);
+  stageInputQueuesRef.current = stageInputQueues;
   // Az élő kódnézet fájljai beszélgetésenként. Nem perzisztál: ez a *munka
   // közbeni* nézet, a lezárt futás változásait a fájllista és a diff mutatja.
   const [liveFilesByConversation, setLiveFilesByConversation] = useState<
@@ -8594,6 +8677,8 @@ function App() {
     null,
   );
   const [appDialog, setAppDialog] = useState<AppDialog | null>(null);
+  const [projectOpening, setProjectOpening] = useState(false);
+  const projectOpeningRef = useRef(false);
   const [syncReady, setSyncReady] = useState(!isTauri);
   const [syncWriteEnabled, setSyncWriteEnabled] = useState(!isTauri);
   const [syncStatus, setSyncStatus] = useState(
@@ -8672,6 +8757,10 @@ function App() {
           ),
         ),
     [localConversationCache, treeSortMode],
+  );
+  const recoverableTombstones = useMemo(
+    () => tombstones.filter((tombstone) => !isPermanentSyncTombstone(tombstone)),
+    [tombstones],
   );
   const sortedProjects = useMemo(
     () =>
@@ -8869,6 +8958,7 @@ function App() {
   // made the WebView renderer stall and appear gray.
   const quoteInstructionDraftsRef = useRef<Record<string, string>>({});
   const inputDraftRef = useRef("");
+  const composerSendingInputRef = useRef<string | null>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   // A küldés előkészítése (képmentés, fájlkontextus) még a futás létrejötte
   // előtt van, de már beszélgetéshez tartozik: egy másik beszélgetésben
@@ -8879,10 +8969,6 @@ function App() {
     if (busy) submitBusyConversationsRef.current.add(key);
     else submitBusyConversationsRef.current.delete(key);
   };
-  // A válasz szövege előbb kész van, mint a futás: a munkaterület mentése
-  // (teljes snapshot + másolás) OneDrive-on tíz másodperceket is elvihet.
-  // Az Enter ezért nem vész el — a küldés megvárja a futás végét.
-  const queuedSendRef = useRef<Set<string>>(new Set());
   const composerScopeRef = useRef(threadKey);
   useEffect(() => {
     if (composerScopeRef.current === threadKey) return;
@@ -9315,11 +9401,49 @@ function App() {
   // A lánc-jelzők a *nézett* futásé: egy másik projektben futó lánc szakaszai
   // nem rajzolhatnak ide panelt.
   const pipelineProgress = viewedRun?.chain?.progress ?? null;
+  const activeRunInputTarget = resolveRunInputTarget(
+    activeConversationId,
+    runsRef.current.values(),
+    pipelineProgress,
+  );
+  const pipelineStageQueueAvailable = Boolean(
+    viewedRun?.chain?.progress &&
+      (viewedRun.chain.progress.phase === "started" ||
+        viewedRun.chain.progress.stageIndex <
+          viewedRun.chain.progress.stageCount - 1),
+  );
+  const activeFollowUps = followUpsForConversation(
+    runInputState,
+    activeConversationId,
+  );
+  const activeRuntimeInputs = runtimeInputsForConversation(
+    runInputState,
+    activeConversationId,
+  );
+  const activeStageInputs = viewedRun
+    ? stageInputQueues[viewedRun.requestId] ?? []
+    : [];
   const liveRunResume = viewedRun?.chain?.resume ?? null;
   // A dokumentumra kötött kattintásfigyelő a renderen kívül fut, ezért a
   // nézett beszélgetés azonosítóját ref-ben is látnia kell.
   activeConversationIdRef.current = activeConversationId;
   const viewingActiveRun = Boolean(viewedRun);
+
+  useEffect(() => {
+    setRunInputMode(
+      activeRunInputTarget
+        ? "steer"
+        : pipelineStageQueueAvailable
+          ? "stage_next"
+          : "follow_up",
+    );
+  }, [
+    activeConversationId,
+    activeRunInputTarget?.providerRequestId,
+    activeRunInputTarget?.providerTurnId,
+    activeRunInputTarget?.stageEpoch,
+    pipelineStageQueueAvailable,
+  ]);
 
   const maxKnownTimelineSequence = [
     Date.now(),
@@ -9992,6 +10116,10 @@ function App() {
 
   const restoreTombstone = async (tombstone: SyncTombstone) => {
     if (!isTauri || syncActionBusyRef.current) return;
+    if (isPermanentSyncTombstone(tombstone)) {
+      notify("A véglegesen törölt elem nem állítható vissza.", "notify");
+      return;
+    }
     if (anyRunActive()) {
       setToast("Aktív válasz közben a Recovery restore szünetel.");
       return;
@@ -10119,6 +10247,7 @@ function App() {
       return null;
     }
     const shouldRestore = (tombstone: SyncTombstone) =>
+      !isPermanentSyncTombstone(tombstone) &&
       (tombstone.entityType === "project" || restoreConversations) &&
       tombstoneMatchesProjectScope(tombstone, project);
 
@@ -10480,6 +10609,20 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!isTauri || !localStoreReady) return;
+    let active = true;
+    void invoke<QueuedFollowUp[]>("pending_followups_list")
+      .then((followUps) => {
+        if (active)
+          dispatchRunInput({ type: "hydrate_follow_ups", followUps });
+      })
+      .catch((error) => console.warn("Follow-up queue unavailable", error));
+    return () => {
+      active = false;
+    };
+  }, [isTauri, localStoreReady]);
+
+  useEffect(() => {
     if (pipelineRecipes.length === 0) return;
     if (pipelineRecipes.some((recipe) => recipe.id === pipelineRecipeId)) return;
     const fallback =
@@ -10510,6 +10653,15 @@ function App() {
       const progressRun = runForProgress(progress.requestId);
       if (progressRun) {
         progressRun.chain = { ...progressRun.chain, progress };
+        progressRun.provider = progress.provider;
+        progressRun.stageEpoch = progress.stageEpoch;
+        if (progress.phase === "started") {
+          // A previous stage's provider turn id must never be a valid target
+          // for the next stage during the short start-event race.
+          progressRun.providerTurnId = undefined;
+          progressRun.turnCompleted = false;
+          progressRun.status = "streaming";
+        }
         // A szakasz sávja a lánc sajátja: a nézet-választás csak addig él,
         // amíg ugyanaz a szakasz fut.
         setRunsRevision((revision) => revision + 1);
@@ -12414,6 +12566,14 @@ function App() {
   }, [toast]);
 
   useEffect(() => {
+    document.documentElement.classList.toggle(
+      "is-project-opening",
+      projectOpening,
+    );
+    return () => document.documentElement.classList.remove("is-project-opening");
+  }, [projectOpening]);
+
+  useEffect(() => {
     if (!isTauri) return;
     let disposed = false;
     let cleanup: (() => void) | undefined;
@@ -12530,6 +12690,115 @@ function App() {
 
   useEffect(() => {
     if (!isTauri) return;
+    let cleanup: (() => void) | undefined;
+    let disposed = false;
+    void listen<unknown>("agent-input-status", (event) => {
+      const status = normalizeAgentInputStatus(event.payload);
+      if (!status) return;
+      const runtimeInput = runInputStateRef.current.inputs[status.inputId];
+      if (!runtimeInput) return;
+      if (status.status === "sending") return;
+      if (status.status === "accepted") {
+        if (runtimeInput.delivery.status === "accepted") return;
+        const capturedTarget = runtimeInput.payload.target;
+        if (!capturedTarget) return;
+        const accepted = status.acceptedTarget ?? {};
+        const target: RunInputTarget = {
+          ...capturedTarget,
+          providerThreadId:
+            firstString(accepted.providerThreadId, accepted.provider_thread_id) ??
+            capturedTarget.providerThreadId,
+          providerTurnId:
+            firstString(accepted.providerTurnId, accepted.provider_turn_id) ??
+            capturedTarget.providerTurnId,
+        };
+        dispatchRunInput({
+          type: "accepted",
+          inputId: status.inputId,
+          acceptedAt: status.timestamp,
+          target,
+        });
+        const ownerRun = runForRequest(target.rootRequestId);
+        const parentTurnId =
+          ownerRun?.clientTurnId ?? `request:${target.rootRequestId}`;
+        const interaction: MessageInteraction = {
+          kind: "steer",
+          inputId: status.inputId,
+          parentTurnId,
+          targetProvider: target.provider,
+          targetRequestId: target.providerRequestId,
+          targetProviderTurnId: target.providerTurnId,
+          pipelineRunId: target.pipelineRunId,
+          stageIndex: target.stageIndex,
+          stageRole: target.stageRole,
+          acceptedAt: status.timestamp,
+        };
+        writeOwnedMessages(status.conversationId, (current) =>
+          current.some(
+            (message) => message.interaction?.inputId === status.inputId,
+          )
+            ? current
+            : [
+                ...current,
+                {
+                  id: status.inputId,
+                  role: "user",
+                  text: runtimeInput.payload.text,
+                  time: status.timestamp,
+                  live: false,
+                  final: true,
+                  sequence: nextTimelineSequence(),
+                  turnId: parentTurnId,
+                  quoteRefs: runtimeInput.payload.quoteRefs,
+                  interaction,
+                },
+              ],
+        );
+        markLocalMutation();
+        if (
+          composerSendingInputRef.current === status.inputId &&
+          inputDraftRef.current.trim() === runtimeInput.payload.text.trim()
+        ) {
+          inputDraftRef.current = "";
+          if (inputRef.current) {
+            inputRef.current.value = "";
+            resizeComposerTextarea(inputRef.current);
+          }
+          quoteInputRefs.current = {};
+          quoteInstructionDraftsRef.current = {};
+          setComposerQuotes([]);
+        }
+        if (composerSendingInputRef.current === status.inputId)
+          composerSendingInputRef.current = null;
+        notify("A futó AI elfogadta a terelést");
+        return;
+      }
+      const code = (status.code ?? "runtime_failed") as RunInputErrorCode;
+      dispatchRunInput({
+        type: "failed",
+        inputId: status.inputId,
+        code,
+        message: status.message ?? describeRunInputError(code),
+        failedAt: status.timestamp,
+      });
+      if (composerSendingInputRef.current === status.inputId)
+        composerSendingInputRef.current = null;
+      notify(describeRunInputError(code), "notify");
+      window.setTimeout(() => inputRef.current?.focus(), 0);
+    })
+      .then((unlisten) => {
+        if (disposed) unlisten();
+        else cleanup = unlisten;
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      cleanup?.();
+    };
+  }, [isTauri]);
+
+  useEffect(() => {
+    if (!isTauri) return;
     let cleanup: Array<() => void> = [];
     let disposed = false;
     const handleAgentEvent = (value: unknown) => {
@@ -12544,6 +12813,25 @@ function App() {
       // van: navigálás közben ezek a sorok is a helyükre mennek.
       const run = runForEvent(codexEvent);
       if (!run) return;
+      if (codexEvent.providerTurnId?.trim()) {
+        run.providerTurnId = codexEvent.providerTurnId.trim();
+        const queuedForStage = stageInputQueuesRef.current[run.requestId] ?? [];
+        const progress = run.chain?.progress;
+        if (queuedForStage.length > 0 && progress?.phase === "started") {
+          const target = resolveRunInputTarget(
+            run.ownerConversationId,
+            runsRef.current.values(),
+            progress,
+          );
+          if (target) {
+            const nextQueues = { ...stageInputQueuesRef.current };
+            delete nextQueues[run.requestId];
+            stageInputQueuesRef.current = nextQueues;
+            setStageInputQueues(nextQueues);
+            queuedForStage.forEach((payload) => void sendSteer(payload, target));
+          }
+        }
+      }
       const ownerConversationId = run.ownerConversationId;
       // A chain stage's final events — the complete assistant message that
       // carries the tool inputs and file paths — race the next stage's
@@ -13695,10 +13983,18 @@ function App() {
     });
   };
 
-  const performDeleteProject = (project: Project) => {
-    if (blockRunProjectMutation(project)) return;
+  const performDeleteProject = (
+    project: Project,
+    options: DeleteExecutionOptions = {},
+  ) => {
+    const {
+      archive = true,
+      skipGuard = false,
+      notification = `Eltávolítva a Tree-ből: ${project.name}`,
+    } = options;
+    if (!skipGuard && blockRunProjectMutation(project)) return;
     markProjectMutation();
-    if (isTauri) {
+    if (isTauri && archive) {
       setTombstones((current) => [
         ...current.filter(
           (tombstone) =>
@@ -13787,7 +14083,7 @@ function App() {
         setActivePlan({ turnId: null, explanation: "", steps: [] });
       }
     }
-    notify(`Eltávolítva a Tree-ből: ${project.name}`);
+    notify(notification);
   };
 
   const deleteProject = (project: Project) => {
@@ -13873,10 +14169,19 @@ function App() {
     });
   };
 
-  const performDeleteThread = (project: Project, thread: string) => {
-    if (blockRunOwnerMutation(`${project.path}/${thread}`)) return;
+  const performDeleteThread = (
+    project: Project,
+    thread: string,
+    options: DeleteExecutionOptions = {},
+  ) => {
+    const {
+      archive = true,
+      skipGuard = false,
+      notification = `Beszélgetés törölve: ${thread}`,
+    } = options;
+    if (!skipGuard && blockRunOwnerMutation(`${project.path}/${thread}`)) return;
     const oldKey = `${project.path}/${thread}`;
-    if (isTauri) {
+    if (isTauri && archive) {
       const conversation = localConversationCacheRef.current[oldKey];
       const duplicateConversationId = Boolean(
         conversation?.id &&
@@ -13957,7 +14262,7 @@ function App() {
       );
       setExpandedWorkLogs({});
     }
-    notify(`Beszélgetés törölve: ${thread}`);
+    notify(notification);
   };
 
   const deleteThread = (project: Project, thread: string) => {
@@ -14021,9 +14326,20 @@ function App() {
     });
   };
 
-  const performDeleteGeneralConversation = (conversation: SyncConversation) => {
+  const performDeleteGeneralConversation = (
+    conversation: SyncConversation,
+    options: DeleteExecutionOptions = {},
+  ) => {
+    const {
+      archive = true,
+      skipGuard = false,
+      notification = `Beszélgetés törölve: ${conversation.title}`,
+    } = options;
     if (!conversation.id) return;
-    if (blockRunOwnerMutation(generalConversationCacheKey(conversation.id)))
+    if (
+      !skipGuard &&
+      blockRunOwnerMutation(generalConversationCacheKey(conversation.id))
+    )
       return;
     const conversationId = conversation.id;
     const key = generalConversationCacheKey(conversationId);
@@ -14032,7 +14348,7 @@ function App() {
     markLocalMutation();
     localConversationCacheRef.current = nextCache;
     setLocalConversationCache(nextCache);
-    if (isTauri) {
+    if (isTauri && archive) {
       setTombstones((current) => [
         ...current.filter(
           (tombstone) =>
@@ -14078,7 +14394,7 @@ function App() {
         "general",
       );
     }
-    notify(`Beszélgetés törölve: ${conversation.title}`);
+    notify(notification);
   };
 
   const deleteGeneralConversation = (conversation: SyncConversation) => {
@@ -14094,6 +14410,168 @@ function App() {
       confirmLabel: "Beszélgetés törlése",
       danger: true,
       onConfirm: () => performDeleteGeneralConversation(conversation),
+    });
+  };
+
+  const permanentlyDeleteSyncEntity = async (
+    tombstone: SyncTombstone,
+    removeLocally: () => void,
+  ) => {
+    if (!isTauri) {
+      notify("A OneDrive-os végleges törlés csak a natív appban érhető el.");
+      return;
+    }
+    if (syncActionBusyRef.current) {
+      notify("Egy másik szinkronművelet még folyamatban van.", "notify");
+      return;
+    }
+    if (anyRunActive()) {
+      notify("Aktív válasz közben nem törölhető véglegesen elem.", "notify");
+      return;
+    }
+
+    let snapshotMutationStarted = false;
+    let snapshotMutationFinished = false;
+    syncActionBusyRef.current = true;
+    setOpenMenu(null);
+    setSyncStatus("végleges törlés…");
+    try {
+      snapshotMutationStarted = true;
+      await beginSnapshotProtectedSyncMutation();
+      const result = await invoke<SyncV2Result>(
+        "sync_v2_permanently_delete_entity",
+        { tombstone },
+      );
+      setSyncHealth(result.health);
+      setSyncWriteEnabled(result.canWrite);
+      removeLocally();
+      finishSnapshotProtectedSyncMutation(result.snapshot.tombstones ?? []);
+      snapshotMutationFinished = true;
+      setRetentionPreview(null);
+      setSyncHealthOpen(false);
+      setSyncStatus("szinkronizálva");
+      if (result.warnings.length > 0)
+        console.warn("Permanent delete completed with warnings", result.warnings);
+    } catch (error) {
+      if (snapshotMutationStarted && !snapshotMutationFinished)
+        finishSnapshotProtectedSyncMutation();
+      setSyncStatus("végleges törlési hiba");
+      markSyncHealthError("A végleges OneDrive-törlés nem sikerült.");
+      notify(`A végleges törlés nem sikerült: ${String(error)}`, "notify");
+      console.warn("Permanent OneDrive delete failed", error);
+    } finally {
+      syncActionBusyRef.current = false;
+    }
+  };
+
+  const permanentlyDeleteProject = (project: Project) => {
+    if (blockRunProjectMutation(project)) return;
+    setAppDialog({
+      kind: "confirm",
+      title: "Biztos? Végleges projekttörlés",
+      message: `Biztos? A(z) „${project.name}” projekt és minden beszélgetése végleg törlődik a Min OneDrive-szinkronjából, és a Recovery Centerből sem lesz visszaállítható. A projektmappa és a saját fájljai változatlanul megmaradnak.`,
+      confirmLabel: "Végleges törlés",
+      danger: true,
+      onConfirm: () => {
+        void permanentlyDeleteSyncEntity(
+          {
+            entityType: "project",
+            entityId: project.id,
+            archivedAt: new Date().toISOString(),
+            projectId: null,
+            title: project.name,
+            relativePath: project.relativePath,
+            pathHint: project.path,
+            reason: PERMANENT_DELETE_REASON,
+          },
+          () =>
+            performDeleteProject(project, {
+              archive: false,
+              skipGuard: true,
+              notification: `Végleg törölve a Min szinkronjából: ${project.name}`,
+            }),
+        );
+      },
+    });
+  };
+
+  const permanentlyDeleteThread = (project: Project, thread: string) => {
+    const ownerKey = `${project.path}/${thread}`;
+    if (blockRunOwnerMutation(ownerKey)) return;
+    const conversation = localConversationCacheRef.current[ownerKey];
+    const duplicateConversationId = Boolean(
+      conversation?.id &&
+        Object.entries(localConversationCacheRef.current).some(
+          ([key, candidate]) =>
+            key !== ownerKey &&
+            key.startsWith(`${project.path}/`) &&
+            candidate.projectId === project.id &&
+            candidate.id === conversation.id,
+        ),
+    );
+    const entityId =
+      !duplicateConversationId && conversation?.id
+        ? conversation.id
+        : `legacy:${project.id}:${thread}`;
+    setAppDialog({
+      kind: "confirm",
+      title: "Biztos? Végleges beszélgetéstörlés",
+      message: `Biztos? A(z) „${thread}” beszélgetés végleg törlődik a Min OneDrive-szinkronjából, és a Recovery Centerből sem lesz visszaállítható.`,
+      confirmLabel: "Végleges törlés",
+      danger: true,
+      onConfirm: () => {
+        void permanentlyDeleteSyncEntity(
+          {
+            entityType: "conversation",
+            entityId,
+            archivedAt: new Date().toISOString(),
+            projectId: project.id,
+            title: thread,
+            relativePath: project.relativePath,
+            pathHint: project.path,
+            reason: PERMANENT_DELETE_REASON,
+          },
+          () =>
+            performDeleteThread(project, thread, {
+              archive: false,
+              skipGuard: true,
+              notification: `Végleg törölve a Min szinkronjából: ${thread}`,
+            }),
+        );
+      },
+    });
+  };
+
+  const permanentlyDeleteGeneralConversation = (
+    conversation: SyncConversation,
+  ) => {
+    if (!conversation.id) return;
+    if (blockRunOwnerMutation(generalConversationCacheKey(conversation.id)))
+      return;
+    setAppDialog({
+      kind: "confirm",
+      title: "Biztos? Végleges beszélgetéstörlés",
+      message: `Biztos? A(z) „${conversation.title}” GENERAL beszélgetés végleg törlődik a Min OneDrive-szinkronjából, és a Recovery Centerből sem lesz visszaállítható.`,
+      confirmLabel: "Végleges törlés",
+      danger: true,
+      onConfirm: () => {
+        void permanentlyDeleteSyncEntity(
+          {
+            entityType: "conversation",
+            entityId: conversation.id!,
+            archivedAt: new Date().toISOString(),
+            projectId: null,
+            title: conversation.title,
+            reason: PERMANENT_DELETE_REASON,
+          },
+          () =>
+            performDeleteGeneralConversation(conversation, {
+              archive: false,
+              skipGuard: true,
+              notification: `Végleg törölve a Min szinkronjából: ${conversation.title}`,
+            }),
+        );
+      },
     });
   };
 
@@ -14170,6 +14648,9 @@ function App() {
       notify("A meglévő projekt kiválasztása a natív Tauri appban érhető el");
       return;
     }
+    if (projectOpeningRef.current) return;
+    projectOpeningRef.current = true;
+    setProjectOpening(true);
     try {
       const selectedPath = await invoke<string | null>(
         "pick_project_directory",
@@ -14217,6 +14698,9 @@ function App() {
       notify(`Meglévő projekt hozzáadva: ${project.name}`);
     } catch (error) {
       notify(`Nem sikerült megnyitni a projektmappát: ${String(error)}`);
+    } finally {
+      projectOpeningRef.current = false;
+      setProjectOpening(false);
     }
   };
 
@@ -14424,6 +14908,12 @@ function App() {
     )
       return;
     const stoppingRun = runForRequest(requestId);
+    if (stoppingRun && stageInputQueuesRef.current[stoppingRun.requestId]) {
+      const nextQueues = { ...stageInputQueuesRef.current };
+      delete nextQueues[stoppingRun.requestId];
+      stageInputQueuesRef.current = nextQueues;
+      setStageInputQueues(nextQueues);
+    }
     const liveMessageId = stoppingRun?.liveMessageId ?? null;
     const finalizeCancellation = () => {
       cancelledRequestIdsRef.current.add(requestId);
@@ -14437,9 +14927,7 @@ function App() {
           message.id === liveMessageId
             ? {
                 ...message,
-                text: stripStaleInterruptionMarker(message).text.trim()
-                  ? `${stripStaleInterruptionMarker(message).text.trimEnd()}\n\nA válasz megszakítva.`
-                  : "A válasz megszakítva.",
+                text: appendInterruptedAnswerMarker(message.text),
                 turnId: message.turnId ?? stoppingRun?.turnId,
                 live: false,
                 final: true,
@@ -14521,52 +15009,6 @@ function App() {
       }
     }
   };
-
-  useEffect(() => {
-    const showingStop = viewingActiveRun && !activeTurnHasCompleted;
-    document.documentElement.classList.toggle("is-streaming", showingStop);
-    // A leállítás jelzése is a nézett beszélgetésé: máshol állítottunk le
-    // valamit, ez az ablak attól még nem „megszakítás alatt" van.
-    document.documentElement.classList.toggle(
-      "is-cancelling",
-      isCancelling && viewingActiveRun,
-    );
-    document
-      .querySelectorAll<HTMLButtonElement>(".send-button")
-      .forEach((button) => {
-        button.setAttribute(
-          "aria-label",
-          showingStop ? "Gondolkodás leállítása" : "Üzenet küldése",
-        );
-      });
-    return () => {
-      document.documentElement.classList.remove(
-        "is-streaming",
-        "is-cancelling",
-      );
-    };
-  }, [viewingActiveRun, isCancelling, activeTurnHasCompleted]);
-
-  useEffect(() => {
-    const onSendButtonClick = (event: MouseEvent) => {
-      // A küldés gomb a *nézett* beszélgetés futását állítja le; ha itt nem
-      // fut semmi, a gomb küld, nem leállít.
-      const stoppable = runForConversation(activeConversationIdRef.current);
-      if (
-        !stoppable ||
-        stoppable.turnCompleted ||
-        !(event.target instanceof Element)
-      )
-        return;
-      const button = event.target.closest(".send-button");
-      if (!button) return;
-      event.preventDefault();
-      event.stopPropagation();
-      void stopGeneration();
-    };
-    document.addEventListener("click", onSendButtonClick, true);
-    return () => document.removeEventListener("click", onSendButtonClick, true);
-  }, [viewingActiveRun, isCancelling, activeTurnHasCompleted]);
 
   /**
    * A futás tényleg véget ért — ha várt egy küldés, most indul. A `requestSubmit`
@@ -14733,20 +15175,498 @@ function App() {
     liveFileBaseReadRef.current.set(baseKey, read);
   };
 
-  const releaseQueuedSend = (conversationId: string | null | undefined) => {
-    // Az azonosító nélküli beszélgetés kulcsa az üres füzér — a sorban állás
-    // ott is valódi, tehát a feloldásnak is meg kell találnia. A korábbi
-    // `if (!id) return` pont ezt a sort hagyta örökre bent.
-    const id = conversationId?.trim() ?? "";
-    if (!queuedSendRef.current.delete(id)) return;
-    setQueuedSendConversations((current) =>
-      current.filter((candidate) => candidate !== id),
+  const sendSteer = async (
+    payload: RunInputPayload,
+    target: RunInputTarget,
+  ) => {
+    composerSendingInputRef.current = payload.inputId;
+    dispatchRunInput({
+      type: "send_started",
+      payload: { ...payload, target },
+      sentAt: new Date().toISOString(),
+    });
+    try {
+      await invoke("agent_steer", {
+        request: {
+          inputId: payload.inputId,
+          conversationId: target.conversationId,
+          rootRequestId: target.rootRequestId,
+          providerRequestId: target.providerRequestId,
+          provider: target.provider,
+          expectedProviderTurnId: target.providerTurnId,
+          expectedStageEpoch: target.stageEpoch,
+          text: payload.modelPrompt || payload.text,
+          pipelineRunId: target.pipelineRunId,
+          stageIndex: target.stageIndex,
+          stageRole: target.stageRole,
+        },
+      });
+    } catch (error) {
+      const details = asRecord(error);
+      const code = (firstString(details.code) ??
+        "runtime_failed") as RunInputErrorCode;
+      const message = firstString(details.message) ?? describeRunInputError(code);
+      dispatchRunInput({
+        type: "failed",
+        inputId: payload.inputId,
+        code,
+        message,
+        failedAt: new Date().toISOString(),
+      });
+      if (composerSendingInputRef.current === payload.inputId)
+        composerSendingInputRef.current = null;
+      notify(describeRunInputError(code), "notify");
+    }
+  };
+
+  const enqueueFollowUp = async (payload: RunInputPayload) => {
+    const conversationId = activeConversationIdRef.current?.trim();
+    if (!conversationId) {
+      notify("A következő üzenethez még nincs mentett beszélgetés.", "notify");
+      return;
+    }
+    const existing = followUpsForConversation(
+      runInputStateRef.current,
+      conversationId,
     );
-    // A sorban álló üzenet a *saját* beszélgetésében indul el. Ha közben
-    // máshol vagyunk, a küldés nem itt történik meg — a szerkesztő tartalma a
-    // beszélgetéssel utazik, tehát csak akkor küldhető, ha ott állunk.
-    if (id !== (activeConversationIdRef.current ?? "")) return;
-    window.setTimeout(() => composerFormRef.current?.requestSubmit(), 0);
+    const now = new Date().toISOString();
+    const followUp: QueuedFollowUp = {
+      id: payload.inputId,
+      conversationId,
+      position: existing.length,
+      body: payload.text,
+      modelPrompt: payload.modelPrompt,
+      quoteRefs: payload.quoteRefs,
+      attachments: payload.images,
+      requestSettings: {
+        mode: activeModeRef.current,
+        provider:
+          activeModeRef.current === "general" || !selectedClaudeModel
+            ? "codex"
+            : "anthropic",
+        projectId:
+          activeModeRef.current === "general" ? null : activeProjectData.id,
+        projectPath:
+          activeModeRef.current === "general" ? null : activeProjectData.path,
+        conversationKey: threadKey,
+        model: selectedModel,
+        effort: effectiveEffort,
+        detailed: showDetailedTrace,
+        pipelineRecipeId: pipelineMode ? activePipelineRecipe?.id : null,
+        pipelineEnabled: showDetailedTrace && pipelineMode,
+        maxBudgetUsd: Number(claudeBudgetUsd),
+        maxTurns: Number(claudeMaxTurns),
+        pipelineStageOverrides: activePipelineRecipe?.stages.map((_, index) => ({
+          model: stageValue(index, "model") || undefined,
+          effort: stageValue(index, "effort") || undefined,
+          provider: stageProvider(index) as "codex" | "anthropic",
+        })),
+      },
+      createdAt: now,
+      updatedAt: now,
+    };
+    try {
+      const stored = await invoke<QueuedFollowUp>("pending_followup_upsert", {
+        followUp,
+      });
+      sessionQueuedFollowUpsRef.current.add(stored.id);
+      dispatchRunInput({ type: "enqueue_follow_up", followUp: stored });
+      inputDraftRef.current = "";
+      if (inputRef.current) {
+        inputRef.current.value = "";
+        resizeComposerTextarea(inputRef.current);
+      }
+      quoteInputRefs.current = {};
+      quoteInstructionDraftsRef.current = {};
+      setComposerQuotes([]);
+      setPendingImages([]);
+      notify("A következő üzenet tartósan sorba állt");
+    } catch (error) {
+      notify(`A következő üzenet nem menthető: ${String(error)}`, "notify");
+    }
+  };
+
+  const enqueueStageInput = (payload: RunInputPayload, run: RunHandle) => {
+    const next = {
+      ...stageInputQueuesRef.current,
+      [run.requestId]: [
+        ...(stageInputQueuesRef.current[run.requestId] ?? []),
+        { ...payload, mode: "steer" as const, target: undefined },
+      ],
+    };
+    stageInputQueuesRef.current = next;
+    setStageInputQueues(next);
+    inputDraftRef.current = "";
+    if (inputRef.current) {
+      inputRef.current.value = "";
+      resizeComposerTextarea(inputRef.current);
+    }
+    quoteInputRefs.current = {};
+    quoteInstructionDraftsRef.current = {};
+    setComposerQuotes([]);
+    setPendingImages([]);
+    notify("Az üzenet a következő pipeline-fázisnak várakozik");
+  };
+
+  const startQueuedFollowUp = async (followUp: QueuedFollowUp) => {
+    if (
+      followUpDispatchingRef.current.has(followUp.id) ||
+      runForConversation(followUp.conversationId) ||
+      runsRef.current.size >= MAX_CONCURRENT_RUNS
+    )
+      return false;
+    const key = ownedConversationKey(followUp.conversationId);
+    const conversation = key
+      ? readConversation(localConversationCacheRef.current, key)
+      : undefined;
+    if (!key || !conversation) return false;
+    const settings = followUp.requestSettings;
+    const projectPath = settings.projectPath?.trim() || null;
+    if (projectPath && runForProject(projectPath)) return false;
+    const recipe = settings.pipelineEnabled
+      ? pipelineRecipes.find(
+          (candidate) => candidate.id === settings.pipelineRecipeId,
+        )
+      : undefined;
+    if (settings.pipelineEnabled && !recipe) return false;
+
+    followUpDispatchingRef.current.add(followUp.id);
+    const requestId = createRequestId();
+    const clientTurnId = `request:${requestId}`;
+    const requestStartedAt = Date.now();
+    let storedImages: MessageImageAttachment[] = [];
+    try {
+      if (followUp.attachments.length > 0) {
+        if (!projectPath) throw new Error("A képekhez hiányzik a projektmappa.");
+        storedImages = await invoke<MessageImageAttachment[]>(
+          "save_image_attachments",
+          {
+            cwd: projectPath,
+            images: followUp.attachments.map(({ name, mimeType, dataUrl }) => ({
+              name,
+              mimeType,
+              dataUrl,
+            })),
+          },
+        );
+      }
+      const previousMessages = conversation.messages ?? [];
+      const liveMessageId = agentAnswerMessageId(
+        followUp.conversationId,
+        requestId,
+      );
+      const userMessage: Message = {
+        id: followUp.id,
+        role: "user",
+        text: followUp.body,
+        time: followUp.createdAt,
+        images: storedImages,
+        quoteRefs: followUp.quoteRefs,
+        detailed: settings.detailed,
+        sequence: nextTimelineSequence(),
+        turnId: clientTurnId,
+      };
+      const liveMessage: Message = {
+        id: liveMessageId,
+        role: "assistant",
+        text: "",
+        time: "most",
+        live: true,
+        final: false,
+        sequence: nextTimelineSequence(),
+        turnId: clientTurnId,
+      };
+      writeOwnedMessages(followUp.conversationId, (current) => [
+        ...current,
+        userMessage,
+        liveMessage,
+      ]);
+      markLocalMutation();
+      const initialPlan: PlanSnapshot = {
+        turnId: clientTurnId,
+        explanation: "",
+        steps:
+          settings.mode === "general"
+            ? []
+            : [
+                {
+                  id: "client-pre-plan",
+                  step: prePlanStepLabel(recipe?.stages[0]?.role),
+                  status: "inProgress",
+                },
+              ],
+        startedAt: requestStartedAt,
+        stepTimes:
+          settings.mode === "general"
+            ? {}
+            : { "client-pre-plan": { startedAt: requestStartedAt } },
+      };
+      const runHandle = beginRun({
+        requestId,
+        ownerConversationId: followUp.conversationId,
+        ownerConversationKey: key,
+        projectPathKey: projectPath
+          ? normalizeConversationKey(projectPath)
+          : null,
+        provider: settings.provider,
+        clientTurnId,
+        stageEpoch: 1,
+        liveMessageId,
+        turnId: clientTurnId,
+        turnTiming: { startedAt: requestStartedAt },
+        plan: initialPlan,
+        planTextBuffer: {},
+        agentMessagePhases: {},
+        processedEvents: new Set(),
+        completedTerminalTurns: new Set(),
+        chainRequestIds: new Set(),
+        planTaskToCarriedStep: {},
+        chain: recipe ? { recipe } : undefined,
+        answerStream: { meta: null, pending: "", frame: null },
+        status: "streaming",
+        turnCompleted: false,
+      });
+      updateOwnedPlanState(followUp.conversationId, initialPlan);
+      sessionQueuedFollowUpsRef.current.delete(followUp.id);
+      await deleteFollowUp(followUp.id);
+
+      let sessionId: string | null = null;
+      if (settings.provider === "anthropic") {
+        const status = await invoke<AgentConversationStatus | null>(
+          "agent_conversation_status",
+          { conversationId: followUp.conversationId },
+        ).catch(() => null);
+        sessionId = status?.hasConflict ? null : (status?.activeSessionId ?? null);
+      } else {
+        sessionId = conversation.threadId ?? null;
+      }
+      const conversationContext = conversationContextForRehydration(
+        previousMessages,
+      );
+      try {
+        if (recipe) {
+          const stageRequestIds = recipe.stages.map(
+            (_, index) => `${requestId}-stage-${index}`,
+          );
+          stageRequestIds.forEach((id) => runHandle.chainRequestIds.add(id));
+          const run = await invoke<PipelineRunResult>("pipeline_send", {
+            request: {
+              recipeId: recipe.id,
+              prompt: followUp.modelPrompt || followUp.body,
+              conversationId: followUp.conversationId,
+              planFile: projectPath
+                ? planFileNameFor(conversation.title, 1)
+                : null,
+              requestIds: stageRequestIds,
+              placeholderRequestId: requestId,
+              images: storedImages,
+              cwd: projectPath,
+              sessionId,
+              conversationContext: conversationContext || null,
+              maxBudgetUsd: settings.maxBudgetUsd ?? null,
+              stageOverrides: settings.pipelineStageOverrides ?? [],
+              runInputs: [],
+            },
+          });
+          const chainSummary = await settleChainGuard(
+            run.guard,
+            followUp.conversationId,
+            projectPath,
+          );
+          const stageMessages: Message[] = run.stages.map((stage, index) => ({
+            id: stage.answerMessageId ?? crypto.randomUUID(),
+            role: "assistant",
+            text: stage.succeeded
+              ? stage.text
+              : `A(z) ${STAGE_ROLE_LABELS[stage.role] ?? stage.role} szakasz megszakadt: ${stage.error ?? "ismeretlen hiba"}`,
+            time: "most",
+            live: false,
+            final: true,
+            turnId: `request:${stage.requestId}`,
+            itemId: "assistant-0",
+            changeSummary:
+              index === run.stages.length - 1 && chainSummary.length > 0
+                ? chainSummary
+                : undefined,
+            pipeline: {
+              runId: run.runId,
+              recipeId: run.recipe.id,
+              chainId: run.chainId,
+              iteration: run.iteration,
+              stageIndex: stage.index,
+              stageCount: run.recipe.stages.length,
+              stageRole: stage.role,
+              stageAgent: stage.agentLabel,
+              verdict: stage.review?.verdict,
+              verdictSummary: stage.review?.summary,
+            },
+          }));
+          writeOwnedMessages(followUp.conversationId, (current) => [
+            ...current.filter(
+              (message) =>
+                message.id !== liveMessageId &&
+                !message.turnId?.startsWith(`request:${requestId}-stage-`),
+            ),
+            ...stageMessages.map((message) => ({
+              ...message,
+              sequence: nextTimelineSequence(),
+            })),
+          ]);
+        } else {
+          const response = await invoke<CodexResponse>("agent_send", {
+            request: {
+              prompt: followUp.modelPrompt || followUp.body,
+              images: storedImages,
+              provider: settings.provider,
+              runtime:
+                settings.provider === "anthropic"
+                  ? "claudeAgentBridge"
+                  : "codexAppServer",
+              conversationId: followUp.conversationId,
+              sessionId,
+              conversationContext: conversationContext || null,
+              model: settings.model,
+              effort: settings.effort,
+              cwd: projectPath,
+              requestId,
+              maxBudgetUsd: settings.maxBudgetUsd ?? null,
+              maxTurns: settings.maxTurns ?? null,
+            },
+          });
+          let changeSummary: ChangeSummaryFile[] | undefined;
+          if (
+            projectPath &&
+            (response.guard.changedFiles.length > 0 ||
+              response.guard.addedFiles.length > 0 ||
+              response.guard.removedFiles.length > 0)
+          ) {
+            changeSummary = changeSummaryFromGuard(response.guard);
+            await applyAgentSnapshotAutomatically(response.guard, projectPath);
+          }
+          settleAnswerStream(runHandle);
+          writeOwnedMessages(followUp.conversationId, (current) =>
+            current.map((message) =>
+              message.id === liveMessageId
+                ? {
+                    ...message,
+                    text: message.text || response.text,
+                    live: false,
+                    final: true,
+                    changeSummary,
+                  }
+                : message,
+            ),
+          );
+          if (response.threadId && settings.provider === "codex")
+            writeBackgroundConversation(followUp.conversationId, (current) => ({
+              ...current,
+              threadId: response.threadId,
+            }));
+        }
+        markLocalMutation();
+      } catch (error) {
+        settleAnswerStream(runHandle);
+        writeOwnedMessages(followUp.conversationId, (current) =>
+          current.map((message) =>
+            message.id === liveMessageId
+              ? {
+                  ...message,
+                  text:
+                    message.text ||
+                    `A sorba állított kérés nem sikerült: ${String(error)}`,
+                  live: false,
+                  final: true,
+                }
+              : message,
+          ),
+        );
+        markLocalMutation();
+      } finally {
+        endRun(requestId);
+        setRunsRevision((revision) => revision + 1);
+      }
+      window.setTimeout(() => void dispatchNextFollowUp(), 0);
+      return true;
+    } catch (error) {
+      notify(`A sorba állított üzenet nem indítható: ${String(error)}`, "notify");
+      return false;
+    } finally {
+      followUpDispatchingRef.current.delete(followUp.id);
+    }
+  };
+
+  const dispatchNextFollowUp = async () => {
+    const eligible = runInputStateRef.current.followUps.filter(
+      (followUp) =>
+        sessionQueuedFollowUpsRef.current.has(followUp.id) &&
+        !followUpDispatchingRef.current.has(followUp.id) &&
+        !runForConversation(followUp.conversationId),
+    );
+    for (const followUp of eligible) {
+      if (await startQueuedFollowUp(followUp)) return;
+    }
+  };
+
+  const deleteFollowUp = async (id: string) => {
+    try {
+      await invoke("pending_followup_delete", { id });
+      dispatchRunInput({ type: "delete_follow_up", id });
+    } catch (error) {
+      notify(`A következő üzenet nem törölhető: ${String(error)}`, "notify");
+    }
+  };
+
+  const moveFollowUp = async (id: string, direction: -1 | 1) => {
+    const item = runInputStateRef.current.followUps.find(
+      (candidate) => candidate.id === id,
+    );
+    if (!item) return;
+    dispatchRunInput({ type: "move_follow_up", id, direction });
+    const preview = runInputReducer(runInputStateRef.current, {
+      type: "move_follow_up",
+      id,
+      direction,
+    });
+    const ids = followUpsForConversation(preview, item.conversationId).map(
+      (followUp) => followUp.id,
+    );
+    try {
+      const stored = await invoke<QueuedFollowUp[]>(
+        "pending_followups_reorder",
+        { conversationId: item.conversationId, ids },
+      );
+      dispatchRunInput({
+        type: "hydrate_follow_ups",
+        followUps: [
+          ...runInputStateRef.current.followUps.filter(
+            (followUp) => followUp.conversationId !== item.conversationId,
+          ),
+          ...stored,
+        ],
+      });
+    } catch (error) {
+      const stored = await invoke<QueuedFollowUp[]>("pending_followups_list").catch(
+        () => runInputStateRef.current.followUps,
+      );
+      dispatchRunInput({ type: "hydrate_follow_ups", followUps: stored });
+      notify(`A sorrend nem menthető: ${String(error)}`, "notify");
+    }
+  };
+
+  const editFollowUp = async (followUp: QueuedFollowUp, send = false) => {
+    inputDraftRef.current = followUp.body;
+    if (inputRef.current) {
+      inputRef.current.value = followUp.body;
+      resizeComposerTextarea(inputRef.current);
+    }
+    quoteInstructionDraftsRef.current = Object.fromEntries(
+      followUp.quoteRefs.map((quote) => [quote.id, quote.instruction]),
+    );
+    setComposerQuotes(followUp.quoteRefs);
+    setPendingImages(followUp.attachments);
+    await deleteFollowUp(followUp.id);
+    if (send) window.setTimeout(() => composerFormRef.current?.requestSubmit(), 0);
+    else window.setTimeout(() => inputRef.current?.focus(), 0);
   };
 
   const submitMessage = async (event: FormEvent<HTMLFormElement>) => {
@@ -14814,17 +15734,60 @@ function App() {
       Boolean(runForConversation(activeConversationId)) ||
       submitBusyConversationsRef.current.has(activeConversationId ?? "");
     if (conversationBusy) {
-      const queuedId = activeConversationId ?? "";
-      queuedSendRef.current.add(queuedId);
-      setQueuedSendConversations((current) =>
-        current.includes(queuedId) ? current : [...current, queuedId],
+      const liveRun = runForConversation(activeConversationId);
+      const target = resolveRunInputTarget(
+        activeConversationId,
+        runsRef.current.values(),
+        liveRun?.chain?.progress ?? null,
       );
-      // Némán sorba állni úgy néz ki, mintha az Enter elveszett volna — a
-      // szerkesztőben marad a szöveg, és látszólag nem történik semmi.
-      notify(
-        "Az előző kör még zárul le — a küldés a végén magától elindul.",
-        "notify",
+      const queueForNextStage = Boolean(
+        !target &&
+          runInputMode === "stage_next" &&
+          liveRun?.chain?.progress &&
+          (liveRun.chain.progress.phase === "started" ||
+            liveRun.chain.progress.stageIndex <
+              liveRun.chain.progress.stageCount - 1),
       );
+      const payload: RunInputPayload = {
+        inputId: crypto.randomUUID(),
+        mode:
+          (target && runInputMode === "steer") || queueForNextStage
+            ? "steer"
+            : "follow_up",
+        text,
+        modelPrompt: modelPrompt || text,
+        quoteRefs: quoteSnapshot,
+        images: pendingImageSnapshot,
+        target: target ?? undefined,
+        createdAt: new Date().toISOString(),
+      };
+      if (queueForNextStage && liveRun) {
+        if (pendingImageSnapshot.length > 0) {
+          notify(
+            "Képes üzenet jelenleg csak következő üzenetként küldhető.",
+            "notify",
+          );
+          return;
+        }
+        enqueueStageInput(payload, liveRun);
+        return;
+      }
+      if (payload.mode === "steer" && target) {
+        if (composerSendingInputRef.current) {
+          notify("Várd meg az előző terelés provider-visszaigazolását.", "notify");
+          return;
+        }
+        if (pendingImageSnapshot.length > 0) {
+          notify(
+            "Képes üzenet jelenleg csak következő üzenetként küldhető.",
+            "notify",
+          );
+          return;
+        }
+        void sendSteer(payload, target);
+      } else {
+        void enqueueFollowUp(payload);
+      }
       return;
     }
     // Egy projektben egy kör: a munkaterület-snapshot közös, két futás
@@ -14874,7 +15837,6 @@ function App() {
     // sorba állt egy rég véget ért futás mögé. A kulcsot végig visszük, és
     // amint megvan a végleges azonosító, a zár átköltözik rá.
     let submitBusyKey = activeConversationId;
-    const queuedOriginKey = activeConversationId ?? "";
     markSubmitBusy(submitBusyKey, true);
     setImagesPreparing(true);
     let storedImages: MessageImageAttachment[] = [
@@ -15208,6 +16170,7 @@ function App() {
         : normalizeConversationKey(activeProjectData.path),
       provider: useClaude ? "anthropic" : "codex",
       clientTurnId,
+      stageEpoch: 1,
       liveMessageId,
       turnId: clientTurnId,
       turnTiming: { startedAt: requestStartedAt },
@@ -15476,7 +16439,7 @@ function App() {
           setTurnCompletedRequestId(null);
           markSubmitBusy(runConversationId, false);
           endRun(requestId);
-          releaseQueuedSend(runConversationId);
+          void dispatchNextFollowUp();
         }
         return;
       }
@@ -15719,12 +16682,15 @@ function App() {
           index === targetIndex
             ? {
                 ...message,
-                text:
-                  stripStaleInterruptionMarker(message).text.trim() ||
-                  regeneration?.originalAnswer.text ||
-                  (wasCancelled
-                    ? "A válasz megszakítva."
-                    : `Nem sikerült a ${providerName}-kérés: ${errorDescription.userMessage}`),
+                text: wasCancelled
+                  ? appendInterruptedAnswerMarker(
+                      stripStaleInterruptionMarker(message).text.trim() ||
+                        regeneration?.originalAnswer.text ||
+                        "",
+                    )
+                  : stripStaleInterruptionMarker(message).text.trim() ||
+                    regeneration?.originalAnswer.text ||
+                    `Nem sikerült a ${providerName}-kérés: ${errorDescription.userMessage}`,
                 turnId: message.turnId ?? activeTurnIdRef.current,
                 live: false,
                 final: true,
@@ -15767,11 +16733,7 @@ function App() {
       // Gazdátlan futás nincs: a táblából kikerülve a késői eseményei nem
       // találnak haza, tehát eldobódnak — nem pedig „mindenhová" írnak.
       endRun(requestId);
-      releaseQueuedSend(runConversationId);
-      // Az első kérdés még azonosító nélküli kulcson állt sorba; az a sor is
-      // ezé a futásé, és vele együtt szabadul fel.
-      if (queuedOriginKey !== runConversationId)
-        releaseQueuedSend(queuedOriginKey);
+      void dispatchNextFollowUp();
     }
   };
 
@@ -15906,10 +16868,10 @@ function App() {
       return;
     }
     const chainStartsAt = messagesRef.current.indexOf(chainMessages[0]);
-    const originalPrompt = [...messagesRef.current.slice(0, chainStartsAt)]
+    const originalPromptMessage = [...messagesRef.current.slice(0, chainStartsAt)]
       .reverse()
-      .find((message) => message.role === "user")
-      ?.text.trim();
+      .find((message) => message.role === "user" && !message.interaction);
+    const originalPrompt = originalPromptMessage?.text.trim();
     if (!originalPrompt) {
       notify("Az eredeti kérdés nem található, a lánc nem indítható újra.");
       return;
@@ -15988,6 +16950,7 @@ function App() {
           : normalizeConversationKey(activeProjectData.path),
       provider: "anthropic",
       clientTurnId: `request:${requestId}`,
+      stageEpoch: 1,
       // Az újrafuttatásnak nincs saját élő buborékja: a szakaszok a maguk
       // kérés-azonosítója alatt streamelnek.
       liveMessageId: "",
@@ -16070,6 +17033,19 @@ function App() {
           userComments: userCommentText || null,
           chainId: chainKey,
           iteration,
+          runInputs: messagesRef.current
+            .filter(
+              (message) =>
+                message.interaction?.kind === "steer" &&
+                message.interaction.parentTurnId === originalPromptMessage?.turnId,
+            )
+            .map((message) => ({
+              inputId: message.interaction!.inputId,
+              acceptedAtStage: message.interaction!.stageIndex ?? -1,
+              acceptedAtRole: message.interaction!.stageRole ?? "run",
+              text: message.text,
+              acceptedAt: message.interaction!.acceptedAt,
+            })),
         },
       });
       // Same as the first pass: the edits go on disk before the answer does.
@@ -16159,7 +17135,7 @@ function App() {
       setRunsRevision((revision) => revision + 1);
       setIsCancelling(false);
       endRun(requestId);
-      releaseQueuedSend(rerunConversationId);
+      void dispatchNextFollowUp();
     }
   };
 
@@ -16356,7 +17332,29 @@ function App() {
   };
   const isInterruptedAssistantText = (text: string) => {
     if (text.toLowerCase().includes("megszak")) return true;
-    return /(?:^|\n\n)A válasz megszakítva\.?\s*$/i.test(text.trim());
+    return hasInterruptedAnswerMarker(text);
+  };
+  const interruptedAnswerWithPartial = (
+    answer: Message,
+    commentary: CommentaryEntry[],
+  ): Message => {
+    if (!(answer.interrupted || hasInterruptedAnswerMarker(answer.text)))
+      return answer;
+    const storedPartial = answer.text.replace(interruptedMarkerPattern, "").trim();
+    const commentaryPartial = [...commentary]
+      .reverse()
+      .find(
+        (entry) =>
+          entry.channel === "assistant-output" && entry.body.trim().length > 0,
+      )
+      ?.body.trim();
+    return {
+      ...answer,
+      text: appendInterruptedAnswerMarker(storedPartial || commentaryPartial || ""),
+      interrupted: true,
+      live: false,
+      final: true,
+    };
   };
   const answerForWorkGroup = (group: WorkLogGroup) => {
     const candidates = messages
@@ -16368,13 +17366,19 @@ function App() {
           message.text.trim().length > 0 &&
           messageBelongsToWorkGroup(message, index, group),
       );
-    const nonInterrupted = [...candidates]
+    // A stop marker is the terminal truth for the turn. Preferring an older,
+    // non-interrupted alias made a cancelled run look completed and hid the
+    // marker behind its last streamed sentence.
+    const interrupted = [...candidates]
       .reverse()
       .find(
         ({ message }) =>
-          !isInterruptedAssistantText(message.text) &&
-          !message.text.toLowerCase().includes("megszak"),
+          message.interrupted || isInterruptedAssistantText(message.text),
       );
+    if (interrupted) return interrupted.message;
+    const nonInterrupted = [...candidates].reverse().find(({ message }) =>
+      Boolean(message.text.trim()),
+    );
     if (nonInterrupted) return nonInterrupted.message;
     if (candidates.length > 0) return candidates[candidates.length - 1].message;
     // A trace without a user bucket has no reliable owner. Never attach the
@@ -16604,7 +17608,7 @@ function App() {
     }
     if (viewingActiveRun && entry.group.key === activeWorkGroup?.key)
       return null;
-    const groupAnswer = answerForWorkGroup(entry.group);
+    let groupAnswer = answerForWorkGroup(entry.group);
     // A quote-only/aborted turn can leave plan metadata behind without an
     // assistant answer. Rendering that orphaned trace produces a stray
     // horizontal rule between messages, so keep the timeline clean.
@@ -16614,6 +17618,7 @@ function App() {
       entry.group,
       groupAnswer.turnId,
     );
+    groupAnswer = interruptedAnswerWithPartial(groupAnswer, groupCommentary);
     if (!groupAnswer.pipeline && !workGroupHasVisibleTrace(entry.group))
       return null;
     // The same legacy leftover as in the message branch, but this copy owns a
@@ -17545,7 +18550,11 @@ function App() {
 
   return (
     <FileActionContext.Provider value={handleFileClick}>
-      <div className="app-shell" onClickCapture={handleLocalLinkClickCapture}>
+      <div
+        className="app-shell"
+        aria-busy={projectOpening}
+        onClickCapture={handleLocalLinkClickCapture}
+      >
       <header className="topbar">
         <div className="brand-lockup">
           <div className="brand-mark">m</div>
@@ -17731,8 +18740,15 @@ function App() {
                           [project.path]: !isOpen,
                         }));
                       }}
+                      onKeyDown={(event) => {
+                        if (event.key !== "Delete" || !event.shiftKey) return;
+                        event.preventDefault();
+                        event.stopPropagation();
+                        permanentlyDeleteProject(project);
+                      }}
                       aria-expanded={isOpen}
-                      title={project.path}
+                      aria-keyshortcuts="Shift+Delete"
+                      title={`${project.path}\nShift+Delete: végleges törlés`}
                     >
                       <span className="chevron">{isOpen ? "⌄" : "›"}</span>
                       <span className="folder-icon">◫</span>
@@ -17794,6 +18810,14 @@ function App() {
                             >
                               Törlés
                             </button>
+                            <button
+                              type="button"
+                              className="danger-action"
+                              onClick={() => permanentlyDeleteProject(project)}
+                              title="Gyorsbillentyű: Shift+Delete"
+                            >
+                              Végleges törlés…
+                            </button>
                           </div>
                         )}
                     </div>
@@ -17806,7 +18830,15 @@ function App() {
                           <button
                             className={`conversation-row${thread === activeThread && project.name === activeProject ? " is-active" : ""}`}
                             onClick={() => selectThread(project, thread)}
-                            title={thread}
+                            onKeyDown={(event) => {
+                              if (event.key !== "Delete" || !event.shiftKey)
+                                return;
+                              event.preventDefault();
+                              event.stopPropagation();
+                              permanentlyDeleteThread(project, thread);
+                            }}
+                            aria-keyshortcuts="Shift+Delete"
+                            title={`${thread}\nShift+Delete: végleges törlés`}
                           >
                             <TreeRunMark
                               state={conversationRunState(
@@ -17859,6 +18891,16 @@ function App() {
                                   >
                                     Törlés
                                   </button>
+                                  <button
+                                    type="button"
+                                    className="danger-action"
+                                    onClick={() =>
+                                      permanentlyDeleteThread(project, thread)
+                                    }
+                                    title="Gyorsbillentyű: Shift+Delete"
+                                  >
+                                    Végleges törlés…
+                                  </button>
                                 </div>
                               )}
                           </div>
@@ -17884,7 +18926,14 @@ function App() {
                       type="button"
                       className={`general-history-row${id === activeGeneralConversationId ? " is-active" : ""}`}
                       onClick={() => selectGeneralConversation(id)}
-                      title={conversation.title}
+                      onKeyDown={(event) => {
+                        if (event.key !== "Delete" || !event.shiftKey) return;
+                        event.preventDefault();
+                        event.stopPropagation();
+                        permanentlyDeleteGeneralConversation(conversation);
+                      }}
+                      aria-keyshortcuts="Shift+Delete"
+                      title={`${conversation.title}\nShift+Delete: végleges törlés`}
                     >
                       <TreeRunMark
                         state={conversationRunState(
@@ -17933,6 +18982,18 @@ function App() {
                               onClick={() => deleteGeneralConversation(conversation)}
                             >
                               Törlés
+                            </button>
+                            <button
+                              type="button"
+                              className="danger-action"
+                              onClick={() =>
+                                permanentlyDeleteGeneralConversation(
+                                  conversation,
+                                )
+                              }
+                              title="Gyorsbillentyű: Shift+Delete"
+                            >
+                              Végleges törlés…
                             </button>
                           </div>
                         )}
@@ -18030,17 +19091,17 @@ function App() {
                         )}
                       </div>
                     )}
-                    {tombstones.length > 0 && (
+                    {recoverableTombstones.length > 0 && (
                       <section
                         className="sync-recovery"
                         aria-label="Recovery Center"
                       >
                         <div className="sync-recovery-heading">
                           <strong>Recovery Center</strong>
-                          <span>{tombstones.length}</span>
+                          <span>{recoverableTombstones.length}</span>
                         </div>
                         <div className="sync-recovery-list">
-                          {[...tombstones]
+                          {[...recoverableTombstones]
                             .sort(
                               (left, right) =>
                                 Date.parse(right.archivedAt) -
@@ -18100,9 +19161,9 @@ function App() {
                               );
                             })}
                         </div>
-                        {tombstones.length > 8 && (
+                        {recoverableTombstones.length > 8 && (
                           <small className="sync-recovery-more">
-                            +{tombstones.length - 8} további archivált elem
+                            +{recoverableTombstones.length - 8} további archivált elem
                           </small>
                         )}
                       </section>
@@ -18292,26 +19353,116 @@ function App() {
             )}
           </div>
           <form ref={composerFormRef} className="composer-wrap" onSubmit={submitMessage}>
-            {queuedSendConversations.includes(activeConversationId ?? "") && (
-              <div className="queued-send" role="status">
-                <ThinkingDots label="Küldés a futó válasz után" />
-                <span>
-                  {activeTurnHasCompleted
-                    ? "A válasz kész, a munkaterület mentése folyik — az üzenet ezután indul."
-                    : "Az üzenet a futó válasz után indul."}
-                </span>
+            {activeFollowUps.length > 0 && (
+              <div className="follow-up-queue" role="region" aria-label="Következő üzenetek">
+                <div className="follow-up-queue-title">
+                  KÖVETKEZŐ ÜZENETEK · {activeFollowUps.length}
+                </div>
+                {activeFollowUps.map((followUp, index) => (
+                  <div className="follow-up-queue-row" key={followUp.id}>
+                    <span className="follow-up-queue-index">{index + 1}.</span>
+                    <span className="follow-up-queue-body" title={followUp.body}>
+                      {followUp.body || "Képes üzenet"}
+                    </span>
+                    {!viewingActiveRun && (
+                      <button type="button" onClick={() => void editFollowUp(followUp, true)}>
+                        Küldés
+                      </button>
+                    )}
+                    <button type="button" onClick={() => void editFollowUp(followUp)}>
+                      Szerkeszt
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="Feljebb"
+                      disabled={index === 0}
+                      onClick={() => void moveFollowUp(followUp.id, -1)}
+                    >
+                      ↑
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="Lejjebb"
+                      disabled={index === activeFollowUps.length - 1}
+                      onClick={() => void moveFollowUp(followUp.id, 1)}
+                    >
+                      ↓
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="Törlés"
+                      onClick={() => void deleteFollowUp(followUp.id)}
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            {viewingActiveRun && (
+              <div className="run-input-mode" role="group" aria-label="Futás közbeni küldés módja">
                 <button
                   type="button"
-                  onClick={() => {
-                    const id = activeConversationId ?? "";
-                    queuedSendRef.current.delete(id);
-                    setQueuedSendConversations((current) =>
-                      current.filter((candidate) => candidate !== id),
-                    );
-                  }}
+                  className={runInputMode === "steer" ? "is-active" : ""}
+                  disabled={!activeRunInputTarget}
+                  onClick={() => setRunInputMode("steer")}
                 >
-                  Mégse
+                  ⇢ TERELÉS
                 </button>
+                {pipelineStageQueueAvailable && !activeRunInputTarget && (
+                  <button
+                    type="button"
+                    className={runInputMode === "stage_next" ? "is-active" : ""}
+                    onClick={() => setRunInputMode("stage_next")}
+                  >
+                    KÖVETKEZŐ FÁZIS
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className={runInputMode === "follow_up" ? "is-active" : ""}
+                  onClick={() => setRunInputMode("follow_up")}
+                >
+                  KÖVETKEZŐ ÜZENET
+                </button>
+                <span className="run-input-target">
+                  {activeRunInputTarget
+                    ? `${STAGE_ROLE_LABELS[activeRunInputTarget.stageRole ?? ""] ?? (activeMode === "general" ? "GENERAL" : "EGY AI")} · ${activeRunInputTarget.provider === "anthropic" ? "Claude" : "ChatGPT"}`
+                    : activeTurnHasCompleted
+                      ? "A válasz kész · mentés folyik"
+                      : "Következő fázis indul…"}
+                </span>
+              </div>
+            )}
+            {activeStageInputs.length > 0 && (
+              <div className="runtime-input-status" aria-live="polite">
+                {activeStageInputs.map((input) => (
+                  <div className="runtime-input-row" key={input.inputId}>
+                    <span>Következő fázisra vár…</span>
+                    <span>{input.text}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            {activeRuntimeInputs.some(
+              (input) => input.delivery.status === "sending" || input.delivery.status === "failed",
+            ) && (
+              <div className="runtime-input-status" aria-live="polite">
+                {activeRuntimeInputs
+                  .filter(
+                    (input) =>
+                      input.delivery.status === "sending" ||
+                      input.delivery.status === "failed",
+                  )
+                  .map((input) => (
+                    <div
+                      key={input.payload.inputId}
+                      className={`runtime-input-row is-${input.delivery.status}`}
+                    >
+                      <span>{input.delivery.status === "sending" ? "Küldés a futó AI-nak…" : "A terelés nem ment át"}</span>
+                      <span>{input.payload.text}</span>
+                    </div>
+                  ))}
               </div>
             )}
             <div className="composer-controls">
@@ -18503,6 +19654,12 @@ function App() {
                 placeholder={
                   reviewCommentTarget
                     ? "Írd be a kommentet a v2 újrafuttatásához…"
+                    : viewingActiveRun && runInputMode === "steer" && activeRunInputTarget
+                      ? "Írj a futó AI-nak…"
+                      : viewingActiveRun && runInputMode === "stage_next"
+                        ? "Írj a következő pipeline-fázisnak…"
+                      : viewingActiveRun
+                        ? "Írd meg a következő üzenetet…"
                     : "Írj egy üzenetet, vagy illessz be egy screenshotot…"
                 }
                 aria-label={
@@ -18552,13 +19709,35 @@ function App() {
                     onSelectEffort={selectEffortIndex}
                   />
                 </div>
+                {viewingActiveRun && !activeTurnHasCompleted && (
+                  <button
+                    type="button"
+                    className="stop-button"
+                    aria-label="Gondolkodás leállítása"
+                    title="Gondolkodás leállítása"
+                    disabled={isCancelling}
+                    onClick={() => void stopGeneration()}
+                  >
+                    ■
+                  </button>
+                )}
                 <button
                   type="submit"
                   className="send-button"
-                  aria-label={reviewCommentTarget ? "Komment küldése" : "Üzenet küldése"}
+                  aria-label={
+                    reviewCommentTarget
+                      ? "Komment küldése"
+                      : viewingActiveRun &&
+                          (runInputMode === "steer" || runInputMode === "stage_next")
+                        ? "Terelés küldése a futó AI-nak"
+                        : "Üzenet küldése"
+                  }
                   disabled={imagesPreparing}
                 >
-                  ↑
+                  {viewingActiveRun &&
+                  (runInputMode === "steer" || runInputMode === "stage_next")
+                    ? "⇢"
+                    : "↑"}
                 </button>
               </div>
             </div>

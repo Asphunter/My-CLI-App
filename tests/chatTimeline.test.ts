@@ -44,6 +44,106 @@ test("a completed plan creates its own card without any work item", () => {
   assert.equal(messageBelongsToWorkGroup(messages, 3, groups[1]), true);
 });
 
+test("an accepted steer stays in its parent work group and never starts a new user bucket", () => {
+  const messages = [
+    {
+      id: "root-user",
+      role: "user" as const,
+      text: "Build it",
+      sequence: 10,
+      turnId: "request:root",
+    },
+    {
+      id: "steer-1",
+      role: "user" as const,
+      text: "Do not touch CSS",
+      sequence: 12,
+      turnId: "request:root",
+      interaction: {
+        kind: "steer" as const,
+        inputId: "input-1",
+        parentTurnId: "request:root",
+      },
+    },
+    {
+      id: "answer",
+      role: "assistant" as const,
+      text: "Done",
+      sequence: 20,
+      turnId: "request:root",
+      final: true,
+    },
+  ];
+  const groups = buildWorkLogGroups({
+    messages,
+    activities: [{ id: 11, turnId: "request:root" }],
+    planHistory: {},
+    commentary: [],
+  });
+
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].userMessageKey, "root-user");
+  assert.equal(messageBelongsToWorkGroup(messages, 1, groups[0]), true);
+});
+
+test("a pipeline steer targets only the stage named by its interaction metadata", () => {
+  const messages = [
+    { id: "u", role: "user" as const, text: "Build", sequence: 1 },
+    {
+      id: "plan-answer",
+      role: "assistant" as const,
+      text: "Plan",
+      sequence: 5,
+      turnId: "request:run-stage-0",
+      pipeline: { runId: "run", stageIndex: 0 },
+    },
+    {
+      id: "steer",
+      role: "user" as const,
+      text: "Use rows",
+      sequence: 7,
+      interaction: {
+        kind: "steer" as const,
+        inputId: "input",
+        parentTurnId: "request:root",
+        pipelineRunId: "run",
+        stageIndex: 1,
+      },
+    },
+    {
+      id: "other-code-answer",
+      role: "assistant" as const,
+      text: "Other run code",
+      sequence: 8,
+      turnId: "request:other-run-stage-1",
+      pipeline: { runId: "other-run", stageIndex: 1 },
+    },
+    {
+      id: "code-answer",
+      role: "assistant" as const,
+      text: "Code",
+      sequence: 10,
+      turnId: "request:run-stage-1",
+      pipeline: { runId: "run", stageIndex: 1 },
+    },
+  ];
+  const groups = buildWorkLogGroups({
+    messages,
+    activities: [],
+    planHistory: {},
+    commentary: [],
+  });
+  const plan = groups.find((group) => group.key.includes("::run:run#0"))!;
+  const code = groups.find((group) => group.key.includes("::run:run#1"))!;
+  const otherCode = groups.find((group) =>
+    group.key.includes("::run:other-run#1"),
+  )!;
+
+  assert.equal(messageBelongsToWorkGroup(messages, 2, plan), false);
+  assert.equal(messageBelongsToWorkGroup(messages, 2, code), true);
+  assert.equal(messageBelongsToWorkGroup(messages, 2, otherCode), false);
+});
+
 test("starting a new stream never reuses the previous historical card", () => {
   const messages = [
     { id: "u-old", role: "user" as const, text: "old", sequence: 10 },

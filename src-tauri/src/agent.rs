@@ -23,6 +23,176 @@ pub enum AgentRuntimeKind {
     ClaudeAgentBridge,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentInputErrorCode {
+    NoActiveRun,
+    NoActiveTurn,
+    TargetChanged,
+    TransportClosed,
+    ProviderRejected,
+    UnsupportedPayload,
+    DuplicateInput,
+    RunCancelled,
+    RuntimeFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentInputTarget {
+    pub conversation_id: String,
+    pub root_request_id: String,
+    pub provider_request_id: String,
+    pub provider: AgentProvider,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_index: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_role: Option<String>,
+    pub stage_epoch: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSteerRequest {
+    pub input_id: String,
+    pub conversation_id: String,
+    pub root_request_id: String,
+    pub provider_request_id: String,
+    pub provider: AgentProvider,
+    pub expected_provider_turn_id: String,
+    pub expected_stage_epoch: u64,
+    pub text: String,
+    #[serde(default)]
+    pub pipeline_run_id: Option<String>,
+    #[serde(default)]
+    pub stage_index: Option<i64>,
+    #[serde(default)]
+    pub stage_role: Option<String>,
+}
+
+impl AgentSteerRequest {
+    pub fn target(
+        &self,
+        provider_thread_id: Option<String>,
+        provider_turn_id: Option<String>,
+    ) -> AgentInputTarget {
+        AgentInputTarget {
+            conversation_id: self.conversation_id.clone(),
+            root_request_id: self.root_request_id.clone(),
+            provider_request_id: self.provider_request_id.clone(),
+            provider: self.provider,
+            provider_thread_id,
+            provider_turn_id,
+            pipeline_run_id: self.pipeline_run_id.clone(),
+            stage_index: self.stage_index,
+            stage_role: self.stage_role.clone(),
+            stage_epoch: self.expected_stage_epoch,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSteerQueued {
+    pub input_id: String,
+    pub queued_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSteerError {
+    pub code: AgentInputErrorCode,
+    pub message: String,
+}
+
+impl AgentSteerError {
+    pub fn new(code: AgentInputErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentInputStatus {
+    Sending,
+    Accepted,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentInputStatusEvent {
+    pub input_id: String,
+    pub conversation_id: String,
+    pub root_request_id: String,
+    pub provider_request_id: String,
+    pub status: AgentInputStatus,
+    pub timestamp: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<AgentInputErrorCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_target: Option<AgentInputTarget>,
+}
+
+impl AgentInputStatusEvent {
+    pub fn sending(request: &AgentSteerRequest) -> Self {
+        Self {
+            input_id: request.input_id.clone(),
+            conversation_id: request.conversation_id.clone(),
+            root_request_id: request.root_request_id.clone(),
+            provider_request_id: request.provider_request_id.clone(),
+            status: AgentInputStatus::Sending,
+            timestamp: now_timestamp(),
+            code: None,
+            message: None,
+            accepted_target: None,
+        }
+    }
+
+    pub fn accepted(request: &AgentSteerRequest, target: AgentInputTarget) -> Self {
+        Self {
+            input_id: request.input_id.clone(),
+            conversation_id: request.conversation_id.clone(),
+            root_request_id: request.root_request_id.clone(),
+            provider_request_id: request.provider_request_id.clone(),
+            status: AgentInputStatus::Accepted,
+            timestamp: now_timestamp(),
+            code: None,
+            message: None,
+            accepted_target: Some(target),
+        }
+    }
+
+    pub fn rejected(
+        request: &AgentSteerRequest,
+        code: AgentInputErrorCode,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            input_id: request.input_id.clone(),
+            conversation_id: request.conversation_id.clone(),
+            root_request_id: request.root_request_id.clone(),
+            provider_request_id: request.provider_request_id.clone(),
+            status: AgentInputStatus::Rejected,
+            timestamp: now_timestamp(),
+            code: Some(code),
+            message: Some(message.into()),
+            accepted_target: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentCapabilities {
@@ -300,7 +470,7 @@ pub fn codex_model_descriptors(models: Vec<crate::codex::CodexModel>) -> Vec<Age
         .collect()
 }
 
-fn now_timestamp() -> String {
+pub(crate) fn now_timestamp() -> String {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())

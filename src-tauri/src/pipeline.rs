@@ -676,6 +676,21 @@ pub struct PipelineRunRequest {
     /// 1-based. v1 is the original run, v2 and v3 are the re-runs.
     #[serde(default)]
     pub iteration: Option<i64>,
+    /// Accepted mid-run user instructions carried into a resumed/retried run.
+    #[serde(default)]
+    pub run_inputs: Vec<PipelineRunInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineRunInput {
+    pub input_id: String,
+    pub accepted_at_stage: i64,
+    pub accepted_at_role: String,
+    pub text: String,
+    pub accepted_at: String,
+    #[serde(default)]
+    pub carried: bool,
 }
 
 /// A stage the caller already has an answer for. The wire form of
@@ -817,7 +832,9 @@ pub struct PipelineProgress {
     pub stage_count: i64,
     pub role: StageRole,
     pub agent_label: String,
+    pub provider: AgentProvider,
     pub request_id: String,
+    pub stage_epoch: u64,
     pub phase: &'static str,
     pub status: RunStatus,
 }

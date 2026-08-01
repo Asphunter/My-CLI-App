@@ -10,6 +10,14 @@ export type TimelineMessageLike = {
   originDeviceId?: string;
   /** Set on every answer a chain produced, one per stage. */
   pipeline?: { runId: string; stageIndex: number };
+  interaction?: {
+    kind: "steer";
+    inputId: string;
+    parentTurnId: string;
+    targetRequestId?: string;
+    pipelineRunId?: string;
+    stageIndex?: number;
+  };
 };
 
 export type TimelineActivityLike = {
@@ -61,6 +69,9 @@ const finiteNumber = (value: unknown): value is number =>
 const messageSequence = (message: TimelineMessageLike, index: number) =>
   finiteNumber(message.sequence) ? message.sequence : index;
 
+export const isSteerTimelineMessage = (message: TimelineMessageLike) =>
+  message.role === "user" && message.interaction?.kind === "steer";
+
 const findLastMessageIndex = <Message extends TimelineMessageLike>(
   messages: Message[],
   matches: (message: Message) => boolean,
@@ -77,7 +88,7 @@ export const userMessageKeyAtIndex = (
 ) => {
   for (let cursor = index; cursor >= 0; cursor -= 1) {
     const message = messages[cursor];
-    if (message?.role === "user")
+    if (message?.role === "user" && !isSteerTimelineMessage(message))
       return message.id ?? `user:${messageSequence(message, cursor)}`;
   }
   return undefined;
@@ -122,7 +133,10 @@ export const buildWorkLogGroups = <
 }): WorkLogGroup<Activity>[] => {
   const userMessages = messages
     .map((message, index) => ({ message, index }))
-    .filter(({ message }) => message.role === "user")
+    .filter(
+      ({ message }) =>
+        message.role === "user" && !isSteerTimelineMessage(message),
+    )
     .map(({ message, index }) => ({
       key: message.id ?? `user:${messageSequence(message, index)}`,
       sequence: messageSequence(message, index),
@@ -384,6 +398,27 @@ export const messageBelongsToWorkGroup = (
   const message = messages[messageIndex];
   if (!message) return false;
   const turnKeys = new Set(workGroupTurnKeys(group));
+  if (isSteerTimelineMessage(message)) {
+    const interaction = message.interaction!;
+    if (
+      interaction.stageIndex !== undefined &&
+      (interaction.pipelineRunId
+        ? group.key.includes(
+            `::run:${interaction.pipelineRunId}#${interaction.stageIndex}`,
+          )
+        : group.key.endsWith(`#${interaction.stageIndex}`))
+    )
+      return true;
+    if (turnKeys.has(interaction.parentTurnId)) return true;
+    const parent = messages.find(
+      (candidate) =>
+        candidate.role === "user" &&
+        !isSteerTimelineMessage(candidate) &&
+        candidate.turnId === interaction.parentTurnId,
+    );
+    const parentKey = parent?.id;
+    return Boolean(parentKey && group.userMessageKey === parentKey);
+  }
   // Once both sides have explicit identities, a mismatch is authoritative.
   // Falling through to a chronological guess is what mixed separate cards.
   if (message.turnId) return turnKeys.has(message.turnId);

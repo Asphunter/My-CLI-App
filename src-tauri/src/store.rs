@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
-pub const STORE_SCHEMA_VERSION: i64 = 23;
+pub const STORE_SCHEMA_VERSION: i64 = 24;
 // The public snapshot and sync contracts represent GENERAL with
 // projectId = null. SQLite keeps this hidden FK target only because the
 // existing conversations.project_id column is intentionally NOT NULL and
@@ -84,6 +84,9 @@ CREATE TABLE IF NOT EXISTS messages (
     -- badged on any device. Travels on the message for the same reason the
     -- detailed flag does: it needs no new journal event type.
     pipeline_json TEXT,
+    -- Accepted mid-turn user input. NULL remains an ordinary turn-opening
+    -- message; the JSON object keeps the exact provider/stage target.
+    interaction_json TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -162,6 +165,24 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
 
 CREATE INDEX IF NOT EXISTS idx_pipeline_runs_conversation
     ON pipeline_runs(conversation_id, created_at);
+
+-- Device-local by design: another machine cannot safely continue a process
+-- that only exists here. The table is never included in sync snapshots.
+CREATE TABLE IF NOT EXISTS pending_followups (
+    id TEXT PRIMARY KEY NOT NULL,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    model_prompt TEXT NOT NULL,
+    quote_refs_json TEXT NOT NULL DEFAULT '[]',
+    attachments_json TEXT NOT NULL DEFAULT '[]',
+    request_settings_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_followups_position
+    ON pending_followups(conversation_id, position);
 
 CREATE TABLE IF NOT EXISTS agent_approvals (
     id TEXT PRIMARY KEY NOT NULL,
@@ -412,6 +433,28 @@ pub struct LocalMessage {
     /// that belong to a run, so an ordinary turn carries nothing extra.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline: Option<LocalMessagePipeline>,
+    /// Provider-accepted mid-turn user input. Kept on the message so the sync
+    /// event and snapshot paths carry it without a second event family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingFollowUp {
+    pub id: String,
+    pub conversation_id: String,
+    pub position: i64,
+    pub body: String,
+    pub model_prompt: String,
+    #[serde(default)]
+    pub quote_refs: serde_json::Value,
+    #[serde(default)]
+    pub attachments: serde_json::Value,
+    #[serde(default)]
+    pub request_settings: serde_json::Value,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -663,6 +706,7 @@ fn same_user_payload(left: &LocalMessage, right: &LocalMessage) -> bool {
         && right.role == "user"
         && left.text == right.text
         && left.images == right.images
+        && left.interaction == right.interaction
 }
 
 fn collapse_abandoned_regeneration_retries(messages: &[LocalMessage]) -> Vec<LocalMessage> {
@@ -1155,6 +1199,7 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
                             detailed: None,
                             change_summary: Vec::new(),
                             pipeline: None,
+                            interaction: None,
                         },
                     ))
                 })
@@ -1710,9 +1755,59 @@ pub fn initialize_connection(connection: &mut Connection) -> Result<(), String> 
             format!("A lokális SQLite v23 migráció commitja sikertelen: {error}")
         })?;
     }
-    // Cheap invariant check rather than a one-shot migration: the fossils can
-    // also arrive later from another device that has not been updated yet.
+    let migrated_version = read_schema_version(connection)?;
+    if migrated_version == 23 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("A lokális SQLite v24 migráció nem indítható el: {error}"))?;
+        let has_interaction_column: bool = {
+            let mut statement = transaction
+                .prepare("PRAGMA table_info(messages)")
+                .map_err(|error| format!("A v24 messages schema nem olvasható: {error}"))?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|error| format!("A v24 messages oszloplista nem olvasható: {error}"))?
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(|error| format!("A v24 messages schema hibás: {error}"))?;
+            columns.contains("interaction_json")
+        };
+        if !has_interaction_column {
+            transaction
+                .execute_batch("ALTER TABLE messages ADD COLUMN interaction_json TEXT;")
+                .map_err(|error| {
+                    format!("A v24 messages.interaction_json oszlop nem hozható létre: {error}")
+                })?;
+        }
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS pending_followups (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                     position INTEGER NOT NULL,
+                     body TEXT NOT NULL,
+                     model_prompt TEXT NOT NULL,
+                     quote_refs_json TEXT NOT NULL DEFAULT '[]',
+                     attachments_json TEXT NOT NULL DEFAULT '[]',
+                     request_settings_json TEXT NOT NULL DEFAULT '{}',
+                     created_at TEXT NOT NULL,
+                     updated_at TEXT NOT NULL
+                 );
+                 CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_followups_position
+                     ON pending_followups(conversation_id, position);
+                 PRAGMA user_version = 24;",
+            )
+            .map_err(|error| format!("A v24 follow-up tábla létrehozása sikertelen: {error}"))?;
+        transaction.commit().map_err(|error| {
+            format!("A lokális SQLite v24 migráció commitja sikertelen: {error}")
+        })?;
+    }
+    // A transient frontend snapshot may briefly assign an answer an older
+    // sequence than its question. Preserve the answer and move it after the
+    // question; deleting it here used to race the final message event.
     repair_answers_before_their_question(connection)?;
+    // Older builds already tombstoned some answers in that race. The append-only
+    // journal can prove which of those later received a valid final event.
+    restore_wrongly_tombstoned_answers(connection)?;
     Ok(())
 }
 
@@ -3480,12 +3575,10 @@ pub fn local_store_health() -> Result<StoreHealth, String> {
     }
 }
 
-/// An answer can never precede its own question: the canonical writer always
-/// places it directly after the user row. Rows that do sit earlier are fossils
-/// of the old shared-`assistant-0` merge, which folded every answer of a
-/// conversation into the first one and saved that text back under a foreign,
-/// much older turn. Drop them and tombstone the id, otherwise the next journal
-/// import resurrects the fossil on every device.
+/// An answer can never precede its own question, but that does not make the
+/// answer disposable. Live/final snapshot writes can race and briefly produce
+/// exactly that ordering. Move the row after its question and let the normal
+/// same-turn identity merge decide which body is canonical.
 pub(crate) fn repair_answers_before_their_question(
     connection: &mut Connection,
 ) -> Result<usize, String> {
@@ -3508,10 +3601,10 @@ pub(crate) fn repair_answers_before_their_question(
         return Ok(0);
     }
 
-    let fossils = {
+    let misplaced = {
         let mut statement = connection
             .prepare(
-                "SELECT answer.id
+                "SELECT answer.id, answer.conversation_id, question.sequence
                  FROM messages AS answer
                  JOIN messages AS question
                    ON question.conversation_id = answer.conversation_id
@@ -3525,39 +3618,225 @@ pub(crate) fn repair_answers_before_their_question(
                 format!("A hibás pozíciójú válaszok lekérdezése sikertelen: {error}")
             })?;
         let rows = statement
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
             .map_err(|error| format!("A hibás pozíciójú válaszok olvasása sikertelen: {error}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("A hibás pozíciójú válaszok olvasása sikertelen: {error}"))?
     };
-    if fossils.is_empty() {
+    if misplaced.is_empty() {
         return Ok(0);
     }
 
-    let now = now_millis();
     let transaction = connection
         .transaction()
         .map_err(|error| format!("A válaszjavítás tranzakciója nem indítható: {error}"))?;
-    for id in &fossils {
-        transaction
-            .execute("DELETE FROM messages WHERE id = ?1", params![id])
-            .map_err(|error| format!("A hibás pozíciójú válasz nem törölhető: {error}"))?;
+    for (id, conversation_id, question_sequence) in &misplaced {
+        let directly_after = question_sequence.saturating_add(1);
+        let occupied: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM messages
+                     WHERE conversation_id = ?1 AND sequence = ?2 AND id <> ?3
+                 )",
+                params![conversation_id, directly_after, id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("A válasz új pozíciója nem ellenőrizhető: {error}"))?;
+        let sequence = if occupied {
+            transaction
+                .query_row(
+                    "SELECT COALESCE(MAX(sequence), ?2) + 1
+                     FROM messages WHERE conversation_id = ?1",
+                    params![conversation_id, question_sequence],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| format!("A válasz új sorszáma nem képezhető: {error}"))?
+        } else {
+            directly_after
+        };
         transaction
             .execute(
-                "INSERT INTO sync_tombstones
-                     (entity_type, entity_id, archived_at, project_id, title, relative_path, path_hint, reason)
-                 VALUES ('message', ?1, ?2, NULL, NULL, NULL, NULL, 'answer-before-question')
-                 ON CONFLICT(entity_type, entity_id) DO UPDATE SET
-                     archived_at = excluded.archived_at,
-                     reason = excluded.reason",
-                params![id, now],
+                "UPDATE messages SET sequence = ?1 WHERE id = ?2",
+                params![sequence, id],
             )
-            .map_err(|error| format!("A hibás válasz tombstone-ja nem menthető: {error}"))?;
+            .map_err(|error| format!("A hibás pozíciójú válasz nem sorolható át: {error}"))?;
     }
     transaction
         .commit()
         .map_err(|error| format!("A válaszjavítás commitja sikertelen: {error}"))?;
-    Ok(fossils.len())
+    Ok(misplaced.len())
+}
+
+/// Restores answers deleted by the former `answer-before-question` heuristic,
+/// but only when a later append-only journal event proves that the final answer
+/// belongs after the matching user question. Real historical fossils have no
+/// such valid event and remain buried.
+pub(crate) fn restore_wrongly_tombstoned_answers(
+    connection: &mut Connection,
+) -> Result<usize, String> {
+    let recovery_tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name IN ('sync_tombstones', 'sync_events')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("A választörlés-helyreállítás sémája nem ellenőrizhető: {error}"))?;
+    if recovery_tables < 2 {
+        return Ok(0);
+    }
+    let event_rows = {
+        let mut statement = connection
+            .prepare(
+                "SELECT tombstone.entity_id, event.payload_json, event.hlc
+                 FROM sync_tombstones AS tombstone
+                 JOIN sync_events AS event
+                   ON event.entity_id = tombstone.entity_id
+                  AND event.event_type = 'message.upsert'
+                 WHERE tombstone.entity_type = 'message'
+                   AND tombstone.reason = 'answer-before-question'
+                 ORDER BY tombstone.entity_id, event.hlc DESC,
+                          event.device_id DESC, event.device_sequence DESC, event.event_id DESC",
+            )
+            .map_err(|error| format!("A téves választörlések naplója nem olvasható: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| format!("A téves választörlések naplója nem járható be: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("A téves választörlés egyik eseménye hibás: {error}"))?;
+        rows
+    };
+
+    let mut seen = HashSet::new();
+    let mut recoverable = Vec::new();
+    for (entity_id, payload_json, event_hlc) in event_rows {
+        if seen.contains(&entity_id) {
+            continue;
+        }
+        let Ok(payload) = serde_json::from_str::<StoredMessageEventPayload>(&payload_json) else {
+            continue;
+        };
+        let message = payload.message;
+        let Some(message_id) = message.id.as_deref() else {
+            continue;
+        };
+        let Some(turn_id) = message.turn_id.as_deref() else {
+            continue;
+        };
+        let Some(answer_sequence) = message.sequence else {
+            continue;
+        };
+        if message_id != entity_id
+            || message.role != "assistant"
+            || message.live.unwrap_or(false)
+            || !message.final_message.unwrap_or(false)
+            || message.text.trim().is_empty()
+        {
+            continue;
+        }
+        let question_sequence = connection
+            .query_row(
+                "SELECT sequence FROM messages
+                 WHERE conversation_id = ?1 AND role = 'user' AND turn_id = ?2
+                 ORDER BY sequence DESC, id DESC LIMIT 1",
+                params![payload.conversation_id, turn_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("A helyreállítandó válasz kérdése nem olvasható: {error}"))?;
+        if !question_sequence.is_some_and(|sequence| answer_sequence > sequence) {
+            continue;
+        }
+        seen.insert(entity_id.clone());
+        recoverable.push((entity_id, payload.conversation_id, message, event_hlc));
+    }
+    if recoverable.is_empty() {
+        return Ok(0);
+    }
+
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("A téves választörlés helyreállítása nem indítható: {error}"))?;
+    for (entity_id, conversation_id, message, event_hlc) in &recoverable {
+        let attachments_json = serde_json::to_string(&message.images)
+            .map_err(|error| format!("A helyreállított válasz csatolmányai hibásak: {error}"))?;
+        let quote_refs_json = serde_json::to_string(&message.quote_refs)
+            .map_err(|error| format!("A helyreállított válasz idézetei hibásak: {error}"))?;
+        let change_summary_json = serde_json::to_string(&message.change_summary)
+            .map_err(|error| format!("A helyreállított válasz fájllistája hibás: {error}"))?;
+        let pipeline_json = message
+            .pipeline
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| format!("A helyreállított válasz pipeline-metaadata hibás: {error}"))?;
+        let interaction_json = message
+            .interaction
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| format!("A helyreállított válasz interakciója hibás: {error}"))?;
+        transaction
+            .execute(
+                "INSERT INTO messages
+                     (id, conversation_id, role, body, sequence, hlc, item_id, turn_id,
+                      code, live, \"final\", origin_device_id, attachments_json,
+                      quote_refs_json, created_at, detailed, change_summary_json,
+                      pipeline_json, interaction_json)
+                 VALUES (?1, ?2, 'assistant', ?3, ?4, ?5, ?6, ?7, ?8, 0, 1,
+                         NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                 ON CONFLICT(id) DO UPDATE SET
+                     body = excluded.body,
+                     sequence = excluded.sequence,
+                     hlc = excluded.hlc,
+                     item_id = COALESCE(excluded.item_id, messages.item_id),
+                     turn_id = COALESCE(excluded.turn_id, messages.turn_id),
+                     live = 0,
+                     \"final\" = 1",
+                params![
+                    entity_id,
+                    conversation_id,
+                    message.text,
+                    message.sequence,
+                    message.hlc.as_deref().unwrap_or(event_hlc),
+                    message.item_id,
+                    message.turn_id,
+                    if message.code.unwrap_or(false) { 1 } else { 0 },
+                    attachments_json,
+                    quote_refs_json,
+                    message.time,
+                    message.detailed,
+                    change_summary_json,
+                    pipeline_json,
+                    interaction_json,
+                ],
+            )
+            .map_err(|error| format!("A tévesen törölt válasz nem állítható helyre: {error}"))?;
+        transaction
+            .execute(
+                "DELETE FROM sync_tombstones
+                 WHERE entity_type = 'message' AND entity_id = ?1
+                   AND reason = 'answer-before-question'",
+                params![entity_id],
+            )
+            .map_err(|error| format!("A téves válasz-tombstone nem törölhető: {error}"))?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("A tévesen törölt válasz helyreállítása sikertelen: {error}"))?;
+    Ok(recoverable.len())
 }
 
 /// What returning to an earlier prompt would do, worked out before doing it.
@@ -3928,8 +4207,32 @@ fn stable_id(kind: &str, key: &str) -> String {
     .to_string()
 }
 
+pub(crate) fn interaction_input_id(message: &LocalMessage) -> Option<&str> {
+    message
+        .interaction
+        .as_ref()
+        .and_then(|interaction| {
+            interaction
+                .get("inputId")
+                .or_else(|| interaction.get("input_id"))
+        })
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn is_steer_message(message: &LocalMessage) -> bool {
+    message
+        .interaction
+        .as_ref()
+        .and_then(|interaction| interaction.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind == "steer")
+}
+
 fn message_identity_keys(message: &LocalMessage) -> Vec<String> {
     let mut keys = Vec::new();
+    let interaction_input_id = interaction_input_id(message);
     let turn_id = message
         .turn_id
         .as_deref()
@@ -3945,17 +4248,26 @@ fn message_identity_keys(message: &LocalMessage) -> Vec<String> {
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    if let Some(turn_id) = turn_id {
+    if let Some(input_id) = interaction_input_id {
+        // A steering input deliberately points at the root client turn. Its
+        // own immutable input id is the identity; using the parent turn here
+        // would coalesce it with (and later delete) the original prompt.
+        keys.push(format!("interaction:{input_id}:{}", message.role));
+    } else if let Some(turn_id) = turn_id {
         keys.push(format!("turn:{turn_id}:{}", message.role));
     }
-    if let Some(item_id) = item_id {
+    if interaction_input_id.is_none() {
+        if let Some(item_id) = item_id {
         // An item id only identifies a message inside its own turn. Providers
         // label content blocks positionally, so every first answer block is
         // `assistant-0`; treating that as a global identity merged every answer
         // in a conversation into one and dropped the rest.
-        match turn_id {
-            Some(turn_id) => keys.push(format!("turn:{turn_id}:item:{item_id}:{}", message.role)),
-            None => keys.push(format!("item:{item_id}:{}", message.role)),
+            match turn_id {
+                Some(turn_id) => {
+                    keys.push(format!("turn:{turn_id}:item:{item_id}:{}", message.role))
+                }
+                None => keys.push(format!("item:{item_id}:{}", message.role)),
+            }
         }
     }
     if let Some(id) = id {
@@ -4074,6 +4386,7 @@ fn merge_snapshot_message_versions(
             .origin_device_id
             .clone()
             .or(incoming.origin_device_id);
+        incoming.interaction = existing.interaction.clone().or(incoming.interaction);
         return incoming;
     }
     incoming.id = existing.id.clone().or(incoming.id);
@@ -4137,6 +4450,9 @@ fn merge_snapshot_message_versions(
     // the badge off the row that has one.
     if incoming.pipeline.is_none() {
         incoming.pipeline = existing.pipeline.clone();
+    }
+    if incoming.interaction.is_none() {
+        incoming.interaction = existing.interaction.clone();
     }
     incoming
 }
@@ -4425,7 +4741,7 @@ pub(crate) fn load_snapshot_from_connection(
                 .prepare(
                     "SELECT id, role, body, created_at, code, live, \"final\", item_id, turn_id,
                             sequence, hlc, origin_device_id, attachments_json, quote_refs_json,
-                            detailed, change_summary_json, pipeline_json
+                            detailed, change_summary_json, pipeline_json, interaction_json
                      FROM messages
                      WHERE conversation_id = ?1
                      ORDER BY sequence, COALESCE(origin_device_id, ''), id",
@@ -4455,6 +4771,9 @@ pub(crate) fn load_snapshot_from_connection(
                             .unwrap_or_default(),
                         pipeline: row
                             .get::<_, Option<String>>(16)?
+                            .and_then(|value| serde_json::from_str(&value).ok()),
+                        interaction: row
+                            .get::<_, Option<String>>(17)?
                             .and_then(|value| serde_json::from_str(&value).ok()),
                     };
                     message.text = collapse_repeated_assistant_text(&message.role, &message.text);
@@ -4634,6 +4953,206 @@ pub(crate) fn load_snapshot_from_connection(
 pub fn load_snapshot() -> Result<LocalStoreSnapshot, String> {
     let store = open_local_store()?;
     load_snapshot_from_connection(&store.connection)
+}
+
+pub fn list_pending_followups() -> Result<Vec<PendingFollowUp>, String> {
+    let store = open_local_store()?;
+    let mut statement = store
+        .connection
+        .prepare(
+            "SELECT id, conversation_id, position, body, model_prompt,
+                    quote_refs_json, attachments_json, request_settings_json,
+                    created_at, updated_at
+             FROM pending_followups
+             ORDER BY conversation_id, position, created_at, id",
+        )
+        .map_err(|error| format!("A follow-up queue nem olvasható: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(PendingFollowUp {
+                id: row.get(0)?,
+                conversation_id: row.get(1)?,
+                position: row.get(2)?,
+                body: row.get(3)?,
+                model_prompt: row.get(4)?,
+                quote_refs: serde_json::from_str(&row.get::<_, String>(5)?)
+                    .unwrap_or_else(|_| serde_json::json!([])),
+                attachments: serde_json::from_str(&row.get::<_, String>(6)?)
+                    .unwrap_or_else(|_| serde_json::json!([])),
+                request_settings: serde_json::from_str(&row.get::<_, String>(7)?)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })
+        .map_err(|error| format!("A follow-up queue bejárása sikertelen: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("A follow-up queue egyik sora hibás: {error}"))?;
+    Ok(rows)
+}
+
+pub fn upsert_pending_followup(follow_up: PendingFollowUp) -> Result<PendingFollowUp, String> {
+    if follow_up.id.trim().is_empty() || follow_up.conversation_id.trim().is_empty() {
+        return Err("A follow-up azonosítója vagy beszélgetése hiányzik.".to_string());
+    }
+    if follow_up.body.trim().is_empty() && follow_up.model_prompt.trim().is_empty() {
+        return Err("Üres follow-up nem állítható sorba.".to_string());
+    }
+    if !follow_up.quote_refs.is_array()
+        || !follow_up.attachments.is_array()
+        || !follow_up.request_settings.is_object()
+    {
+        return Err("A follow-up strukturált payloadja hibás.".to_string());
+    }
+    let quote_refs_json = serde_json::to_string(&follow_up.quote_refs)
+        .map_err(|error| format!("A follow-up idézetei nem írhatók: {error}"))?;
+    let attachments_json = serde_json::to_string(&follow_up.attachments)
+        .map_err(|error| format!("A follow-up csatolmányai nem írhatók: {error}"))?;
+    let request_settings_json = serde_json::to_string(&follow_up.request_settings)
+        .map_err(|error| format!("A follow-up beállításai nem írhatók: {error}"))?;
+    let store = open_local_store()?;
+    store
+        .connection
+        .execute(
+            "INSERT INTO pending_followups
+             (id, conversation_id, position, body, model_prompt, quote_refs_json,
+              attachments_json, request_settings_json, created_at, updated_at)
+             VALUES (
+                 ?1, ?2,
+                 (SELECT COALESCE(MAX(position) + 1, 0)
+                  FROM pending_followups WHERE conversation_id = ?2),
+                 ?4, ?5, ?6, ?7, ?8, ?9, ?10
+             )
+             ON CONFLICT(id) DO UPDATE SET
+                 body = excluded.body,
+                 model_prompt = excluded.model_prompt,
+                 quote_refs_json = excluded.quote_refs_json,
+                 attachments_json = excluded.attachments_json,
+                 request_settings_json = excluded.request_settings_json,
+                 updated_at = excluded.updated_at",
+            params![
+                follow_up.id,
+                follow_up.conversation_id,
+                follow_up.position.max(0),
+                follow_up.body,
+                follow_up.model_prompt,
+                quote_refs_json,
+                attachments_json,
+                request_settings_json,
+                follow_up.created_at,
+                follow_up.updated_at,
+            ],
+        )
+        .map_err(|error| format!("A follow-up nem menthető: {error}"))?;
+    list_pending_followups()?
+        .into_iter()
+        .find(|item| item.id == follow_up.id)
+        .ok_or_else(|| "A mentett follow-up nem olvasható vissza.".to_string())
+}
+
+fn resequence_pending_followups(
+    transaction: &Transaction<'_>,
+    conversation_id: &str,
+    ids: &[String],
+) -> Result<(), String> {
+    for (index, id) in ids.iter().enumerate() {
+        transaction
+            .execute(
+                "UPDATE pending_followups SET position = ?1
+                 WHERE id = ?2 AND conversation_id = ?3",
+                params![-((index as i64) + 1), id, conversation_id],
+            )
+            .map_err(|error| format!("A follow-up ideiglenes sorrendje nem menthető: {error}"))?;
+    }
+    for (index, id) in ids.iter().enumerate() {
+        transaction
+            .execute(
+                "UPDATE pending_followups SET position = ?1
+                 WHERE id = ?2 AND conversation_id = ?3",
+                params![index as i64, id, conversation_id],
+            )
+            .map_err(|error| format!("A follow-up sorrendje nem menthető: {error}"))?;
+    }
+    Ok(())
+}
+
+pub fn reorder_pending_followups(
+    conversation_id: &str,
+    ids: Vec<String>,
+) -> Result<Vec<PendingFollowUp>, String> {
+    let mut store = open_local_store()?;
+    let transaction = store
+        .connection
+        .transaction()
+        .map_err(|error| format!("A follow-up átrendezése nem indítható: {error}"))?;
+    let existing = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT id FROM pending_followups
+                 WHERE conversation_id = ?1 ORDER BY position, created_at, id",
+            )
+            .map_err(|error| format!("A follow-up sorrend nem olvasható: {error}"))?;
+        let rows = statement
+            .query_map(params![conversation_id], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("A follow-up sorrend nem járható be: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("A follow-up sorrend hibás: {error}"))?;
+        rows
+    };
+    let requested = ids.iter().cloned().collect::<HashSet<_>>();
+    let current = existing.iter().cloned().collect::<HashSet<_>>();
+    if requested.len() != ids.len() || requested != current {
+        return Err("A follow-up sorrend közben megváltozott.".to_string());
+    }
+    resequence_pending_followups(&transaction, conversation_id, &ids)?;
+    transaction
+        .commit()
+        .map_err(|error| format!("A follow-up sorrend commitja sikertelen: {error}"))?;
+    list_pending_followups().map(|items| {
+        items
+            .into_iter()
+            .filter(|item| item.conversation_id == conversation_id)
+            .collect()
+    })
+}
+
+pub fn delete_pending_followup(id: &str) -> Result<(), String> {
+    let mut store = open_local_store()?;
+    let transaction = store
+        .connection
+        .transaction()
+        .map_err(|error| format!("A follow-up törlése nem indítható: {error}"))?;
+    let conversation_id = transaction
+        .query_row(
+            "SELECT conversation_id FROM pending_followups WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("A törlendő follow-up nem olvasható: {error}"))?;
+    transaction
+        .execute("DELETE FROM pending_followups WHERE id = ?1", params![id])
+        .map_err(|error| format!("A follow-up nem törölhető: {error}"))?;
+    if let Some(conversation_id) = conversation_id {
+        let ids = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id FROM pending_followups
+                     WHERE conversation_id = ?1 ORDER BY position, created_at, id",
+                )
+                .map_err(|error| format!("A megmaradt follow-up sorrend nem olvasható: {error}"))?;
+            let rows = statement
+                .query_map(params![conversation_id], |row| row.get::<_, String>(0))
+                .map_err(|error| format!("A megmaradt follow-up sorrend nem járható be: {error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("A megmaradt follow-up sorrend hibás: {error}"))?;
+            rows
+        };
+        resequence_pending_followups(&transaction, &conversation_id, &ids)?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("A follow-up törlés commitja sikertelen: {error}"))
 }
 
 pub(crate) fn save_snapshot_in_connection(
@@ -5043,19 +5562,33 @@ pub(crate) fn save_snapshot_in_connection(
                 .map(|pipeline| serde_json::to_string(pipeline))
                 .transpose()
                 .map_err(|error| format!("A pipeline-metaadat nem szerializálható: {error}"))?;
+            let interaction_json = message
+                .interaction
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| format!("Az interakció-metaadat nem szerializálható: {error}"))?;
             let identity_role = message.role.clone();
-            let identity_turn_id = message
-                .turn_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
-            let identity_item_id = message
-                .item_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
+            let identity_turn_id = (!is_steer_message(&message))
+                .then(|| {
+                    message
+                        .turn_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                })
+                .flatten();
+            let identity_item_id = (!is_steer_message(&message))
+                .then(|| {
+                    message
+                        .item_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                })
+                .flatten();
             // A stale device can publish the provisional empty assistant row
             // after another device already stored the completed answer. Do
             // not let the alias cleanup below delete that stronger row just
@@ -5135,8 +5668,8 @@ pub(crate) fn save_snapshot_in_connection(
             message_ids.insert(message_id.clone());
             transaction
                 .execute(
-                    "INSERT INTO messages (id, conversation_id, role, body, sequence, hlc, item_id, turn_id, code, live, \"final\", origin_device_id, attachments_json, quote_refs_json, created_at, detailed, change_summary_json, pipeline_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?17, ?18, ?19)
+                    "INSERT INTO messages (id, conversation_id, role, body, sequence, hlc, item_id, turn_id, code, live, \"final\", origin_device_id, attachments_json, quote_refs_json, created_at, detailed, change_summary_json, pipeline_json, interaction_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?17, ?18, ?19, ?20)
                      ON CONFLICT(id) DO UPDATE SET
                      body = CASE
                              WHEN messages.role = 'user' THEN messages.body
@@ -5192,7 +5725,8 @@ pub(crate) fn save_snapshot_in_connection(
                                  THEN excluded.change_summary_json
                              ELSE messages.change_summary_json
                          END,
-                         pipeline_json = COALESCE(excluded.pipeline_json, messages.pipeline_json)",
+                         pipeline_json = COALESCE(excluded.pipeline_json, messages.pipeline_json),
+                         interaction_json = COALESCE(excluded.interaction_json, messages.interaction_json)",
                     params![
                         message_id,
                         conversation_id,
@@ -5213,6 +5747,7 @@ pub(crate) fn save_snapshot_in_connection(
                         message.detailed.map(|value| if value { 1 } else { 0 }),
                         change_summary_json,
                         pipeline_json,
+                        interaction_json,
                     ],
                 )
                 .map_err(|error| format!("A lokális üzenet mentése sikertelen: {error}"))?;
@@ -5445,6 +5980,8 @@ mod tests {
             ("agent_sessions", "provider_session_id"),
             ("agent_session_entries", "body_json"),
             ("agent_approvals", "request_id"),
+            ("messages", "interaction_json"),
+            ("pending_followups", "request_settings_json"),
         ] {
             let exists: i64 = connection
                 .query_row(
@@ -6190,6 +6727,7 @@ mod tests {
                 detailed: None,
                 change_summary: Vec::new(),
                 pipeline: None,
+                interaction: None,
             }],
             work_items: vec![LocalWorkItem {
                 id: 11,
@@ -6245,6 +6783,114 @@ mod tests {
         }
     }
 
+    #[test]
+    fn schema_v24_migrates_v23_without_losing_messages() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+        connection
+            .execute(
+                "INSERT INTO projects (id, name, canonical_path, created_at, updated_at)
+                 VALUES ('p', 'P', 'C:/p', '1', '1')",
+                [],
+            )
+            .expect("insert project");
+        connection
+            .execute(
+                "INSERT INTO conversations
+                 (id, project_id, scope, title, created_at, updated_at)
+                 VALUES ('c', 'p', 'coding', 'C', '1', '1')",
+                [],
+            )
+            .expect("insert conversation");
+        connection
+            .execute(
+                "INSERT INTO messages
+                 (id, conversation_id, role, body, sequence, code, live, \"final\",
+                  attachments_json, quote_refs_json, change_summary_json, created_at)
+                 VALUES ('m', 'c', 'user', 'hello', 1, 0, 0, 1, '[]', '[]', '[]', '1')",
+                [],
+            )
+            .expect("insert message");
+        connection
+            .execute_batch(
+                "DROP TABLE pending_followups;
+                 ALTER TABLE messages DROP COLUMN interaction_json;
+                 PRAGMA user_version = 23;",
+            )
+            .expect("downgrade fixture to v23");
+
+        initialize_connection(&mut connection).expect("run v24 migration");
+
+        assert_eq!(read_schema_version(&connection).unwrap(), 24);
+        let interaction_column: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('messages')
+                 WHERE name = 'interaction_json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let queue_table: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'pending_followups'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let message_body: String = connection
+            .query_row("SELECT body FROM messages WHERE id = 'm'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(interaction_column, 1);
+        assert_eq!(queue_table, 1);
+        assert_eq!(message_body, "hello");
+    }
+
+    #[test]
+    fn steer_interaction_round_trip_keeps_the_root_prompt_and_deduplicates_input_id() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+        let mut snapshot = test_snapshot();
+        let conversation = snapshot.conversations.values_mut().next().unwrap();
+        let parent_turn = "request:root".to_string();
+        conversation.messages[0].turn_id = Some(parent_turn.clone());
+        conversation.messages[0].id = Some(Uuid::new_v4().to_string());
+        let mut steer = conversation.messages[0].clone();
+        steer.id = Some(Uuid::new_v4().to_string());
+        steer.text = "Ne módosítsd a CSS-t.".to_string();
+        steer.sequence = Some(11);
+        steer.interaction = Some(serde_json::json!({
+            "kind": "steer",
+            "inputId": "input-1",
+            "parentTurnId": parent_turn,
+            "targetProvider": "codex",
+            "targetRequestId": "stage-1",
+            "acceptedAt": "2"
+        }));
+        let mut duplicate = steer.clone();
+        duplicate.id = Some(Uuid::new_v4().to_string());
+        conversation.messages.extend([steer, duplicate]);
+
+        save_snapshot_in_connection(&mut connection, snapshot).expect("save snapshot");
+        let loaded = load_snapshot_from_connection(&connection).expect("load snapshot");
+        let messages = &loaded.conversations.values().next().unwrap().messages;
+        assert_eq!(messages.iter().filter(|message| message.role == "user").count(), 2);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| interaction_input_id(message) == Some("input-1"))
+                .count(),
+            1
+        );
+        assert!(messages.iter().any(|message| {
+            message.role == "user"
+                && message.interaction.is_none()
+                && message.turn_id.as_deref() == Some("request:root")
+        }));
+    }
+
     /// Two Claude answers in one conversation must both survive a save.
     ///
     /// The bridge labels every answer block by its index inside the model
@@ -6294,6 +6940,7 @@ mod tests {
                     detailed: None,
                     change_summary: Vec::new(),
                     pipeline: None,
+                    interaction: None,
                 });
                 conversation.messages.push(LocalMessage {
                     id: Some(format!("answer-{index}")),
@@ -6314,6 +6961,7 @@ mod tests {
                     detailed: None,
                     change_summary: Vec::new(),
                     pipeline: None,
+                    interaction: None,
                 });
             }
         }
@@ -6494,6 +7142,7 @@ mod tests {
                 detailed: None,
                 change_summary: Vec::new(),
                 pipeline: None,
+                interaction: None,
             });
             for (index, role) in roles.iter().enumerate() {
                 conversation.messages.push(LocalMessage {
@@ -6526,6 +7175,7 @@ mod tests {
                         verdict: None,
                         verdict_summary: None,
                     }),
+                    interaction: None,
                 });
             }
         }
@@ -6591,6 +7241,7 @@ mod tests {
                 detailed: None,
                 change_summary: Vec::new(),
                 pipeline: None,
+                interaction: None,
             });
             conversation.messages.push(LocalMessage {
                 id: Some(answer_id.clone()),
@@ -6621,6 +7272,7 @@ mod tests {
                     verdict: Some("changes_requested".to_string()),
                     verdict_summary: Some("a teszt nem futott le.".to_string()),
                 }),
+                interaction: None,
             });
         }
         save_snapshot_in_connection(&mut connection, snapshot).expect("save conversation");
@@ -6692,6 +7344,7 @@ mod tests {
                 detailed: Some(false),
                 change_summary: Vec::new(),
                 pipeline: None,
+                interaction: None,
             });
             conversation.messages.push(LocalMessage {
                 id: Some(answer_id.clone()),
@@ -6717,6 +7370,7 @@ mod tests {
                     binary_or_truncated: None,
                 }],
                 pipeline: None,
+                interaction: None,
             });
         }
         save_snapshot_in_connection(&mut connection, snapshot).expect("save conversation");
@@ -6860,6 +7514,7 @@ mod tests {
                 detailed: None,
                 change_summary: Vec::new(),
                 pipeline: None,
+                interaction: None,
             });
             conversation.messages.push(LocalMessage {
                 id: Some(message_id.clone()),
@@ -6879,6 +7534,7 @@ mod tests {
                 detailed: None,
                 change_summary: Vec::new(),
                 pipeline: None,
+                interaction: None,
             });
             snapshot
         };
@@ -6907,7 +7563,7 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_stored_before_its_own_question_is_repaired_and_stays_deleted() {
+    fn an_answer_stored_before_its_own_question_is_resequenced_not_deleted() {
         let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
         configure_connection(&connection).expect("configure SQLite");
         initialize_connection(&mut connection).expect("initialize schema");
@@ -6940,6 +7596,7 @@ mod tests {
                 detailed: None,
                 change_summary: Vec::new(),
                 pipeline: None,
+                interaction: None,
             });
             conversation.messages.push(LocalMessage {
                 id: Some(Uuid::new_v4().to_string()),
@@ -6959,12 +7616,13 @@ mod tests {
                 detailed: None,
                 change_summary: Vec::new(),
                 pipeline: None,
+                interaction: None,
             });
         }
         save_snapshot_in_connection(&mut connection, snapshot).expect("save conversation");
 
-        // The fossil the old merge produced: another turn's answer text written
-        // under this turn, ahead of the question it supposedly answers.
+        // A transient live snapshot can put a real answer ahead of its question.
+        // The repair must never infer a permanent deletion from ordering alone.
         let fossil_id = Uuid::new_v4().to_string();
         connection
             .execute(
@@ -6979,23 +7637,26 @@ mod tests {
             .expect("insert fossil");
 
         let repaired =
-            repair_answers_before_their_question(&mut connection).expect("repair fossils");
-        assert_eq!(repaired, 1, "the misplaced answer must be repaired");
+            repair_answers_before_their_question(&mut connection).expect("repair order");
+        assert_eq!(repaired, 1, "the misplaced answer must be resequenced");
 
-        let remaining: Vec<String> = {
+        let remaining: Vec<(String, i64)> = {
             let mut statement = connection
-                .prepare("SELECT body FROM messages WHERE role = 'assistant' ORDER BY sequence")
+                .prepare("SELECT body, sequence FROM messages WHERE role = 'assistant' ORDER BY sequence")
                 .expect("prepare");
             statement
-                .query_map([], |row| row.get::<_, String>(0))
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
                 .expect("query")
                 .collect::<Result<Vec<_>, _>>()
                 .expect("collect")
         };
         assert_eq!(
             remaining,
-            vec!["Elso valasz".to_string()],
-            "the real answer must survive and only the fossil may go"
+            vec![
+                ("Elso valasz".to_string(), 101),
+                ("Egy masik turn valasza".to_string(), 102),
+            ],
+            "both bodies survive; same-turn identity reconciliation can choose the canonical one"
         );
 
         let tombstoned: i64 = connection
@@ -7006,10 +7667,121 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("count tombstones");
-        assert_eq!(
-            tombstoned, 1,
-            "without a tombstone the next journal import resurrects the fossil"
-        );
+        assert_eq!(tombstoned, 0, "ordering alone must never create a tombstone");
+    }
+
+    #[test]
+    fn a_valid_final_event_restores_an_answer_tombstoned_by_the_old_race() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        let conversation_id = Uuid::new_v4().to_string();
+        let question_id = Uuid::new_v4().to_string();
+        let answer_id = Uuid::new_v4().to_string();
+        let turn_id = "request:restorable";
+        let mut snapshot = test_snapshot();
+        {
+            let conversation = snapshot
+                .conversations
+                .values_mut()
+                .next()
+                .expect("conversation");
+            conversation.id = Some(conversation_id.clone());
+            conversation.messages.clear();
+            conversation.messages.push(LocalMessage {
+                id: Some(question_id),
+                role: "user".to_string(),
+                text: "Csak mondd, hogy OK".to_string(),
+                time: "100".to_string(),
+                code: None,
+                live: Some(false),
+                final_message: Some(false),
+                item_id: None,
+                turn_id: Some(turn_id.to_string()),
+                sequence: Some(100),
+                hlc: None,
+                origin_device_id: None,
+                images: Vec::new(),
+                quote_refs: Vec::new(),
+                detailed: None,
+                change_summary: Vec::new(),
+                pipeline: None,
+                interaction: None,
+            });
+        }
+        save_snapshot_in_connection(&mut connection, snapshot).expect("save question");
+
+        let answer = LocalMessage {
+            id: Some(answer_id.clone()),
+            role: "assistant".to_string(),
+            text: "OK".to_string(),
+            time: "101".to_string(),
+            code: None,
+            live: Some(false),
+            final_message: Some(true),
+            item_id: None,
+            turn_id: Some(turn_id.to_string()),
+            sequence: Some(101),
+            hlc: None,
+            origin_device_id: None,
+            images: Vec::new(),
+            quote_refs: Vec::new(),
+            detailed: None,
+            change_summary: Vec::new(),
+            pipeline: None,
+            interaction: None,
+        };
+        let payload = serde_json::json!({
+            "conversationId": conversation_id,
+            "message": answer,
+        });
+        connection
+            .execute(
+                "INSERT INTO devices (id, name, created_at, updated_at)
+                 VALUES ('device', 'test', '100', '100')",
+                [],
+            )
+            .expect("insert device");
+        connection
+            .execute(
+                "INSERT INTO sync_events
+                     (event_id, device_id, device_sequence, hlc, entity_id, event_type,
+                      payload_json, payload_hash, event_hash, previous_hash, imported_at)
+                 VALUES ('event', 'device', 1, '00000000000000000101-00000000', ?1,
+                         'message.upsert', ?2, 'payload', 'event-hash', NULL, '101')",
+                params![answer_id, payload.to_string()],
+            )
+            .expect("insert final answer event");
+        connection
+            .execute(
+                "INSERT INTO sync_tombstones
+                     (entity_type, entity_id, archived_at, reason)
+                 VALUES ('message', ?1, '100', 'answer-before-question')",
+                params![answer_id],
+            )
+            .expect("insert old tombstone");
+
+        let restored = restore_wrongly_tombstoned_answers(&mut connection)
+            .expect("restore valid answer");
+        assert_eq!(restored, 1);
+        let body: String = connection
+            .query_row(
+                "SELECT body FROM messages WHERE id = ?1",
+                params![answer_id],
+                |row| row.get(0),
+            )
+            .expect("read restored answer");
+        assert_eq!(body, "OK");
+        let tombstones: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_tombstones
+                 WHERE entity_type = 'message' AND entity_id = ?1",
+                params![answer_id],
+                |row| row.get(0),
+            )
+            .expect("count tombstones");
+        assert_eq!(tombstones, 0);
     }
 
     #[test]
@@ -7217,6 +7989,7 @@ mod tests {
             detailed: None,
             change_summary: Vec::new(),
             pipeline: None,
+            interaction: None,
         };
         let mut completed = placeholder.clone();
         completed.id = Some(Uuid::new_v4().to_string());
@@ -7274,6 +8047,7 @@ mod tests {
             detailed: None,
             change_summary: Vec::new(),
             pipeline: None,
+            interaction: None,
         });
         save_snapshot_in_connection(&mut connection, completed_snapshot.clone())
             .expect("save completed answer");
@@ -7305,6 +8079,7 @@ mod tests {
                 detailed: None,
                 change_summary: Vec::new(),
                 pipeline: None,
+                interaction: None,
             },
         ];
         save_snapshot_in_connection(&mut connection, stale_snapshot)
@@ -7356,6 +8131,7 @@ mod tests {
                 detailed: None,
                 change_summary: Vec::new(),
                 pipeline: None,
+                interaction: None,
             });
         save_snapshot_in_connection(&mut connection, snapshot).expect("save placeholder");
         let conversation_id: String = connection
@@ -8275,6 +9051,7 @@ mod tests {
                         detailed: None,
                         change_summary: Vec::new(),
                         pipeline: None,
+                        interaction: None,
                     })
                     .collect(),
                 work_items: Vec::new(),

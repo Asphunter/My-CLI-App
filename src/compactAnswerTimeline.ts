@@ -154,7 +154,14 @@ export const buildCompactTraceSections = (
     });
   };
   for (const item of trace) {
-    if (item.presentation === "narrative" || item.important) {
+    // Commands, files, tools and provider reasoning are implementation detail
+    // even when their underlying activity failed. Their error status remains
+    // visible inside the technical group; only narration and explicit status
+    // events may interrupt the collapsed technical stream.
+    const primary =
+      item.presentation === "narrative" ||
+      (item.presentation === "status" && item.important);
+    if (primary) {
       flushTechnical();
       sections.push({ kind: "primary", id: item.id, item });
       continue;

@@ -5,7 +5,24 @@ import {
   acceptTerminalAgentEvent,
   agentEventIdentity,
   normalizeAgentEventEnvelope,
+  normalizeAgentInputStatus,
 } from "../src/agentEvent.ts";
+
+test("agent input ACKs normalize camelCase and snake_case envelopes", () => {
+  const accepted = normalizeAgentInputStatus({
+    input_id: "input-1",
+    conversationId: "conversation-1",
+    root_request_id: "root-1",
+    providerRequestId: "stage-1",
+    status: "accepted",
+    timestamp: "100",
+    accepted_target: { provider_turn_id: "turn-1" },
+  });
+
+  assert.equal(accepted?.inputId, "input-1");
+  assert.equal(accepted?.status, "accepted");
+  assert.equal(accepted?.acceptedTarget?.provider_turn_id, "turn-1");
+});
 
 test("the provider-neutral channel maps to the existing Coding timeline shape", () => {
   const event = normalizeAgentEventEnvelope({

@@ -44,6 +44,10 @@ const QUARANTINE_SCHEMA_VERSION: i64 = 1;
 const INCREMENTAL_DIRECTORY_CACHE_META_KEY: &str = "sync_incremental_directory_cache_v1";
 const LOCAL_REDUCER_CHECKPOINT_SCHEMA_VERSION: i64 = 1;
 const LOCAL_REDUCER_CHECKPOINT_META_KEY: &str = "sync_local_reducer_checkpoint_v1";
+// Kept as a minimal tombstone after an explicit Shift+Delete compaction.  It
+// contains no conversation body, but it must survive so an offline device
+// cannot publish an old copy back into the shared Tree later.
+const PERMANENT_DELETE_REASON: &str = "min:permanent-delete:v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -138,6 +142,29 @@ struct TombstoneEventPayload {
     relative_path: Option<String>,
     path_hint: Option<String>,
     reason: Option<String>,
+}
+
+fn permanent_delete_reason(reason: Option<&str>) -> bool {
+    reason == Some(PERMANENT_DELETE_REASON)
+}
+
+fn permanent_delete_payload(payload: &TombstoneEventPayload) -> bool {
+    permanent_delete_reason(payload.reason.as_deref())
+}
+
+fn tombstone_event_should_replace(
+    existing: Option<&(EventRank, bool, TombstoneEventPayload)>,
+    incoming_rank: &EventRank,
+    incoming_archived: bool,
+    incoming: &TombstoneEventPayload,
+) -> bool {
+    let incoming_is_permanent = incoming_archived && permanent_delete_payload(incoming);
+    existing
+        .map(|(existing_rank, _, existing_payload)| {
+            incoming_is_permanent
+                || (!permanent_delete_payload(existing_payload) && incoming_rank > existing_rank)
+        })
+        .unwrap_or(true)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3178,6 +3205,9 @@ fn merge_message_versions(existing: &LocalMessage, mut incoming: LocalMessage) -
         if merged.detailed.is_none() {
             merged.detailed = incoming.detailed;
         }
+        if merged.interaction.is_none() {
+            merged.interaction = incoming.interaction;
+        }
         merged.live = Some(false);
         return merged;
     }
@@ -3233,6 +3263,9 @@ fn merge_message_versions(existing: &LocalMessage, mut incoming: LocalMessage) -
     if incoming.quote_refs.is_empty() {
         incoming.quote_refs = existing.quote_refs.clone();
     }
+    if incoming.interaction.is_none() {
+        incoming.interaction = existing.interaction.clone();
+    }
     if incoming.hlc.is_none() {
         incoming.hlc = existing.hlc.clone();
     }
@@ -3259,6 +3292,7 @@ fn existing_message_alias_id(
     messages: &BTreeMap<String, (EventRank, LocalMessage)>,
     incoming: &LocalMessage,
 ) -> Option<String> {
+    let interaction_input_id = store::interaction_input_id(incoming);
     let turn_id = incoming
         .turn_id
         .as_deref()
@@ -3272,6 +3306,12 @@ fn existing_message_alias_id(
     messages.iter().find_map(|(id, (_, existing))| {
         if existing.role != incoming.role {
             return None;
+        }
+        let same_interaction = interaction_input_id.is_some_and(|input_id| {
+            store::interaction_input_id(existing) == Some(input_id)
+        });
+        if interaction_input_id.is_some() || store::interaction_input_id(existing).is_some() {
+            return same_interaction.then(|| id.clone());
         }
         let existing_turn_id = existing
             .turn_id
@@ -3756,10 +3796,12 @@ fn reduce_snapshot(connection: &Connection) -> Result<LocalStoreSnapshot, String
                     tombstone.project_id = Some(project_id.clone());
                 }
                 let key = (tombstone.entity_type.clone(), tombstone.entity_id.clone());
-                let should_replace = tombstones
-                    .get(&key)
-                    .map(|(existing_rank, _, _)| rank > *existing_rank)
-                    .unwrap_or(true);
+                let should_replace = tombstone_event_should_replace(
+                    tombstones.get(&key),
+                    &rank,
+                    event.event_type == TOMBSTONE_UPSERT,
+                    &tombstone,
+                );
                 if should_replace {
                     tombstones.insert(key, (rank, event.event_type == TOMBSTONE_UPSERT, tombstone));
                 }
@@ -4109,6 +4151,12 @@ fn normalized_message_id(conversation_id: &str, message: &LocalMessage, index: u
         .filter(|value| Uuid::parse_str(value).is_ok())
     {
         return id.to_string();
+    }
+    if let Some(input_id) = store::interaction_input_id(message) {
+        return stable_id(
+            "message",
+            &format!("{conversation_id}:interaction:{input_id}:{}", message.role),
+        );
     }
     if let Some(turn_id) = message
         .turn_id
@@ -4472,7 +4520,9 @@ fn build_restore_preview(
         "Az entitás újra látható lesz minden gépen, amelyik beolvassa ezt az eventet.".to_string(),
         "A korábbi üzenetek és work itemek megmaradnak a journalban.".to_string(),
     ];
-    let blocking_reason = if !health.can_write {
+    let blocking_reason = if permanent_delete_reason(source.reason.as_deref()) {
+        Some("Ez egy végleges törlési jelölés; nem állítható vissza.".to_string())
+    } else if !health.can_write {
         Some("A journal jelenleg karanténban van; restore event nem írható.".to_string())
     } else if current.is_none() {
         Some("Ez az entitás már nincs archivált állapotban; valószínűleg egy másik gép már visszaállította.".to_string())
@@ -4985,6 +5035,193 @@ fn purge_compacted_events(root: &Path, snapshot: &CompactionSnapshot) -> Result<
             let _ = fs::rename(moved_target, moved_source);
         }
         return Err(format!("A compaction trash törlése sikertelen: {error}"));
+    }
+    Ok(())
+}
+
+fn permanent_delete_path_key(value: &str) -> String {
+    value
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_lowercase()
+}
+
+fn permanent_delete_target(
+    snapshot: &LocalStoreSnapshot,
+    requested: &LocalTombstone,
+) -> Result<LocalTombstone, String> {
+    if !matches!(requested.entity_type.as_str(), "project" | "conversation") {
+        return Err("Csak projekt vagy beszélgetés törölhető véglegesen.".to_string());
+    }
+
+    let requested_relative = requested
+        .relative_path
+        .as_deref()
+        .map(permanent_delete_path_key);
+    let requested_path = requested
+        .path_hint
+        .as_deref()
+        .map(permanent_delete_path_key);
+    let matching_project = snapshot.projects.iter().find(|project| {
+        project.id == requested.entity_id
+            || requested
+                .project_id
+                .as_deref()
+                .is_some_and(|project_id| project.id == project_id)
+            || requested_relative.as_ref().is_some_and(|relative| {
+                project
+                    .relative_path
+                    .as_deref()
+                    .map(permanent_delete_path_key)
+                    .as_ref()
+                    == Some(relative)
+            })
+            || requested_path
+                .as_ref()
+                .is_some_and(|path| permanent_delete_path_key(&project.path_hint) == *path)
+    });
+    let mut project_ids = HashMap::new();
+    if let (Some(raw_project_id), Some(project)) =
+        (requested.project_id.as_ref(), matching_project)
+    {
+        project_ids.insert(raw_project_id.clone(), project.id.clone());
+    }
+    let (mut entity_id, mut payload) = normalized_tombstone(requested, &project_ids)?;
+    if requested.entity_type == "conversation"
+        && !snapshot
+            .conversations
+            .values()
+            .any(|conversation| conversation.id.as_deref() == Some(entity_id.as_str()))
+    {
+        let matching_ids = snapshot
+            .conversations
+            .values()
+            .filter(|conversation| {
+                conversation.title == requested.title.clone().unwrap_or_default()
+                    && match payload.project_id.as_ref() {
+                        Some(project_id) => conversation.project_id == *project_id,
+                        None => conversation.scope == store::GENERAL_SCOPE,
+                    }
+            })
+            .filter_map(|conversation| conversation.id.clone())
+            .collect::<BTreeSet<_>>();
+        if matching_ids.len() == 1 {
+            entity_id = matching_ids.into_iter().next().unwrap_or(entity_id);
+            payload.entity_id = entity_id.clone();
+        } else if matching_ids.len() > 1 {
+            return Err(
+                "A beszélgetés azonosítása nem egyértelmű; a végleges törlés blokkolva."
+                    .to_string(),
+            );
+        }
+    }
+
+    let exists = if requested.entity_type == "project" {
+        snapshot.projects.iter().any(|project| project.id == entity_id)
+            || snapshot.tombstones.iter().any(|tombstone| {
+                tombstone.entity_type == "project" && tombstone.entity_id == entity_id
+            })
+    } else {
+        snapshot.conversations.values().any(|conversation| {
+            conversation.id.as_deref() == Some(entity_id.as_str())
+        }) || snapshot.tombstones.iter().any(|tombstone| {
+            tombstone.entity_type == "conversation" && tombstone.entity_id == entity_id
+        })
+    };
+    if !exists {
+        return Err("A véglegesen törlendő elem már nincs a szinkronizált állapotban.".to_string());
+    }
+
+    Ok(LocalTombstone {
+        entity_type: payload.entity_type,
+        entity_id,
+        archived_at: now_text(),
+        project_id: payload.project_id,
+        title: payload.title,
+        relative_path: payload.relative_path,
+        path_hint: payload.path_hint,
+        reason: Some(PERMANENT_DELETE_REASON.to_string()),
+    })
+}
+
+fn prune_snapshot_for_permanent_delete(
+    snapshot: &LocalStoreSnapshot,
+    target: &LocalTombstone,
+) -> LocalStoreSnapshot {
+    let mut source = snapshot.clone();
+    source.tombstones.retain(|tombstone| {
+        tombstone.entity_type != target.entity_type || tombstone.entity_id != target.entity_id
+    });
+    source.tombstones.push(target.clone());
+    let candidate = permanent_delete_candidate(target);
+    let mut pruned = prune_snapshot_for_compaction_selected(&source, &[candidate], None);
+    // Keep only the identity metadata required to reject stale offline
+    // upserts.  Messages, work items and plan/commentary data are gone from
+    // the new authoritative snapshot.
+    pruned.tombstones.push(target.clone());
+    pruned
+}
+
+fn permanent_delete_candidate(target: &LocalTombstone) -> SyncRetentionCandidate {
+    SyncRetentionCandidate {
+        selection_key: retention_selection_key(&target.entity_type, &target.entity_id),
+        entity_type: target.entity_type.clone(),
+        entity_id: target.entity_id.clone(),
+        label: tombstone_label(target),
+        archived_at: target.archived_at.clone(),
+        age_days: Some(0),
+        eligible: true,
+        reason: "Azonnali, felhasználó által megerősített végleges törlés.".to_string(),
+    }
+}
+
+fn replace_answer_checkpoints_after_permanent_delete(
+    root: &Path,
+    device_id: &str,
+    snapshot: &LocalStoreSnapshot,
+) -> Result<(), String> {
+    {
+        let _guard = answer_checkpoint_lock()
+            .lock()
+            .map_err(|_| "A válasz-checkpoint lockja sérült.".to_string())?;
+        let directory = root.join("answer-checkpoints");
+        if directory.exists() {
+            for entry in fs::read_dir(&directory)
+                .map_err(|error| format!("A válasz-checkpoint mappa nem olvasható: {error}"))?
+            {
+                let entry = entry.map_err(|error| {
+                    format!("A válasz-checkpoint bejegyzése nem olvasható: {error}")
+                })?;
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                    format!("A válasz-checkpoint státusza nem olvasható: {error}")
+                })?;
+                if metadata.file_type().is_symlink() {
+                    return Err(format!(
+                        "A válasz-checkpoint mappa symlinket tartalmaz, ezért a törlés blokkolva: {}.",
+                        path.display()
+                    ));
+                }
+                if metadata.is_file()
+                    && path.extension().and_then(|value| value.to_str()) == Some("json")
+                {
+                    fs::remove_file(&path).map_err(|error| {
+                        format!("A régi válasz-checkpoint nem törölhető: {error}")
+                    })?;
+                }
+            }
+        }
+    }
+    write_answer_checkpoint(root, device_id, snapshot)
+}
+
+fn remove_obsolete_compaction_snapshots(root: &Path, keep: &Path) -> Result<(), String> {
+    for path in retention_json_files(&retention_root(root).join("snapshots"))? {
+        if path == keep {
+            continue;
+        }
+        fs::remove_file(&path)
+            .map_err(|error| format!("A régi compaction snapshot nem törölhető: {error}"))?;
     }
     Ok(())
 }
@@ -5825,7 +6062,123 @@ pub(crate) fn sync_v2_retention_backup() -> Result<SyncRetentionPreview, String>
     build_retention_preview(&runtime)
 }
 
+pub(crate) fn sync_v2_permanently_delete_entity(
+    requested: LocalTombstone,
+) -> Result<SyncV2Result, String> {
+    let _guard = append_lock()
+        .lock()
+        .map_err(|_| "A v2 sync append lockja sérült.".to_string())?;
+    let runtime = load_retention_runtime()?;
+    if !runtime.report.can_write || !runtime.health.can_write {
+        return Err(format!(
+            "A végleges törlés blokkolva, mert a OneDrive journal nem írható biztonságosan: {}",
+            runtime.report.warnings.join(" | ")
+        ));
+    }
+
+    // Checkpoints are a recovery source too. Merge them before pruning so an
+    // unrelated answer that only survives there is retained by the new
+    // authoritative compaction snapshot.
+    let complete_snapshot = canonicalize_snapshot_for_compaction(
+        merge_answer_checkpoints(runtime.snapshot.clone(), read_answer_checkpoints(&runtime.root)),
+    )?;
+    let target = permanent_delete_target(&complete_snapshot, &requested)?;
+    let pruned_state = prune_snapshot_for_permanent_delete(&complete_snapshot, &target);
+    let candidate = permanent_delete_candidate(&target);
+    let pruned_agent_sessions = prune_agent_session_state_for_compaction(
+        &runtime.agent_sessions,
+        &complete_snapshot,
+        &[candidate],
+        None,
+    );
+    let (compaction, snapshot_path) = write_compaction_snapshot(
+        &runtime.root,
+        &runtime.scan,
+        pruned_state.clone(),
+        pruned_agent_sessions,
+    )?;
+
+    // Until the compacted event journal is actually removed, failures remain
+    // recoverable from the authoritative events.  This ordering avoids ever
+    // reporting success while an old OneDrive snapshot/checkpoint still holds
+    // the deleted body.
+    if let Err(error) = remove_obsolete_compaction_snapshots(&runtime.root, &snapshot_path) {
+        let _ = fs::remove_file(&snapshot_path);
+        return Err(error);
+    }
+    if let Err(error) = replace_answer_checkpoints_after_permanent_delete(
+        &runtime.root,
+        &runtime.device_id,
+        &pruned_state,
+    ) {
+        let _ = fs::remove_file(&snapshot_path);
+        return Err(error);
+    }
+    if let Err(error) = purge_compacted_events(&runtime.root, &compaction) {
+        let _ = fs::remove_file(&snapshot_path);
+        return Err(error);
+    }
+
+    // From here the shared deletion is irreversible. Local SQLite refresh is
+    // best effort: a machine-local failure must not make the frontend publish
+    // its old copy back after the command reports an error.
+    let mut health = runtime.health.clone();
+    health.status = "healthy".to_string();
+    health.checked_at = now_text();
+    health.warnings.clear();
+    health.blocked_devices.clear();
+    health.can_write = true;
+    health.recovery_action = "Nincs teendő. A végleges törlés szinkronizálva.".to_string();
+    let mut imported_events = 0;
+    let mut warnings = Vec::new();
+    if let Ok(mut local_store) = store::open_local_store() {
+        match import_into_store(&runtime.root, &runtime.device_id, &mut local_store) {
+            Ok(report) if report.can_write => {
+                imported_events = report.imported_events;
+                if let Err(error) = store::save_snapshot_in_connection(
+                    &mut local_store.connection,
+                    pruned_state.clone(),
+                ) {
+                    warnings.push(format!(
+                        "A végleges törlés megtörtént, de a helyi SQLite frissítése későbbre maradt: {error}"
+                    ));
+                }
+                if let Ok(updated_health) =
+                    build_sync_health(&runtime.root, &local_store.connection, &report)
+                {
+                    health = updated_health;
+                }
+            }
+            Ok(report) => warnings.push(format!(
+                "A végleges törlés megtörtént, de a helyi journal-ellenőrzés figyelmeztetett: {}",
+                report.warnings.join(" | ")
+            )),
+            Err(error) => warnings.push(format!(
+                "A végleges törlés megtörtént, de a helyi sync-index frissítése későbbre maradt: {error}"
+            )),
+        }
+    } else {
+        warnings.push(
+            "A végleges törlés megtörtént, de a helyi SQLite csak a következő indításkor frissül."
+                .to_string(),
+        );
+    }
+    Ok(SyncV2Result {
+        device_id: runtime.device_id,
+        snapshot: pruned_state,
+        health,
+        imported_events,
+        written_events: 0,
+        blocked_devices: Vec::new(),
+        warnings,
+        can_write: true,
+    })
+}
+
 pub(crate) fn sync_v2_restore_entity(tombstone: LocalTombstone) -> Result<SyncV2Result, String> {
+    if permanent_delete_reason(tombstone.reason.as_deref()) {
+        return Err("A véglegesen törölt elem nem állítható vissza.".to_string());
+    }
     let device_id = local_device_id()?;
     let root = sync_root()?;
     let mut local_store = store::open_local_store()?;
@@ -5980,6 +6333,7 @@ mod tests {
             detailed: None,
             change_summary: Vec::new(),
             pipeline: None,
+            interaction: None,
         }
     }
 
@@ -7700,6 +8054,7 @@ mod tests {
                 detailed: None,
                 change_summary: Vec::new(),
                 pipeline: None,
+                interaction: None,
             }],
             work_items: Vec::new(),
             thread_id: Some("foreign-machine-rollout".to_string()),
@@ -7780,6 +8135,7 @@ mod tests {
                 detailed: None,
                 change_summary: Vec::new(),
                 pipeline: None,
+                interaction: None,
             }],
             work_items: Vec::new(),
             thread_id: None,
@@ -7848,6 +8204,7 @@ mod tests {
                 detailed: None,
                 change_summary: Vec::new(),
                 pipeline: None,
+                interaction: None,
             }],
             work_items: Vec::new(),
             thread_id: None,
@@ -8187,6 +8544,7 @@ mod tests {
                     detailed: None,
                     change_summary: Vec::new(),
                     pipeline: None,
+                    interaction: None,
                 },
             })
             .expect("message payload"),
@@ -8496,6 +8854,41 @@ mod tests {
         .expect("build stale restore preview");
         assert!(!stale.can_restore);
         assert!(stale.blocking_reason.is_some());
+
+        let permanent = LocalTombstone {
+            reason: Some(PERMANENT_DELETE_REASON.to_string()),
+            ..tombstone
+        };
+        let permanent_preview = build_restore_preview(
+            &permanent,
+            &LocalStoreSnapshot {
+                schema_version: STORE_SCHEMA_VERSION,
+                projects: Vec::new(),
+                conversations: BTreeMap::new(),
+                tombstones: vec![permanent.clone()],
+            },
+            SyncHealth {
+                status: "healthy".to_string(),
+                journal_path: "journal".to_string(),
+                quarantine_path: "quarantine".to_string(),
+                checked_at: "123".to_string(),
+                last_import_at: Some("123".to_string()),
+                scanned_events: 1,
+                accepted_events: 1,
+                imported_events: 1,
+                stored_events: 1,
+                blocked_devices: Vec::new(),
+                warnings: Vec::new(),
+                can_write: true,
+                recovery_action: "Nincs teendő".to_string(),
+            },
+        )
+        .expect("build permanent restore preview");
+        assert!(!permanent_preview.can_restore);
+        assert!(permanent_preview
+            .blocking_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("végleges")));
     }
 
     #[test]
@@ -8635,6 +9028,115 @@ mod tests {
             vec!["unknown:selection".to_string()],
         )
         .is_err());
+    }
+
+    #[test]
+    fn permanent_delete_prunes_only_the_target_and_keeps_a_non_restorable_marker() {
+        let project_id = stable_id("project", "permanent-delete-project");
+        let deleted_id = stable_id("conversation", "permanent-delete-target");
+        let kept_id = stable_id("conversation", "permanent-delete-kept");
+        let conversation = |id: &str, title: &str| LocalConversation {
+            id: Some(id.to_string()),
+            scope: store::CODING_SCOPE.to_string(),
+            project_id: project_id.clone(),
+            title: title.to_string(),
+            messages: Vec::new(),
+            work_items: Vec::new(),
+            thread_id: None,
+            updated_at: now_text(),
+            plan_history: BTreeMap::new(),
+            commentary: Vec::new(),
+        };
+        let snapshot = LocalStoreSnapshot {
+            schema_version: STORE_SCHEMA_VERSION,
+            projects: vec![LocalProject {
+                id: project_id.clone(),
+                name: "Permanent delete".to_string(),
+                relative_path: Some("permanent-delete".to_string()),
+                path_hint: "C:\\permanent-delete".to_string(),
+                threads: vec!["Delete me".to_string(), "Keep me".to_string()],
+            }],
+            conversations: BTreeMap::from([
+                (
+                    format!("{project_id}::Delete me"),
+                    conversation(&deleted_id, "Delete me"),
+                ),
+                (
+                    format!("{project_id}::Keep me"),
+                    conversation(&kept_id, "Keep me"),
+                ),
+            ]),
+            tombstones: Vec::new(),
+        };
+        let requested = LocalTombstone {
+            entity_type: "conversation".to_string(),
+            entity_id: "legacy:old-project-id:Delete me".to_string(),
+            archived_at: now_text(),
+            project_id: Some("old-project-id".to_string()),
+            title: Some("Delete me".to_string()),
+            relative_path: Some("permanent-delete".to_string()),
+            path_hint: Some("C:\\permanent-delete".to_string()),
+            reason: Some(PERMANENT_DELETE_REASON.to_string()),
+        };
+        let target = permanent_delete_target(&snapshot, &requested)
+            .expect("resolve legacy permanent-delete target");
+        assert_eq!(target.entity_id, deleted_id);
+
+        let pruned = prune_snapshot_for_permanent_delete(&snapshot, &target);
+
+        assert_eq!(pruned.projects.len(), 1);
+        assert_eq!(pruned.projects[0].threads, vec!["Keep me"]);
+        assert_eq!(pruned.conversations.len(), 1);
+        assert_eq!(
+            pruned.conversations.values().next().and_then(|value| value.id.as_deref()),
+            Some(kept_id.as_str())
+        );
+        assert_eq!(pruned.tombstones.len(), 1);
+        assert_eq!(pruned.tombstones[0].entity_id, deleted_id);
+        assert!(permanent_delete_reason(
+            pruned.tombstones[0].reason.as_deref()
+        ));
+    }
+
+    #[test]
+    fn permanent_delete_marker_cannot_be_overridden_by_a_later_restore() {
+        let permanent = TombstoneEventPayload {
+            entity_type: "conversation".to_string(),
+            entity_id: "conversation-id".to_string(),
+            archived_at: "1".to_string(),
+            project_id: None,
+            title: Some("Deleted".to_string()),
+            relative_path: None,
+            path_hint: None,
+            reason: Some(PERMANENT_DELETE_REASON.to_string()),
+        };
+        let restore = TombstoneEventPayload {
+            reason: Some("old client restore".to_string()),
+            ..permanent.clone()
+        };
+        let existing = (
+            compaction_baseline_rank(),
+            true,
+            permanent.clone(),
+        );
+        let later_rank = EventRank {
+            hlc: "99999999999999999999-99999999".to_string(),
+            device_id: Uuid::new_v4().to_string(),
+            sequence: u64::MAX,
+        };
+
+        assert!(!tombstone_event_should_replace(
+            Some(&existing),
+            &later_rank,
+            false,
+            &restore,
+        ));
+        assert!(tombstone_event_should_replace(
+            Some(&(later_rank, false, restore)),
+            &compaction_baseline_rank(),
+            true,
+            &permanent,
+        ));
     }
 
     #[test]

@@ -2,14 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  appendInterruptedAnswerMarker,
   beginAssistantRegeneration,
   bothAssistantVersionsAreSettled,
   collapseRepeatedAssistantText,
   collapseAbandonedRegenerationRetries,
   coalesceMessageIdentities,
+  hasInterruptedAnswerMarker,
   messageIdentityKeys,
   isNewerSettledAssistantVersion,
   isSettledHistoricalAssistant,
+  mergeInterruptedAssistantVersions,
   messagesShareIdentity,
   type MessageIdentityLike,
 } from "../src/messageIdentity.ts";
@@ -43,6 +46,42 @@ const mergeVersions = (existing: TestMessage, incoming: TestMessage) => {
     turnId: existing.turnId ?? incoming.turnId,
   };
 };
+
+test("a megszakítás megőrzi a részválaszt és pontosan egy jelölést tesz utána", () => {
+  const once = appendInterruptedAnswerMarker("Már elkészült rész.");
+  const twice = appendInterruptedAnswerMarker(once);
+  assert.equal(once, "Már elkészült rész.\n\nA válasz megszakítva.");
+  assert.equal(twice, once);
+  assert.equal(hasInterruptedAnswerMarker(twice), true);
+});
+
+test("üres részválaszból is tartós megszakítási jelölés készül", () => {
+  assert.equal(appendInterruptedAnswerMarker(""), "A válasz megszakítva.");
+});
+
+test("a cache részválasza és az adatbázis stop jelölése együtt marad", () => {
+  const partial = {
+    role: "assistant" as const,
+    text: "Tesztelés alatt: lefuttatom a projekt tesztjeit.",
+    turnId: "request:cancelled",
+    sequence: 42,
+    live: false,
+    final: true,
+  };
+  const stopped = {
+    ...partial,
+    text: "A válasz megszakítva.",
+  };
+
+  assert.deepEqual(mergeInterruptedAssistantVersions(partial, stopped), {
+    text: `${partial.text}\n\nA válasz megszakítva.`,
+    interrupted: true,
+  });
+  assert.deepEqual(mergeInterruptedAssistantVersions(stopped, partial), {
+    text: `${partial.text}\n\nA válasz megszakítva.`,
+    interrupted: true,
+  });
+});
 
 test("legacy cache and OneDrive copies without strong ids render once", () => {
   const result = coalesceMessageIdentities<TestMessage>(
@@ -80,6 +119,31 @@ test("different strong ids at the same sequence never blend user payloads", () =
     result.map((message) => message.text),
     ["Elso kerdes", "Masodik kerdes"],
   );
+});
+
+test("a steer uses inputId identity and cannot merge into its parent prompt", () => {
+  const root: TestMessage = {
+    id: "root",
+    role: "user",
+    text: "Build it",
+    turnId: "request:root",
+  };
+  const steer: TestMessage = {
+    id: "steer-a",
+    role: "user",
+    text: "No CSS",
+    turnId: "request:root",
+    interaction: { kind: "steer", inputId: "input-1" },
+  };
+  const duplicate = { ...steer, id: "steer-b" };
+  const result = coalesceMessageIdentities(
+    [root, steer, duplicate],
+    mergeVersions,
+  );
+
+  assert.equal(result.length, 2);
+  assert.equal(result[0].text, "Build it");
+  assert.equal(result[1].text, "No CSS");
 });
 
 test("legacy assistant aliases with exact sequence and payload render once", () => {

@@ -203,7 +203,12 @@ test("a magyar narráció és a fontos hiba megszakítja a technikai csoportot",
       presentation: "narrative",
       summary: "A gépi ellenőrzés elkészült.",
     },
-    { id: "c1", presentation: "command", summary: "$ adb devices" },
+    {
+      id: "c1",
+      presentation: "command",
+      summary: "$ adb devices",
+      important: true,
+    },
     {
       id: "error",
       presentation: "status",

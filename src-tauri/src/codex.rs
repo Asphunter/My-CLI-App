@@ -8,7 +8,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -82,6 +82,13 @@ pub struct PendingImageUpload {
 struct ActiveRequest {
     cancelled: Arc<AtomicBool>,
     pid: Option<u32>,
+    writer: Option<Arc<Mutex<Option<ChildStdin>>>>,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    steer_gate_open: bool,
+    next_rpc_id: Arc<AtomicU64>,
+    pending_steers: HashMap<u64, crate::agent::AgentSteerRequest>,
+    accepted_inputs: HashSet<String>,
 }
 
 static ACTIVE_REQUESTS: OnceLock<Mutex<HashMap<String, ActiveRequest>>> = OnceLock::new();
@@ -111,9 +118,288 @@ pub fn begin_request(request_id: &str) -> Result<Arc<AtomicBool>, String> {
         ActiveRequest {
             cancelled: cancelled.clone(),
             pid: None,
+            writer: None,
+            thread_id: None,
+            turn_id: None,
+            steer_gate_open: false,
+            next_rpc_id: Arc::new(AtomicU64::new(1_000)),
+            pending_steers: HashMap::new(),
+            accepted_inputs: HashSet::new(),
         },
     );
     Ok(cancelled)
+}
+
+fn attach_app_server_writer(request_id: &str, writer: Arc<Mutex<Option<ChildStdin>>>) {
+    if let Ok(mut requests) = active_requests().lock() {
+        if let Some(request) = requests.get_mut(request_id) {
+            request.writer = Some(writer);
+        }
+    }
+}
+
+fn open_steer_gate(request_id: &str, thread_id: &str, turn_id: &str) {
+    if let Ok(mut requests) = active_requests().lock() {
+        if let Some(request) = requests.get_mut(request_id) {
+            request.thread_id = Some(thread_id.to_string());
+            request.turn_id = Some(turn_id.to_string());
+            request.steer_gate_open = true;
+        }
+    }
+}
+
+fn emit_input_status(
+    app: &tauri::AppHandle,
+    event: &crate::agent::AgentInputStatusEvent,
+) -> Result<(), String> {
+    emit_main_window(app, "agent-input-status", event)
+}
+
+fn classify_steer_rejection(value: &Value) -> crate::agent::AgentInputErrorCode {
+    let message = value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if message.contains("expectedturnid")
+        || message.contains("expected turn")
+        || message.contains("turn mismatch")
+        || message.contains("not active")
+    {
+        crate::agent::AgentInputErrorCode::TargetChanged
+    } else {
+        crate::agent::AgentInputErrorCode::ProviderRejected
+    }
+}
+
+fn steer_error_message(value: &Value) -> String {
+    value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("A Codex nem fogadta el a menet közbeni üzenetet.")
+        .to_string()
+}
+
+fn handle_steer_response(
+    app: &tauri::AppHandle,
+    request_id: &str,
+    value: &Value,
+) -> Result<bool, String> {
+    let Some(rpc_id) = value.get("id").and_then(Value::as_u64) else {
+        return Ok(false);
+    };
+    let (pending, thread_id, turn_id, accepted) = {
+        let mut requests = active_requests()
+            .lock()
+            .map_err(|_| "A Codex-kérések állapota zárolva maradt.".to_string())?;
+        let Some(active) = requests.get_mut(request_id) else {
+            return Ok(false);
+        };
+        let Some(pending) = active.pending_steers.remove(&rpc_id) else {
+            return Ok(false);
+        };
+        let accepted = value.get("error").is_none();
+        if accepted {
+            active.accepted_inputs.insert(pending.input_id.clone());
+        }
+        (
+            pending,
+            active.thread_id.clone(),
+            active.turn_id.clone(),
+            accepted,
+        )
+    };
+    if accepted {
+        let target = pending.target(thread_id, turn_id);
+        crate::record_accepted_pipeline_input(&pending);
+        emit_input_status(
+            app,
+            &crate::agent::AgentInputStatusEvent::accepted(&pending, target),
+        )?;
+    } else {
+        emit_input_status(
+            app,
+            &crate::agent::AgentInputStatusEvent::rejected(
+                &pending,
+                classify_steer_rejection(value),
+                steer_error_message(value),
+            ),
+        )?;
+    }
+    Ok(true)
+}
+
+fn close_steer_gate(
+    app: &tauri::AppHandle,
+    request_id: &str,
+    code: crate::agent::AgentInputErrorCode,
+    message: &str,
+) {
+    let pending = active_requests()
+        .lock()
+        .ok()
+        .and_then(|mut requests| {
+            requests.get_mut(request_id).map(|active| {
+                active.steer_gate_open = false;
+                active.turn_id = None;
+                active.pending_steers.drain().map(|(_, item)| item).collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_default();
+    for request in pending {
+        let _ = emit_input_status(
+            app,
+            &crate::agent::AgentInputStatusEvent::rejected(
+                &request,
+                code,
+                message.to_string(),
+            ),
+        );
+    }
+}
+
+fn detach_app_server_writer(request_id: &str) {
+    if let Ok(mut requests) = active_requests().lock() {
+        if let Some(request) = requests.get_mut(request_id) {
+            request.steer_gate_open = false;
+            request.turn_id = None;
+            if let Some(writer) = request.writer.take() {
+                if let Ok(mut stdin) = writer.lock() {
+                    stdin.take();
+                }
+            }
+        }
+    }
+}
+
+fn codex_steer_frame(
+    rpc_id: u64,
+    request: &crate::agent::AgentSteerRequest,
+    thread_id: &str,
+    turn_id: &str,
+) -> Value {
+    json!({
+        "id": rpc_id,
+        "method": "turn/steer",
+        "params": {
+            "threadId": thread_id,
+            "input": [{ "type": "text", "text": request.text }],
+            "expectedTurnId": turn_id,
+        }
+    })
+}
+
+pub fn steer(
+    app: &tauri::AppHandle,
+    request: crate::agent::AgentSteerRequest,
+) -> Result<crate::agent::AgentSteerQueued, crate::agent::AgentSteerError> {
+    use crate::agent::{AgentInputErrorCode, AgentProvider, AgentSteerError};
+
+    if request.provider != AgentProvider::Codex {
+        return Err(AgentSteerError::new(
+            AgentInputErrorCode::TargetChanged,
+            "A célzott futás nem Codex providerhez tartozik.",
+        ));
+    }
+    if request.text.trim().is_empty() {
+        return Err(AgentSteerError::new(
+            AgentInputErrorCode::UnsupportedPayload,
+            "Üres menet közbeni üzenet nem küldhető.",
+        ));
+    }
+    let (writer, rpc_id, thread_id, turn_id) = {
+        let mut requests = active_requests().lock().map_err(|_| {
+            AgentSteerError::new(
+                AgentInputErrorCode::RuntimeFailed,
+                "A Codex-kérések állapota zárolva maradt.",
+            )
+        })?;
+        let active = requests.get_mut(&request.provider_request_id).ok_or_else(|| {
+            AgentSteerError::new(
+                AgentInputErrorCode::NoActiveRun,
+                "A célzott Codex-kérés már nem aktív.",
+            )
+        })?;
+        if active.cancelled.load(Ordering::Acquire) {
+            return Err(AgentSteerError::new(
+                AgentInputErrorCode::RunCancelled,
+                "A célzott Codex-kérést leállították.",
+            ));
+        }
+        if active.accepted_inputs.contains(&request.input_id)
+            || active
+                .pending_steers
+                .values()
+                .any(|pending| pending.input_id == request.input_id)
+        {
+            return Err(AgentSteerError::new(
+                AgentInputErrorCode::DuplicateInput,
+                "Ezt a menet közbeni üzenetet a Codex futás már megkapta.",
+            ));
+        }
+        if !active.steer_gate_open {
+            return Err(AgentSteerError::new(
+                AgentInputErrorCode::NoActiveTurn,
+                "A Codex provider turnje már nem fogad inputot.",
+            ));
+        }
+        let thread_id = active.thread_id.clone().ok_or_else(|| {
+            AgentSteerError::new(
+                AgentInputErrorCode::NoActiveTurn,
+                "A Codex thread még nem áll készen a terelésre.",
+            )
+        })?;
+        let turn_id = active.turn_id.clone().ok_or_else(|| {
+            AgentSteerError::new(
+                AgentInputErrorCode::NoActiveTurn,
+                "A Codex turn még nem áll készen a terelésre.",
+            )
+        })?;
+        if turn_id != request.expected_provider_turn_id {
+            return Err(AgentSteerError::new(
+                AgentInputErrorCode::TargetChanged,
+                "A célzott Codex turn közben megváltozott.",
+            ));
+        }
+        let writer = active.writer.clone().ok_or_else(|| {
+            AgentSteerError::new(
+                AgentInputErrorCode::TransportClosed,
+                "A Codex stdin csatornája nem érhető el.",
+            )
+        })?;
+        let rpc_id = active.next_rpc_id.fetch_add(1, Ordering::Relaxed);
+        active.pending_steers.insert(rpc_id, request.clone());
+        (writer, rpc_id, thread_id, turn_id)
+    };
+
+    let _ = emit_input_status(app, &crate::agent::AgentInputStatusEvent::sending(&request));
+    let write_result = writer
+        .lock()
+        .map_err(|_| "A Codex stdin zárolva maradt.".to_string())
+        .and_then(|mut stdin| {
+            let stdin = stdin
+                .as_mut()
+                .ok_or_else(|| "A Codex stdin csatornája lezárult.".to_string())?;
+            send_json(stdin, codex_steer_frame(rpc_id, &request, &thread_id, &turn_id))
+        });
+    if let Err(message) = write_result {
+        if let Ok(mut requests) = active_requests().lock() {
+            if let Some(active) = requests.get_mut(&request.provider_request_id) {
+                active.pending_steers.remove(&rpc_id);
+            }
+        }
+        return Err(AgentSteerError::new(
+            AgentInputErrorCode::TransportClosed,
+            message,
+        ));
+    }
+    let queued_at = crate::agent::AgentInputStatusEvent::sending(&request).timestamp;
+    Ok(crate::agent::AgentSteerQueued {
+        input_id: request.input_id,
+        queued_at,
+    })
 }
 
 pub fn attach_child_pid(request_id: &str, pid: u32) {
@@ -2766,6 +3052,19 @@ fn send_json(stdin: &mut ChildStdin, value: Value) -> Result<(), String> {
     stdin.flush().map_err(|error| error.to_string())
 }
 
+fn send_json_shared(
+    writer: &Arc<Mutex<Option<ChildStdin>>>,
+    value: Value,
+) -> Result<(), String> {
+    let mut stdin = writer
+        .lock()
+        .map_err(|_| "A Codex stdin zárolva maradt.".to_string())?;
+    let stdin = stdin
+        .as_mut()
+        .ok_or_else(|| "A Codex stdin csatornája lezárult.".to_string())?;
+    send_json(stdin, value)
+}
+
 pub(crate) fn emit_main_window<T: Serialize>(
     app: &tauri::AppHandle,
     event: &str,
@@ -2830,7 +3129,7 @@ fn approval_request(value: &Value) -> Option<CodexApprovalRequest> {
 
 fn handle_server_request(
     _app: &tauri::AppHandle,
-    stdin: &mut ChildStdin,
+    writer: &Arc<Mutex<Option<ChildStdin>>>,
     value: &Value,
     cancellation: &Arc<AtomicBool>,
 ) -> Result<(), String> {
@@ -2849,8 +3148,8 @@ fn handle_server_request(
         // run non-interactive without opening a modal dialog.
         "acceptForSession"
     };
-    send_json(
-        stdin,
+    send_json_shared(
+        writer,
         json!({
             "id": request.request_id,
             "result": { "decision": decision }
@@ -3157,18 +3456,22 @@ pub fn send(
         if cancellation.load(Ordering::Relaxed) {
             return Err("A Codex-kérés megszakítva.".to_string());
         }
-        let mut stdin = child
+        let stdin = child
             .stdin
             .take()
             .ok_or_else(|| "A Codex stdin nem érhető el.".to_string())?;
+        let writer = Arc::new(Mutex::new(Some(stdin)));
+        if let Some(request_id) = request.request_id.as_deref() {
+            attach_app_server_writer(request_id, Arc::clone(&writer));
+        }
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| "A Codex stdout nem érhető el.".to_string())?;
         let reader = CancellableLineReader::new(stdout);
 
-        send_json(
-            &mut stdin,
+        send_json_shared(
+            &writer,
             json!({
                 "id": 1,
                 "method": "initialize",
@@ -3179,7 +3482,7 @@ pub fn send(
             }),
         )?;
         read_cancellable_response(&reader, 1, &cancellation)?;
-        send_json(&mut stdin, json!({ "method": "initialized", "params": {} }))?;
+        send_json_shared(&writer, json!({ "method": "initialized", "params": {} }))?;
         emit_main_window(
             &app,
             "codex-transport",
@@ -3215,16 +3518,16 @@ pub fn send(
                 "sandbox": sandbox_policy,
                 "developerInstructions": UI_DEVELOPER_INSTRUCTIONS
             });
-            send_json(
-                &mut stdin,
+            send_json_shared(
+                &writer,
                 json!({ "id": 2, "method": "thread/resume", "params": resume_params }),
             )?;
             match read_cancellable_response(&reader, 2, &cancellation) {
                 Ok(response) => (response, 3),
                 Err(error) if is_missing_rollout_error(&error) => {
                     thread_rehydrated = true;
-                    send_json(
-                        &mut stdin,
+                    send_json_shared(
+                        &writer,
                         json!({ "id": 3, "method": "thread/start", "params": start_params }),
                     )?;
                     (read_cancellable_response(&reader, 3, &cancellation)?, 4)
@@ -3232,8 +3535,8 @@ pub fn send(
                 Err(error) => return Err(error),
             }
         } else {
-            send_json(
-                &mut stdin,
+            send_json_shared(
+                &writer,
                 json!({ "id": 2, "method": "thread/start", "params": start_params }),
             )?;
             (read_cancellable_response(&reader, 2, &cancellation)?, 3)
@@ -3272,8 +3575,8 @@ pub fn send(
             turn_params["effort"] = Value::String(effort.to_string());
         }
 
-        send_json(
-            &mut stdin,
+        send_json_shared(
+            &writer,
             json!({
                 "id": turn_request_id,
                 "method": "turn/start",
@@ -3293,8 +3596,16 @@ pub fn send(
         if cancellation.load(Ordering::Relaxed) {
             return Err("A Codex-kérés megszakítva.".to_string());
         }
-        let (_, buffered_notifications) =
+        let (turn_response, buffered_notifications) =
             read_cancellable_response_with_notifications(&reader, turn_request_id, &cancellation)?;
+        let provider_turn_id = turn_response["result"]["turn"]["id"]
+            .as_str()
+            .or_else(|| turn_response["result"]["turnId"].as_str())
+            .ok_or_else(|| "A Codex nem adott vissza turn azonosítót.".to_string())?
+            .to_string();
+        if let Some(request_id) = request.request_id.as_deref() {
+            open_steer_gate(request_id, &thread_id, &provider_turn_id);
+        }
         emit_main_window(
             &app,
             "codex-transport",
@@ -3332,6 +3643,13 @@ pub fn send(
                 .get("method")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            if method.is_empty() {
+                if let Some(request_id) = request.request_id.as_deref() {
+                    if handle_steer_response(&app, request_id, &value)? {
+                        continue;
+                    }
+                }
+            }
             if method == "turn/completed" && final_text.trim().is_empty() {
                 final_text = unknown_agent_message_order
                     .iter()
@@ -3358,7 +3676,7 @@ pub fn send(
                 events.push(event);
             }
             if !method.is_empty() && value.get("id").is_some() {
-                handle_server_request(&app, &mut stdin, &value, &cancellation)?;
+                handle_server_request(&app, &writer, &value, &cancellation)?;
                 continue;
             }
             if method == "item/started"
@@ -3463,6 +3781,14 @@ pub fn send(
                 }
             } else if method == "turn/completed" {
                 turn_completed_for_result.store(true, Ordering::Release);
+                if let Some(request_id) = request.request_id.as_deref() {
+                    close_steer_gate(
+                        &app,
+                        request_id,
+                        crate::agent::AgentInputErrorCode::NoActiveTurn,
+                        "A Codex turn lezárult az input elfogadása előtt.",
+                    );
+                }
                 emit_main_window(
                     &app,
                     "codex-transport",
@@ -3485,6 +3811,24 @@ pub fn send(
             thread_rehydrated,
         })
     })();
+
+    if let Some(request_id) = request.request_id.as_deref() {
+        if !turn_completed.load(Ordering::Acquire) {
+            let (code, message) = if cancellation.load(Ordering::Acquire) {
+                (
+                    crate::agent::AgentInputErrorCode::RunCancelled,
+                    "A Codex futást az input elfogadása előtt leállították.",
+                )
+            } else {
+                (
+                    crate::agent::AgentInputErrorCode::RuntimeFailed,
+                    "A Codex runtime az input elfogadása előtt leállt.",
+                )
+            };
+            close_steer_gate(&app, request_id, code, message);
+        }
+        detach_app_server_writer(request_id);
+    }
 
     terminate(child);
     let guard_result = finalize_agent_snapshot(&guard_snapshot);
@@ -4252,6 +4596,51 @@ pub fn sync_save(state: Value) -> Result<(), String> {
 #[cfg(test)]
 mod sync_tests {
     use super::*;
+
+    #[test]
+    fn steer_frame_targets_the_exact_running_turn() {
+        let request = crate::agent::AgentSteerRequest {
+            input_id: "input-1".to_string(),
+            conversation_id: "conversation-1".to_string(),
+            root_request_id: "root-1".to_string(),
+            provider_request_id: "root-1-stage-1".to_string(),
+            provider: crate::agent::AgentProvider::Codex,
+            expected_provider_turn_id: "turn-9".to_string(),
+            expected_stage_epoch: 2,
+            text: "Előbb a hibás tesztet javítsd.".to_string(),
+            pipeline_run_id: Some("pipeline-1".to_string()),
+            stage_index: Some(1),
+            stage_role: Some("code".to_string()),
+        };
+        assert_eq!(
+            codex_steer_frame(1_007, &request, "thread-4", "turn-9"),
+            serde_json::json!({
+                "id": 1_007,
+                "method": "turn/steer",
+                "params": {
+                    "threadId": "thread-4",
+                    "input": [{"type": "text", "text": "Előbb a hibás tesztet javítsd."}],
+                    "expectedTurnId": "turn-9"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn stale_turn_errors_are_classified_as_target_changes() {
+        assert_eq!(
+            classify_steer_rejection(&serde_json::json!({
+                "error": {"message": "expectedTurnId does not match active turn"}
+            })),
+            crate::agent::AgentInputErrorCode::TargetChanged
+        );
+        assert_eq!(
+            classify_steer_rejection(&serde_json::json!({
+                "error": {"message": "invalid request"}
+            })),
+            crate::agent::AgentInputErrorCode::ProviderRejected
+        );
+    }
 
     #[test]
     fn projects_root_resolution_is_independent_of_machine_absolute_path() {
@@ -5172,6 +5561,7 @@ mod sync_tests {
             detailed: None,
             change_summary: Vec::new(),
             pipeline: None,
+            interaction: None,
         }
     }
 

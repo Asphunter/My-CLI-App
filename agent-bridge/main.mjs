@@ -26,6 +26,7 @@ import {
 } from "./protocol.mjs";
 import { shouldStartFreshSession } from "./recovery.mjs";
 import { streamedStringField } from "./streamingJson.mjs";
+import { TurnInputBroker } from "./turnInputBroker.mjs";
 
 const activeRequests = new Map();
 const dispatchTasks = new Set();
@@ -1041,7 +1042,33 @@ async function runLiveTurn(request) {
     // megérkezett nyers JSON és a fájl útvonala, amint kiderül. Ebből él az
     // élő kódnézet, amíg a hívás tart; a blokk lezárásakor kiürül.
     fileWrites: new Map(),
+    inputAttemptSequence: 0,
+    inputCloseCode: "no_active_turn",
+    inputBroker: null,
   };
+  turn.inputBroker = new TurnInputBroker({
+    onAccepted: (entry, attemptId) => {
+      writeMessage({
+        type: "steer_accepted",
+        request,
+        sessionId: turn.sessionId,
+        payload: {
+          inputId: entry.inputId,
+          attemptId,
+          providerTurnId: turn.sessionId ?? request.requestId,
+          ...entry.meta,
+        },
+      });
+    },
+    onRejected: (entry, code, message) => {
+      writeMessage({
+        type: "steer_rejected",
+        request,
+        sessionId: turn.sessionId,
+        payload: { inputId: entry.inputId, code, message, ...entry.meta },
+      });
+    },
+  });
   activeRequests.set(request.requestId, turn);
   // Without an explicit systemPrompt the SDK uses a minimal prompt that omits
   // Claude Code's coding guidance entirely, so the preset is requested and the
@@ -1108,11 +1135,23 @@ async function runLiveTurn(request) {
             env: { ...process.env, CLAUDE_AGENT_SDK_CLIENT_APP: "min-local-ai-workspace/0.1.0" },
           },
         });
+        const inputAttemptId = `${request.requestId}:attempt-${++turn.inputAttemptSequence}`;
+        const inputTask = stream
+          .streamInput(turn.inputBroker.beginAttempt(inputAttemptId))
+          .catch((error) => {
+            if (!abortController.signal.aborted) abortController.abort(error);
+            throw error;
+          });
         finalResult = null;
-        for await (const event of stream) {
-          if (typeof event?.session_id === "string") turn.sessionId = event.session_id;
-          handleSdkEvent(turn, event);
-          if (event?.type === "result") finalResult = event;
+        try {
+          for await (const event of stream) {
+            if (typeof event?.session_id === "string") turn.sessionId = event.session_id;
+            handleSdkEvent(turn, event);
+            if (event?.type === "result") finalResult = event;
+          }
+        } finally {
+          turn.inputBroker.endAttempt(inputAttemptId);
+          await inputTask;
         }
         if (!finalResult) throw new Error("A Claude bridge nem adott turn eredményt.");
         if (finalResult.subtype !== "success") {
@@ -1198,6 +1237,7 @@ async function runLiveTurn(request) {
         sessionId: turn.sessionId,
         payload: { code: finalResult.subtype ?? "turn_failed", errorCode: classifyConnectionError(errors), message: safeErrors, sessionId: turn.sessionId, totalCostUsd: finalResult.total_cost_usd ?? null },
       });
+      turn.inputCloseCode = "runtime_failed";
       return;
     }
     const gluedText = typeof finalResult.result === "string" ? finalResult.result : "";
@@ -1241,13 +1281,23 @@ async function runLiveTurn(request) {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (abortController.signal.aborted) {
+      turn.inputCloseCode = "run_cancelled";
       writeMessage({ type: "turn_failed", request, sessionId: turn.sessionId, payload: { code: "cancelled", errorCode: "cancelled", message: "A Claude-kérés megszakadt." } });
     } else {
+      turn.inputCloseCode = "runtime_failed";
       const safeMessage = safeErrorMessage(error);
       diagnostic("live turn failed", { requestId: request.requestId, error: safeMessage });
       writeMessage({ type: "turn_failed", request, sessionId: turn.sessionId, payload: { code: "turn_failed", errorCode: classifyConnectionError(message), message: safeMessage } });
     }
   } finally {
+    turn.inputBroker.close(
+      turn.inputCloseCode,
+      turn.inputCloseCode === "run_cancelled"
+        ? "A Claude futást az input elfogadása előtt leállították."
+        : turn.inputCloseCode === "runtime_failed"
+          ? "A Claude runtime az input elfogadása előtt leállt."
+          : "A Claude turn lezárult az input elfogadása előtt.",
+    );
     rejectSessionStoreForRequest(request.requestId, "A Claude turn lezárult a SessionStore válasza előt.");
     activeRequests.delete(request.requestId);
   }
@@ -1260,7 +1310,7 @@ async function dispatch(request) {
     return;
   }
   if (type === "initialize") {
-    writeMessage({ type: "ready", request, payload: { protocolVersion: PROTOCOL_VERSION, bridgeVersion: "0.2.0", capabilities: ["live_turn", "resume_turn", "connection_test", "approvals", "questions"] } });
+    writeMessage({ type: "ready", request, payload: { protocolVersion: PROTOCOL_VERSION, bridgeVersion: "0.3.0", capabilities: ["live_turn", "resume_turn", "connection_test", "approvals", "questions", "steer_turn"] } });
     return;
   }
   if (type === "test_connection") {
@@ -1274,6 +1324,49 @@ async function dispatch(request) {
   if (type === "cancel_turn") {
     const turn = activeRequests.get(request.requestId);
     if (turn) turn.abortController.abort();
+    return;
+  }
+  if (type === "steer_turn") {
+    const turn = activeRequests.get(request.requestId);
+    const inputId = typeof request.payload?.inputId === "string"
+      ? request.payload.inputId
+      : "";
+    const reject = (code, message) => writeMessage({
+      type: "steer_rejected",
+      request,
+      sessionId: turn?.sessionId ?? null,
+      payload: { inputId, code, message },
+    });
+    if (!turn || !turn.inputBroker) {
+      reject("no_active_turn", "A Claude turn már nem aktív.");
+      return;
+    }
+    const expectedTurnId = typeof request.payload?.expectedProviderTurnId === "string"
+      ? request.payload.expectedProviderTurnId
+      : "";
+    const activeTurnId = turn.sessionId ?? request.requestId;
+    if (!expectedTurnId || expectedTurnId !== activeTurnId) {
+      reject("target_changed", "A célzott Claude turn közben megváltozott.");
+      return;
+    }
+    const queued = turn.inputBroker.enqueue({
+      inputId,
+      text: request.payload?.text,
+      meta: {
+        conversationId: request.payload?.conversationId,
+        rootRequestId: request.payload?.rootRequestId,
+        providerRequestId: request.requestId,
+        pipelineRunId: request.payload?.pipelineRunId,
+        stageIndex: request.payload?.stageIndex,
+        stageRole: request.payload?.stageRole,
+        stageEpoch: request.payload?.stageEpoch,
+      },
+    });
+    if (!queued.accepted) {
+      reject(queued.code, queued.code === "duplicate_input"
+        ? "Ezt az inputot a Claude futás már feldolgozta."
+        : "A Claude inputcsatornája nem fogadta el az üzenetet.");
+    }
     return;
   }
   if (type === "approval_response") {

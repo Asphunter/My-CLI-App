@@ -513,6 +513,164 @@ fn pipeline_runs_by_request() -> &'static std::sync::Mutex<
     RUNS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+#[derive(Debug, Clone)]
+struct ActivePipelineStage {
+    root_request_id: String,
+    provider_request_id: String,
+    provider: agent::AgentProvider,
+    stage_index: i64,
+    stage_role: String,
+    stage_epoch: u64,
+}
+
+fn active_pipeline_stages() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, ActivePipelineStage>,
+> {
+    static STAGES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, ActivePipelineStage>>,
+    > = std::sync::OnceLock::new();
+    STAGES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn pipeline_run_inputs() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, Vec<pipeline::PipelineRunInput>>,
+> {
+    static INPUTS: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, Vec<pipeline::PipelineRunInput>>,
+        >,
+    > = std::sync::OnceLock::new();
+    INPUTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub(crate) fn record_accepted_pipeline_input(request: &agent::AgentSteerRequest) {
+    let Some(run_id) = request.pipeline_run_id.as_deref() else {
+        return;
+    };
+    let entry = pipeline::PipelineRunInput {
+        input_id: request.input_id.clone(),
+        accepted_at_stage: request.stage_index.unwrap_or_default(),
+        accepted_at_role: request.stage_role.clone().unwrap_or_default(),
+        text: request.text.clone(),
+        accepted_at: agent::now_timestamp(),
+        carried: false,
+    };
+    if let Ok(mut inputs) = pipeline_run_inputs().lock() {
+        let journal = inputs.entry(run_id.to_string()).or_default();
+        if !journal.iter().any(|item| item.input_id == entry.input_id) {
+            journal.push(entry);
+        }
+    }
+}
+
+fn prompt_with_pipeline_inputs(
+    run_id: &str,
+    stage_index: usize,
+    prompt: String,
+) -> String {
+    let entries = pipeline_run_inputs()
+        .lock()
+        .ok()
+        .and_then(|inputs| inputs.get(run_id).cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| entry.carried || entry.accepted_at_stage < stage_index as i64)
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return prompt;
+    }
+    let instructions = entries
+        .iter()
+        .map(|entry| format!("- {}", entry.text.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{prompt}\n\n[A FUTÁS KÖZBEN HOZZÁADOTT FELHASZNÁLÓI UTASÍTÁSOK]\n{instructions}"
+    )
+}
+
+fn set_active_pipeline_stage(run_id: &str, stage: ActivePipelineStage) {
+    if let Ok(mut stages) = active_pipeline_stages().lock() {
+        stages.insert(run_id.to_string(), stage);
+    }
+}
+
+fn clear_active_pipeline_stage(run_id: &str, provider_request_id: &str) {
+    if let Ok(mut stages) = active_pipeline_stages().lock() {
+        if stages
+            .get(run_id)
+            .is_some_and(|stage| stage.provider_request_id == provider_request_id)
+        {
+            stages.remove(run_id);
+        }
+    }
+}
+
+fn validate_pipeline_steer_target(
+    request: &agent::AgentSteerRequest,
+) -> Result<(), agent::AgentSteerError> {
+    use agent::{AgentInputErrorCode, AgentSteerError};
+    let pipeline_run_id = request.pipeline_run_id.as_deref();
+    if pipeline_run_id.is_none() {
+        if pipeline_run_for_request(&request.provider_request_id).is_some() {
+            return Err(AgentSteerError::new(
+                AgentInputErrorCode::TargetChanged,
+                "A célzott kérés közben pipeline-szakasszá vált.",
+            ));
+        }
+        return Ok(());
+    }
+    let run_id = pipeline_run_id.unwrap_or_default();
+    let stages = active_pipeline_stages().lock().map_err(|_| {
+        AgentSteerError::new(
+            AgentInputErrorCode::RuntimeFailed,
+            "A pipeline célállapota zárolva maradt.",
+        )
+    })?;
+    let active = stages.get(run_id).ok_or_else(|| {
+        AgentSteerError::new(
+            AgentInputErrorCode::TargetChanged,
+            "A célzott pipeline-fázis már nem aktív.",
+        )
+    })?;
+    if active.root_request_id != request.root_request_id
+        || active.provider_request_id != request.provider_request_id
+        || active.provider != request.provider
+        || Some(active.stage_index) != request.stage_index
+        || request.stage_role.as_deref() != Some(active.stage_role.as_str())
+        || active.stage_epoch != request.expected_stage_epoch
+    {
+        return Err(AgentSteerError::new(
+            AgentInputErrorCode::TargetChanged,
+            "A pipeline közben másik fázisra váltott.",
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn agent_steer(
+    app: tauri::AppHandle,
+    request: agent::AgentSteerRequest,
+) -> Result<agent::AgentSteerQueued, agent::AgentSteerError> {
+    let result = validate_pipeline_steer_target(&request).and_then(|_| match request.provider {
+        agent::AgentProvider::Codex => codex::steer(&app, request.clone()),
+        agent::AgentProvider::Anthropic => claude::steer(&app, request.clone()),
+    });
+    if let Err(error) = &result {
+        let _ = codex::emit_main_window(
+            &app,
+            "agent-input-status",
+            &agent::AgentInputStatusEvent::rejected(
+                &request,
+                error.code,
+                error.message.clone(),
+            ),
+        );
+    }
+    result
+}
+
 fn register_pipeline_request_ids(run_id: &str, request_ids: &[String]) {
     if let Ok(mut runs) = pipeline_runs_by_request().lock() {
         for request_id in request_ids {
@@ -638,6 +796,20 @@ async fn pipeline_send(
         request.request_ids.first().map_or("chain", String::as_str),
     )?;
     let run_id = store::begin_pipeline_run(&request.conversation_id, &recipe)?;
+    if let Ok(mut inputs) = pipeline_run_inputs().lock() {
+        inputs.insert(
+            run_id.clone(),
+            request
+                .run_inputs
+                .iter()
+                .cloned()
+                .map(|mut input| {
+                    input.carried = true;
+                    input
+                })
+                .collect(),
+        );
+    }
     // Registered before the first stage starts, so a stop pressed in the first
     // second has something to name. Includes the placeholder the frontend is
     // still showing as the active request at that point.
@@ -705,8 +877,13 @@ async fn pipeline_send(
                 let chain_id = chain_id.clone();
                 let recipe_id = recipe_id.clone();
                 let request_id = request.request_ids[execution.index].clone();
+                let root_request_id = request
+                    .placeholder_request_id
+                    .clone()
+                    .unwrap_or_else(|| request.request_ids[0].clone());
                 let agent_label = pipeline::stage_agent_label(&execution.stage);
                 async move {
+                    let stage_epoch = execution.index as u64 + 1;
                     let progress = |phase: &'static str, status: pipeline::RunStatus| {
                         pipeline::PipelineProgress {
                             run_id: run_id.clone(),
@@ -715,19 +892,41 @@ async fn pipeline_send(
                             stage_count,
                             role: execution.stage.role,
                             agent_label: agent_label.clone(),
+                            provider: execution.stage.provider,
                             request_id: request_id.clone(),
+                            stage_epoch,
                             phase,
                             status,
                         }
                     };
+                    set_active_pipeline_stage(
+                        &run_id,
+                        ActivePipelineStage {
+                            root_request_id: root_request_id.clone(),
+                            provider_request_id: request_id.clone(),
+                            provider: execution.stage.provider,
+                            stage_index: execution.index as i64,
+                            stage_role: execution.stage.role.as_wire().to_string(),
+                            stage_epoch,
+                        },
+                    );
                     let _ = codex::emit_main_window(
                         &app,
                         "pipeline-progress",
                         &progress("started", pipeline::RunStatus::Running),
                     );
-                    store::update_pipeline_run_stage(&run_id, execution.index as i64)?;
+                    if let Err(error) =
+                        store::update_pipeline_run_stage(&run_id, execution.index as i64)
+                    {
+                        clear_active_pipeline_stage(&run_id, &request_id);
+                        return Err(error);
+                    }
                     let turn = agent::AgentTurnRequest {
-                        prompt: execution.prompt,
+                        prompt: prompt_with_pipeline_inputs(
+                            &run_id,
+                            execution.index,
+                            execution.prompt,
+                        ),
                         images: if execution.is_first {
                             request.images.clone()
                         } else {
@@ -752,6 +951,7 @@ async fn pipeline_send(
                         keep_workspace: true,
                     };
                     let result = run_agent_turn_inner(app.clone(), turn, false).await;
+                    clear_active_pipeline_stage(&run_id, &request_id);
                     let phase = if result.is_ok() { "finished" } else { "failed" };
                     let _ = codex::emit_main_window(
                         &app,
@@ -924,6 +1124,11 @@ async fn pipeline_send(
     if let Ok(mut runs) = live_pipeline_runs().lock() {
         runs.remove(&run_id);
     }
+    let accepted_run_inputs = pipeline_run_inputs()
+        .lock()
+        .ok()
+        .and_then(|mut inputs| inputs.remove(&run_id))
+        .unwrap_or_default();
     // Whatever the chain wrote is now staged and the tree is back at its base,
     // exactly as a single turn leaves it. The staged report goes back to the
     // frontend, which applies it the same way it applies a single turn's —
@@ -953,6 +1158,31 @@ async fn pipeline_send(
         (None, guard) => guard,
     };
     store::finish_pipeline_run(&run_id, status.as_wire(), run_error.as_deref())?;
+    if let (Some(cwd), Some(plan_file)) =
+        (request.cwd.as_deref(), request.plan_file.as_deref())
+    {
+        if !accepted_run_inputs.is_empty() {
+            let body = accepted_run_inputs
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "- [{} · {}] {}",
+                        entry.accepted_at_role,
+                        entry.accepted_at,
+                        entry.text.trim()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let _ = append_plan_file(
+                cwd,
+                plan_file,
+                &format!(
+                    "\n\n## Futás közben hozzáadott felhasználói utasítások\n\n{body}\n"
+                ),
+            );
+        }
+    }
     activity.finish(status == pipeline::RunStatus::Completed);
     Ok(pipeline::PipelineRunResult {
         run_id,
@@ -1483,6 +1713,41 @@ async fn local_store_save(
 }
 
 #[tauri::command]
+async fn pending_followups_list() -> Result<Vec<store::PendingFollowUp>, String> {
+    tauri::async_runtime::spawn_blocking(store::list_pending_followups)
+        .await
+        .map_err(|error| format!("A follow-up queue betöltése leállt: {error}"))?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn pending_followup_upsert(
+    follow_up: store::PendingFollowUp,
+) -> Result<store::PendingFollowUp, String> {
+    tauri::async_runtime::spawn_blocking(move || store::upsert_pending_followup(follow_up))
+        .await
+        .map_err(|error| format!("A follow-up mentése leállt: {error}"))?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn pending_followups_reorder(
+    conversation_id: String,
+    ids: Vec<String>,
+) -> Result<Vec<store::PendingFollowUp>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        store::reorder_pending_followups(&conversation_id, ids)
+    })
+    .await
+    .map_err(|error| format!("A follow-up átrendezése leállt: {error}"))?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn pending_followup_delete(id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || store::delete_pending_followup(&id))
+        .await
+        .map_err(|error| format!("A follow-up törlése leállt: {error}"))?
+}
+
+#[tauri::command]
 async fn sync_v2_pull() -> Result<sync::SyncV2Result, String> {
     tauri::async_runtime::spawn_blocking(sync::sync_v2_pull)
         .await
@@ -1564,6 +1829,17 @@ async fn sync_v2_restore_entity(
         .map_err(|error| format!("A v2 restore háttérfeladata leállt: {error}"))?
 }
 
+#[tauri::command]
+async fn sync_v2_permanently_delete_entity(
+    tombstone: store::LocalTombstone,
+) -> Result<sync::SyncV2Result, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        sync::sync_v2_permanently_delete_entity(tombstone)
+    })
+    .await
+    .map_err(|error| format!("A v2 végleges törlés háttérfeladata leállt: {error}"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default();
@@ -1613,6 +1889,7 @@ pub fn run() {
             pipeline_forget_placeholder,
             agent_conversation_status,
             agent_answer_checkpoint,
+            agent_steer,
             agent_cancel,
             agent_approval_response,
             agent_question_response,
@@ -1661,6 +1938,10 @@ pub fn run() {
             local_store_import_v1,
             local_store_load,
             local_store_save,
+            pending_followups_list,
+            pending_followup_upsert,
+            pending_followups_reorder,
+            pending_followup_delete,
             sync_v2_pull,
             sync_v2_rebuild_from_local,
             sync_v2_publish_snapshot,
@@ -1670,7 +1951,8 @@ pub fn run() {
             sync_v2_retention_backup,
             sync_v2_retention_purge,
             sync_v2_retention_purge_selected,
-            sync_v2_restore_entity
+            sync_v2_restore_entity,
+            sync_v2_permanently_delete_entity
         ])
         .run(tauri::generate_context!())
         .expect("error while running min");
@@ -1745,6 +2027,48 @@ mod tests {
 
         // Bírálat nélkül (megszakadt kör) nincs mit naplózni a verdiktről.
         assert_eq!(plan_journal_entry(1, None, &[]), "");
+    }
+
+    #[test]
+    fn later_pipeline_stages_receive_only_accepted_or_carried_run_inputs() {
+        let run_id = format!("pipeline-input-test-{}", uuid::Uuid::new_v4());
+        pipeline_run_inputs().lock().unwrap().insert(
+            run_id.clone(),
+            vec![
+                pipeline::PipelineRunInput {
+                    input_id: "code-note".to_string(),
+                    accepted_at_stage: 0,
+                    accepted_at_role: "plan".to_string(),
+                    text: "Use compact rows".to_string(),
+                    accepted_at: "1".to_string(),
+                    carried: false,
+                },
+                pipeline::PipelineRunInput {
+                    input_id: "future-note".to_string(),
+                    accepted_at_stage: 2,
+                    accepted_at_role: "review".to_string(),
+                    text: "Do not leak backwards".to_string(),
+                    accepted_at: "2".to_string(),
+                    carried: false,
+                },
+                pipeline::PipelineRunInput {
+                    input_id: "carried-note".to_string(),
+                    accepted_at_stage: 2,
+                    accepted_at_role: "review".to_string(),
+                    text: "Inherited from v1".to_string(),
+                    accepted_at: "3".to_string(),
+                    carried: true,
+                },
+            ],
+        );
+
+        let prompt = prompt_with_pipeline_inputs(&run_id, 1, "CODE".to_string());
+        assert!(prompt.contains("Use compact rows"));
+        assert!(prompt.contains("Inherited from v1"));
+        assert!(!prompt.contains("Do not leak backwards"));
+        assert!(prompt.contains("FUTÁS KÖZBEN HOZZÁADOTT"));
+
+        pipeline_run_inputs().lock().unwrap().remove(&run_id);
     }
 
     /// A project may be claimed once at a time, and the claim frees itself.

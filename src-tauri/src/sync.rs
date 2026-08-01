@@ -6181,6 +6181,7 @@ mod tests {
         answer.turn_id = Some("request:stage-2".to_string());
         answer.pipeline = Some(store::LocalMessagePipeline {
             run_id: "run-7".to_string(),
+            recipe_id: None,
             chain_id: "run-7".to_string(),
             iteration: 1,
             stage_index: 2,
@@ -6245,6 +6246,7 @@ mod tests {
         let mut badged = test_message("answer", "assistant", "A szakasz valasza", true);
         badged.pipeline = Some(store::LocalMessagePipeline {
             run_id: "run-1".to_string(),
+            recipe_id: None,
             chain_id: "run-1".to_string(),
             iteration: 1,
             stage_index: 1,

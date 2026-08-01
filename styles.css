@@ -883,6 +883,9 @@ textarea::placeholder { color: var(--faint); }
 .compact-answer-body { padding: 9px 12px; color: #c9d2dc; line-height: var(--line-height); }
 .compact-answer-line { display: flex; min-height: 18px; align-items: flex-start; gap: 8px; }
 .compact-answer-line p { min-width: 0; flex: 1 1 auto; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.compact-answer-text, .message-answer-text { min-width: 0; flex: 1 1 auto; }
+.compact-answer-text p, .message-answer-text p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.compact-answer-text p + p, .message-answer-text p + p { margin-top: 5px; }
 .compact-answer-body > .quote-backlinks { display: flex; justify-content: flex-end; margin-top: 5px; }
 .trace-card.is-live { border-color: #3d6c53; }
 .turn-progress-answer { position: relative; border-radius: 3px 3px 0 0; border-bottom: 1px solid var(--border); background: rgba(35, 40, 46, .96); }
@@ -962,6 +965,18 @@ textarea::placeholder { color: var(--faint); }
 .trace-step-row { display: grid; grid-template-columns: 24px minmax(0, 1fr) max-content; align-items: center; gap: 6px; width: 100%; min-height: 27px; padding: 3px 6px; border: 1px solid transparent; border-radius: 4px; background: rgba(48, 55, 62, .28); color: var(--muted); text-align: left; cursor: pointer; }
 .trace-step-row:hover, .trace-step-row:focus-visible { border-color: #547a64; color: var(--text); }
 .trace-step-row-inProgress { border-color: var(--accent); background: rgba(123, 217, 171, .12); box-shadow: inset 3px 0 0 var(--accent); color: var(--text); }
+.trace-step-row.is-current { position: relative; isolation: isolate; }
+.trace-step-row.is-current::after {
+  content: ""; position: absolute; inset: -1px; z-index: 0; pointer-events: none;
+  border-radius: 4px; padding: 1px;
+  background: conic-gradient(from var(--step-sweep, 0turn), transparent 0turn, transparent .62turn, var(--accent) .88turn, transparent 1turn);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  animation: step-sweep 1.8s linear infinite;
+}
+.trace-step-row.is-current > * { position: relative; z-index: 1; }
 .trace-step-row-completed .trace-step-name { color: #a9bcaf; }
 .trace-step-row.is-selected:not(.trace-step-row-inProgress) { border-color: var(--accent); background: rgba(123, 217, 171, .09); color: var(--text); }
 .trace-step-row.is-disabled { background: rgba(35, 40, 46, .35); color: var(--faint); opacity: .52; cursor: default; }
@@ -993,8 +1008,11 @@ textarea::placeholder { color: var(--faint); }
 .trace-internal-history-body { display: grid; grid-column: 1 / -1; gap: 3px; max-height: 180px; overflow: auto; margin-top: 0; padding: 5px 7px; border-left: 1px solid #40534a; color: #8e9b95; font-size: 8px; line-height: 1.35; white-space: pre-wrap; }
 
 @keyframes trace-spin { to { transform: rotate(360deg); } }
+@property --step-sweep { syntax: "<angle>"; inherits: false; initial-value: 0turn; }
+@keyframes step-sweep { to { --step-sweep: 1turn; } }
 @media (prefers-reduced-motion: reduce) {
   .trace-content, .trace-content.is-expanded { transition: none; transform: none; }
+  .trace-step-row.is-current::after { animation: none; opacity: .6; }
 }
 .trace-thinking-item code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 .trace-code-button { display: inline-grid; width: 24px; height: 20px; place-items: center; margin-top: 0; padding: 0; border: 1px solid #5a8d71; border-radius: 4px; background: rgba(25, 58, 45, .7); color: var(--accent); font-family: ui-monospace, Consolas, monospace; font-size: 8px; cursor: pointer; }
@@ -1032,7 +1050,16 @@ textarea::placeholder { color: var(--faint); }
 .answer-heading-4 { font-size: 1em; }
 .pipeline-answer-body p + .answer-heading,
 .turn-progress-answer-body p + .answer-heading,
+.compact-answer-text p + .answer-heading,
+.message-answer-text p + .answer-heading,
 .trace-plan-content p + .answer-heading { margin-top: 12px; }
+.answer-list { margin: 6px 0; padding-left: 22px; }
+.answer-list li { margin: 2px 0; padding-left: 2px; overflow-wrap: anywhere; }
+.answer-blockquote { margin: 7px 0; padding: 5px 9px; border-left: 2px solid #5e9877; background: rgba(34, 57, 45, .3); color: #bdcbd2; white-space: pre-wrap; }
+.answer-code-block { max-width: 100%; margin: 7px 0; border-radius: 5px; }
+.answer-code-block pre { max-height: 320px; font-size: 10px; line-height: 1.55; }
+.answer-code-block code { white-space: pre; }
+.answer-quote-backlinks { display: flex; justify-content: flex-end; margin-top: 5px; }
 
 /* A terv első másodperceiben nincs mit két panelbe rendezni: csak a jelzés —
    ott, ahol a lépéslista is kezdődik, nem a panel közepén. */
@@ -1088,13 +1115,15 @@ textarea::placeholder { color: var(--faint); }
 /* Fülsáv: az aktív fül a kód lapjához tartozik, ezért ugyanaz a háttere, és
    az alatta lévő vonal ott megszakad — ez köti a fület a tartalmához. */
 .live-code-tabs { display: flex; align-items: flex-end; gap: 1px; overflow-x: auto; padding: 4px 6px 0; border-top: 1px solid var(--border-soft); background: #101315; box-shadow: inset 0 -1px 0 var(--border-soft); scrollbar-width: thin; scrollbar-color: #2b3946 transparent; }
-.live-code-tab { display: flex; align-items: center; flex: 0 0 auto; max-width: 210px; border: 1px solid transparent; border-bottom: 0; border-radius: 4px 4px 0 0; color: var(--faint); }
+.live-code-tab { display: flex; align-items: center; flex: 0 0 auto; max-width: 210px; border: 1px solid transparent; border-bottom: 0; border-radius: 4px 4px 0 0; background: transparent; color: #81968a; }
+.live-code-tab > button { border: 0; background: transparent; color: inherit; appearance: none; }
 .live-code-tab > button:first-child { min-width: 0; padding: 4px 2px 5px 9px; overflow: hidden; color: inherit; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
-.live-code-tab:hover:not(.is-active) { background: #171c1f; color: var(--muted); }
-.live-code-tab.is-active { border-color: var(--border-soft); background: #0b0e10; box-shadow: 0 1px 0 #0b0e10; color: var(--text); }
+.live-code-tab:hover:not(.is-active) { background: rgba(55, 121, 91, .16); color: #b6d8c5; }
+.live-code-tab.is-active { border-color: rgba(123, 217, 171, .38); background: #16251e; box-shadow: inset 0 -2px 0 rgba(123, 217, 171, .42), 0 1px 0 #0b0e10; color: #d4f3e1; }
+.live-code-tab.is-active > button:first-child { color: #d4f3e1; }
 /* Az épp írt fájl neve dőlt: a fülsávon látszik, hol tart a munka. */
 .live-code-tab.is-writing > button:first-child { color: var(--tick4-khaki-strong); font-style: italic; }
-.live-code-tab-close { flex: 0 0 auto; width: 15px; height: 15px; margin-right: 5px; border-radius: 3px; color: transparent; font-size: 12px; line-height: 1; }
+.live-code-tab-close { flex: 0 0 auto; width: 15px; height: 15px; margin-right: 5px; border-radius: 3px; background: transparent; color: transparent; font-size: 12px; line-height: 1; }
 .live-code-tab:hover .live-code-tab-close, .live-code-tab.is-active .live-code-tab-close { color: var(--faint); }
 .live-code-tab-close:hover { background: #2c2022; color: #ffadb5; }
 .live-code-tabs-actions { display: flex; align-items: center; gap: 5px; margin: 0 2px 4px auto; padding-left: 8px; }
@@ -1106,10 +1135,11 @@ textarea::placeholder { color: var(--faint); }
 .live-code-line { display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 8px; }
 .live-code-line code { padding-right: 10px; color: #d4d4d4; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 10px; line-height: 1.5; white-space: pre; }
 .live-code-number { padding-right: 6px; color: #495159; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 9px; line-height: 1.5; text-align: right; user-select: none; }
-/* Amit ez a művelet írt: csak a sorszám jelöli meg. Új fájlnál a változás az
-   egész tartalom, és egy végig színezett háttér nem mond semmit — csak
-   olvashatatlanná teszi a kódot. */
-.live-code-line.is-changed .live-code-number { color: var(--tick4-khaki-strong); }
+/* A művelet által írt sorokat halvány zöld jelöli. Új fájlnál ez a teljes
+   tartalom, de a kontraszt visszafogott marad, hogy a kód olvasható legyen. */
+.live-code-line.is-changed { background: rgba(55, 121, 91, .22); box-shadow: inset 2px 0 rgba(123, 217, 171, .56); }
+.live-code-line.is-changed code { color: #d7f5e2; }
+.live-code-line.is-changed .live-code-number { color: #8fd7ad; }
 
 .inline-code-diff-overlay { position: fixed; inset: 0; z-index: 140; display: grid; place-items: center; padding: 16px; background: rgba(0, 0, 0, .72); }
 .inline-code-diff-card { display: grid; gap: 10px; width: min(1120px, calc(100vw - 32px)); max-height: min(820px, calc(100vh - 32px)); overflow: hidden; padding: 16px; border: 1px solid #496050; border-radius: 10px; background: #111416; box-shadow: 0 22px 60px rgba(0, 0, 0, .68); color: var(--muted); }
@@ -1367,6 +1397,12 @@ textarea::placeholder { color: var(--faint); }
 .composer:focus-within {
   border-color: var(--tick4-khaki-border) !important;
   box-shadow: 0 0 0 2px rgba(150, 147, 116, .08) !important;
+}
+
+.composer.is-review-comment,
+.composer.is-review-comment:focus-within {
+  border-color: #b05a57 !important;
+  box-shadow: 0 0 0 2px rgba(176, 90, 87, .22), 0 8px 26px rgba(0, 0, 0, .28) !important;
 }
 
 .composer-quote {
@@ -1632,8 +1668,8 @@ textarea::placeholder { color: var(--faint); }
 /* The chain is read column by column: one column per stage, each stacking the
    role, its vendor, its model and its reasoning. Clicking a cell steps to the
    next value and right click steps back, so nine choices need no dropdowns. */
-/* Right aligned so the tick keeps its place when the chain switch appears or
-   disappears beside it; a left aligned row slid it sideways on every toggle. */
+/* Right aligned so the detail tick keeps its place beside the compact stage
+   grid instead of moving when the chain choice changes. */
 .composer-controls-top { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
 .composer-controls-top .composer-detail-toggle { min-height: 22px; font-size: 9px; }
 /* The sidebar's switch fills its column; here it must stay two cells wide in a
@@ -1648,9 +1684,13 @@ textarea::placeholder { color: var(--faint); }
 .composer-stage-grid { display: grid; grid-auto-flow: column; grid-auto-columns: 48px; gap: 11px; margin-top: 2px; }
 .composer-stage-col { display: flex; flex-direction: column; align-items: stretch; gap: 2px; }
 .composer-stage-role { color: var(--faint); font-size: 9px; font-weight: 700; letter-spacing: .06em; text-align: center; }
+.composer-stage-toggle { display: inline-flex; align-items: center; justify-content: center; gap: 2px; color: var(--faint); font: inherit; cursor: pointer; user-select: none; }
+.composer-stage-toggle input { width: 10px; height: 10px; margin: 0; accent-color: var(--accent); cursor: pointer; }
+.composer-stage-toggle:hover { color: var(--text); }
 .composer-stage-col button { position: relative; width: 100%; min-height: 17px; padding: 1px 3px; border: 1px solid #40515a; border-radius: 4px; background: rgba(25, 32, 36, .72); color: var(--muted); font-size: 9px; font-weight: 600; white-space: nowrap; cursor: pointer; }
 .composer-stage-col button:hover { border-color: #5e9877; color: var(--text); }
 .composer-stage-col .composer-stage-vendor { color: var(--text); font-weight: 700; }
+.composer-stage-placeholder { display: grid; min-height: 17px; place-items: center; color: var(--faint); font-size: 9px; opacity: .55; }
 /* The model and reasoning rows read as a chain, so the hand-off is drawn
    between them; the vendor row is a per-stage fact, not a sequence. */
 .composer-stage-col:not(:last-child) button:nth-of-type(2)::after,
@@ -1837,12 +1877,29 @@ textarea::placeholder { color: var(--faint); }
 .pipeline-answer-next button:disabled {
   opacity: .42; cursor: default; background: rgba(150, 147, 116, .16);
 }
-/* Prefilling the composer is the fallback, not the offer. */
-.pipeline-answer-next button.is-secondary {
-  border-color: #5c6670; background: transparent; color: var(--muted);
+.pipeline-rerun-options {
+  display: inline-flex; align-items: center; gap: 5px;
 }
-.pipeline-answer-next button.is-secondary:hover {
-  border-color: #7a848d; background: rgba(255, 255, 255, .05); color: #cfd8de;
+.pipeline-rerun-options button:first-child {
+  border-color: #b05a57; background: rgba(176, 90, 87, .15); color: #f0c0b8;
+}
+.pipeline-rerun-options button:first-child:hover {
+  background: rgba(176, 90, 87, .3);
+}
+
+.composer-review-comment-banner {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 5px 10px 4px; border-bottom: 1px solid rgba(208, 108, 101, .4);
+  color: #e8a39a; font-size: 9px; font-weight: 700; letter-spacing: .08em;
+}
+.composer-review-comment-banner button {
+  padding: 1px 5px; border: 1px solid rgba(208, 108, 101, .55); border-radius: 3px;
+  background: transparent; color: #e8a39a; font: inherit; font-size: 9px;
+  cursor: pointer;
+}
+.composer-review-comment-banner button:hover,
+.composer-review-comment-banner button:focus-visible {
+  background: rgba(208, 108, 101, .16); color: #ffe0db; outline: 0;
 }
 
 /* The verdict is a surface, not a font colour: coloured lettering in a strip of

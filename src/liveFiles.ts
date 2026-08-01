@@ -48,15 +48,82 @@ export type LiveFileTouch = {
   sequence: number;
 };
 
+/**
+ * A live-file path has two representations: the first spelling we show to the
+ * user, and a canonical identity used for merging events. Claude, Codex and
+ * the backfill path are allowed to disagree about slashes, `./` and casing;
+ * none of those differences may create a second tab.
+ */
+export const canonicalLiveFilePath = (
+  value: string,
+  projectRoot?: string,
+): string => {
+  const normalize = (input: string) =>
+    input.trim().replace(/^\\\\\?\\/, "").replaceAll("\\", "/");
+  let path = normalize(value);
+  const root = normalize(projectRoot ?? "").replace(/\/+$/, "");
+  if (root && path.toLowerCase().startsWith(`${root.toLowerCase()}/`))
+    path = path.slice(root.length + 1);
+
+  const segments: string[] = [];
+  for (const segment of path.split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === ".." && segments.length > 0) {
+      const previous = segments.at(-1);
+      if (previous && previous !== ".." && !/^[a-zA-Z]:$/.test(previous)) {
+        segments.pop();
+        continue;
+      }
+    }
+    segments.push(segment);
+  }
+  return segments.join("/");
+};
+
+/** Case-folded identity; the display path keeps the first observed casing. */
+export const liveFilePathKey = (value: string, projectRoot?: string) =>
+  canonicalLiveFilePath(value, projectRoot).toLowerCase();
+
+const dedupeLiveFiles = (files: LiveFile[]): LiveFile[] => {
+  const result: LiveFile[] = [];
+  const indexes = new Map<string, number>();
+  for (const raw of files) {
+    const path = canonicalLiveFilePath(raw.path);
+    const key = liveFilePathKey(path);
+    const index = indexes.get(key);
+    if (index === undefined) {
+      indexes.set(key, result.length);
+      result.push({ ...raw, path });
+      continue;
+    }
+    const current = result[index];
+    const newer = raw.sequence >= current.sequence ? raw : current;
+    result[index] = {
+      ...current,
+      ...newer,
+      path: current.path,
+      closed: current.closed && raw.closed,
+    };
+  }
+  return result;
+};
+
 /** A modell hozzányúlt egy fájlhoz: új fül, vagy a meglévő frissítése. */
 export const touchLiveFile = (
   state: LiveFileState,
   touch: LiveFileTouch,
+  projectRoot?: string,
 ): LiveFileState => {
-  const existing = state.files.findIndex((file) => file.path === touch.path);
+  const path = canonicalLiveFilePath(touch.path, projectRoot);
+  const key = liveFilePathKey(path);
+  const existingFiles = dedupeLiveFiles(state.files);
+  const existing = existingFiles.findIndex(
+    (file) => liveFilePathKey(file.path) === key,
+  );
+  const targetPath = existing >= 0 ? existingFiles[existing].path : path;
   const files =
     existing >= 0
-      ? state.files.map((file, index) =>
+      ? existingFiles.map((file, index) =>
           index === existing
             ? {
                 ...file,
@@ -64,17 +131,26 @@ export const touchLiveFile = (
                 streaming: touch.streaming,
                 mode: touch.mode,
                 highlight: touch.highlight ?? file.highlight,
+                sequence: touch.sequence,
                 // Amihez a modell újra hozzányúl, az visszakerül a sávra: a
                 // bezárás azt jelentette, hogy addig nem érdekes.
                 closed: false,
               }
             : file,
         )
-      : [...state.files, { ...touch }];
+      : [...existingFiles, { ...touch, path: targetPath }];
+  const activePath = state.following
+    ? targetPath
+    : state.activePath
+      ? files.find(
+          (file) =>
+            liveFilePathKey(file.path) === liveFilePathKey(state.activePath!),
+        )?.path ?? state.activePath
+      : targetPath;
   return {
     files,
     // A követés a munkát nézi; kézi választás után az olvasó marad, ahol van.
-    activePath: state.following ? touch.path : (state.activePath ?? touch.path),
+    activePath,
     following: state.following,
   };
 };
@@ -84,8 +160,15 @@ export const selectLiveFile = (
   state: LiveFileState,
   path: string,
 ): LiveFileState =>
-  state.files.some((file) => file.path === path)
-    ? { ...state, activePath: path, following: false }
+  state.files.find((file) => liveFilePathKey(file.path) === liveFilePathKey(path))
+    ? {
+        ...state,
+        activePath:
+          state.files.find(
+            (file) => liveFilePathKey(file.path) === liveFilePathKey(path),
+          )?.path ?? path,
+        following: false,
+      }
     : state;
 
 /** Vissza a munkához: a legutóbb érintett fájl, és a követés újraindul. */
@@ -107,12 +190,16 @@ export const closeLiveFile = (
   state: LiveFileState,
   path: string,
 ): LiveFileState => {
-  const index = state.files.findIndex((file) => file.path === path);
+  const key = liveFilePathKey(path);
+  const index = state.files.findIndex(
+    (file) => liveFilePathKey(file.path) === key,
+  );
   if (index < 0) return state;
   const files = state.files.map((file) =>
-    file.path === path ? { ...file, closed: true } : file,
+    liveFilePathKey(file.path) === key ? { ...file, closed: true } : file,
   );
-  if (state.activePath !== path) return { ...state, files };
+  if (liveFilePathKey(state.activePath ?? "") !== key)
+    return { ...state, files };
   // A bezárt fül helyén a szomszédja marad, ahogy egy szerkesztőben szokás.
   const open = files.filter((file) => !file.closed);
   const next =
@@ -136,7 +223,12 @@ export const openLiveFiles = (state: LiveFileState) =>
 
 export const activeLiveFile = (state: LiveFileState) => {
   const open = openLiveFiles(state);
-  return open.find((file) => file.path === state.activePath) ?? open.at(-1);
+  return (
+    open.find(
+      (file) =>
+        liveFilePathKey(file.path) === liveFilePathKey(state.activePath ?? ""),
+    ) ?? open.at(-1)
+  );
 };
 
 /**
@@ -153,12 +245,21 @@ export const applyEditToFile = (
   oldString: string,
   newString: string,
 ): { content: string; highlight: { from: number; to: number } } | null => {
-  if (!oldString) return null;
-  const at = base.indexOf(oldString);
+  // The disk can contain CRLF while a model sends LF (or the other way
+  // around). Normalize only the live projection so the edit still lands on
+  // its real file line instead of falling back to a patch at line 1.
+  const displayBase = base.replace(/\r\n?/g, "\n");
+  const displayOld = oldString.replace(/\r\n?/g, "\n");
+  const displayNew = newString.replace(/\r\n?/g, "\n");
+  if (!displayOld) return null;
+  const at = displayBase.indexOf(displayOld);
   if (at < 0) return null;
-  const content = base.slice(0, at) + newString + base.slice(at + oldString.length);
-  const from = base.slice(0, at).split("\n").length;
-  const inserted = newString.split("\n").length;
+  const content =
+    displayBase.slice(0, at) +
+    displayNew +
+    displayBase.slice(at + displayOld.length);
+  const from = displayBase.slice(0, at).split("\n").length;
+  const inserted = displayNew.split("\n").length;
   return { content, highlight: { from, to: from + Math.max(0, inserted - 1) } };
 };
 

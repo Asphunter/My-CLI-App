@@ -6,14 +6,119 @@ mod pipeline;
 mod store;
 mod sync;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(desktop)]
-use tauri::Manager;
+use tauri::{Emitter, Manager, WindowEvent};
+
+/// Native source of truth for work that must finish before the desktop window
+/// can be closed. The React run table is intentionally not used here: the
+/// native command may still be preparing/finalizing while the WebView has
+/// already rendered the last provider event.
+static ACTIVE_WORK: AtomicUsize = AtomicUsize::new(0);
+
+fn active_work_count() -> usize {
+    ACTIVE_WORK.load(Ordering::SeqCst)
+}
+
+#[cfg(desktop)]
+fn set_taskbar_running(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_progress_bar(tauri::window::ProgressBarState {
+            status: Some(tauri::window::ProgressBarStatus::Indeterminate),
+            progress: None,
+        });
+        #[cfg(target_os = "windows")]
+        {
+            let _ = window.set_overlay_icon(None);
+        }
+    }
+}
+
+#[cfg(desktop)]
+fn set_taskbar_terminal(app: &tauri::AppHandle, success: bool) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_progress_bar(tauri::window::ProgressBarState {
+            status: Some(tauri::window::ProgressBarStatus::None),
+            progress: None,
+        });
+        #[cfg(target_os = "windows")]
+        {
+            let overlay = success.then(success_overlay_icon);
+            let _ = window.set_overlay_icon(overlay);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn success_overlay_icon() -> tauri::image::Image<'static> {
+    // A tiny green circle with a white check is rendered in RGBA so the
+    // overlay works without adding an image decoding feature or a second
+    // bundled asset. Windows scales the 16x16 image for the taskbar itself.
+    const SIZE: usize = 16;
+    let mut pixels = vec![0_u8; SIZE * SIZE * 4];
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let dx = x as i32 - 7;
+            let dy = y as i32 - 7;
+            let in_circle = dx * dx + dy * dy <= 49;
+            let check = (y == 10 && (x == 4 || x == 5))
+                || (y == 9 && x == 6)
+                || (y == 8 && x == 7)
+                || (y == 7 && x == 8)
+                || (y == 6 && x == 9)
+                || (y == 5 && x == 10)
+                || (y == 4 && x == 11);
+            if in_circle || check {
+                let at = (y * SIZE + x) * 4;
+                if check {
+                    pixels[at..at + 4].copy_from_slice(&[255, 255, 255, 255]);
+                } else {
+                    pixels[at..at + 4].copy_from_slice(&[46, 204, 113, 255]);
+                }
+            }
+        }
+    }
+    tauri::image::Image::new_owned(pixels, SIZE as u32, SIZE as u32)
+}
+
+struct WorkActivity {
+    app: tauri::AppHandle,
+    completed: bool,
+}
+
+impl WorkActivity {
+    fn new(app: &tauri::AppHandle) -> Self {
+        if ACTIVE_WORK.fetch_add(1, Ordering::SeqCst) == 0 {
+            #[cfg(desktop)]
+            set_taskbar_running(app);
+        }
+        Self {
+            app: app.clone(),
+            completed: false,
+        }
+    }
+
+    fn finish(&mut self, completed: bool) {
+        self.completed = completed;
+    }
+}
+
+impl Drop for WorkActivity {
+    fn drop(&mut self) {
+        let previous = ACTIVE_WORK.fetch_sub(1, Ordering::SeqCst);
+        if previous <= 1 {
+            #[cfg(desktop)]
+            set_taskbar_terminal(&self.app, self.completed);
+        }
+    }
+}
 
 #[tauri::command]
 async fn codex_send(
     app: tauri::AppHandle,
     mut request: codex::CodexRequest,
 ) -> Result<codex::CodexResponse, String> {
+    let mut activity = WorkActivity::new(&app);
     let request_id = request.request_id.clone().unwrap_or_else(|| {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -28,6 +133,7 @@ async fn codex_send(
             .await
             .map_err(|error| format!("A Codex-háttérfeladat leállt: {error}"))?;
     codex::end_request(&request_id);
+    activity.finish(result.is_ok());
     result
 }
 
@@ -54,6 +160,17 @@ async fn run_agent_turn(
 /// the whole run, and a stage asking for it again would be told, correctly,
 /// that the project is busy — by itself.
 async fn run_agent_turn_inner(
+    app: tauri::AppHandle,
+    request: agent::AgentTurnRequest,
+    claims_project: bool,
+) -> Result<agent::AgentResponse, String> {
+    let mut activity = WorkActivity::new(&app);
+    let result = run_agent_turn_inner_impl(app, request, claims_project).await;
+    activity.finish(result.is_ok());
+    result
+}
+
+async fn run_agent_turn_inner_impl(
     app: tauri::AppHandle,
     mut request: agent::AgentTurnRequest,
     claims_project: bool,
@@ -307,6 +424,15 @@ fn plan_journal_entry(
     retry_feedback: Option<&str>,
     stages: &[pipeline::PipelineStageResult],
 ) -> String {
+    plan_journal_entry_with_comments(iteration, retry_feedback, None, stages)
+}
+
+fn plan_journal_entry_with_comments(
+    iteration: i64,
+    retry_feedback: Option<&str>,
+    user_comments: Option<&str>,
+    stages: &[pipeline::PipelineStageResult],
+) -> String {
     let mut journal = String::new();
     // Az első kör feladata maga a terv, ami már a fájlban van; egy újabb körnek
     // viszont a kifogás a feladata, és csak itt marad meg írásban.
@@ -317,14 +443,27 @@ fn plan_journal_entry(
         {
             journal.push_str(&format!("\n\n## v{iteration} feladat\n\n{feedback}\n"));
         }
+        if let Some(comments) = user_comments
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            journal.push_str(&format!(
+                "\n\n### v{iteration} felhasználói megjegyzés\n\n{comments}\n"
+            ));
+        }
     }
     if let Some(review) = stages
         .iter()
-        .find(|stage| stage.role == pipeline::StageRole::Review && stage.succeeded)
+        .find(|stage| stage.role.is_review() && stage.succeeded)
     {
         let text = review.text.trim();
         if !text.is_empty() {
-            journal.push_str(&format!("\n\n## v{iteration} bírálat\n\n{text}\n"));
+            let heading = if review.role == pipeline::StageRole::PlanReview {
+                "tervbírálat"
+            } else {
+                "kódbírálat"
+            };
+            journal.push_str(&format!("\n\n## v{iteration} {heading}\n\n{text}\n"));
         }
     }
     journal
@@ -489,6 +628,8 @@ async fn pipeline_send(
         ));
     }
 
+    let mut activity = WorkActivity::new(&app);
+
     // The chain holds the project for its whole length, not stage by stage:
     // between two stages the tree is mid-work, and a turn starting there would
     // snapshot the coder's unfinished state as its own "before".
@@ -540,11 +681,14 @@ async fn pipeline_send(
         let request = &request;
         let run_id = run_id.clone();
         let cancel_run_id = run_id.clone();
+        let chain_id = chain_id.clone();
+        let recipe_id = recipe.id.clone();
         pipeline::run_stages_from(
             &recipe,
             &request.prompt,
             pipeline::RunStart {
                 initial_session: request.session_id.clone(),
+                user_comments: request.user_comments.clone(),
                 start_index: start_stage,
                 seed_artifacts: request
                     .seed_artifacts
@@ -558,6 +702,8 @@ async fn pipeline_send(
             move |execution| {
                 let app = app.clone();
                 let run_id = run_id.clone();
+                let chain_id = chain_id.clone();
+                let recipe_id = recipe_id.clone();
                 let request_id = request.request_ids[execution.index].clone();
                 let agent_label = pipeline::stage_agent_label(&execution.stage);
                 async move {
@@ -645,6 +791,28 @@ async fn pipeline_send(
                             }
                         }
                     }
+                    // Ne csak a teljes lánc végén kerüljön a fázis a
+                    // v1/v2 panelhez. A következő fázis kérhet felhasználói
+                    // választ, vagy az app bezárható/megszakadhat; ilyenkor az
+                    // addig elkészült válaszoknak újraindítás után is a
+                    // közös run panelben kell maradniuk. A lánc végi kör
+                    // később ugyanazt a metaadatot a review verdikttel frissíti.
+                    let _ = store::label_pipeline_stage_answer(
+                        &request.conversation_id,
+                        &request_id,
+                        &store::LocalMessagePipeline {
+                            run_id: run_id.clone(),
+                            recipe_id: Some(recipe_id.clone()),
+                            chain_id: chain_id.clone(),
+                            iteration,
+                            stage_index: execution.index as i64,
+                            stage_count,
+                            stage_role: execution.stage.role.as_wire().to_string(),
+                            stage_agent: agent_label.clone(),
+                            verdict: None,
+                            verdict_summary: None,
+                        },
+                    );
                     let mut changed_files = response.guard.changed_files.clone();
                     changed_files.extend(response.guard.added_files.iter().cloned());
                     changed_files.extend(response.guard.removed_files.iter().cloned());
@@ -661,8 +829,8 @@ async fn pipeline_send(
         .await
     };
 
-    // The badge is stamped once the chain is done, so a stage's verdict is
-    // already known when its answer is labelled.
+    // A fázis alapjelvénye már közvetlenül a válasza után tartósan elment.
+    // Itt felülírjuk ugyanazt a metaadatot a már ismert review verdikttel.
     let mut stages = Vec::<pipeline::PipelineStageResult>::new();
     for stage_result in &outcome.stages {
         let stage = &recipe.stages[stage_result.index];
@@ -675,11 +843,12 @@ async fn pipeline_send(
                 &request_id,
                 &store::LocalMessagePipeline {
                     run_id: run_id.clone(),
+                    recipe_id: Some(recipe.id.clone()),
                     chain_id: chain_id.clone(),
                     iteration,
                     stage_index: stage_result.index as i64,
                     stage_count,
-                    stage_role: format!("{:?}", stage.role).to_lowercase(),
+                    stage_role: stage.role.as_wire().to_string(),
                     stage_agent: agent_label.clone(),
                     verdict: stage_result
                         .review
@@ -724,7 +893,12 @@ async fn pipeline_send(
     if let (Some(cwd), Some(plan_file)) =
         (request.cwd.as_deref(), request.plan_file.as_deref())
     {
-        let journal = plan_journal_entry(iteration, request.retry_feedback.as_deref(), &stages);
+        let journal = plan_journal_entry_with_comments(
+            iteration,
+            request.retry_feedback.as_deref(),
+            request.user_comments.as_deref(),
+            &stages,
+        );
         if !journal.is_empty() {
             if let Err(error) = append_plan_file(cwd, plan_file, &journal) {
                 let _ = codex::emit_main_window(
@@ -779,6 +953,7 @@ async fn pipeline_send(
         (None, guard) => guard,
     };
     store::finish_pipeline_run(&run_id, status.as_wire(), run_error.as_deref())?;
+    activity.finish(status == pipeline::RunStatus::Completed);
     Ok(pipeline::PipelineRunResult {
         run_id,
         chain_id,
@@ -1404,6 +1579,29 @@ pub fn run() {
         }
     }));
 
+    let builder = builder.setup(|app| {
+        #[cfg(desktop)]
+        if let Some(window) = app.get_webview_window("main") {
+            let event_window = window.clone();
+            window.on_window_event(move |event| {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    if active_work_count() > 0 {
+                        api.prevent_close();
+                        let _ = event_window.emit(
+                            "app-close-blocked",
+                            serde_json::json!({
+                                "message": "A futás még folyamatban van. Várd meg a végét vagy állítsd le, mielőtt bezárod az alkalmazást."
+                            }),
+                        );
+                    }
+                }
+            });
+            #[cfg(desktop)]
+            set_taskbar_terminal(app.handle(), false);
+        }
+        Ok(())
+    });
+
     builder
         .invoke_handler(tauri::generate_handler![
             codex_send,
@@ -1532,7 +1730,7 @@ mod tests {
 
         let first = plan_journal_entry(1, None, &[review("VERDIKT: JAVÍTANDÓ — hiányzik a rács.")]);
         assert!(!first.contains("feladat"), "az első kör feladata maga a terv");
-        assert!(first.contains("## v1 bírálat"));
+        assert!(first.contains("## v1 kódbírálat"));
         assert!(first.contains("hiányzik a rács"));
 
         let second = plan_journal_entry(
@@ -1541,7 +1739,7 @@ mod tests {
             &[review("VERDIKT: ELFOGAD")],
         );
         let task = second.find("## v2 feladat").expect("a kör feladata");
-        let verdict = second.find("## v2 bírálat").expect("a kör bírálata");
+        let verdict = second.find("## v2 kódbírálat").expect("a kör bírálata");
         assert!(task < verdict, "időrendben: előbb a feladat, utána a bírálat");
         assert!(second.contains("a rács hiányzik"));
 

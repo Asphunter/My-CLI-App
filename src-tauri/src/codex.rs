@@ -1224,11 +1224,16 @@ fn is_guard_excluded_directory(path: &Path) -> bool {
             matches!(
                 name.to_ascii_lowercase().as_str(),
                 ".git"
+                    | ".dart_tool"
+                    | ".gradle"
                     | ".min-sync"
+                    | ".pub-cache"
+                    | ".toolchain"
                     | "node_modules"
                     | "target"
                     | "dist"
                     | ".vite"
+                    | "build"
                     | "artifacts"
                     | "conversation audits"
             )
@@ -4415,6 +4420,40 @@ mod sync_tests {
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].relative_path, "source/build_helpers/keep.cpp");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_snapshot_excludes_flutter_toolchains_and_generated_caches() {
+        let root =
+            std::env::temp_dir().join(format!("min-agent-flutter-root-{}", uuid::Uuid::new_v4()));
+        let source = root.join("app").join("lib");
+        let toolchain = root.join(".toolchain").join("flutter").join("bin");
+        let dart_tool = root.join("app").join(".dart_tool");
+        let gradle = root.join("app").join("android").join(".gradle");
+        let build = root.join("app").join("build").join("outputs");
+        std::fs::create_dir_all(&source).expect("Flutter source fixture");
+        std::fs::create_dir_all(&toolchain).expect("toolchain fixture");
+        std::fs::create_dir_all(&dart_tool).expect("Dart cache fixture");
+        std::fs::create_dir_all(&gradle).expect("Gradle cache fixture");
+        std::fs::create_dir_all(&build).expect("Flutter build fixture");
+        std::fs::write(source.join("main.dart"), "void main() {}")
+            .expect("Flutter source file");
+        std::fs::write(toolchain.join("flutter.bat"), "generated")
+            .expect("toolchain file");
+        std::fs::write(dart_tool.join("package_config.json"), "generated")
+            .expect("Dart cache file");
+        std::fs::write(gradle.join("cache.bin"), "generated")
+            .expect("Gradle cache file");
+        std::fs::write(build.join("app.apk"), "generated")
+            .expect("Flutter build file");
+
+        let files = collect_guard_snapshot(&root)
+            .expect("collect Flutter snapshot files")
+            .0;
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].relative_path, "app/lib/main.dart");
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -418,6 +418,10 @@ pub struct LocalMessage {
 #[serde(rename_all = "camelCase")]
 pub struct LocalMessagePipeline {
     pub run_id: String,
+    /// The recipe that produced this stage. Optional for messages written
+    /// before recipe-aware pipeline rendering existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe_id: Option<String>,
     /// Ties the iterations of one question together, so a re-run after a
     /// rejected review lands in the same panel instead of a second one below
     /// it. Empty on rows written before re-runs existed; the UI falls back to
@@ -429,7 +433,7 @@ pub struct LocalMessagePipeline {
     pub iteration: i64,
     pub stage_index: i64,
     pub stage_count: i64,
-    /// `plan` / `code` / `review` — the wire form of the stage role.
+    /// `plan` / `plan_review` / `code` / `review` — the wire form of the stage role.
     pub stage_role: String,
     /// Human-facing agent label for the badge, e.g. "Claude · Opus 5".
     pub stage_agent: String,
@@ -6512,6 +6516,7 @@ mod tests {
                     change_summary: Vec::new(),
                     pipeline: Some(LocalMessagePipeline {
                         run_id: "run-1".to_string(),
+                        recipe_id: None,
                         chain_id: "run-1".to_string(),
                         iteration: 1,
                         stage_index: index as i64,
@@ -6606,6 +6611,7 @@ mod tests {
                 change_summary: Vec::new(),
                 pipeline: Some(LocalMessagePipeline {
                     run_id: "run-1".to_string(),
+                    recipe_id: None,
                     chain_id: "run-1".to_string(),
                     iteration: 1,
                     stage_index: 2,

@@ -113,3 +113,10 @@ test("az utolsó lépés szelete a következő fejlécig tart, nem a kockázatok
   assert.ok(!slice.includes("Kockázatok"));
   assert.ok(!slice.includes("Eltérés"));
 });
+
+test("a terv lépésszámát a modell dönti el, nem a kliens csonkolja", () => {
+  const plan = Array.from({ length: 16 }, (_, index) => `${index + 1}. Lépés ${index + 1}`).join(
+    "\n",
+  );
+  assert.equal(numberedPlanSteps(plan).length, 16);
+});

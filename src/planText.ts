@@ -9,10 +9,6 @@
 const NUMBERED_LINE = /^(\d+)[.)]\s+\S/;
 const HEADING_LINE = /^#{1,6}\s/;
 
-/** Legfeljebb ennyi pontot vesz át a lista — egy elszabadult felsorolás nem
- *  nyomhatja szét a panelt. */
-const MAX_STEPS = 12;
-
 /**
  * A terv fő lépés-futamának sorindexei.
  *
@@ -47,7 +43,7 @@ const mainStepRun = (lines: string[]): number[] => {
   }
   let best: NumberedRow[] = [];
   for (const run of runs) if (run.length > best.length) best = run;
-  return best.slice(0, MAX_STEPS).map((row) => row.index);
+  return best.map((row) => row.index);
 };
 
 /**

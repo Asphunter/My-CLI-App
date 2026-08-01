@@ -5,12 +5,14 @@ import {
   EMPTY_LIVE_FILES,
   activeLiveFile,
   applyEditToFile,
+  canonicalLiveFilePath,
   closeLiveFile,
   followLiveFiles,
   openLiveFiles,
   reopenLiveFiles,
   selectLiveFile,
   touchLiveFile,
+  liveFilePathKey,
   wholeFileHighlight,
 } from "../src/liveFiles.ts";
 
@@ -113,6 +115,25 @@ test("a szerkesztés a lemezen álló fájlra vetül, és megmondja a sorait", (
   assert.deepEqual(applied.highlight, { from: 2, to: 3 });
 });
 
+test("a 100. sor körüli szerkesztés megtartja a teljes fájl sorszámait", () => {
+  const base = Array.from({ length: 120 }, (_, index) => `sor-${index + 1}`).join(
+    "\n",
+  );
+  const applied = applyEditToFile(base, "sor-100", "ÚJ-100\nÚJ-101");
+  assert.ok(applied);
+  assert.equal(applied.content.split("\n")[98], "sor-99");
+  assert.equal(applied.content.split("\n")[99], "ÚJ-100");
+  assert.equal(applied.content.split("\n")[100], "ÚJ-101");
+  assert.deepEqual(applied.highlight, { from: 100, to: 101 });
+});
+
+test("CRLF fájl és LF patch esetén is ugyanaz marad a sorszám", () => {
+  const applied = applyEditToFile("első\r\n" + "régi\r\n" + "utolsó", "régi", "új");
+  assert.ok(applied);
+  assert.equal(applied.content, "első\núj\nutolsó");
+  assert.deepEqual(applied.highlight, { from: 2, to: 2 });
+});
+
 test("ha a keresett szöveg nincs meg, nem rajzolunk félrevezető fájlt", () => {
   assert.equal(applyEditToFile("egy\nkettő\n", "nincs ilyen", "x"), null);
   assert.equal(applyEditToFile("egy\n", "", "x"), null);
@@ -121,4 +142,34 @@ test("ha a keresett szöveg nincs meg, nem rajzolunk félrevezető fájlt", () =
 test("új fájlnál az egész tartalom a változás", () => {
   assert.deepEqual(wholeFileHighlight("a\nb\nc"), { from: 1, to: 3 });
   assert.deepEqual(wholeFileHighlight(""), { from: 1, to: 1 });
+});
+
+test("az eltérő útvonal-spellingek ugyanazt a live fájlt azonosítják", () => {
+  let state = touchLiveFile(
+    EMPTY_LIVE_FILES,
+    touch("./Requirements.TXT", "első", 1),
+    "C:/projekt",
+  );
+  state = touchLiveFile(
+    state,
+    touch("C:/PROJEKT/requirements.txt", "második", 2),
+    "c:/projekt",
+  );
+  assert.equal(state.files.length, 1);
+  assert.equal(state.files[0].content, "második");
+  assert.equal(state.files[0].path, "Requirements.TXT");
+  assert.equal(canonicalLiveFilePath("./src\\..\\app.js"), "app.js");
+  assert.equal(
+    liveFilePathKey("C:/Projekt/APP.JS", "c:/projekt"),
+    liveFilePathKey("app.js"),
+  );
+});
+
+test("azonos fájlnév különböző könyvtárban külön tab marad", () => {
+  let state = touchLiveFile(EMPTY_LIVE_FILES, touch("src/app.js", "src", 1));
+  state = touchLiveFile(state, touch("tests/app.js", "test", 2));
+  assert.deepEqual(state.files.map((file) => file.path), [
+    "src/app.js",
+    "tests/app.js",
+  ]);
 });

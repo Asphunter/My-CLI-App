@@ -20,17 +20,21 @@ import { listen } from "@tauri-apps/api/event";
 import katex from "katex";
 import { mathPattern, parseMath } from "./mathText";
 import { markdownTableAt } from "./markdownTable";
+import { splitAnswerMarkdownBlocks } from "./answerMarkdown";
 import {
   EMPTY_LIVE_FILES,
   activeLiveFile,
   applyEditToFile,
   closeLiveFile,
+  canonicalLiveFilePath,
   followLiveFiles,
   openLiveFiles,
   reopenLiveFiles,
   selectLiveFile,
   touchLiveFile,
+  liveFilePathKey,
   wholeFileHighlight,
+  type LiveFileMode,
   type LiveFileState,
   type LiveFileTouch,
 } from "./liveFiles";
@@ -243,7 +247,7 @@ type AgentDiffPreview = {
   files: AgentDiffFile[];
 };
 type PipelineRecipeStage = {
-  role: "plan" | "code" | "review";
+  role: "plan" | "plan_review" | "code" | "review";
   provider: "codex" | "anthropic";
   runtime: string;
   model?: string;
@@ -251,18 +255,43 @@ type PipelineRecipeStage = {
   maxTurns?: number;
 };
 
+type PipelineRecipeBoundaryRole = "plan" | "code";
+type PipelineRecipeReviewTarget = "plan" | "implementation";
+
 type PipelineRecipe = {
   id: string;
   label: string;
   stages: PipelineRecipeStage[];
+  /** Explicit recipe behavior; optional for compatibility with old snapshots. */
+  outputRole?: PipelineRecipeBoundaryRole;
+  retryFromRole?: PipelineRecipeBoundaryRole;
+  reviewTarget?: PipelineRecipeReviewTarget;
 };
+
+const recipeOutputRole = (recipe: PipelineRecipe): PipelineRecipeBoundaryRole =>
+  recipe.outputRole ??
+  (recipe.stages.some((stage) => stage.role === "code") ? "code" : "plan");
+
+const recipeRetryFromRole = (
+  recipe: PipelineRecipe,
+): PipelineRecipeBoundaryRole =>
+  recipe.retryFromRole ??
+  (recipe.stages.some((stage) => stage.role === "plan_review") ? "plan" : "code");
+
+const recipeReviewTarget = (
+  recipe: PipelineRecipe,
+): PipelineRecipeReviewTarget =>
+  recipe.reviewTarget ??
+  (recipe.stages.some((stage) => stage.role === "plan_review")
+    ? "plan"
+    : "implementation");
 
 type PipelineProgressEvent = {
   runId: string;
   conversationId: string;
   stageIndex: number;
   stageCount: number;
-  role: "plan" | "code" | "review";
+  role: "plan" | "plan_review" | "code" | "review";
   agentLabel: string;
   requestId: string;
   phase: "started" | "finished" | "failed";
@@ -271,7 +300,7 @@ type PipelineProgressEvent = {
 
 type PipelineStageResult = {
   index: number;
-  role: "plan" | "code" | "review";
+  role: "plan" | "plan_review" | "code" | "review";
   agentLabel: string;
   requestId: string;
   succeeded: boolean;
@@ -298,6 +327,8 @@ type PipelineRunResult = {
 /** The stage badge a message carries so a run groups on any device. */
 type MessagePipeline = {
   runId: string;
+  /** Recipe snapshot identifier; absent on pre-recipe pipeline rows. */
+  recipeId?: string;
   /** Shared by every iteration of one question. Absent on pre-versioning rows. */
   chainId?: string;
   /** 1-based; absent or 0 on rows written before re-runs existed. */
@@ -394,6 +425,7 @@ const LIVE_RERUN_SLOT = "__live-rerun-slot__";
 
 const STAGE_ROLE_LABELS: Record<string, string> = {
   plan: "TERV",
+  plan_review: "TERV REVIEW",
   code: "KÓD",
   review: "REVIEW",
 };
@@ -406,6 +438,7 @@ const STAGE_ROLE_LABELS: Record<string, string> = {
  */
 const PRE_PLAN_STEP_LABELS: Record<string, string> = {
   plan: "0. Terv előkészítése és feladatértelmezése",
+  plan_review: "0. Tervbírálat előkészítése és a terv áttekintése",
   code: "0. Kódolás előkészítése és a terv értelmezése",
   review: "0. Bírálat előkészítése és a változások áttekintése",
 };
@@ -557,6 +590,8 @@ type RunHandle = {
    * „épp melyik szakasznál tartunk" a másik panelére hazudna.
    */
   chain?: {
+    /** Recipe captured at send time; never read from the current composer. */
+    recipe?: PipelineRecipe;
     progress?: PipelineProgressEvent | null;
     resume?: {
       chainKey: string;
@@ -979,7 +1014,13 @@ const planFileNameFor = (title: string, iteration: number) => {
  * like a whole empty row of text. Splitting on the blank line and letting CSS
  * set the gap keeps the structure and drops the hole.
  */
-const answerParagraphs = (text: string) =>
+const answerTextParagraphs = (
+  text: string,
+  keyPrefix = "answer",
+  renderInline: (value: string) => ReactNode = (value) => (
+    <InlineMarkdown text={value} />
+  ),
+): ReactNode[] =>
   text
     .split(/\n{2,}/)
     .map((paragraph) => paragraph.trim())
@@ -992,22 +1033,60 @@ const answerParagraphs = (text: string) =>
       if (heading)
         return [
           <p
-            key={`para-${index}`}
+            key={`${keyPrefix}-para-${index}`}
             className={`answer-heading answer-heading-${heading[1].length}`}
           >
-            <InlineMarkdown text={heading[2]} />
+            {renderInline(heading[2])}
           </p>,
+        ];
+      const lines = paragraph.split("\n");
+      const unorderedItems = lines.map((line) =>
+        line.match(/^\s*[-*+]\s+(\S.*)$/)?.[1],
+      );
+      if (unorderedItems.every(Boolean))
+        return [
+          <ul className="answer-list" key={`${keyPrefix}-list-${index}`}>
+            {unorderedItems.map((item, itemIndex) => (
+              <li key={`${keyPrefix}-list-${index}-${itemIndex}`}>
+                {renderInline(item!)}
+              </li>
+            ))}
+          </ul>,
+        ];
+      const orderedItems = lines.map((line) =>
+        line.match(/^\s*\d+[.)]\s+(\S.*)$/)?.[1],
+      );
+      if (orderedItems.every(Boolean))
+        return [
+          <ol className="answer-list" key={`${keyPrefix}-ordered-${index}`}>
+            {orderedItems.map((item, itemIndex) => (
+              <li key={`${keyPrefix}-ordered-${index}-${itemIndex}`}>
+                {renderInline(item!)}
+              </li>
+            ))}
+          </ol>,
+        ];
+      const quoteLines = lines.map((line) =>
+        line.match(/^\s*>\s?(.*)$/)?.[1],
+      );
+      if (quoteLines.every((line) => line !== undefined))
+        return [
+          <blockquote
+            className="answer-blockquote"
+            key={`${keyPrefix}-quote-${index}`}
+          >
+            {renderInline(quoteLines.join("\n"))}
+          </blockquote>,
         ];
       // A bekezdés tartalmazhat táblát — akár egy bevezető mondat után is.
       // A tábla sorai táblává állnak össze, a köztük lévő szöveg bekezdés
       // marad; ha nincs tábla, ez pontosan a régi egy-bekezdés ág.
-      const lines = paragraph.split("\n");
       const blocks: ReactNode[] = [];
       let buffer: string[] = [];
       const flushText = (key: string) => {
         const body = buffer.join("\n").trim();
         buffer = [];
-        if (body) blocks.push(<p key={key}><InlineMarkdown text={body} /></p>);
+        if (body) blocks.push(<p key={key}>{renderInline(body)}</p>);
       };
       for (let line = 0; line < lines.length; ) {
         const table = markdownTableAt(lines, line);
@@ -1016,9 +1095,12 @@ const answerParagraphs = (text: string) =>
           line += 1;
           continue;
         }
-        flushText(`para-${index}-text-${line}`);
+        flushText(`${keyPrefix}-para-${index}-text-${line}`);
         blocks.push(
-          <div className="answer-table-wrap" key={`para-${index}-table-${line}`}>
+          <div
+            className="answer-table-wrap"
+            key={`${keyPrefix}-para-${index}-table-${line}`}
+          >
             <table className="answer-table">
               <thead>
                 <tr>
@@ -1045,9 +1127,69 @@ const answerParagraphs = (text: string) =>
         );
         line = table.end;
       }
-      flushText(`para-${index}`);
+      flushText(`${keyPrefix}-para-${index}`);
       return blocks;
     });
+
+/** Render full answer Markdown without dropping executable instructions. */
+const answerParagraphs = (
+  text: string,
+  quoteRefs: QuoteReference[] = [],
+  onQuoteJump?: QuoteJumpHandler,
+) => {
+  const remainingQuoteIds = new Set(quoteRefs.map((quote) => quote.id));
+  const renderInline = (value: string) => {
+    if (!onQuoteJump) return <InlineMarkdown text={value} />;
+    const matches = quoteRefs.filter(
+      (quote) =>
+        remainingQuoteIds.has(quote.id) &&
+        [quote.text, quote.instruction]
+          .filter(Boolean)
+          .some((needle) => value.includes(needle)),
+    );
+    matches.forEach((quote) => remainingQuoteIds.delete(quote.id));
+    return matches.length > 0 ? (
+      answerWithQuoteBacklinks(value, matches, onQuoteJump)
+    ) : (
+      <InlineMarkdown text={value} />
+    );
+  };
+  const blocks: ReactNode[] = [];
+  splitAnswerMarkdownBlocks(text).forEach((block, index) => {
+    if (block.type === "text") {
+      blocks.push(...answerTextParagraphs(
+        block.text,
+        `answer-block-${index}`,
+        renderInline,
+      ));
+      return;
+    }
+    blocks.push(
+      <section
+        className="code-block answer-code-block"
+        key={`answer-code-${index}`}
+      >
+        <div className="code-header">
+          <span>KÓD</span>
+          <span>{block.language}</span>
+        </div>
+        <pre>
+          <code>{highlightCode(block.code)}</code>
+        </pre>
+      </section>,
+    );
+  });
+  const unmatchedQuotes = quoteRefs.filter((quote) =>
+    remainingQuoteIds.has(quote.id),
+  );
+  if (onQuoteJump && unmatchedQuotes.length > 0)
+    blocks.push(
+      <div className="answer-quote-backlinks" key="answer-quote-backlinks">
+        {quoteBacklinkButtons(unmatchedQuotes, onQuoteJump)}
+      </div>,
+    );
+  return blocks;
+};
 
 const answerWithQuoteBacklinks = (
   text: string,
@@ -2946,7 +3088,6 @@ const planTextToSteps = (text: string): PlanStep[] =>
       (line) =>
         line.length > 2 && !/^plan:?$/i.test(line) && !/^terv:?$/i.test(line),
     )
-    .slice(0, 8)
     .map((step, index) => ({
       id: `plan-text-${index}`,
       step,
@@ -4260,13 +4401,26 @@ function LiveCodePanel({
     () => (file?.content ?? "").split("\n"),
     [file?.content],
   );
-  // Írás közben a friss sor legyen a szem előtt — enélkül a panel a fájl
-  // elején állna, miközben a gépelés lent tart.
+  // Írás közben a friss rész legyen a szem előtt. Új fájlnál ez a fájl vége,
+  // meglévő fájl szerkesztésénél viszont a ténylegesen módosított sor — nem a
+  // patch eleje és nem automatikusan a 100. sor helyett a dokumentum vége.
   useEffect(() => {
     if (!open || !file?.streaming) return;
     const node = codeRef.current;
-    if (node) node.scrollTop = node.scrollHeight;
-  }, [open, file?.streaming, file?.content]);
+    if (!node) return;
+    if (file.mode === "edit") {
+      const changedLine = node.querySelector<HTMLElement>(
+        ".live-code-line.is-changed",
+      );
+      if (!changedLine) return;
+      node.scrollTop = Math.max(
+        0,
+        changedLine.offsetTop - node.clientHeight * 0.35,
+      );
+      return;
+    }
+    node.scrollTop = node.scrollHeight;
+  }, [open, file?.streaming, file?.content, file?.mode, file?.highlight]);
   if (state.files.length === 0) return null;
   const writing = state.files.some((item) => item.streaming);
   return (
@@ -5171,7 +5325,7 @@ const MessageRow = memo(function MessageRow({
   const visibleText =
     message.role === "user"
       ? userMessageDisplayText(message)
-      : textWithoutCodeBlocks(message.text);
+      : message.text;
   const final = isFinal ?? message.final;
   const isPending =
     message.role === "assistant" && !message.text.trim() && !final;
@@ -5222,11 +5376,17 @@ const MessageRow = memo(function MessageRow({
             </div>
           )}
           {visibleText && (
-            <p>
-              <InlineMarkdown text={visibleText} />
-              {message.role === "user" && onQuoteJump &&
-                quoteBacklinkButtons(message.quoteRefs ?? [], onQuoteJump)}
-            </p>
+            message.role === "user" ? (
+              <p>
+                <InlineMarkdown text={visibleText} />
+                {onQuoteJump &&
+                  quoteBacklinkButtons(message.quoteRefs ?? [], onQuoteJump)}
+              </p>
+            ) : (
+              <div className="message-answer-text">
+                {answerParagraphs(visibleText)}
+              </div>
+            )
           )}
           {!visibleText && message.role === "user" && onQuoteJump &&
             quoteBacklinkButtons(message.quoteRefs ?? [], onQuoteJump)}
@@ -6877,32 +7037,18 @@ function TurnProgressCard({
         <div className="compact-answer-body">
           <div className="compact-answer-line">
             {hasAnswer && (
-              <p>
-                {answerWithQuoteBacklinks(
-                  textWithoutCodeBlocks(answerBodyText),
+              <div className="compact-answer-text">
+                {answerParagraphs(
+                  answerBodyText,
                   answerQuoteRefs,
-                  onQuoteJump ?? (() => undefined),
+                  onQuoteJump,
                 )}
-              </p>
+              </div>
             )}
             {streaming && (
               <span className="trace-answer-spinner" aria-label="Válasz készül" />
             )}
           </div>
-          {onQuoteJump && answerQuoteRefs.length > 0 &&
-            answerQuoteRefs.some(
-              (quote) =>
-                !answer?.text.includes(quote.text) &&
-                !(quote.instruction && answer?.text.includes(quote.instruction)),
-            ) &&
-            quoteBacklinkButtons(
-              answerQuoteRefs.filter(
-                (quote) =>
-                  !answer?.text.includes(quote.text) &&
-                  !(quote.instruction && answer?.text.includes(quote.instruction)),
-              ),
-              onQuoteJump,
-            )}
         </div>
         {changeSummary.length > 0 && (
           <div className="compact-answer-changes">
@@ -6981,49 +7127,22 @@ function TurnProgressCard({
               </div>
               {traceView === "answer" && <div className="turn-progress-answer-body">
                 <div className="trace-answer-line">
-                  {hasAnswer &&
-                    // A quote backlink is matched against the whole answer, so
-                    // a quote spanning a paragraph break would lose its link if
-                    // the text were split. Paragraphs when there is nothing to
-                    // lose; one block when there is.
-                    //
+                  {hasAnswer && (
                     // The wrapper is load-bearing: this row is a flex line so
-                    // the spinner can sit beside the text, and loose paragraphs
-                    // became flex items — one narrow column per paragraph,
-                    // which is exactly as unreadable as it sounds.
-                    (answerQuoteRefs.length === 0 ? (
-                      <div className="trace-answer-text">
-                        {answerParagraphs(
-                          textWithoutCodeBlocks(answerBodyText),
-                        )}
-                      </div>
-                    ) : (
-                    <p>
-                      {answerWithQuoteBacklinks(
-                        textWithoutCodeBlocks(answerBodyText),
+                    // the spinner can sit beside the text, and loose Markdown
+                    // blocks must stay one readable column.
+                    <div className="trace-answer-text">
+                      {answerParagraphs(
+                        answerBodyText,
                         answerQuoteRefs,
-                        onQuoteJump ?? (() => undefined),
+                        onQuoteJump,
                       )}
-                    </p>
-                  ))}
+                    </div>
+                  )}
                   {streaming && (
                     <span className="trace-answer-spinner" aria-label="Válasz készül" />
                   )}
                 </div>
-                {onQuoteJump && answerQuoteRefs.length > 0 &&
-                  answerQuoteRefs.some(
-                    (quote) =>
-                      !answer?.text.includes(quote.text) &&
-                      !(quote.instruction && answer?.text.includes(quote.instruction)),
-                  ) &&
-                  quoteBacklinkButtons(
-                    answerQuoteRefs.filter(
-                      (quote) =>
-                        !answer?.text.includes(quote.text) &&
-                        !(quote.instruction && answer?.text.includes(quote.instruction)),
-                    ),
-                    onQuoteJump,
-                  )}
               </div>}
             </div>
             <ChangeSummaryPanel
@@ -7105,6 +7224,8 @@ function TurnProgressCard({
                     step.status === "pending" &&
                     step.id !== activeStep.id &&
                     !hasTraceForStep(step.id));
+                const currentStep =
+                  !planDrafting && streaming && step.id === activeStep.id;
                 const elapsed = stepElapsedFor(step);
                 return (
                   <div
@@ -7118,7 +7239,7 @@ function TurnProgressCard({
                       className={
                         planDrafting
                           ? "trace-step-row is-plain"
-                          : `trace-step-row trace-step-row-${displayStatus(step)}${selectedStep.id === step.id ? " is-selected" : ""}${disabled ? " is-disabled" : ""}`
+                          : `trace-step-row trace-step-row-${displayStatus(step)}${selectedStep.id === step.id ? " is-selected" : ""}${currentStep ? " is-current" : ""}${disabled ? " is-disabled" : ""}`
                       }
                       onClick={() => selectStep(step.id)}
                       disabled={disabled}
@@ -7896,7 +8017,9 @@ function App() {
   // costs three times the wall clock and three times the reading.
   const [pipelineMode, setPipelineMode] = useState(false);
   const [pipelineRecipes, setPipelineRecipes] = useState<PipelineRecipe[]>([]);
-  const [pipelineRecipeId, setPipelineRecipeId] = useState("plan_code_review");
+  const [pipelineRecipeId, setPipelineRecipeId] = useState(() =>
+    localStorage.getItem("min-pipeline-recipe") ?? "plan_code_review",
+  );
   // Which phase of a running chain the reader is looking at. Null follows the
   // one that is actually running, which is what a progress display should do.
   const [liveStageChoice, setLiveStageChoice] = useState<number | null>(null);
@@ -7973,6 +8096,106 @@ function App() {
   const activePipelineRecipe =
     pipelineRecipes.find((recipe) => recipe.id === pipelineRecipeId) ??
     pipelineRecipes[0];
+  const selectPipelineRecipe = (recipeId: string) => {
+    setPipelineRecipeId(recipeId);
+    localStorage.setItem("min-pipeline-recipe", recipeId);
+  };
+  const setCodingPipelineEnabled = (enabled: boolean) => {
+    const target = pipelineRecipes.find((recipe) =>
+      enabled
+        ? recipeReviewTarget(recipe) === "implementation"
+        : recipeReviewTarget(recipe) === "plan",
+    );
+    if (target) selectPipelineRecipe(target.id);
+  };
+
+  // The KÓD column doubles as the compact recipe switch. It remains visible
+  // even for TERV REVIEW, so the user can turn the implementation stage back
+  // on without a second selector row that makes the composer too tall.
+  const renderComposerStageColumn = (
+    stage: PipelineRecipeStage,
+    index: number,
+  ) => {
+    const isCodeStage = stage.role === "code";
+    return (
+      <div className="composer-stage-col" key={`stage-${stage.role}-${index}`}>
+        <span className="composer-stage-role">
+          {isCodeStage ? (
+            <label
+              className="composer-stage-toggle"
+              title="KÓD bekapcsolása — TERV → KÓD → REVIEW"
+            >
+              <input
+                type="checkbox"
+                checked
+                onChange={(event) =>
+                  setCodingPipelineEnabled(event.currentTarget.checked)
+                }
+                aria-label="KÓD szakasz bekapcsolása"
+              />
+              <span>KÓD</span>
+            </label>
+          ) : (
+            stage.role === "plan_review"
+              ? "REVIEW"
+              : STAGE_ROLE_LABELS[stage.role] ?? stage.role
+          )}
+        </span>
+        <button
+          type="button"
+          className="composer-stage-vendor"
+          onClick={() => cycleStageValue(index, "vendor", 1)}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            cycleStageValue(index, "vendor", -1);
+          }}
+          title="Gyártó — kattints a másikra"
+        >
+          {stageProvider(index) === "anthropic" ? "Claude" : "ChatGPT"}
+        </button>
+        <button
+          type="button"
+          onClick={() => cycleStageValue(index, "model", 1)}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            cycleStageValue(index, "model", -1);
+          }}
+          title="Modell — kattints a következőért, jobb klikk visszafelé"
+        >
+          {shortModelLabel(stageValue(index, "model") ?? "")}
+        </button>
+        <button
+          type="button"
+          onClick={() => cycleStageValue(index, "effort", 1)}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            cycleStageValue(index, "effort", -1);
+          }}
+          title="Reasoning — kattints a következőért, jobb klikk visszafelé"
+        >
+          {stageValue(index, "effort") || FALLBACK_EFFORTS[0]}
+        </button>
+      </div>
+    );
+  };
+  const composerPlanStage = activePipelineRecipe?.stages.find(
+    (stage) => stage.role === "plan",
+  );
+  const composerPlanStageIndex = composerPlanStage
+    ? activePipelineRecipe?.stages.indexOf(composerPlanStage) ?? -1
+    : -1;
+  const composerCodeStage = activePipelineRecipe?.stages.find(
+    (stage) => stage.role === "code",
+  );
+  const composerCodeStageIndex = composerCodeStage
+    ? activePipelineRecipe?.stages.indexOf(composerCodeStage) ?? -1
+    : -1;
+  const composerReviewStage = activePipelineRecipe?.stages.find(
+    (stage) => stage.role === "review" || stage.role === "plan_review",
+  );
+  const composerReviewStageIndex = composerReviewStage
+    ? activePipelineRecipe?.stages.indexOf(composerReviewStage) ?? -1
+    : -1;
   const [pendingImages, setPendingImages] = useState<PendingImageAttachment[]>(
     [],
   );
@@ -8129,6 +8352,19 @@ function App() {
   // másodpercenként tucatjával jönnek, és mindegyiknél olvasni a lemezt
   // értelmetlen. A `null` azt jelenti: olvastuk, nincs ilyen fájl (új fájl).
   const liveFileBaseRef = useRef<Map<string, string | null>>(new Map());
+  // Keep one in-flight read per file while streamed edit deltas arrive.
+  const liveFileBaseReadRef = useRef<Map<string, Promise<string | null>>>(
+    new Map(),
+  );
+  // If the read is slower than the stream, let its completion use the latest
+  // edit delta rather than the first (still incomplete) one.
+  const liveFileBaseProjectRef = useRef<
+    Map<string, (base: string | null) => void>
+  >(new Map());
+  // ChatGPT/Codex can deliver a complete file item before the LIVE-specific
+  // stream exists. Remember which activity versions have been backfilled so
+  // the render-side recovery below does not re-read the same file forever.
+  const liveFileBackfillKeysRef = useRef<Set<string>>(new Set());
   // A delták gyorsabban jönnek, mint ahogy a React festeni tud; a képkockára
   // adagolt írás ugyanaz a fogás, mint a válasz-stream `drainAnswerStream`-je.
   const liveFilePendingRef = useRef<Map<string, LiveFileTouch>>(new Map());
@@ -8147,6 +8383,12 @@ function App() {
   >(null);
   const [isAtBottom, setIsAtBottom] = useState(true);
   const [toast, setToast] = useState("");
+  const [reviewCommentTarget, setReviewCommentTarget] = useState<string | null>(
+    null,
+  );
+  const [reviewRerunChoiceTarget, setReviewRerunChoiceTarget] = useState<
+    string | null
+  >(null);
   const [fileActionMenu, setFileActionMenu] =
     useState<FileActionMenuState | null>(null);
   const [selectionQuote, setSelectionQuote] = useState<SelectionQuote | null>(
@@ -8444,6 +8686,8 @@ function App() {
     quoteInstructionDraftsRef.current = {};
     setComposerQuotes([]);
     setShowDetailedTrace(false);
+    setReviewCommentTarget(null);
+    setReviewRerunChoiceTarget(null);
   }, [threadKey]);
   const resizeComposerTextarea = (textarea: HTMLTextAreaElement | null) => {
     if (!textarea) return;
@@ -9980,6 +10224,15 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (pipelineRecipes.length === 0) return;
+    if (pipelineRecipes.some((recipe) => recipe.id === pipelineRecipeId)) return;
+    const fallback =
+      pipelineRecipes.find((recipe) => recipe.id === "plan_code_review") ??
+      pipelineRecipes[0];
+    if (fallback) selectPipelineRecipe(fallback.id);
+  }, [pipelineRecipes, pipelineRecipeId]);
+
+  useEffect(() => {
     if (!isTauri) return;
     // A chain takes minutes, so the UI has to follow it stage by stage instead
     // of showing nothing until the whole run finishes. The stage's request id
@@ -10029,6 +10282,7 @@ function App() {
                   ...message,
                   pipeline: {
                     runId: progress.runId,
+                    recipeId: progressRun.chain?.recipe?.id,
                     chainId: resume?.chainKey ?? progress.runId,
                     iteration: resume?.iteration ?? 1,
                     stageIndex: progress.stageIndex,
@@ -11898,6 +12152,28 @@ function App() {
   }, [toast]);
 
   useEffect(() => {
+    if (!isTauri) return;
+    let disposed = false;
+    let cleanup: (() => void) | undefined;
+    void listen<{ message?: string }>("app-close-blocked", (event) => {
+      if (!disposed)
+        setToast(
+          event.payload?.message ??
+            "A futás még folyamatban van. Várd meg a végét vagy állítsd le.",
+        );
+    })
+      .then((unlisten) => {
+        if (disposed) unlisten();
+        else cleanup = unlisten;
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      cleanup?.();
+    };
+  }, [isTauri]);
+
+  useEffect(() => {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
@@ -12267,8 +12543,8 @@ function App() {
             setCodeStatus("terv frissítve");
           } else if (carriedListActive) {
             // A kódoló a terv pontjait veszi fel checklistként, méghozzá
-            // elemenként: nyolc hívás, nyolc egyre hosszabb lista. Ha ezeket
-            // beengednénk, a KÓD lépéslistája újra „kiíródna" fentről lefelé,
+            // elemenként, egyre hosszabb lista. Ha ezeket beengednénk, a KÓD
+            // lépéslistája újra „kiíródna" fentről lefelé,
             // ahogy a TERV-ben — pedig ugyanaz a lista, csak most már halad.
             // A hordozott lista marad, és csak az állapotokat vesszük át róla.
             const mapping = mapIncomingTasksToCarried();
@@ -12400,9 +12676,7 @@ function App() {
         let inferredStepId: string | undefined;
         if (
           !planStepIdOverride &&
-          run.plan.source !== "claude-task" &&
-          run.plan.source !== "claude-todo" &&
-          run.plan.source !== "carried-plan" &&
+          run.provider !== "anthropic" &&
           codexEvent.requestId &&
           run.chainRequestIds.has(codexEvent.requestId) &&
           run.plan.steps.length >= 2
@@ -12410,7 +12684,8 @@ function App() {
           const inferencePath =
             extractFilePath(codexEvent.payload) ?? activity.detail;
           const baseName = inferencePath
-            ?.split(/[\/]/)
+            ?.replaceAll("\\", "/")
+            .split("/")
             .pop()
             ?.toLowerCase();
           if (baseName && baseName.includes(".")) {
@@ -12445,6 +12720,11 @@ function App() {
           : statusActiveStepId;
         const planStepId =
           planStepIdOverride ??
+          // ChatGPT/Codex does not always emit a new activeStepId when it
+          // moves from one carried-plan file to the next. A reliable filename
+          // match must outrank the stale first active step; Claude keeps its
+          // TaskUpdate mapping as the authoritative path.
+          (run.provider !== "anthropic" ? inferredStepId : undefined) ??
           explicitActiveStepId ??
           inferredStepId;
         if (planTrackingDiagnosticsEnabled() && run.provider === "anthropic") {
@@ -12470,14 +12750,17 @@ function App() {
         // kerül, csak nem gépel — a fül és a fájlnézet ugyanaz. A Claude
         // fájljait a saját, élő csatornája hozza; itt a lezáró esemény már
         // csak megerősítené ugyanazt.
+        const filePath =
+          extractFilePath(codexEvent.payload) ??
+          (activityWithStep.kind === "file"
+            ? activityWithStep.detail
+            : undefined);
         if (
           activityWithStep.kind === "file" &&
-          run.provider !== "anthropic" &&
-          (activityWithStep.afterCode?.trim() ||
-            activityWithStep.code?.trim())
+          (activityWithStep.afterCode?.trim() || activityWithStep.code?.trim())
         ) {
           const livePath = relativeChangePath(
-            activityWithStep.detail,
+            filePath ?? activityWithStep.detail,
             runProjectPathRef.current || activeProjectPathRef.current,
           );
           const content =
@@ -12492,11 +12775,11 @@ function App() {
               sequence: activityWithStep.id,
             });
         }
-        const filePath = extractFilePath(codexEvent.payload);
         if (
-          !activityWithStep.code &&
+          activityWithStep.kind === "file" &&
           filePath &&
-          /\.[a-z0-9]{1,8}$/i.test(filePath)
+          /\.[a-z0-9]{1,8}$/i.test(filePath) &&
+          (!activityWithStep.code || !activityWithStep.afterCode)
         ) {
           void invoke<string | null>("read_code_file", {
             cwd: runProjectPathRef.current || activeProjectPathRef.current,
@@ -12504,6 +12787,25 @@ function App() {
           })
             .then((code) => {
               if (!code) return;
+              // Codex often reports only a patch or the file path in the
+              // activity. The finished file on disk is the authoritative
+              // content for the LIVE panel, so backfill it when available.
+              // Claude's dedicated fileWrite stream may already have painted
+              // the same path; touching it here is harmless and also covers
+              // Claude runtimes that only emit a completed file item.
+              const livePath = relativeChangePath(
+                filePath,
+                runProjectPathRef.current || activeProjectPathRef.current,
+              );
+              if (livePath)
+                queueLiveFile(ownerConversationId, {
+                  path: livePath,
+                  content: code,
+                  streaming: false,
+                  mode: activityWithStep.beforeCode ? "edit" : "write",
+                  highlight: wholeFileHighlight(code),
+                  sequence: activityId,
+                });
               writeOwnedWorkItems(ownerConversationId, (current) =>
                 current.map((item) =>
                   item.id === activityId ||
@@ -14013,10 +14315,11 @@ function App() {
     setLiveFilesByConversation((current) => {
       const next = { ...current };
       for (const [key, touch] of pending) {
-        const [conversationId] = key.split(" ");
+        const [conversationId] = key.split("\u0000");
         next[conversationId] = touchLiveFile(
           next[conversationId] ?? EMPTY_LIVE_FILES,
           touch,
+          runProjectPathRef.current || activeProjectPathRef.current,
         );
       }
       return next;
@@ -14028,7 +14331,11 @@ function App() {
     touch: LiveFileTouch,
   ) => {
     if (!conversationId) return;
-    liveFilePendingRef.current.set(`${conversationId} ${touch.path}`, touch);
+    const projectRoot =
+      runProjectPathRef.current || activeProjectPathRef.current;
+    const path = canonicalLiveFilePath(touch.path, projectRoot);
+    const normalizedTouch = { ...touch, path };
+    liveFilePendingRef.current.set(`${conversationId}\u0000${liveFilePathKey(path)}`, normalizedTouch);
     if (liveFileFrameRef.current === null)
       liveFileFrameRef.current = window.requestAnimationFrame(flushLiveFiles);
   };
@@ -14055,10 +14362,13 @@ function App() {
     },
   ) => {
     if (!conversationId || !write.path) return;
+    const projectRoot =
+      runProjectPathRef.current || activeProjectPathRef.current;
+    const path = canonicalLiveFilePath(write.path, projectRoot);
     if (write.mode === "write") {
       const content = write.content ?? "";
       queueLiveFile(conversationId, {
-        path: write.path,
+        path,
         content,
         streaming: write.streaming,
         mode: "write",
@@ -14070,22 +14380,33 @@ function App() {
     const newString = write.newString ?? "";
     const showPatch = () =>
       queueLiveFile(conversationId, {
-        path: write.path,
+        path,
         content: newString,
         streaming: write.streaming,
         mode: "edit",
         highlight: wholeFileHighlight(newString),
         sequence: write.sequence,
       });
-    // A csere két fele közül a keresett szövegnek teljesnek kell lennie,
-    // különben nincs mire illeszteni; addig a beírt rész önmagában látszik.
-    if (!write.oldString) {
-      showPatch();
-      return;
-    }
-    const baseKey = `${conversationId} ${write.path}`;
-    const known = liveFileBaseRef.current.get(baseKey);
+    // The original file is needed before we can safely place an edit. Do not
+    // render the patch at line 1 while old_string is still streaming.
+    const baseKey = `${conversationId}\u0000${liveFilePathKey(path)}`;
     const project = (base: string | null) => {
+      // Until old_string is complete, keep the whole original file on screen
+      // so an edit around line 100 keeps its real line numbers.
+      if (!write.oldString) {
+        if (base !== null) {
+          queueLiveFile(conversationId, {
+            path,
+            content: base,
+            streaming: write.streaming,
+            mode: "edit",
+            sequence: write.sequence,
+          });
+        } else {
+          showPatch();
+        }
+        return;
+      }
       const applied =
         base === null
           ? null
@@ -14095,7 +14416,7 @@ function App() {
         return;
       }
       queueLiveFile(conversationId, {
-        path: write.path,
+        path,
         content: applied.content,
         streaming: write.streaming,
         mode: "edit",
@@ -14103,23 +14424,39 @@ function App() {
         sequence: write.sequence,
       });
     };
+    const known = liveFileBaseRef.current.get(baseKey);
+    liveFileBaseProjectRef.current.set(baseKey, project);
     if (known !== undefined) {
+      liveFileBaseProjectRef.current.delete(baseKey);
       project(known);
       return;
     }
-    // Amíg a lemez válaszol, a folt látszik — a fülnek nem kell megvárnia.
-    showPatch();
-    void invoke<string | null>("read_code_file", {
+    const pending = liveFileBaseReadRef.current.get(baseKey);
+    if (pending) return;
+    const read = invoke<string | null>("read_code_file", {
       cwd: runProjectPathRef.current || activeProjectPathRef.current,
-      path: write.path,
+      path,
     })
       .then((base) => {
-        liveFileBaseRef.current.set(baseKey, base ?? null);
-        project(base ?? null);
+        const value = base ?? null;
+        liveFileBaseRef.current.set(baseKey, value);
+        liveFileBaseReadRef.current.delete(baseKey);
+        const latestProject =
+          liveFileBaseProjectRef.current.get(baseKey) ?? project;
+        liveFileBaseProjectRef.current.delete(baseKey);
+        latestProject(value);
+        return value;
       })
       .catch(() => {
         liveFileBaseRef.current.set(baseKey, null);
+        liveFileBaseReadRef.current.delete(baseKey);
+        const latestProject =
+          liveFileBaseProjectRef.current.get(baseKey) ?? project;
+        liveFileBaseProjectRef.current.delete(baseKey);
+        latestProject(null);
+        return null;
       });
+    liveFileBaseReadRef.current.set(baseKey, read);
   };
 
   const releaseQueuedSend = (conversationId: string | null | undefined) => {
@@ -14140,6 +14477,16 @@ function App() {
 
   const submitMessage = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (reviewCommentTarget) {
+      const comment = inputDraftRef.current.trim();
+      if (!comment) {
+        notify("Írj egy kommentet a v2 újrafuttatásához.", "notify");
+        inputRef.current?.focus();
+        return;
+      }
+      void rerunChainFromReview(reviewCommentTarget, comment);
+      return;
+    }
     const pendingRegeneration = regenerationTargetRef.current;
     regenerationTargetRef.current = null;
     const generalInstruction = (
@@ -14597,6 +14944,10 @@ function App() {
       completedTerminalTurns: new Set(),
       chainRequestIds: new Set(),
       planTaskToCarriedStep: {},
+      chain:
+        runPipeline && activePipelineRecipe
+          ? { recipe: activePipelineRecipe }
+          : undefined,
       answerStream: { meta: null, pending: "", frame: null },
       status: "preparing",
       turnCompleted: false,
@@ -14742,10 +15093,14 @@ function App() {
               );
           // The card with the real file list belongs to the stage that wrote
           // the files.
-          const codeStageIndex = run.stages.reduce(
-            (last, stage, index) => (stage.role === "code" ? index : last),
-            -1,
+          const outputStageRole = recipeOutputRole(run.recipe);
+          const outputStageIndex = run.stages.findIndex(
+            (stage) => stage.role === outputStageRole,
           );
+          const artifactStageIndex =
+            outputStageIndex >= 0
+              ? outputStageIndex
+              : run.stages.findIndex((stage) => stage.role === "plan");
           const stageMessages: Message[] = run.stages.map((stage, stageIndex) => ({
             // The runner already stored this answer; reuse its id so the row it
             // wrote and the row shown here are the same row. Inventing an id
@@ -14765,11 +15120,12 @@ function App() {
             turnId: `request:${stage.requestId}`,
             itemId: "assistant-0",
             changeSummary:
-              stageIndex === codeStageIndex && chainSummary.length > 0
+              stageIndex === artifactStageIndex && chainSummary.length > 0
                 ? chainSummary
                 : undefined,
             pipeline: {
               runId: run.runId,
+              recipeId: run.recipe.id,
               chainId: run.chainId,
               iteration: run.iteration,
               stageIndex: stage.index,
@@ -15196,15 +15552,39 @@ function App() {
   };
 
   /**
-   * Runs the chain again from the coding stage after a rejected review.
+   * Runs the chain again from the role targeted by a rejected review.
    *
    * Not a fresh chain, and not a new question: the plan the reviewer agreed to
-   * is handed back as an artifact, so the coder fixes what was objected to
-   * instead of re-deciding what to do. The result joins the same panel as the
-   * next version rather than opening a second one below it.
+   * is handed back as an artifact. A plan review re-runs the planner itself;
+   * an implementation review keeps the accepted plan and resumes at coding.
    */
-  const rerunChainFromCode = async (chainKey: string) => {
-    if (!isTauri || !activePipelineRecipe) return;
+  const activateReviewCommentMode = (chainKey: string) => {
+    setReviewRerunChoiceTarget(null);
+    setReviewCommentTarget(chainKey);
+    // A REVIEW comment is a separate instruction, never a continuation of a
+    // draft that happened to be in the normal composer.
+    inputDraftRef.current = "";
+    if (inputRef.current) {
+      inputRef.current.value = "";
+      resizeComposerTextarea(inputRef.current);
+      window.setTimeout(() => inputRef.current?.focus(), 0);
+    }
+  };
+
+  const cancelReviewCommentMode = () => {
+    setReviewCommentTarget(null);
+    inputDraftRef.current = "";
+    if (inputRef.current) {
+      inputRef.current.value = "";
+      resizeComposerTextarea(inputRef.current);
+    }
+  };
+
+  const rerunChainFromReview = async (
+    chainKey: string,
+    userComments = "",
+  ) => {
+    if (!isTauri) return;
     if (anyRunActive()) {
       notify("Előbb fejeződjön be a futó kérés.");
       return;
@@ -15218,6 +15598,18 @@ function App() {
         message.pipeline && chainKeyOf(message.pipeline) === chainKey,
     );
     if (chainMessages.length === 0) return;
+    const chainRecipeId = chainMessages
+      .map((message) => message.pipeline?.recipeId)
+      .find((id): id is string => Boolean(id));
+    const chainRecipe =
+      pipelineRecipes.find((recipe) => recipe.id === chainRecipeId) ??
+      (chainMessages.some(
+        (message) => message.pipeline?.stageRole === "plan_review",
+      )
+        ? pipelineRecipes.find((recipe) => recipe.id === "plan_review")
+        : pipelineRecipes.find((recipe) => recipe.id === "plan_code_review")) ??
+      activePipelineRecipe;
+    if (!chainRecipe) return;
     const latestVersion = Math.max(
       ...chainMessages.map((message) => iterationOf(message.pipeline!)),
     );
@@ -15230,7 +15622,11 @@ function App() {
     // Newest first by construction: the timeline holds later versions later.
     const newestOfRole = (role: string) =>
       chainMessages.filter((message) => message.pipeline!.stageRole === role).at(-1);
-    const objection = newestOfRole("review")?.text.trim();
+    const reviewTarget = recipeReviewTarget(chainRecipe);
+    const reviewRole =
+      reviewTarget === "plan" ? "plan_review" : "review";
+    const objection = newestOfRole(reviewRole)?.text.trim();
+    const userCommentText = userComments.trim();
     if (!objection) {
       notify("A bíráló szövege nélkül nincs mit javítani.");
       return;
@@ -15244,11 +15640,12 @@ function App() {
       notify("Az eredeti kérdés nem található, a lánc nem indítható újra.");
       return;
     }
-    const startStage = activePipelineRecipe.stages.findIndex(
-      (recipeStage) => recipeStage.role === "code",
+    const startRole = recipeRetryFromRole(chainRecipe);
+    const startStage = chainRecipe.stages.findIndex(
+      (recipeStage) => recipeStage.role === startRole,
     );
     if (startStage < 0) {
-      notify("A recept nem tartalmaz kódoló szakaszt.");
+      notify("A receptben nincs újrafuttatható szakasz.");
       return;
     }
     // The plan is carried, not re-run, so the tab that shows it needs its text
@@ -15272,11 +15669,16 @@ function App() {
         text: newestOfRole("code")!.text,
         changedFiles: [],
       },
+      newestOfRole("plan_review") && {
+        role: "plan_review",
+        text: newestOfRole("plan_review")!.text,
+        changedFiles: [],
+      },
     ].filter(Boolean);
 
     const iteration = latestVersion + 1;
     const requestId = createEntityId();
-    const stageRequestIds = activePipelineRecipe.stages.map(
+    const stageRequestIds = chainRecipe.stages.map(
       (_, index) => `${requestId}-stage-${index}`,
     );
     // Az újrafuttatás is egy futás: a gazdája az a beszélgetés, amelyikből
@@ -15288,10 +15690,12 @@ function App() {
       return;
     }
     setLiveStageChoice(null);
+    setReviewRerunChoiceTarget(null);
 
     // A re-run is a chain, and a chain is read in the detailed layout: the
     // panel it draws has phases. Without this the composer still showed the
     // plain single-agent settings, and the run rendered as if it were one.
+    selectPipelineRecipe(chainRecipe.id);
     setShowDetailedTrace(true);
     setPipelineMode(true);
     // The elapsed clock counts from the plan's start, and the plan still held
@@ -15324,7 +15728,10 @@ function App() {
       planTaskToCarriedStep: {},
       // A `startStage` előtti szakaszok ebben a körben nem futnak: enélkül a
       // sáv úgy rajzolná őket, mintha még sorra kerülnének.
-      chain: { resume: { chainKey, startStage, iteration, carried } },
+      chain: {
+        recipe: chainRecipe,
+        resume: { chainKey, startStage, iteration, carried },
+      },
       answerStream: { meta: null, pending: "", frame: null },
       status: "streaming",
       turnCompleted: false,
@@ -15336,7 +15743,7 @@ function App() {
         {
           id: "client-pre-plan",
           step: prePlanStepLabel(
-            activePipelineRecipe.stages[startStage]?.role ?? "code",
+            chainRecipe.stages[startStage]?.role ?? "code",
           ),
           status: "inProgress",
         },
@@ -15344,16 +15751,27 @@ function App() {
       startedAt: rerunStartedAt,
       stepTimes: { "client-pre-plan": { startedAt: rerunStartedAt } },
     });
+    setReviewCommentTarget(null);
+    if (userCommentText) {
+      inputDraftRef.current = "";
+      if (inputRef.current) {
+        inputRef.current.value = "";
+        resizeComposerTextarea(inputRef.current);
+      }
+    }
     try {
       const run = await invoke<PipelineRunResult>("pipeline_send", {
         request: {
-          recipeId: activePipelineRecipe.id,
+          recipeId: chainRecipe.id,
           prompt: originalPrompt,
           conversationId: activeConversationId,
           // Egy kérdés = egy terv-fájl. Az újrafuttatás nem tervez, csak a
-          // kör naplóját írja a meglévő fájl végére — ezért ugyanazt a nevet
-          // kapja, nem egy `-v2` másodpéldányt.
-          planFile: planFileNameFor(activeThread, 1),
+          // A TERV REVIEW újrafutása új tervet ír; a KÓD-tól induló javítás a
+          // korábbi tervet tartja meg, ezért annak v1 fájlját naplózza.
+          planFile: planFileNameFor(
+            activeThread,
+            chainRecipe.id === "plan_review" ? iteration : 1,
+          ),
           requestIds: stageRequestIds,
           placeholderRequestId: null,
           images: [],
@@ -15361,14 +15779,21 @@ function App() {
           sessionId: claudeSessionIds[threadKey] ?? null,
           conversationContext: null,
           maxBudgetUsd: Number(claudeBudgetUsd),
-          stageOverrides: activePipelineRecipe.stages.map((_, index) => ({
-            model: stageValue(index, "model") || undefined,
-            effort: stageValue(index, "effort") || undefined,
-            provider: stageProvider(index),
+          stageOverrides: chainRecipe.stages.map((_, index) => ({
+            model:
+              pipelineStageOverrides[`${chainRecipe.id}:${index}`]?.model ??
+              undefined,
+            effort:
+              pipelineStageOverrides[`${chainRecipe.id}:${index}`]?.effort ??
+              undefined,
+            provider:
+              pipelineStageOverrides[`${chainRecipe.id}:${index}`]?.provider ??
+              undefined,
           })),
           startStage,
           seedArtifacts,
           retryFeedback: objection,
+          userComments: userCommentText || null,
           chainId: chainKey,
           iteration,
         },
@@ -15379,10 +15804,14 @@ function App() {
         rerunConversationId,
         activeMode === "general" ? null : activeProjectData.path,
       );
-      const codeStageIndex = run.stages.reduce(
-        (last, stage, index) => (stage.role === "code" ? index : last),
-        -1,
+      const outputStageRole = recipeOutputRole(run.recipe);
+      const outputStageIndex = run.stages.findIndex(
+        (stage) => stage.role === outputStageRole,
       );
+      const artifactStageIndex =
+        outputStageIndex >= 0
+          ? outputStageIndex
+          : run.stages.findIndex((stage) => stage.role === "plan");
       const stageMessages: Message[] = run.stages.map((stageResult, stageIndex) => ({
         id: stageResult.answerMessageId ?? crypto.randomUUID(),
         role: "assistant",
@@ -15395,11 +15824,12 @@ function App() {
         turnId: `request:${stageResult.requestId}`,
         itemId: "assistant-0",
         changeSummary:
-          stageIndex === codeStageIndex && chainSummary.length > 0
+          stageIndex === artifactStageIndex && chainSummary.length > 0
             ? chainSummary
             : undefined,
         pipeline: {
           runId: run.runId,
+          recipeId: run.recipe.id,
           chainId: run.chainId,
           iteration: run.iteration,
           stageIndex: stageResult.index,
@@ -16108,23 +16538,14 @@ function App() {
           )}
         </div>
       ) : undefined;
-    const askForTheFix = () => {
-      const reason = runVerdict?.verdictSummary?.trim();
-      const draft = reason
-        ? `A bíráló ezt kifogásolta: ${reason}
-Javítsd ki, majd futtasd le újra a teszteket.`
-        : "Javítsd ki, amit a bíráló kifogásolt, majd futtasd le újra a teszteket.";
-      inputDraftRef.current = draft;
-      if (inputRef.current) {
-        inputRef.current.value = draft;
-        resizeComposerTextarea(inputRef.current);
-        inputRef.current.focus();
-      }
-    };
-    // A rejected verdict used to end the run on a red panel and a shrug: the
-    // only affordance wrote a draft into the composer and left the sending to
-    // the reader. This re-runs the chain itself, from the coder -- the plan was
-    // what the reviewer agreed to, and re-planning only risks drifting off it.
+    const historicalRecipe = stage
+      ? pipelineRecipes.find((recipe) => recipe.id === stage.recipeId)
+      : undefined;
+    const planReviewRecipe = historicalRecipe
+      ? recipeReviewTarget(historicalRecipe) === "plan"
+      : chain.map((item) => item.role).includes("plan_review");
+    // A rejected verdict gets a direct, recipe-aware retry. PlanReview starts
+    // from TERV; implementation review starts from KÓD with the accepted plan.
     const rejected = runVerdict?.verdict === "changes_requested";
     const atNewestVersion = selectedVersion === latestVersion;
     const canRerun =
@@ -16146,7 +16567,9 @@ Javítsd ki, majd futtasd le újra a teszteket.`
             {runVerdict.verdictSummary?.trim() &&
             runVerdict.verdictSummary.trim().toUpperCase() !== "ELFOGAD"
               ? `A bíráló elfogadta: ${runVerdict.verdictSummary.trim()}`
-              : "A bíráló elfogadta a megoldást."}
+              : planReviewRecipe
+                ? "A bíráló elfogadta a tervet."
+                : "A bíráló elfogadta a megoldást."}
           </span>
         </div>
       ) : undefined;
@@ -16163,28 +16586,59 @@ Javítsd ki, majd futtasd le újra a teszteket.`
               type="button"
               disabled={!canRerun}
               title={
-                viewingActiveRun
-                  ? "Előbb fejezze be a futó kérés."
-                  : "A tervet megtartja, a kódolást és a bírálatot futtatja újra."
+                  viewingActiveRun
+                    ? "Előbb fejezze be a futó kérés."
+                    : planReviewRecipe
+                      ? "A tervet és a tervbírálatot futtatja újra, új tervverzióban."
+                      : "A tervet megtartja, a kódolást és a bírálatot futtatja újra."
               }
-              onClick={() => void rerunChainFromCode(chainKey)}
+              onClick={() =>
+                setReviewRerunChoiceTarget((current) =>
+                  current === chainKey ? null : chainKey,
+                )
+              }
             >
-              {`Újra a KÓD-tól (v${latestVersion + 1})`}
+              {planReviewRecipe
+                ? `Újra a TERV-től (v${latestVersion + 1})`
+                : `Újra a KÓD-tól (v${latestVersion + 1})`}
             </button>
           )}
-          <button type="button" className="is-secondary" onClick={askForTheFix}>
-            Javíttatom
-          </button>
+          {reviewRerunChoiceTarget === chainKey && (
+            <div
+              className="pipeline-rerun-options"
+              role="group"
+              aria-label="V2 komment beállítása"
+            >
+              <button
+                type="button"
+                onClick={() => activateReviewCommentMode(chainKey)}
+              >
+                Komment
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setReviewRerunChoiceTarget(null);
+                  void rerunChainFromReview(chainKey);
+                }}
+              >
+                Nincs komment
+              </button>
+            </div>
+          )}
         </div>
       ) : acceptedFooter;
     if (stage && selectedStage === PIPELINE_ANSWER_TAB) {
-      // Composed here rather than asked of a fourth model: the coder already
-      // wrote what changed, and the reviewer already said whether to trust it.
-      const coder = runStages.find((item) => item.role === "code");
+      // Composed here rather than asked of a fourth model: the producing stage
+      // already wrote the answer, and the reviewer already said whether to
+      // trust it. PlanReview recipes have no coder, so the plan is the output.
+      const outputStage =
+        runStages.find((item) => item.role === "code") ??
+        runStages.find((item) => item.role === "plan");
       const doer = messages.find(
         (message) =>
-          message.pipeline?.runId === coder?.runId &&
-          message.pipeline?.stageRole === "code",
+          message.pipeline?.runId === outputStage?.runId &&
+          message.pipeline?.stageIndex === outputStage?.stageIndex,
       );
       const answerText = (doer ?? groupAnswer).text;
       return (
@@ -16192,7 +16646,7 @@ Javítsd ki, majd futtasd le újra a teszteket.`
           {runHeader}
           <article className="trace-card in-run is-run-end pipeline-answer-card">
             <div className="pipeline-answer-body">
-              {answerParagraphs(textWithoutCodeBlocks(answerText))}
+              {answerParagraphs(answerText)}
             </div>
             {runFooter}
           </article>
@@ -16381,6 +16835,125 @@ Javítsd ki, majd futtasd le újra a teszteket.`
     : [...messages]
         .reverse()
         .find((message) => message.role === "assistant" && message.live);
+
+  // The run owns the durable conversation id. During the first message (and
+  // while an untitled thread is renamed) the tree-derived active id can lag
+  // behind it by one render; using that lagging key would hide a correctly
+  // queued LIVE file from the panel.
+  const liveFilesConversationId =
+    viewedRun?.ownerConversationId ?? activeConversationId;
+
+  // A native Codex turn reports file changes as ordinary `item/started` /
+  // `item/completed` work items. Those rows are enough for the FÁJLOK /
+  // VÁLTOZÁSOK summary, but older app-server versions do not emit the
+  // dedicated `item/fileWrite/delta` stream that Claude uses. Recover the
+  // active stage's files from the work log as a second path to the LIVE panel;
+  // this also covers a turn that was hydrated before the panel was mounted.
+  useEffect(() => {
+    if (
+      !isTauri ||
+      activeMode !== "coding" ||
+      !viewingActiveRun ||
+      !liveFilesConversationId
+    )
+      return;
+    const activities =
+      pipelineProgress && liveTurnId
+        ? [
+            ...codeActivity.filter((activity) => activity.turnId === liveTurnId),
+            ...(liveWorkGroup?.activities ?? []),
+          ]
+        : (liveWorkGroup?.activities ?? []);
+    if (activities.length === 0) return;
+    const cwd = runProjectPathRef.current || activeProjectPath;
+    for (const activity of activities) {
+      if (activity.kind !== "file") continue;
+      const rawPath = activity.detail?.trim();
+      if (!rawPath || !/\.[a-z0-9]{1,8}$/i.test(rawPath)) continue;
+      const readOnly =
+        /(?:^|[\\/._-])(read|inspect|view|open)(?:$|[\\/._-])/i.test(
+          activity.eventType,
+        ) || /(?:read|inspect|view|open)$/i.test(activity.eventType);
+      if (
+        readOnly &&
+        activity.beforeCode === undefined &&
+        activity.afterCode === undefined &&
+        !activity.changeKind
+      )
+        continue;
+      const source = activity.afterCode ?? activity.code ?? "";
+      const patchLike = /^\s*(?:@@|diff --|\+\+\+\s|---\s)/.test(source);
+      const hasWriteEvidence =
+        Boolean(source.trim()) ||
+        activity.beforeCode !== undefined ||
+        activity.afterCode !== undefined ||
+        Boolean(activity.changeKind) ||
+        /(?:change|create|delete|remove|write|patch|edit)/i.test(
+          activity.eventType,
+        );
+      if (!hasWriteEvidence) continue;
+      const path = relativeChangePath(rawPath, cwd);
+      const version = [
+        activity.status,
+        activity.code?.length ?? 0,
+        activity.beforeCode?.length ?? 0,
+        activity.afterCode?.length ?? 0,
+      ].join(":");
+      const key = `${liveFilesConversationId}\u0000${activity.id}\u0000${path}\u0000${version}`;
+      if (liveFileBackfillKeysRef.current.has(key)) continue;
+      liveFileBackfillKeysRef.current.add(key);
+      const fallback = patchLike ? "" : source;
+      const mode: LiveFileMode =
+        activity.beforeCode !== undefined ||
+        activity.afterCode !== undefined ||
+        patchLike ||
+        /(?:change|patch|edit)/i.test(activity.eventType)
+          ? "edit"
+          : "write";
+      void invoke<string | null>("read_code_file", {
+        cwd,
+        path: rawPath,
+      })
+        .then((disk) => {
+          const content = disk ?? fallback;
+          if (!content) {
+            liveFileBackfillKeysRef.current.delete(key);
+            return;
+          }
+          queueLiveFile(liveFilesConversationId, {
+            path,
+            content,
+            streaming: activity.status === "running",
+            mode,
+            highlight: wholeFileHighlight(content),
+            sequence: activity.id,
+          });
+        })
+        .catch(() => {
+          if (fallback)
+            queueLiveFile(liveFilesConversationId, {
+              path,
+              content: fallback,
+              streaming: activity.status === "running",
+              mode,
+              highlight: wholeFileHighlight(fallback),
+              sequence: activity.id,
+            });
+          else liveFileBackfillKeysRef.current.delete(key);
+        });
+    }
+  }, [
+    activeMode,
+    activeProjectPath,
+    codeActivity,
+    isTauri,
+    liveFilesConversationId,
+    liveTurnId,
+    liveWorkGroup,
+    pipelineProgress,
+    viewingActiveRun,
+  ]);
+
   const activeUserMessage = [...messages]
     .reverse()
     .find((message) => message.role === "user");
@@ -16390,8 +16963,9 @@ Javítsd ki, majd futtasd le újra a teszteket.`
   // Everything a running chain shows lives in one panel. Its phases are known
   // the moment it starts, so the strip is complete from the first second and
   // the marker simply follows the phase that is running.
+  const livePipelineRecipe = viewedRun?.chain?.recipe ?? activePipelineRecipe;
   const liveRunStages = pipelineProgress
-    ? (activePipelineRecipe?.stages.map((stage, index) => ({
+    ? (livePipelineRecipe?.stages.map((stage, index) => ({
         index,
         role: stage.role,
       })) ??
@@ -16568,11 +17142,11 @@ Javítsd ki, majd futtasd le újra a teszteket.`
   // Az élő kódnézet a képernyőn álló beszélgetésé — akkor is, ha a futás már
   // véget ért: a munka végén is jogos megnézni, mi került a fájlokba.
   const viewedLiveFiles =
-    liveFilesByConversation[activeConversationId ?? ""] ?? EMPTY_LIVE_FILES;
+    liveFilesByConversation[liveFilesConversationId ?? ""] ?? EMPTY_LIVE_FILES;
   const updateViewedLiveFiles = (
     change: (state: LiveFileState) => LiveFileState,
   ) => {
-    const id = activeConversationId ?? "";
+    const id = liveFilesConversationId ?? "";
     setLiveFilesByConversation((current) => ({
       ...current,
       [id]: change(current[id] ?? EMPTY_LIVE_FILES),
@@ -16668,7 +17242,16 @@ Javítsd ki, majd futtasd le újra a teszteket.`
     );
   // A re-run draws itself inside the panel it belongs to; everything else
   // still streams below the conversation, where a new answer belongs.
-  const rerunInPlace = Boolean(liveRunResume && pipelineProgress);
+  const hasLiveRerunSlot = timelineContent.some(
+    (node) => node === LIVE_RERUN_SLOT,
+  );
+  // Csak akkor rejtjük el az alsó live panelt, ha a történetben tényleg
+  // megtaláltuk és ki is tudjuk cserélni a v2 helyőrzőjét. Egy részben
+  // visszatöltött vagy megszakított láncnál korábban a panel mindkét
+  // helyről eltűnhetett.
+  const rerunInPlace = Boolean(
+    liveRunResume && pipelineProgress && hasLiveRerunSlot,
+  );
   const timelineWithLiveRerun = rerunInPlace
     ? timelineContent.map((node) =>
         node === LIVE_RERUN_SLOT ? liveTurnContent : node,
@@ -17500,47 +18083,46 @@ Javítsd ki, majd futtasd le újra a teszteket.`
               </div>
               {showDetailedTrace && pipelineMode && activePipelineRecipe && (
                 <div className="composer-stage-grid" aria-label="Lánc beállítása">
-                  {activePipelineRecipe.stages.map((stage, index) => (
-                    <div className="composer-stage-col" key={`stage-${index}`}>
-                      <span className="composer-stage-role">
-                        {STAGE_ROLE_LABELS[stage.role] ?? stage.role}
-                      </span>
-                      <button
-                        type="button"
-                        className="composer-stage-vendor"
-                        onClick={() => cycleStageValue(index, "vendor", 1)}
-                        onContextMenu={(event) => {
-                          event.preventDefault();
-                          cycleStageValue(index, "vendor", -1);
-                        }}
-                        title="Gyártó — kattints a másikra"
-                      >
-                        {stageProvider(index) === "anthropic" ? "Claude" : "ChatGPT"}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => cycleStageValue(index, "model", 1)}
-                        onContextMenu={(event) => {
-                          event.preventDefault();
-                          cycleStageValue(index, "model", -1);
-                        }}
-                        title="Modell — kattints a következőért, jobb klikk visszafelé"
-                      >
-                        {shortModelLabel(stageValue(index, "model") ?? "")}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => cycleStageValue(index, "effort", 1)}
-                        onContextMenu={(event) => {
-                          event.preventDefault();
-                          cycleStageValue(index, "effort", -1);
-                        }}
-                        title="Reasoning — kattints a következőért, jobb klikk visszafelé"
-                      >
-                        {stageValue(index, "effort") || FALLBACK_EFFORTS[0]}
-                      </button>
-                    </div>
-                  ))}
+                  {composerPlanStage &&
+                    renderComposerStageColumn(
+                      composerPlanStage,
+                      composerPlanStageIndex,
+                    )}
+                  {composerCodeStage
+                    ? renderComposerStageColumn(
+                        composerCodeStage,
+                        composerCodeStageIndex,
+                      )
+                    : (
+                        <div className="composer-stage-col composer-code-toggle-col">
+                          <span className="composer-stage-role">
+                            <label
+                              className="composer-stage-toggle"
+                              title="KÓD bekapcsolása — TERV → KÓD → REVIEW"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={false}
+                                onChange={(event) =>
+                                  setCodingPipelineEnabled(
+                                    event.currentTarget.checked,
+                                  )
+                                }
+                                aria-label="KÓD szakasz bekapcsolása"
+                              />
+                              <span>KÓD</span>
+                            </label>
+                          </span>
+                          <span className="composer-stage-placeholder">ki</span>
+                          <span className="composer-stage-placeholder">—</span>
+                          <span className="composer-stage-placeholder">—</span>
+                        </div>
+                      )}
+                  {composerReviewStage &&
+                    renderComposerStageColumn(
+                      composerReviewStage,
+                      composerReviewStageIndex,
+                    )}
                 </div>
               )}
             {pipelineProgress && (
@@ -17555,7 +18137,19 @@ Javítsd ki, majd futtasd le újra a teszteket.`
               </div>
             )}
             </div>
-            <div className="composer">
+            <div className={`composer${reviewCommentTarget ? " is-review-comment" : ""}`}>
+              {reviewCommentTarget && (
+                <div className="composer-review-comment-banner">
+                  <span>REVIEW KOMMENT</span>
+                  <button
+                    type="button"
+                    onClick={cancelReviewCommentMode}
+                    aria-label="REVIEW komment mód bezárása"
+                  >
+                    Mégse
+                  </button>
+                </div>
+              )}
               {composerQuotes.length > 0 && (
                 <div className="composer-quotes" aria-label="Kijelölt idézetek">
                   {composerQuotes.map((quote, index) => (
@@ -17632,7 +18226,16 @@ Javítsd ki, majd futtasd le újra a teszteket.`
                 }}
                 onKeyDown={handleInputKeyDown}
                 onPaste={handleInputPaste}
-                placeholder="Írj egy üzenetet, vagy illessz be egy screenshotot…"
+                placeholder={
+                  reviewCommentTarget
+                    ? "Írd be a kommentet a v2 újrafuttatásához…"
+                    : "Írj egy üzenetet, vagy illessz be egy screenshotot…"
+                }
+                aria-label={
+                  reviewCommentTarget
+                    ? "REVIEW komment a v2 újrafuttatásához"
+                    : "Üzenet"
+                }
                 />
               </div>
               {activeMode !== "general" && (
@@ -17678,7 +18281,7 @@ Javítsd ki, majd futtasd le újra a teszteket.`
                 <button
                   type="submit"
                   className="send-button"
-                  aria-label="Üzenet küldése"
+                  aria-label={reviewCommentTarget ? "Komment küldése" : "Üzenet küldése"}
                   disabled={imagesPreparing}
                 >
                   ↑

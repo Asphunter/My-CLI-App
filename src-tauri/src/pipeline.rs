@@ -25,14 +25,35 @@ const MAX_ARTIFACT_CHARS: usize = 12_000;
 #[serde(rename_all = "snake_case")]
 pub enum StageRole {
     Plan,
+    PlanReview,
     Code,
     Review,
 }
 
 impl StageRole {
+    /// Stable value sent to the frontend/store. `Debug` formatting is not a
+    /// wire format for compound roles (`PlanReview` would become `planreview`).
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::PlanReview => "plan_review",
+            Self::Code => "code",
+            Self::Review => "review",
+        }
+    }
+
+    pub fn is_review(self) -> bool {
+        matches!(self, Self::PlanReview | Self::Review)
+    }
+
+    pub fn starts_fresh_session(self) -> bool {
+        self.is_review()
+    }
+
     pub fn tool_profile(self) -> StageToolProfile {
         match self {
             Self::Plan => StageToolProfile::ReadOnly,
+            Self::PlanReview => StageToolProfile::ReadOnly,
             Self::Code => StageToolProfile::Full,
             Self::Review => StageToolProfile::Reviewer,
         }
@@ -42,6 +63,7 @@ impl StageRole {
     pub fn label(self) -> &'static str {
         match self {
             Self::Plan => "TERV",
+            Self::PlanReview => "TERV REVIEW",
             Self::Code => "KÓD",
             Self::Review => "REVIEW",
         }
@@ -50,6 +72,7 @@ impl StageRole {
     fn artifact_heading(self) -> &'static str {
         match self {
             Self::Plan => "A tervező terve",
+            Self::PlanReview => "A terv bírálata",
             Self::Code => "A kódoló összefoglalója",
             Self::Review => "A korábbi review",
         }
@@ -61,8 +84,9 @@ impl StageRole {
                 "Te vagy a tervező. Fájlt NEM módosíthatsz és parancsot NEM futtathatsz; \
                  a szerkesztő eszközöket meg sem kaptad. Olvasd el, ami a feladathoz kell, \
                  majd adj számozott lépéslistát: minden lépésnél nevezd meg az érintett \
-                 fájlt és azt, hogy mi változik. Legfeljebb 8 pont legyen — egy pont egy \
-                 összefüggő munkaegység, ne bontsd apró részlépésekre. \
+                 fájlt és azt, hogy mi változik. A pontok számát te határozd meg a \
+                 feladat érdemi bontása alapján; egy pont egy összefüggő munkaegység \
+                 legyen, ne bontsd apró részlépésekre. \
                  Az eredeti feladat számszerű követelményeit (tartományok, mértékegységek, \
                  darabszámok, nevesített értékek) szó szerint tartsd meg, és a tervben is \
                  ugyanabban a mennyiségben és egységben nevezd meg őket, ahogy a feladat \
@@ -70,6 +94,9 @@ impl StageRole {
                  Ha bármelyiket mégis átértelmezed, azt `## Eltérés a feladattól` cím alatt, \
                  tételesen és indoklással írd le. A végén sorold fel a kockázatokat. \
                  Ne írd meg a kódot, csak a tervet."
+            }
+            Self::PlanReview => {
+                "Te vagy a független műszaki tervbíráló. A TERV-et nem te írtad. Fájlt NEM módosíthatsz és parancsot NEM futtathatsz; csak olvasó és webes forráskereső eszközöket kaptál. ELŐSZÖR az EREDETI FELADAT ellenőrizd, utána a tervet. Ellenőrizd a követelmények teljes lefedését, a számszerű értékeket és mértékegységeket, a feltételezéseket, az architektúrát és interfészeket, a mérési/kalibrációs/verifikációs stratégiát, a hibautakat és kockázatokat, valamint külső forrásoknál a forrásminőséget és licencet. A blokkoló hibákat különítsd el az ajánlásoktól, és minden megállapítást bizonyítékkal támassz alá. A végén pontosan `VERDIKT: ELFOGAD` vagy `VERDIKT: JAVÍTANDÓ` sort adj, utána egyetlen mondat indoklással."
             }
             Self::Code => {
                 "Te vagy a kódoló. Hajtsd végre a fenti tervet. Mielőtt bármihez nyúlnál, \
@@ -106,6 +133,45 @@ impl StageRole {
     }
 }
 
+/// The stage whose artifact is the user-facing output of a recipe, and the
+/// stage from which a rejected review can be resumed. These are deliberately
+/// separate from `StageRole`: a recipe may have a plan review without ever
+/// having a coding stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecipeBoundaryRole {
+    Plan,
+    Code,
+}
+
+impl Default for RecipeBoundaryRole {
+    fn default() -> Self {
+        Self::Code
+    }
+}
+
+impl RecipeBoundaryRole {
+    fn stage_role(self) -> StageRole {
+        match self {
+            Self::Plan => StageRole::Plan,
+            Self::Code => StageRole::Code,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecipeReviewTarget {
+    Plan,
+    Implementation,
+}
+
+impl Default for RecipeReviewTarget {
+    fn default() -> Self {
+        Self::Implementation
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecipeStage {
@@ -126,6 +192,15 @@ pub struct Recipe {
     pub id: String,
     pub label: String,
     pub stages: Vec<RecipeStage>,
+    /// Which artifact the VÁLASZ tab and file summary should foreground.
+    #[serde(default)]
+    pub output_role: RecipeBoundaryRole,
+    /// Which stage a rejected review reruns first.
+    #[serde(default)]
+    pub retry_from_role: RecipeBoundaryRole,
+    /// Whether the final verdict evaluates the plan or the implementation.
+    #[serde(default)]
+    pub review_target: RecipeReviewTarget,
 }
 
 impl Recipe {
@@ -146,6 +221,46 @@ impl Recipe {
             // Two coding stages would both claim the same working tree and the
             // rollback guard could no longer attribute a change to one turn.
             return Err("Egy receptben legfeljebb egy kódoló szakasz lehet.".to_string());
+        }
+        if !self
+            .stages
+            .iter()
+            .any(|stage| stage.role == self.output_role.stage_role())
+        {
+            return Err("A recept kimeneti szerepe nincs benne a szakaszokban.".to_string());
+        }
+        if !self
+            .stages
+            .iter()
+            .any(|stage| stage.role == self.retry_from_role.stage_role())
+        {
+            return Err("A recept újrafuttatási szerepe nincs benne a szakaszokban.".to_string());
+        }
+        let review_role = match self.review_target {
+            RecipeReviewTarget::Plan => StageRole::PlanReview,
+            RecipeReviewTarget::Implementation => StageRole::Review,
+        };
+        if !self.stages.iter().any(|stage| stage.role == review_role) {
+            return Err("A recept bírálati céljához nincs megfelelő review szakasz.".to_string());
+        }
+        for (index, stage) in self.stages.iter().enumerate() {
+            match stage.role {
+                StageRole::PlanReview
+                    if !self.stages[..index]
+                        .iter()
+                        .any(|s| s.role == StageRole::Plan) =>
+                {
+                    return Err("A TERV REVIEW csak TERV után állhat.".to_string());
+                }
+                StageRole::Review
+                    if !self.stages[..index]
+                        .iter()
+                        .any(|s| s.role == StageRole::Code) =>
+                {
+                    return Err("A kód REVIEW csak KÓD után állhat.".to_string());
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -177,30 +292,46 @@ pub fn builtin_recipes() -> Vec<Recipe> {
         effort: Some(effort.to_string()),
         max_turns: Some(max_turns),
     };
-    vec![Recipe {
-        id: "plan_code_review".to_string(),
-        label: "Terv → Kód → Review".to_string(),
-        stages: vec![
-            // Medium on both working stages: `max` on the planner bought
-            // deliberation the plan rarely needed and paid for it in minutes
-            // per run, and the two stages that produce the work should reason
-            // at the same level rather than one straining while the other
-            // coasts.
-            claude(StageRole::Plan, "claude-opus-5", "medium", 15),
-            // A kódoló körönként eszközt hív: a lépéskövetés (TaskUpdate a
-            // lépés előtt és után) nyolc lépésnél önmagában ~16 kör, mellé az
-            // olvasás, szerkesztés, tesztfuttatás. A 40 valódi feladaton
-            // rendre elfogyott — a szakasz „Reached maximum number of turns"
-            // hibával halt meg, és a kész munka visszagördült. A 120 továbbra
-            // is elszabadulás-védelem, nem munkaplafon.
-            claude(StageRole::Code, "claude-opus-5", "medium", 120),
-            // A bíráló ugyanúgy checklistet vezet (TaskCreate/TaskUpdate), és
-            // fájlt olvas, tesztet futtat — a 15 kör a könyvelésre is kevés
-            // volt, és a szakasz „Reached maximum number of turns (15)"-tel
-            // halt meg. A limit itt is elszabadulás-védelem, nem munkaplafon.
-            codex(StageRole::Review, "gpt-5.6-sol", "medium", 120),
-        ],
-    }]
+    vec![
+        Recipe {
+            id: "plan_code_review".to_string(),
+            label: "Terv → Kód → Review".to_string(),
+            stages: vec![
+                // Medium on both working stages: `max` on the planner bought
+                // deliberation the plan rarely needed and paid for it in minutes
+                // per run, and the two stages that produce the work should reason
+                // at the same level rather than one straining while the other
+                // coasts.
+                claude(StageRole::Plan, "claude-opus-5", "medium", 15),
+                // A kódoló körönként eszközt hív: a lépéskövetés (TaskUpdate a
+                // lépés előtt és után) minden tervpontnál új köröket jelent, mellé az
+                // olvasás, szerkesztés, tesztfuttatás. A 40 valódi feladaton
+                // rendre elfogyott — a szakasz „Reached maximum number of turns"
+                // hibával halt meg, és a kész munka visszagördült. A 120 továbbra
+                // is elszabadulás-védelem, nem munkaplafon.
+                claude(StageRole::Code, "claude-opus-5", "medium", 120),
+                // A bíráló ugyanúgy checklistet vezet (TaskCreate/TaskUpdate), és
+                // fájlt olvas, tesztet futtat — a 15 kör a könyvelésre is kevés
+                // volt, és a szakasz „Reached maximum number of turns (15)"-tel
+                // halt meg. A limit itt is elszabadulás-védelem, nem munkaplafon.
+                codex(StageRole::Review, "gpt-5.6-sol", "medium", 120),
+            ],
+            output_role: RecipeBoundaryRole::Code,
+            retry_from_role: RecipeBoundaryRole::Code,
+            review_target: RecipeReviewTarget::Implementation,
+        },
+        Recipe {
+            id: "plan_review".to_string(),
+            label: "Terv → Terv review".to_string(),
+            stages: vec![
+                claude(StageRole::Plan, "claude-opus-5", "medium", 15),
+                codex(StageRole::PlanReview, "gpt-5.6-sol", "medium", 120),
+            ],
+            output_role: RecipeBoundaryRole::Plan,
+            retry_from_role: RecipeBoundaryRole::Plan,
+            review_target: RecipeReviewTarget::Plan,
+        },
+    ]
 }
 
 pub fn recipe_by_id(id: &str) -> Option<Recipe> {
@@ -241,6 +372,20 @@ pub fn stage_prompt(
     original_prompt: &str,
     artifacts: &[StageArtifact],
     feedback: Option<&str>,
+) -> String {
+    stage_prompt_with_comments(role, original_prompt, artifacts, feedback, None)
+}
+
+/// Builds a retry prompt while keeping the reviewer objection and the user's
+/// own notes in separate, explicit blocks. Both are delivered only to the
+/// first stage of the resumed chain; the later reviewer inspects the produced
+/// result rather than being anchored by the user's wording.
+pub fn stage_prompt_with_comments(
+    role: StageRole,
+    original_prompt: &str,
+    artifacts: &[StageArtifact],
+    feedback: Option<&str>,
+    user_comments: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
     prompt.push_str("[EREDETI FELADAT]\n");
@@ -285,6 +430,15 @@ pub fn stage_prompt(
         );
     }
 
+    if let Some(comments) = user_comments.map(str::trim).filter(|value| !value.is_empty()) {
+        prompt.push_str("\n[FELHASZNÁLÓI MEGJEGYZÉSEK]\n");
+        prompt.push_str(
+            "A felhasználó az újrafuttatáshoz ezeket a kiegészítő szempontokat adta. Vedd figyelembe őket, de ne tekintsd őket a bíráló verdiktjének:\n",
+        );
+        prompt.push_str(&truncated(comments, MAX_ARTIFACT_CHARS));
+        prompt.push('\n');
+    }
+
     prompt.push_str("[SZEREP]\n");
     prompt.push_str(role.instruction());
     prompt.push_str("\n\n[STRICT STEP TRACKING PROTOCOL]\n");
@@ -295,11 +449,14 @@ pub fn stage_prompt(
         StageRole::Review => prompt.push_str(
             "Create the complete review checklist before the first inspection. Keep exactly one item in_progress at a time, "
         ),
+        StageRole::PlanReview => prompt.push_str(
+            "Create the complete plan-review checklist before the first inspection. Keep exactly one item in_progress at a time, "
+        ),
         StageRole::Plan => prompt.push_str(
             "Do not present internal work as completed plan steps; the numbered plan is the output, not a progress claim. "
         ),
     }
-    if matches!(role, StageRole::Code | StageRole::Review) {
+    if matches!(role, StageRole::Code | StageRole::PlanReview | StageRole::Review) {
         prompt.push_str(
             "then update that same item before moving to the next one. Do not jump ahead, go back, or replace the checklist with a different set of work phases. ",
         );
@@ -507,6 +664,11 @@ pub struct PipelineRunRequest {
     /// The reviewer's objection, handed to the first stage of a re-run.
     #[serde(default)]
     pub retry_feedback: Option<String>,
+    /// Optional notes the user added beside the v2 retry action. Kept separate
+    /// from the reviewer's objection so the model can distinguish authority
+    /// from additional context.
+    #[serde(default)]
+    pub user_comments: Option<String>,
     /// Ties the iterations of one question together. The first run leaves this
     /// empty and becomes the chain; every re-run names it.
     #[serde(default)]
@@ -715,6 +877,8 @@ pub struct RunStart {
     /// Handed to the first stage that actually runs, and to that one only: the
     /// stages after it read the objection out of the review artifact anyway.
     pub feedback: Option<String>,
+    /// Optional user notes, handed to the same first resumed stage only.
+    pub user_comments: Option<String>,
 }
 
 /// Walks the chain, possibly from partway through it.
@@ -740,6 +904,7 @@ where
         start_index,
         seed_artifacts,
         feedback,
+        user_comments,
     } = start;
     let mut artifacts = seed_artifacts;
     let mut stages = Vec::<StageRunResult>::new();
@@ -768,18 +933,21 @@ where
         let execution = StageExecution {
             index,
             stage: stage.clone(),
-            prompt: stage_prompt(
+            prompt: stage_prompt_with_comments(
                 stage.role,
                 original_prompt,
                 &artifacts,
                 (index == start_index).then_some(feedback.as_deref()).flatten(),
+                (index == start_index)
+                    .then_some(user_comments.as_deref())
+                    .flatten(),
             ),
             // A bíráló nem folytatja a kódoló menetét. Két okból: aki a kódot
             // írta, annak a session-je nem független szem, a bírálandó munkát
             // pedig az artifact-blokk amúgy is átadja. Mellékhatásként a
             // szakasz nem várja meg a kódoló megnőtt session-jének betöltését
             // sem — a Claude-hídnál ez percenkénti nagyságrendű állás volt.
-            session_id: (stage.role != StageRole::Review)
+            session_id: (!stage.role.starts_fresh_session())
                 .then(|| session_by_runtime.get(&runtime_key).cloned())
                 .flatten(),
             // The user's attachments and conversation context belong to the
@@ -805,7 +973,7 @@ where
                 if let Some(session) = outcome.session_id.clone() {
                     session_by_runtime.insert(runtime_key, session);
                 }
-                let review = (stage.role == StageRole::Review)
+                let review = stage.role.is_review()
                     .then(|| parse_review_verdict(&outcome.text))
                     .flatten();
                 artifacts.push(StageArtifact {
@@ -889,6 +1057,8 @@ mod tests {
             StageToolProfile::ReadOnly,
             "a planner that can edit files is not a planner"
         );
+        assert_eq!(StageRole::PlanReview.tool_profile(), StageToolProfile::ReadOnly);
+        assert_eq!(StageRole::PlanReview.as_wire(), "plan_review");
         assert_eq!(StageRole::Code.tool_profile(), StageToolProfile::Full);
         assert_eq!(
             StageRole::Review.tool_profile(),
@@ -901,7 +1071,12 @@ mod tests {
     fn every_stage_prompt_demands_tex_notation_for_formulas() {
         // A GONDOLKODÁS MENETE KaTeX-szel renderel, és csak TeX-jelölést
         // ismer fel — a Claude e szabály nélkül Unicode-képleteket írt.
-        for role in [StageRole::Plan, StageRole::Code, StageRole::Review] {
+        for role in [
+            StageRole::Plan,
+            StageRole::PlanReview,
+            StageRole::Code,
+            StageRole::Review,
+        ] {
             let prompt = stage_prompt(role, "Feladat.", &[]);
             assert!(prompt.contains("[KÉPLETEK]"));
             assert!(prompt.contains("\\( ... \\)"));
@@ -912,8 +1087,9 @@ mod tests {
     #[test]
     fn coding_and_review_prompts_require_ordered_explicit_step_tracking() {
         let code = stage_prompt(StageRole::Code, "Feladat.", &[]);
+        let plan_review = stage_prompt(StageRole::PlanReview, "Feladat.", &[]);
         let review = stage_prompt(StageRole::Review, "Feladat.", &[]);
-        for prompt in [code, review] {
+        for prompt in [code, plan_review, review] {
             assert!(prompt.contains("STRICT STEP TRACKING PROTOCOL"));
             assert!(prompt.contains("exact plan/review title"));
             assert!(prompt.contains("one item in_progress at a time") || prompt.contains("complete checklist"));
@@ -1023,6 +1199,80 @@ mod tests {
             RunStatus::Failed,
             "the later roles would reason about an artifact that does not exist"
         );
+    }
+
+    #[test]
+    fn plan_review_recipe_runs_the_plan_then_a_fresh_plan_review() {
+        let recipe = recipe_by_id("plan_review").expect("preset");
+        recipe.validate().expect("valid plan review recipe");
+        assert_eq!(recipe.stages.len(), 2);
+        assert_eq!(recipe.stages[0].role, StageRole::Plan);
+        assert_eq!(recipe.stages[1].role, StageRole::PlanReview);
+        let recorder = Recorder::with(vec![
+            ok("1. Ellenőrizd a követelményeket.", Some("author-session")),
+            ok("VERDIKT: ELFOGAD - a terv teljes.", Some("review-session")),
+        ]);
+        let outcome = recorder.run(&recipe, "Készíts tervet.", None);
+        let seen = recorder.seen.borrow();
+        assert_eq!(seen.iter().map(|run| run.index).collect::<Vec<_>>(), vec![0, 1]);
+        assert!(seen[1].prompt.contains("A tervező terve"));
+        assert_eq!(seen[1].session_id, None, "the plan review starts fresh");
+        assert_eq!(outcome.stages[1].role, StageRole::PlanReview);
+        assert_eq!(
+            outcome.stages[1]
+                .review
+                .as_ref()
+                .expect("plan verdict")
+                .verdict,
+            ReviewVerdict::Accepted
+        );
+    }
+
+    #[test]
+    fn recipe_behavior_metadata_is_stable_on_the_frontend_wire() {
+        let full = recipe_by_id("plan_code_review").expect("full preset");
+        let plan = recipe_by_id("plan_review").expect("plan review preset");
+        assert_eq!(full.output_role, RecipeBoundaryRole::Code);
+        assert_eq!(full.retry_from_role, RecipeBoundaryRole::Code);
+        assert_eq!(full.review_target, RecipeReviewTarget::Implementation);
+        assert_eq!(plan.output_role, RecipeBoundaryRole::Plan);
+        assert_eq!(plan.retry_from_role, RecipeBoundaryRole::Plan);
+        assert_eq!(plan.review_target, RecipeReviewTarget::Plan);
+        let full_json = serde_json::to_value(full).expect("full recipe json");
+        let plan_json = serde_json::to_value(plan).expect("plan recipe json");
+        assert_eq!(full_json["outputRole"], "code");
+        assert_eq!(full_json["retryFromRole"], "code");
+        assert_eq!(full_json["reviewTarget"], "implementation");
+        assert_eq!(plan_json["outputRole"], "plan");
+        assert_eq!(plan_json["retryFromRole"], "plan");
+        assert_eq!(plan_json["reviewTarget"], "plan");
+    }
+
+    #[test]
+    fn user_comments_are_separate_and_only_reach_the_first_retry_stage() {
+        let recipe = recipe_by_id("plan_code_review").expect("preset");
+        let seen = std::cell::RefCell::new(Vec::<StageExecution>::new());
+        let _ = tauri::async_runtime::block_on(run_stages_from(
+            &recipe,
+            "Feladat.",
+            RunStart {
+                start_index: 1,
+                seed_artifacts: vec![artifact(StageRole::Plan, "A terv.")],
+                feedback: Some("A bíráló kifogása.".to_string()),
+                user_comments: Some("A felhasználó kiegészítése.".to_string()),
+                ..RunStart::default()
+            },
+            || false,
+            |execution| {
+                seen.borrow_mut().push(execution);
+                async { ok("Kész.", None) }
+            },
+        ));
+        let seen = seen.borrow();
+        assert!(seen[0].prompt.contains("[MIÉRT FUTSZ ÚJRA]"));
+        assert!(seen[0].prompt.contains("[FELHASZNÁLÓI MEGJEGYZÉSEK]"));
+        assert!(seen[0].prompt.contains("A felhasználó kiegészítése."));
+        assert!(!seen[1].prompt.contains("[FELHASZNÁLÓI MEGJEGYZÉSEK]"));
     }
 
     /// Records what each stage was handed, so a test asserts on the chain
@@ -1382,6 +1632,9 @@ mod tests {
             id: "bad".to_string(),
             label: "Két kódoló".to_string(),
             stages: vec![recommended.stages[1].clone(), recommended.stages[1].clone()],
+            output_role: RecipeBoundaryRole::Code,
+            retry_from_role: RecipeBoundaryRole::Code,
+            review_target: RecipeReviewTarget::Implementation,
         };
         assert!(
             two_writers.validate().is_err(),
@@ -1398,6 +1651,7 @@ mod tests {
             "Feladat.",
             RunStart {
                 initial_session: None,
+                user_comments: None,
                 start_index: 1,
                 seed_artifacts: vec![artifact(StageRole::Plan, "1. lépés: írd át a szorzást.")],
                 feedback: Some("a szorzás helyett összeadás maradt.".to_string()),

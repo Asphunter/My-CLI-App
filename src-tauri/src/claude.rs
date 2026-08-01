@@ -22,7 +22,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 use uuid::Uuid;
 
@@ -40,7 +40,6 @@ const DEFAULT_MAX_TURNS: u32 = 40;
 const MAX_TURNS_CEILING: u32 = 200;
 const MAX_API_KEY_LENGTH: usize = 4096;
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -163,6 +162,7 @@ fn pending_approvals() -> &'static Mutex<HashMap<String, String>> {
 }
 
 /// True while this turn has an approval or a question the user has not answered.
+#[cfg(test)]
 fn waiting_for_user(request_id: &str) -> bool {
     let approval = pending_approvals()
         .lock()
@@ -1391,55 +1391,15 @@ impl CancellableLineReader {
         Self { lines: receiver }
     }
 
+    /// Wait for the next bridge event without imposing a wall-clock deadline on
+    /// the turn. The short receive poll keeps user cancellation responsive; an
+    /// actual EOF still reports a closed bridge immediately.
     fn next(&self, cancellation: &AtomicBool) -> Result<Option<String>, String> {
-        self.next_with_idle_timeout(cancellation, BRIDGE_IDLE_TIMEOUT)
-    }
-
-    /// The idle timeout exists to catch a bridge that has died quietly. A turn
-    /// waiting on a person is not that: it is silent because the answer has not
-    /// been given yet, and killing it after ten minutes lost a chain's coding
-    /// stage that had already done its work and was asking to run the tests.
-    fn next_waiting_for_user(
-        &self,
-        cancellation: &AtomicBool,
-        request_id: &str,
-    ) -> Result<Option<String>, String> {
-        loop {
-            let blocked_on_user = waiting_for_user(request_id);
-            match self.next_with_idle_timeout(cancellation, BRIDGE_IDLE_TIMEOUT) {
-                Err(error) if blocked_on_user && error.contains("időtúllépés") => {
-                    // Still the user's move, so the clock starts over rather
-                    // than the turn being declared dead.
-                    if !waiting_for_user(request_id) {
-                        return Err(error);
-                    }
-                    continue;
-                }
-                other => return other,
-            }
-        }
-    }
-
-    fn next_with_idle_timeout(
-        &self,
-        cancellation: &AtomicBool,
-        idle_timeout: Duration,
-    ) -> Result<Option<String>, String> {
-        let deadline = Instant::now() + idle_timeout;
         loop {
             if cancellation.load(Ordering::Acquire) {
                 return Err("A Claude-kérés megszakítva.".to_string());
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(
-                    "A Claude bridge válasza időtúllépés miatt nem érkezett meg.".to_string(),
-                );
-            }
-            match self
-                .lines
-                .recv_timeout(remaining.min(Duration::from_millis(100)))
-            {
+            match self.lines.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(line) => return line,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1447,6 +1407,17 @@ impl CancellableLineReader {
                 }
             }
         }
+    }
+
+    /// User approvals/questions may leave the bridge silent for an arbitrary
+    /// amount of time. They are still ordinary events from the reader's point
+    /// of view, so they follow the same no-deadline path as every other event.
+    fn next_waiting_for_user(
+        &self,
+        cancellation: &AtomicBool,
+        _request_id: &str,
+    ) -> Result<Option<String>, String> {
+        self.next(cancellation)
     }
 }
 
@@ -1601,15 +1572,21 @@ mod tests {
     }
 
     #[test]
-    fn bridge_reader_reports_idle_timeout() {
+    fn bridge_reader_waits_without_a_wall_clock_timeout_until_cancelled() {
         let (_sender, receiver) = mpsc::channel();
         let reader = CancellableLineReader { lines: receiver };
-        let cancellation = AtomicBool::new(false);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let cancellation_for_reader = Arc::clone(&cancellation);
 
-        let error = reader
-            .next_with_idle_timeout(&cancellation, Duration::from_millis(2))
-            .expect_err("an idle bridge must time out");
-        assert!(error.contains("időtúllépés"));
+        let handle = thread::spawn(move || reader.next(&cancellation_for_reader));
+        thread::sleep(std::time::Duration::from_millis(10));
+        cancellation.store(true, Ordering::Release);
+
+        let error = handle
+            .join()
+            .expect("the bridge reader thread must finish after cancellation")
+            .expect_err("an idle bridge must wait until it is cancelled");
+        assert!(error.contains("megszakítva"));
     }
 
     #[test]

@@ -23,6 +23,7 @@ type CompactAnswersTimelineProps = {
   streaming: boolean;
   interrupted?: boolean;
   elapsed?: string;
+  statusIcon?: ReactNode;
   actions?: ReactNode;
   changes?: ReactNode;
   footer?: ReactNode;
@@ -59,6 +60,7 @@ export default function CompactAnswersTimeline({
   streaming,
   interrupted = false,
   elapsed,
+  statusIcon,
   actions,
   changes,
   footer,
@@ -79,6 +81,8 @@ export default function CompactAnswersTimeline({
   );
   const [expandedDetailId, setExpandedDetailId] = useState<string | null>(null);
   const [thinkingExpanded, setThinkingExpanded] = useState(false);
+  const [thinkingPreparing, setThinkingPreparing] = useState(false);
+  const [thinkingOpening, setThinkingOpening] = useState(false);
   const [thinkingClosing, setThinkingClosing] = useState(false);
   const [answerColumnWidth, setAnswerColumnWidth] = useState<number>();
   const [manualPanelHeight, setManualPanelHeight] = useState<number>();
@@ -109,14 +113,11 @@ export default function CompactAnswersTimeline({
         180,
         Math.min(COMPACT_ANSWER_MAX_HEIGHT, window.innerHeight - 230),
       );
-      const answerHeading = answersPanel.querySelector<HTMLElement>(
-        ".compact-answer-panel-heading",
-      );
       const answerHeight = Math.max(
         42,
         Math.min(
           answerViewportLimit,
-          (answerHeading?.offsetHeight ?? 29) + answersList.scrollHeight + 2,
+          answersList.scrollHeight + 2,
         ),
       );
       const heading = thinkingPanel.querySelector<HTMLElement>(
@@ -135,7 +136,7 @@ export default function CompactAnswersTimeline({
       const answerWithChangesHeight = Math.ceil(answerHeight) + changesHeight;
       const next = {
         answer: Math.ceil(answerHeight),
-        timeline: thinkingExpanded || thinkingClosing
+        timeline: thinkingExpanded || thinkingPreparing || thinkingClosing
           ? Math.max(answerWithChangesHeight, expandedThinkingHeight)
           : answerWithChangesHeight,
         changes: changesHeight,
@@ -147,6 +148,11 @@ export default function CompactAnswersTimeline({
           ? current
           : next,
       );
+      if (thinkingPreparing) {
+        setThinkingPreparing(false);
+        setThinkingOpening(true);
+        setThinkingExpanded(true);
+      }
     };
     measure();
     if (typeof ResizeObserver === "undefined") {
@@ -165,6 +171,7 @@ export default function CompactAnswersTimeline({
     expandedTechnicalId,
     selected?.text,
     thinkingExpanded,
+    thinkingPreparing,
     thinkingClosing,
     visibleTrace,
     Boolean(changes),
@@ -173,10 +180,22 @@ export default function CompactAnswersTimeline({
     setExpandedTechnicalId(null);
     setExpandedDetailId(null);
     setThinkingExpanded(false);
+    setThinkingPreparing(false);
+    setThinkingOpening(false);
     setThinkingClosing(false);
     setAnswerColumnWidth(undefined);
     setManualPanelHeight(undefined);
   }, [selected?.id]);
+
+  useEffect(() => {
+    if (!thinkingOpening) return;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      setThinkingOpening(false);
+      return;
+    }
+    const timeout = window.setTimeout(() => setThinkingOpening(false), 230);
+    return () => window.clearTimeout(timeout);
+  }, [thinkingOpening]);
 
   useEffect(() => {
     if (!thinkingClosing) return;
@@ -191,6 +210,7 @@ export default function CompactAnswersTimeline({
   const toggleThinking = () => {
     if (thinkingExpanded) {
       setThinkingExpanded(false);
+      setThinkingOpening(false);
       setThinkingClosing(true);
       return;
     }
@@ -198,7 +218,9 @@ export default function CompactAnswersTimeline({
       answersPanelRef.current?.getBoundingClientRect().width;
     if (closedAnswerWidth) setAnswerColumnWidth(closedAnswerWidth);
     setThinkingClosing(false);
-    setThinkingExpanded(true);
+    // Előbb láthatatlanul kimérjük a kétoszlopos elrendezés végső
+    // magasságát. Így a nyitás nem a rövid válasz magasságáról nő tovább.
+    setThinkingPreparing(true);
   };
 
   const startPanelResize = (
@@ -303,10 +325,10 @@ export default function CompactAnswersTimeline({
     manualPanelHeight && displayedContentFloor
       ? Math.max(manualPanelHeight, displayedContentFloor)
       : manualPanelHeight ??
-        (thinkingExpanded || thinkingClosing
+        (thinkingExpanded || thinkingPreparing || thinkingClosing
           ? panelHeights?.timeline
           : displayedContentFloor);
-  const thinkingVisible = thinkingExpanded || thinkingClosing;
+  const thinkingVisible = thinkingExpanded || thinkingPreparing || thinkingClosing;
   const layoutStyle = {
     ...(displayedAnswerHeight
       ? { "--compact-answer-height": `${displayedAnswerHeight}px` }
@@ -327,6 +349,16 @@ export default function CompactAnswersTimeline({
       aria-label="Válasz és gondolkodás"
     >
       <div
+        className={`compact-answer-status-rail${streaming ? " is-running" : interrupted ? " is-interrupted" : " is-complete"}`}
+        role="status"
+        aria-label={`${streaming ? "A válasz készül" : interrupted ? "A válasz megszakítva" : "A válasz elkészült"}${elapsed ? `, ${elapsed}` : ""}`}
+      >
+        <span className="compact-answer-provider-mark" aria-hidden="true">
+          {statusIcon}
+        </span>
+        {elapsed && <time>{elapsed}</time>}
+      </div>
+      <div
         className={`compact-answers-layout${thinkingVisible ? "" : " is-thinking-collapsed"}${thinkingClosing ? " is-thinking-closing" : ""}${footer ? " has-compact-tail" : ""}${resizing === "columns" ? " is-resizing-columns" : ""}${resizing === "height" ? " is-resizing-height" : ""}${selected?.live ? " is-current" : ""}`}
         style={layoutStyle}
         ref={layoutRef}
@@ -336,59 +368,29 @@ export default function CompactAnswersTimeline({
           aria-label="Válasz"
           ref={answersPanelRef}
         >
-          <div className="trace-panel-heading compact-answer-panel-heading">
-            <strong>VÁLASZ</strong>
-            <span
-              className={`compact-answer-state${streaming ? " is-running" : interrupted ? " is-interrupted" : " is-complete"}`}
-              role="status"
-              aria-label={
-                streaming
-                  ? "A válasz készül"
-                  : interrupted
-                    ? "A válasz megszakítva"
-                    : "A válasz elkészült"
-              }
-            >
-              {streaming ? (
-                <span className="trace-answer-spinner" aria-hidden="true" />
-              ) : interrupted ? (
-                <>
-                  <span className="compact-answer-interrupted-icon" aria-hidden="true">
-                    ■
-                  </span>
-                  <span className="compact-answer-interrupted-label">
-                    MEGSZAKÍTVA
-                  </span>
-                </>
-              ) : (
-                <span className="compact-answer-complete-icon" aria-hidden="true">
-                  ✓
-                </span>
-              )}
-              {elapsed && <time>{elapsed}</time>}
-            </span>
-            <button
-              type="button"
-              className="compact-thinking-side-toggle"
-              onClick={toggleThinking}
-              aria-expanded={thinkingExpanded}
-              aria-controls={`compact-thinking-${selected?.id ?? "pending"}`}
-              aria-label={
-                thinkingExpanded
-                  ? "Gondolkodás menetének bezárása"
-                  : "Gondolkodás menetének megnyitása"
-              }
-              title={
-                thinkingExpanded
-                  ? "Gondolkodás menetének bezárása"
-                  : "Gondolkodás menetének megnyitása"
-              }
-            >
-              <span aria-hidden="true">{thinkingExpanded ? "‹" : "›"}</span>
-            </button>
-          </div>
           <div className="compact-answers-list" ref={answersListRef}>
-            {actions && <div className="compact-answer-action-row">{actions}</div>}
+            <div className="compact-answer-action-row">
+              {actions}
+              <button
+                type="button"
+                className="compact-thinking-toolbar-toggle"
+                onClick={toggleThinking}
+                aria-expanded={thinkingExpanded}
+                aria-controls={`compact-thinking-${selected?.id ?? "pending"}`}
+                aria-label={
+                  thinkingExpanded
+                    ? "Gondolkodás menetének bezárása"
+                    : "Gondolkodás menetének megnyitása"
+                }
+                title={
+                  thinkingExpanded
+                    ? "Gondolkodás menetének bezárása"
+                    : "Gondolkodás menetének megnyitása"
+                }
+              >
+                <span aria-hidden="true">{thinkingExpanded ? "‹" : "›"}</span>
+              </button>
+            </div>
             {selected && (
               <article
                 className={`compact-answer-block${selected.pending ? " is-pending" : ""}`}
@@ -428,7 +430,7 @@ export default function CompactAnswersTimeline({
           />
         )}
         <section
-          className={`compact-thinking-panel${thinkingExpanded ? " is-opening" : thinkingClosing ? " is-closing" : " is-collapsed"}`}
+          className={`compact-thinking-panel${thinkingPreparing ? " is-preparing" : thinkingOpening ? " is-opening" : thinkingClosing ? " is-closing" : thinkingExpanded ? "" : " is-collapsed"}`}
           id={`compact-thinking-${selected?.id ?? "pending"}`}
           aria-label="Gondolkodás menete"
           aria-hidden={!thinkingExpanded}

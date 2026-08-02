@@ -144,6 +144,8 @@ type Message = {
   /** Which pipeline stage produced this message, when it belongs to a run. */
   pipeline?: MessagePipeline;
   interaction?: MessageInteraction;
+  /** The AI that produced this answer; drives the answer-rail identity icon. */
+  provider?: AgentProviderId;
 };
 
 type AgentProviderId = "codex" | "anthropic" | "kimi" | "deepseek";
@@ -159,6 +161,26 @@ const PROVIDER_LABELS: Record<AgentProviderId, string> = {
   kimi: "Kimi",
   deepseek: "DeepSeek",
 };
+
+const normalizeAgentProvider = (
+  provider: string | null | undefined,
+): AgentProviderId | undefined => {
+  const value = provider?.trim().toLowerCase();
+  if (!value) return undefined;
+  if (value === "codex" || value === "openai" || value.includes("chatgpt"))
+    return "codex";
+  if (value === "anthropic" || value.includes("claude")) return "anthropic";
+  if (value.includes("kimi")) return "kimi";
+  if (value.includes("deepseek")) return "deepseek";
+  return undefined;
+};
+
+const COMPOSER_PROVIDERS: AgentProviderId[] = [
+  "anthropic",
+  "codex",
+  "kimi",
+  "deepseek",
+];
 
 type MessageInteraction = {
   kind: "steer";
@@ -322,6 +344,47 @@ type PipelineRecipe = {
   reviewTarget?: PipelineRecipeReviewTarget;
 };
 
+// The browser build is also our lightweight visual preview. Mirror the
+// desktop's default recipe there so the composer switch and both faces can be
+// inspected without a running Tauri command backend.
+const PREVIEW_PIPELINE_RECIPES: PipelineRecipe[] = [
+  {
+    id: "plan_code_review",
+    label: "Terv → Kód → Review",
+    stages: [
+      {
+        role: "plan",
+        provider: "anthropic",
+        runtime: "claude_agent_bridge",
+        accessProfile: "claude",
+        model: "claude-opus-5",
+        effort: "medium",
+        maxTurns: 15,
+      },
+      {
+        role: "code",
+        provider: "anthropic",
+        runtime: "claude_agent_bridge",
+        accessProfile: "claude",
+        model: "claude-opus-5",
+        effort: "medium",
+        maxTurns: 120,
+      },
+      {
+        role: "review",
+        provider: "codex",
+        runtime: "codex_app_server",
+        model: "gpt-5.6-sol",
+        effort: "medium",
+        maxTurns: 120,
+      },
+    ],
+    outputRole: "code",
+    retryFromRole: "code",
+    reviewTarget: "implementation",
+  },
+];
+
 const recipeOutputRole = (recipe: PipelineRecipe): PipelineRecipeBoundaryRole =>
   recipe.outputRole ??
   (recipe.stages.some((stage) => stage.role === "code") ? "code" : "plan");
@@ -424,10 +487,8 @@ const MAX_CHAIN_ITERATIONS = 3;
  */
 const PIPELINE_MODELS: Record<AgentProviderId, string[]> = {
   anthropic: [
-    "claude-opus-5",
     "claude-opus-4-8",
-    "claude-opus-4-7",
-    "claude-opus-4-6",
+    "claude-opus-5",
     "claude-fable-5",
   ],
   codex: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
@@ -437,10 +498,8 @@ const PIPELINE_MODELS: Record<AgentProviderId, string[]> = {
 
 /** Short enough that every cell fits one fixed width. */
 const PIPELINE_MODEL_LABELS: Record<string, string> = {
-  "claude-opus-5": "Opus 5",
   "claude-opus-4-8": "Opus 4.8",
-  "claude-opus-4-7": "Opus 4.7",
-  "claude-opus-4-6": "Opus 4.6",
+  "claude-opus-5": "Opus 5",
   "claude-fable-5": "Fable 5",
   // The generation is already implied by the vendor cell above, and carrying
   // it here forced every cell to the width of "5.6 Terra".
@@ -939,13 +998,6 @@ const fallbackModels: CodexModel[] = [
  */
 const claudeCodingModels: CodexModel[] = [
   {
-    id: "claude-opus-5",
-    displayName: "Opus 5",
-    description: "A legerősebb Claude coding modell.",
-    supportedReasoningEfforts: FALLBACK_EFFORTS,
-    defaultReasoningEffort: DEFAULT_CLAUDE_EFFORT,
-  },
-  {
     id: "claude-opus-4-8",
     displayName: "Opus 4.8",
     description: "Claude Opus 4.8 coding modell.",
@@ -953,16 +1005,9 @@ const claudeCodingModels: CodexModel[] = [
     defaultReasoningEffort: DEFAULT_CLAUDE_EFFORT,
   },
   {
-    id: "claude-opus-4-7",
-    displayName: "Opus 4.7",
-    description: "Claude Opus 4.7 coding modell.",
-    supportedReasoningEfforts: FALLBACK_EFFORTS,
-    defaultReasoningEffort: DEFAULT_CLAUDE_EFFORT,
-  },
-  {
-    id: "claude-opus-4-6",
-    displayName: "Opus 4.6",
-    description: "Claude Opus 4.6 coding modell.",
+    id: "claude-opus-5",
+    displayName: "Opus 5",
+    description: "A legerősebb Claude coding modell.",
     supportedReasoningEfforts: FALLBACK_EFFORTS,
     defaultReasoningEffort: DEFAULT_CLAUDE_EFFORT,
   },
@@ -2747,6 +2792,7 @@ const mergeMessages = (
               : message.quoteRefs,
         detailed: existing.detailed ?? message.detailed,
         interaction: existing.interaction ?? message.interaction,
+        provider: message.provider ?? existing.provider,
         changeSummary:
           existing.changeSummary && existing.changeSummary.length > 0
             ? existing.changeSummary
@@ -5521,41 +5567,133 @@ type EffortSliderProps = {
   activeIndex: number;
   activeLabel: string;
   onSelect: (index: number) => void;
-  vertical?: boolean;
+  provider: AgentProviderId;
+  modelId: string;
+  models: string[];
+  onCycleProvider: (direction: 1 | -1) => void;
+  onSelectModel: (modelId: string) => void;
+  controlLabel: string;
 };
+
+function ProviderMark({ provider }: { provider: AgentProviderId }) {
+  if (provider === "anthropic") {
+    return (
+      <svg viewBox="0 0 24 24" data-provider="anthropic" aria-hidden="true">
+        <path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M18.4 5.6 5.6 18.4" />
+      </svg>
+    );
+  }
+  if (provider === "kimi") {
+    return (
+      <svg viewBox="0 0 24 24" data-provider="kimi" aria-hidden="true">
+        <path className="kimi-k" d="M4.2 3.2v17.6M4.2 12h6.1L15.8 3h4.1l-5.8 9 6.2 8.8h-4.4L10.3 12" />
+        <path className="kimi-dot" d="M17.2 3.1h3.7v4.2h-3.7z" />
+      </svg>
+    );
+  }
+  if (provider === "deepseek") {
+    return (
+      <svg viewBox="0 0 24 24" data-provider="deepseek" aria-hidden="true">
+        <path className="deepseek-whale" d="M2.2 11.6c1.8.3 3.5-.1 5-1.2 1.5-1 3.2-1.4 5.1-1.1l1.6-2.6c.5-.8 1.1-1.2 1.8-1.3-.1 1.1.1 2 .6 2.7.8-.8 1.8-1.1 3-.9-.2 1.4-1 2.5-2.4 3.1.7 4.6-2.2 8-7.2 8-4.2 0-6.8-2.2-7.5-6.7Z" />
+        <path className="deepseek-belly" d="M5.5 13.4c2.4.9 4.8.6 7.1-.8-1 2.2-2.7 3.2-5.1 2.8" />
+        <circle className="deepseek-eye" cx="13.7" cy="10.8" r=".8" />
+      </svg>
+    );
+  }
+  return (
+    <svg viewBox="0 0 24 24" data-provider="codex" aria-hidden="true">
+      {[0, 60, 120, 180, 240, 300].map((rotation) => (
+        <path
+          d="M12 2.8a4.5 4.5 0 0 1 4.5 4.5v3.8L14 12.6V7.3a2 2 0 0 0-2-2H8.2"
+          transform={`rotate(${rotation} 12 12)`}
+          key={rotation}
+        />
+      ))}
+    </svg>
+  );
+}
 
 function EffortSlider({
   efforts,
   activeIndex,
   activeLabel,
   onSelect,
-  vertical = false,
+  provider,
+  modelId,
+  models,
+  onCycleProvider,
+  onSelectModel,
+  controlLabel,
 }: EffortSliderProps) {
   const max = Math.max(0, efforts.length - 1);
   const progress = max > 0 ? (activeIndex / max) * 100 : 0;
+  const thumbOffset = 9 - 18 * (progress / 100);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const wheelAtRef = useRef(0);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!modelMenuOpen) return;
+    const closeOutside = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node))
+        setModelMenuOpen(false);
+    };
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setModelMenuOpen(false);
+    };
+    window.addEventListener("pointerdown", closeOutside);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeOutside);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [modelMenuOpen]);
+
+  const handleWheel = (event: WheelEvent<HTMLDivElement>) => {
+    if (Math.abs(event.deltaY) < 2) return;
+    event.preventDefault();
+    const now = Date.now();
+    if (now - wheelAtRef.current < 240) return;
+    wheelAtRef.current = now;
+    setModelMenuOpen(false);
+    onCycleProvider(event.deltaY > 0 ? 1 : -1);
+  };
+
   return (
     <div
-      className={`composer-effort-slider${vertical ? " is-vertical" : ""}`}
-      style={{ "--effort-progress": `${progress}%` } as CSSProperties}
-      title={`Reasoning: ${activeLabel}`}
+      className="composer-effort-slider has-model-thumb"
+      style={
+        {
+          "--effort-progress": `${progress}%`,
+          "--effort-thumb-left": `calc(${progress}% + ${thumbOffset}px)`,
+        } as CSSProperties
+      }
+      title={`${PROVIDER_LABELS[provider]} · ${shortModelLabel(modelId)} · Reasoning: ${activeLabel}. Görgő: AI-váltás · jobb klikk az ikonon: modellválasztás.`}
+      data-provider={provider}
+      data-model={modelId}
+      onWheel={handleWheel}
+      ref={rootRef}
     >
       <div className="composer-effort-track" aria-hidden="true">
         {efforts.map((effort, index) => (
           <span
             className={`${index === activeIndex ? "is-active" : ""}${index === 0 ? " is-first" : ""}${index === max ? " is-last" : ""}`}
-            style={
-              vertical
-                ? { bottom: `${max > 0 ? (index / max) * 100 : 50}%` }
-                : { left: `${max > 0 ? (index / max) * 100 : 50}%` }
-            }
+            style={{ left: `${max > 0 ? (index / max) * 100 : 50}%` }}
             key={effort}
-          >
-            {index === activeIndex && (
-              <span className="composer-effort-label">{activeLabel}</span>
-            )}
-          </span>
+          />
         ))}
       </div>
+      <span className="composer-submodel-label" aria-hidden="true">
+        {shortModelLabel(modelId)}
+      </span>
+      <span
+        className="composer-model-thumb"
+        data-provider={provider}
+        data-model={modelId}
+        aria-hidden="true"
+      >
+        <ProviderMark provider={provider} />
+      </span>
       <input
         type="range"
         min="0"
@@ -5563,10 +5701,41 @@ function EffortSlider({
         step="1"
         value={activeIndex}
         onChange={(event) => onSelect(Number(event.currentTarget.value))}
-        aria-label="Reasoning erőssége"
+        onContextMenu={(event) => {
+          event.preventDefault();
+          const bounds = event.currentTarget.getBoundingClientRect();
+          const thumbX =
+            bounds.left + 9 + (bounds.width - 18) * (progress / 100);
+          if (Math.abs(event.clientX - thumbX) <= 14)
+            setModelMenuOpen((open) => !open);
+        }}
+        aria-label={`${controlLabel} reasoning erőssége`}
         aria-valuetext={activeLabel}
-        aria-orientation={vertical ? "vertical" : "horizontal"}
+        aria-orientation="horizontal"
       />
+      {modelMenuOpen && (
+        <div
+          className="composer-model-variants"
+          role="menu"
+          aria-label={`${PROVIDER_LABELS[provider]} modellek`}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          {models.map((model) => (
+            <button
+              type="button"
+              role="menuitem"
+              className={model === modelId ? "is-selected" : ""}
+              onClick={() => {
+                onSelectModel(model);
+                setModelMenuOpen(false);
+              }}
+              key={model}
+            >
+              {shortModelLabel(model)}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -6564,6 +6733,7 @@ type TurnProgressCardProps = {
    * LÉPÉSEK lista alján marad.
    */
   runCompletedAt?: number;
+  provider?: AgentProviderId;
 };
 
 function TurnProgressCard({
@@ -6595,6 +6765,7 @@ function TurnProgressCard({
   liveFiles,
   runStartedAt,
   runCompletedAt,
+  provider = "codex",
 }: TurnProgressCardProps) {
   const quoteAnchor = (suffix: string) =>
     `${quoteAnchorPrefix}:${suffix}`;
@@ -7573,6 +7744,7 @@ function TurnProgressCard({
         streaming={streaming}
         interrupted={answerInterrupted}
         elapsed={overallElapsed}
+        statusIcon={<ProviderMark provider={provider} />}
         actions={answerActions}
         renderAnswer={(block: CompactAnswerBlock) => (
           <div className="compact-answer-text">
@@ -8564,7 +8736,9 @@ function App() {
     phase: "out" | "in";
     targetDetailed: boolean;
   } | null>(null);
-  const [pipelineRecipes, setPipelineRecipes] = useState<PipelineRecipe[]>([]);
+  const [pipelineRecipes, setPipelineRecipes] = useState<PipelineRecipe[]>(
+    isTauri ? [] : PREVIEW_PIPELINE_RECIPES,
+  );
   const [pipelineRecipeId, setPipelineRecipeId] = useState(() =>
     localStorage.getItem("min-pipeline-recipe") ?? "plan_code_review",
   );
@@ -8624,6 +8798,22 @@ function App() {
     if (field === "effort") return providerEfforts(stageProvider(index));
     return PIPELINE_MODELS[stageProvider(index)];
   };
+  const setStageValue = (
+    index: number,
+    field: "model" | "effort",
+    value: string,
+  ) => {
+    setPipelineStageOverrides((state) => ({
+      ...state,
+      [stageOverrideKey(index)]: {
+        ...state[stageOverrideKey(index)],
+        [field]: value,
+        ...(field === "model"
+          ? { accessProfile: accessProfileOfModel(value) }
+          : {}),
+      },
+    }));
+  };
   /** Stepping instead of a dropdown: the chain stays two lines tall. */
   const cycleStageValue = (
     index: number,
@@ -8631,17 +8821,12 @@ function App() {
     direction: 1 | -1,
   ) => {
     if (field === "vendor") {
-      const providers: AgentProviderId[] = [
-        "anthropic",
-        "codex",
-        "kimi",
-        "deepseek",
-      ];
-      const currentIndex = providers.indexOf(stageProvider(index));
+      const currentIndex = COMPOSER_PROVIDERS.indexOf(stageProvider(index));
       const next =
-        providers[
-          (currentIndex + direction + providers.length) % providers.length
-        ] ?? providers[0];
+        COMPOSER_PROVIDERS[
+          (currentIndex + direction + COMPOSER_PROVIDERS.length) %
+            COMPOSER_PROVIDERS.length
+        ] ?? COMPOSER_PROVIDERS[0];
       setPipelineStageOverrides((state) => ({
         ...state,
         [stageOverrideKey(index)]: {
@@ -8661,16 +8846,7 @@ function App() {
     const at = choices.indexOf(current);
     const next =
       choices[(at + direction + choices.length) % choices.length] ?? choices[0];
-    setPipelineStageOverrides((state) => ({
-      ...state,
-      [stageOverrideKey(index)]: {
-        ...state[stageOverrideKey(index)],
-        [field]: next,
-        ...(field === "model"
-          ? { accessProfile: accessProfileOfModel(next) }
-          : {}),
-      },
-    }));
+    setStageValue(index, field, next);
   };
   const activePipelineRecipe =
     pipelineRecipes.find((recipe) => recipe.id === pipelineRecipeId) ??
@@ -8688,16 +8864,18 @@ function App() {
     if (target) selectPipelineRecipe(target.id);
   };
 
-  // The KÓD column doubles as the compact recipe switch. It remains visible
-  // even for TERV REVIEW, so the user can turn the implementation stage back
-  // on without a second selector row that makes the composer too tall.
-  const renderComposerStageColumn = (
+  // Every phase is the same two-cell row: role + model-bearing effort slider.
+  // Keeping all three rows on one grid is what makes their tracks pixel-aligned.
+  const renderComposerStageRow = (
     stage: PipelineRecipeStage,
     index: number,
   ) => {
     const isCodeStage = stage.role === "code";
+    const efforts = stageChoices(index, "effort");
+    const activeEffort = stageValue(index, "effort") || efforts[0] || "";
+    const activeEffortIndex = Math.max(0, efforts.indexOf(activeEffort));
     return (
-      <div className="composer-stage-col" key={`stage-${stage.role}-${index}`}>
+      <div className="composer-stage-row" key={`stage-${stage.role}-${index}`}>
         <span className="composer-stage-role">
           {isCodeStage ? (
             <label
@@ -8720,40 +8898,27 @@ function App() {
               : STAGE_ROLE_LABELS[stage.role] ?? stage.role
           )}
         </span>
-        <button
-          type="button"
-          className="composer-stage-vendor"
-          onClick={() => cycleStageValue(index, "vendor", 1)}
-          onContextMenu={(event) => {
-            event.preventDefault();
-            cycleStageValue(index, "vendor", -1);
+        <EffortSlider
+          efforts={efforts}
+          activeIndex={activeEffortIndex}
+          activeLabel={activeEffort}
+          onSelect={(effortIndex) => {
+            const effort = efforts[effortIndex];
+            if (effort) setStageValue(index, "effort", effort);
           }}
-          title="Gyártó — kattints a másikra"
-        >
-          {PROVIDER_LABELS[stageProvider(index)]}
-        </button>
-        <button
-          type="button"
-          onClick={() => cycleStageValue(index, "model", 1)}
-          onContextMenu={(event) => {
-            event.preventDefault();
-            cycleStageValue(index, "model", -1);
-          }}
-          title="Modell — kattints a következőért, jobb klikk visszafelé"
-        >
-          {shortModelLabel(stageValue(index, "model") ?? "")}
-        </button>
-        <button
-          type="button"
-          onClick={() => cycleStageValue(index, "effort", 1)}
-          onContextMenu={(event) => {
-            event.preventDefault();
-            cycleStageValue(index, "effort", -1);
-          }}
-          title="Reasoning — kattints a következőért, jobb klikk visszafelé"
-        >
-          {stageValue(index, "effort") || FALLBACK_EFFORTS[0]}
-        </button>
+          provider={stageProvider(index)}
+          modelId={stageValue(index, "model") ?? ""}
+          models={stageChoices(index, "model")}
+          onCycleProvider={(direction) =>
+            cycleStageValue(index, "vendor", direction)
+          }
+          onSelectModel={(model) => setStageValue(index, "model", model)}
+          controlLabel={
+            stage.role === "plan_review"
+              ? "REVIEW"
+              : STAGE_ROLE_LABELS[stage.role] ?? stage.role
+          }
+        />
       </div>
     );
   };
@@ -8856,10 +9021,11 @@ function App() {
       return DEFAULT_MODEL;
     }
     const stored = localStorage.getItem("min-model");
-    // Sonnet is no longer one of the two Claude models the app offers. Falling
-    // through to the catalog check would have answered a Claude selection with
-    // a GPT one, so the vendor is kept and the model moved to its neighbour.
+    // Removed Claude variants must stay on Claude instead of silently falling
+    // through to the default GPT model.
     if (stored === "claude-sonnet-5") return "claude-opus-5";
+    if (stored === "claude-opus-4-6" || stored === "claude-opus-4-7")
+      return "claude-opus-4-8";
     return stored ?? DEFAULT_MODEL;
   });
   const [selectedEffort, setSelectedEffort] = useState(() => {
@@ -14378,7 +14544,7 @@ function App() {
     if (result !== false) setAppDialog(null);
   };
 
-  const selectModel = (model: string | null) => {
+  const selectModel = (model: string | null, announce = true) => {
     setSelectedModel(model);
     const modelData = modelCatalog.find((candidate) => candidate.id === model);
     if (
@@ -14391,11 +14557,24 @@ function App() {
           DEFAULT_EFFORT,
       );
     setModelMenuOpen(false);
-    notify(
-      model
-        ? `Modell kiválasztva: ${modelData?.displayName ?? model}`
-        : "Automatikus modell kiválasztva",
-    );
+    if (announce)
+      notify(
+        model
+          ? `Modell kiválasztva: ${modelData?.displayName ?? model}`
+          : "Automatikus modell kiválasztva",
+      );
+  };
+
+  const cycleSelectedProvider = (direction: 1 | -1) => {
+    const currentProvider = providerOfModel(selectedModel);
+    const currentIndex = COMPOSER_PROVIDERS.indexOf(currentProvider);
+    const nextProvider =
+      COMPOSER_PROVIDERS[
+        (currentIndex + direction + COMPOSER_PROVIDERS.length) %
+          COMPOSER_PROVIDERS.length
+      ] ?? COMPOSER_PROVIDERS[0];
+    const nextModel = PIPELINE_MODELS[nextProvider][0];
+    if (nextModel) selectModel(nextModel, false);
   };
 
   const toggleModelMenu = () => {
@@ -16491,6 +16670,7 @@ function App() {
           sequence: liveSequence,
           interrupted: false,
           changeSummary: undefined,
+          provider: runProvider,
         }
       : {
           id: liveMessageId,
@@ -16501,6 +16681,7 @@ function App() {
           final: false,
           sequence: liveSequence,
           turnId: clientTurnId,
+          provider: runProvider,
         };
     const userMessageId = regeneration?.source.id ?? createEntityId();
     const userMessage: Message = regeneration
@@ -16906,6 +17087,7 @@ function App() {
             final: true,
             turnId: `request:${stage.requestId}`,
             itemId: "assistant-0",
+            provider: run.recipe.stages[stageIndex]?.provider ?? "codex",
             changeSummary:
               stageIndex === artifactStageIndex && chainSummary.length > 0
                 ? chainSummary
@@ -17120,6 +17302,7 @@ function App() {
           live: false,
           final: true,
           interrupted: false,
+          provider: runProvider,
           changeSummary:
             responseChangeSummary.length > 0
               ? responseChangeSummary
@@ -18540,6 +18723,12 @@ function App() {
         runPosition={stage ? "end" : undefined}
         runStartedAt={chainStartedAt}
         runCompletedAt={chainCompletedAt}
+        provider={
+          groupAnswer.provider ??
+          normalizeAgentProvider(groupAnswer.pipeline?.stageAgent) ??
+          normalizeAgentProvider(agentConversationStatus?.provider) ??
+          selectedProvider
+        }
         runTone={
           groupAnswer.pipeline?.verdict
             ? groupAnswer.pipeline.verdict === "accepted"
@@ -18940,6 +19129,11 @@ function App() {
         liveFiles
         runStartedAt={viewedRun?.turnTiming?.startedAt}
         runCompletedAt={viewedRun?.turnTiming?.completedAt}
+        provider={
+          viewedRun?.chain?.recipe?.stages[liveShownStage]?.provider ??
+          viewedRun?.provider ??
+          selectedProvider
+        }
         plan={
           planHistory[liveFinishedStageTurnId] ??
           (liveShownStage === 0
@@ -19041,6 +19235,11 @@ function App() {
           liveFiles
           runStartedAt={viewedRun?.turnTiming?.startedAt}
           runCompletedAt={viewedRun?.turnTiming?.completedAt}
+          provider={
+            pipelineProgress?.provider ??
+            viewedRun?.provider ??
+            selectedProvider
+          }
           plan={activePlan}
           activities={
             pipelineProgress && liveTurnId
@@ -20173,17 +20372,17 @@ function App() {
                 {showDetailedTrace && activePipelineRecipe && (
                   <div className="composer-stage-grid" aria-label="Lánc beállítása">
                     {composerPlanStage &&
-                      renderComposerStageColumn(
+                      renderComposerStageRow(
                         composerPlanStage,
                         composerPlanStageIndex,
                       )}
                     {composerCodeStage
-                      ? renderComposerStageColumn(
+                      ? renderComposerStageRow(
                           composerCodeStage,
                           composerCodeStageIndex,
                         )
                       : (
-                        <div className="composer-stage-col composer-code-toggle-col">
+                        <div className="composer-stage-row composer-code-toggle-row">
                           <span className="composer-stage-role">
                             <label
                               className="composer-stage-toggle"
@@ -20202,13 +20401,14 @@ function App() {
                               <span>KÓD</span>
                             </label>
                           </span>
-                          <span className="composer-stage-placeholder">ki</span>
-                          <span className="composer-stage-placeholder">—</span>
-                          <span className="composer-stage-placeholder">—</span>
+                          <span
+                            className="composer-stage-slider-placeholder"
+                            aria-hidden="true"
+                          />
                         </div>
                       )}
                     {composerReviewStage &&
-                      renderComposerStageColumn(
+                      renderComposerStageRow(
                         composerReviewStage,
                         composerReviewStageIndex,
                       )}
@@ -20221,15 +20421,12 @@ function App() {
                       activeIndex={activeEffortIndex}
                       activeLabel={activeEffortLabel}
                       onSelect={selectEffortIndex}
-                      vertical
-                    />
-                    <ModelPicker
-                      open={modelMenuOpen}
-                      activeLabel={activeLabel}
-                      selectedModel={selectedModel}
-                      modelFamilies={modelFamilies}
-                      onToggle={toggleModelMenu}
-                      onSelectModel={selectModel}
+                      provider={selectedProvider}
+                      modelId={selectedModel ?? activeModel.id}
+                      models={PIPELINE_MODELS[selectedProvider]}
+                      onCycleProvider={cycleSelectedProvider}
+                      onSelectModel={(model) => selectModel(model, false)}
+                      controlLabel="EGY AI"
                     />
                   </div>
                 )}

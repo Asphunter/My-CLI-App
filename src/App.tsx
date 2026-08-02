@@ -146,11 +146,25 @@ type Message = {
   interaction?: MessageInteraction;
 };
 
+type AgentProviderId = "codex" | "anthropic" | "kimi" | "deepseek";
+type AgentAccessProfile =
+  | "claude"
+  | "kimiCode"
+  | "kimiOpenPlatform"
+  | "deepseekApi";
+
+const PROVIDER_LABELS: Record<AgentProviderId, string> = {
+  codex: "ChatGPT",
+  anthropic: "Claude",
+  kimi: "Kimi",
+  deepseek: "DeepSeek",
+};
+
 type MessageInteraction = {
   kind: "steer";
   inputId: string;
   parentTurnId: string;
-  targetProvider: "codex" | "anthropic";
+  targetProvider: AgentProviderId;
   targetRequestId: string;
   targetProviderTurnId?: string;
   pipelineRunId?: string;
@@ -287,8 +301,9 @@ type AgentDiffPreview = {
 };
 type PipelineRecipeStage = {
   role: "plan" | "plan_review" | "code" | "review";
-  provider: "codex" | "anthropic";
+  provider: AgentProviderId;
   runtime: string;
+  accessProfile?: AgentAccessProfile;
   model?: string;
   effort?: string;
   maxTurns?: number;
@@ -332,7 +347,7 @@ type PipelineProgressEvent = {
   stageCount: number;
   role: "plan" | "plan_review" | "code" | "review";
   agentLabel: string;
-  provider: "codex" | "anthropic";
+  provider: AgentProviderId;
   requestId: string;
   stageEpoch: number;
   phase: "started" | "finished" | "failed";
@@ -407,7 +422,7 @@ const MAX_CHAIN_ITERATIONS = 3;
  * only the model its preset happened to name - and a chain is unusable if the
  * same click means something different in each column.
  */
-const PIPELINE_MODELS: Record<"anthropic" | "codex", string[]> = {
+const PIPELINE_MODELS: Record<AgentProviderId, string[]> = {
   anthropic: [
     "claude-opus-5",
     "claude-opus-4-8",
@@ -416,6 +431,8 @@ const PIPELINE_MODELS: Record<"anthropic" | "codex", string[]> = {
     "claude-fable-5",
   ],
   codex: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+  kimi: ["kimi-k3", "k3", "k3-256k"],
+  deepseek: ["deepseek-v4-flash"],
 };
 
 /** Short enough that every cell fits one fixed width. */
@@ -430,6 +447,10 @@ const PIPELINE_MODEL_LABELS: Record<string, string> = {
   "gpt-5.6-sol": "Sol",
   "gpt-5.6-terra": "Terra",
   "gpt-5.6-luna": "Luna",
+  "kimi-k3": "K3 Raw",
+  k3: "K3 Code",
+  "k3-256k": "K3 256K",
+  "deepseek-v4-flash": "V4 Flash",
 };
 
 /** The chain is read at a glance, so the vendor prefix is dropped. */
@@ -607,7 +628,7 @@ type RunHandle = {
   ownerConversationKey: string;
   /** Coding: a projekt-zár kulcsa (normalizált path). GENERAL: null. */
   readonly projectPathKey: string | null;
-  provider: "codex" | "anthropic";
+  provider: AgentProviderId;
   readonly clientTurnId: string;
   liveMessageId: string;
   /** A provider szálazonosítója; a requestId nélküli események tartaléka. */
@@ -754,6 +775,57 @@ type ClaudeQuestionRequest = {
     options?: Array<{ label?: string; description?: string }>;
   }>;
 };
+type AgentAuthStatus = {
+  provider: AgentProviderId;
+  accessProfile?: AgentAccessProfile;
+  configured: boolean;
+  source: string;
+  preview?: string | null;
+};
+
+type AgentConnectionResult = {
+  provider: AgentProviderId;
+  accessProfile?: AgentAccessProfile;
+  success: boolean;
+  model: string;
+  effort: string;
+  text?: string | null;
+  error?: string | null;
+};
+
+const PROVIDER_CREDENTIALS: Array<{
+  key: AgentAccessProfile;
+  provider: Exclude<AgentProviderId, "codex">;
+  label: string;
+  model: string;
+  effort: string;
+  hint: string;
+}> = [
+  {
+    key: "kimiOpenPlatform",
+    provider: "kimi",
+    label: "Kimi Open Platform · Raw",
+    model: "kimi-k3",
+    effort: "high",
+    hint: "Tokenalapú api.moonshot.ai kulcs; nincs automatikus feltöltés vagy vásárlás.",
+  },
+  {
+    key: "kimiCode",
+    provider: "kimi",
+    label: "Kimi Code · Előfizetés",
+    model: "k3",
+    effort: "high",
+    hint: "A Kimi Code Console-ban létrehozott coding kulcs.",
+  },
+  {
+    key: "deepseekApi",
+    provider: "deepseek",
+    label: "DeepSeek API · Raw",
+    model: "deepseek-v4-flash",
+    effort: "high",
+    hint: "Előre fizetett, használatarányos API-kulcs; a Min nem kezel egyenleget.",
+  },
+];
 type ModelFamily = { key: string; label: string; models: CodexModel[] };
 type OpenMenu = { kind: "project" | "thread" | "general"; key: string } | null;
 type AppDialog =
@@ -796,6 +868,7 @@ const EFFORT_PREFERENCE_VERSION = "1";
 const READING_SETTINGS_VERSION = "3";
 const FALLBACK_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 const EFFORT_LABELS: Record<string, string> = {
+  none: "Off",
   low: "Low",
   medium: "Medium",
   high: "High",
@@ -901,6 +974,87 @@ const claudeCodingModels: CodexModel[] = [
     defaultReasoningEffort: DEFAULT_CLAUDE_EFFORT,
   },
 ];
+
+const kimiCodingModels: CodexModel[] = [
+  {
+    id: "kimi-k3",
+    displayName: "Kimi K3 (Raw)",
+    description: "Kimi Open Platform, közvetlen tokenalapú API-hozzáférés.",
+    supportedReasoningEfforts: ["low", "high", "max"],
+    defaultReasoningEffort: "high",
+  },
+  {
+    id: "k3",
+    displayName: "Kimi K3 Code",
+    description: "Kimi Code előfizetés Anthropic-kompatibilis coding útvonala.",
+    supportedReasoningEfforts: ["low", "high", "max"],
+    defaultReasoningEffort: "high",
+  },
+  {
+    id: "k3-256k",
+    displayName: "Kimi K3 Code 256K",
+    description: "Kimi Code 256K kontextusú coding útvonal.",
+    supportedReasoningEfforts: ["low", "high", "max"],
+    defaultReasoningEffort: "high",
+  },
+];
+
+const deepSeekCodingModels: CodexModel[] = [
+  {
+    id: "deepseek-v4-flash",
+    displayName: "DeepSeek V4 Flash",
+    description: "DeepSeek közvetlen API, Anthropic-kompatibilis coding útvonal.",
+    supportedReasoningEfforts: ["none", "high", "max"],
+    defaultReasoningEffort: "high",
+  },
+];
+
+const externalCodingModels = [...kimiCodingModels, ...deepSeekCodingModels];
+
+const providerOfModel = (modelId: string | null): AgentProviderId => {
+  if (modelId?.startsWith("claude-")) return "anthropic";
+  if (modelId === "kimi-k3" || modelId === "k3" || modelId === "k3-256k")
+    return "kimi";
+  if (modelId === "deepseek-v4-flash") return "deepseek";
+  return "codex";
+};
+
+const accessProfileOfModel = (
+  modelId: string | null,
+): AgentAccessProfile | undefined => {
+  if (modelId?.startsWith("claude-")) return "claude";
+  if (modelId === "kimi-k3") return "kimiOpenPlatform";
+  if (modelId === "k3" || modelId === "k3-256k") return "kimiCode";
+  if (modelId === "deepseek-v4-flash") return "deepseekApi";
+  return undefined;
+};
+
+const runtimeOfProvider = (provider: AgentProviderId) =>
+  provider === "codex"
+    ? "codexAppServer"
+    : provider === "anthropic"
+      ? "claudeAgentBridge"
+      : "compatibleAgentBridge";
+
+const providerSupportsImageInput = (
+  provider: AgentProviderId,
+  accessProfile?: AgentAccessProfile | null,
+) =>
+  provider === "codex" ||
+  provider === "anthropic" ||
+  (provider === "kimi" && accessProfile === "kimiOpenPlatform");
+
+const bridgeSessionCacheKey = (
+  conversationKey: string,
+  provider: AgentProviderId,
+) => `${provider}:${conversationKey}`;
+
+const providerEfforts = (provider: AgentProviderId) =>
+  provider === "kimi"
+    ? ["low", "high", "max"]
+    : provider === "deepseek"
+      ? ["none", "high", "max"]
+      : FALLBACK_EFFORTS;
 
 type AppSound = "notify" | "complete";
 const APP_SOUND_FILES: Record<AppSound, string> = {
@@ -4555,7 +4709,7 @@ function LiveCodePanel({
         )}
       </button>
       {open && (
-        <>
+        <div className="live-code-expanded">
           <div className="live-code-tabs" role="tablist">
             {openFiles.map((item) => (
               <span
@@ -4635,7 +4789,7 @@ function LiveCodePanel({
               Minden fül be van zárva.
             </p>
           )}
-        </>
+        </div>
       )}
     </section>
   );
@@ -5109,71 +5263,60 @@ const familyVariantLabel = (family: ModelFamily, model: CodexModel) => {
 };
 
 /** Which side of the picker a model sits on. */
-const vendorOfModel = (modelId: string | null): "anthropic" | "codex" =>
-  modelId?.startsWith("claude-") ? "anthropic" : "codex";
+const vendorOfModel = providerOfModel;
 
-/**
- * The GPT generation whose variants hide behind a hover.
- *
- * One row for the generation and a flyout for Luna/Terra/Sol keeps the menu as
- * narrow as the chip above it; listing all three inline made the panel wider
- * than the composer needed it to be.
- */
+/** A GPT family whose variants occupy the next click-open cascade level. */
 const GPT_FLYOUT_FAMILY = "gpt-5.6";
-const GPT_FLYOUT_LABEL = "GPT 5.6";
 
 type ModelPickerProps = {
-  /** A chain picks its own model per stage, so this one is not in charge. */
-  disabled?: boolean;
   open: boolean;
-  loading: boolean;
   activeLabel: string;
   selectedModel: string | null;
   modelFamilies: ModelFamily[];
-  activeEffortLabel: string;
-  supportedEfforts: string[];
-  activeEffortIndex: number;
   onToggle: () => void;
   onSelectModel: (id: string | null) => void;
-  onSelectEffort: (index: number) => void;
 };
 
 function ModelPicker({
   open,
-  loading,
   activeLabel,
   selectedModel,
   modelFamilies,
-  activeEffortLabel,
-  supportedEfforts,
-  activeEffortIndex,
   onToggle,
   onSelectModel,
-  onSelectEffort,
-  disabled = false,
 }: ModelPickerProps) {
-  // Which vendor's models the menu is showing. It follows the selection when
-  // the menu opens, so the list you see is the list the chip is naming.
-  const [vendor, setVendor] = useState<"anthropic" | "codex">(() =>
-    vendorOfModel(selectedModel),
-  );
-  const [flyoutOpen, setFlyoutOpen] = useState(false);
+  const [vendor, setVendor] = useState<AgentProviderId | null>(null);
+  const [flyoutFamily, setFlyoutFamily] = useState<string | null>(null);
   useEffect(() => {
-    if (open) {
-      setVendor(vendorOfModel(selectedModel));
-      setFlyoutOpen(false);
-    }
-  }, [open, selectedModel]);
+    if (!open) return;
+    setVendor(null);
+    setFlyoutFamily(null);
+  }, [open]);
 
   const claudeModels =
     modelFamilies.find((family) => family.key === "claude")?.models ?? [];
-  const gptVariants =
-    modelFamilies.find((family) => family.key === GPT_FLYOUT_FAMILY)?.models ??
-    [];
-  const gptSelected = gptVariants.some((model) => model.id === selectedModel);
+  const kimiModels =
+    modelFamilies.find((family) => family.key === "kimi")?.models ?? [];
+  const deepSeekModels =
+    modelFamilies.find((family) => family.key === "deepseek")?.models ?? [];
+  const selectedVendor = selectedModel ? vendorOfModel(selectedModel) : null;
+  const seenChatModels = new Set<string>();
+  const chatFamilies = modelFamilies.flatMap((family) => {
+    if (["claude", "kimi", "deepseek"].includes(family.key)) return [];
+    const models = family.models.filter((model) => {
+      if (
+        vendorOfModel(model.id) !== "codex" ||
+        seenChatModels.has(model.id)
+      )
+        return false;
+      seenChatModels.add(model.id);
+      return true;
+    });
+    return models.length > 0 ? [{ ...family, models }] : [];
+  });
 
   return (
-    <div className={`model-picker${disabled ? " is-disabled" : ""}`} aria-disabled={disabled}>
+    <div className="model-picker">
       <button
         type="button"
         className="model-chip"
@@ -5181,9 +5324,7 @@ function ModelPicker({
         aria-haspopup="menu"
         aria-expanded={open}
       >
-        <span>
-          {activeLabel} · {activeEffortLabel}
-        </span>
+        <span>{activeLabel}</span>
         <span className="model-chevron">⌄</span>
       </button>
       {open && (
@@ -5201,129 +5342,231 @@ function ModelPicker({
               <span>Automatikus</span>
               <span>{selectedModel === null ? "✓" : ""}</span>
             </button>
-            {/* The same switch as EGY AI | MULTI-AI: one control, two sides,
-                and the models below belong to whichever side is showing. */}
+            {/* One segmented control with two sides; the models below belong
+                to whichever vendor side is showing. */}
             <div
-              className="model-vendor-switch mode-switch"
+              className="model-vendor-switch"
               role="tablist"
               aria-label="Gyártó"
             >
               <button
                 type="button"
                 role="tab"
-                aria-selected={vendor === "anthropic"}
-                className={vendor === "anthropic" ? "is-active" : ""}
+                aria-selected={vendor === "codex"}
+                className={`${vendor === "codex" ? "is-active" : ""}${selectedVendor === "codex" ? " is-selected" : ""}`}
                 onClick={() => {
-                  setVendor("anthropic");
-                  setFlyoutOpen(false);
+                  setVendor((current) => current === "codex" ? null : "codex");
+                  setFlyoutFamily(null);
                 }}
               >
-                Claude
+                <span>ChatGPT</span><span aria-hidden="true">›</span>
               </button>
               <button
                 type="button"
                 role="tab"
-                aria-selected={vendor === "codex"}
-                className={vendor === "codex" ? "is-active" : ""}
-                onClick={() => setVendor("codex")}
+                aria-selected={vendor === "anthropic"}
+                className={`${vendor === "anthropic" ? "is-active" : ""}${selectedVendor === "anthropic" ? " is-selected" : ""}`}
+                onClick={() => {
+                  setVendor((current) => current === "anthropic" ? null : "anthropic");
+                  setFlyoutFamily(null);
+                }}
               >
-                ChatGPT
+                <span>Claude</span><span aria-hidden="true">›</span>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={vendor === "kimi"}
+                className={`${vendor === "kimi" ? "is-active" : ""}${selectedVendor === "kimi" ? " is-selected" : ""}`}
+                onClick={() => {
+                  setVendor((current) => current === "kimi" ? null : "kimi");
+                  setFlyoutFamily(null);
+                }}
+              >
+                <span>Kimi</span><span aria-hidden="true">›</span>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={vendor === "deepseek"}
+                className={`${vendor === "deepseek" ? "is-active" : ""}${selectedVendor === "deepseek" ? " is-selected" : ""}`}
+                onClick={() => {
+                  setVendor((current) => current === "deepseek" ? null : "deepseek");
+                  setFlyoutFamily(null);
+                }}
+              >
+                <span>DeepSeek</span><span aria-hidden="true">›</span>
               </button>
             </div>
-            <div className="model-variants">
-              {vendor === "anthropic"
-                ? claudeModels.map((model) => (
-                    <button
-                      type="button"
-                      className={`model-variant${model.id === selectedModel ? " is-selected" : ""}`}
-                      onClick={() => onSelectModel(model.id)}
-                      key={model.id}
-                    >
-                      <strong>{model.displayName}</strong>
-                      <span className="model-check">
-                        {model.id === selectedModel ? "✓" : ""}
-                      </span>
-                    </button>
-                  ))
-                : gptVariants.length > 0 && (
-                    <div
-                      className="model-flyout-anchor"
-                      onMouseEnter={() => setFlyoutOpen(true)}
-                      onMouseLeave={() => setFlyoutOpen(false)}
-                    >
+            {vendor && (
+              <div className="model-variants" role="menu">
+                {vendor === "anthropic"
+                  ? claudeModels.map((model) => (
                       <button
                         type="button"
-                        className={`model-variant${gptSelected ? " is-selected" : ""}${flyoutOpen ? " is-open" : ""}`}
-                        aria-haspopup="menu"
-                        aria-expanded={flyoutOpen}
-                        onFocus={() => setFlyoutOpen(true)}
-                        onClick={() => setFlyoutOpen((value) => !value)}
+                        role="menuitem"
+                        className={`model-variant${model.id === selectedModel ? " is-selected" : ""}`}
+                        onClick={() => onSelectModel(model.id)}
+                        key={model.id}
                       >
-                        <span className="model-flyout-arrow">‹</span>
-                        <strong>{GPT_FLYOUT_LABEL}</strong>
+                        <strong>{PIPELINE_MODEL_LABELS[model.id] ?? model.displayName}</strong>
                         <span className="model-check">
-                          {gptSelected ? "✓" : ""}
+                          {model.id === selectedModel ? "✓" : ""}
                         </span>
                       </button>
-                      {/* Opens to the left: the picker sits at the right edge
-                          of the composer, and a right-hand flyout would run
-                          off the window. */}
-                      {flyoutOpen && (
-                        <div className="model-flyout" role="menu">
-                          {gptVariants.map((model) => (
-                            <button
-                              type="button"
-                              className={`model-variant${model.id === selectedModel ? " is-selected" : ""}`}
-                              onClick={() => onSelectModel(model.id)}
-                              key={model.id}
-                            >
-                              <strong>
-                                {familyVariantLabel(
-                                  { key: GPT_FLYOUT_FAMILY, label: "5.6", models: gptVariants },
-                                  model,
-                                )}
-                              </strong>
-                              <span className="model-check">
-                                {model.id === selectedModel ? "✓" : ""}
-                              </span>
-                            </button>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  )}
-            </div>
-          </div>
-          <div className="reasoning-control">
-            <div className="reasoning-heading">
-              <span>Reasoning</span>
-              <strong>{activeEffortLabel}</strong>
-            </div>
-            <input
-              className="reasoning-slider"
-              type="range"
-              min="0"
-              max={Math.max(0, supportedEfforts.length - 1)}
-              step="1"
-              value={activeEffortIndex}
-              onChange={(event) => onSelectEffort(Number(event.target.value))}
-              aria-label="Reasoning erőssége"
-            />
-            <div className="reasoning-scale">
-              <span>
-                {EFFORT_LABELS[supportedEfforts[0]] ?? supportedEfforts[0]}
-              </span>
-              <span>
-                {loading
-                  ? "modellek betöltése…"
-                  : (EFFORT_LABELS[
-                      supportedEfforts[supportedEfforts.length - 1]
-                    ] ?? supportedEfforts[supportedEfforts.length - 1])}
-              </span>
-            </div>
+                    ))
+                  : vendor === "kimi"
+                    ? kimiModels.map((model) => (
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className={`model-variant${model.id === selectedModel ? " is-selected" : ""}`}
+                          onClick={() => onSelectModel(model.id)}
+                          key={model.id}
+                          title={model.description}
+                        >
+                          <strong>{PIPELINE_MODEL_LABELS[model.id] ?? model.displayName}</strong>
+                          <span className="model-check">
+                            {model.id === selectedModel ? "✓" : ""}
+                          </span>
+                        </button>
+                      ))
+                    : vendor === "deepseek"
+                      ? deepSeekModels.map((model) => (
+                          <button
+                            type="button"
+                            role="menuitem"
+                            className={`model-variant${model.id === selectedModel ? " is-selected" : ""}`}
+                            onClick={() => onSelectModel(model.id)}
+                            key={model.id}
+                            title={model.description}
+                          >
+                            <strong>{PIPELINE_MODEL_LABELS[model.id] ?? model.displayName}</strong>
+                            <span className="model-check">
+                              {model.id === selectedModel ? "✓" : ""}
+                            </span>
+                          </button>
+                        ))
+                      : chatFamilies.map((family) => {
+                          const familySelected = family.models.some(
+                            (model) => model.id === selectedModel,
+                          );
+                          if (family.models.length === 1) {
+                            const model = family.models[0];
+                            return (
+                              <button
+                                type="button"
+                                role="menuitem"
+                                className={`model-variant${familySelected ? " is-selected" : ""}`}
+                                onClick={() => onSelectModel(model.id)}
+                                key={family.key}
+                              >
+                                <strong>{family.key.startsWith("gpt-") ? `GPT ${family.label}` : family.label}</strong>
+                                <span className="model-check">
+                                  {familySelected ? "✓" : ""}
+                                </span>
+                              </button>
+                            );
+                          }
+                          const familyOpen = flyoutFamily === family.key;
+                          return (
+                            <div className="model-flyout-anchor" key={family.key}>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                className={`model-variant${familySelected ? " is-selected" : ""}${familyOpen ? " is-open" : ""}`}
+                                aria-haspopup="menu"
+                                aria-expanded={familyOpen}
+                                onClick={() =>
+                                  setFlyoutFamily((current) =>
+                                    current === family.key ? null : family.key,
+                                  )
+                                }
+                              >
+                                <strong>{family.key.startsWith("gpt-") ? `GPT ${family.label}` : family.label}</strong>
+                                <span className="model-flyout-arrow">›</span>
+                              </button>
+                              {familyOpen && (
+                                <div className="model-flyout" role="menu">
+                                  {family.models.map((model) => (
+                                    <button
+                                      type="button"
+                                      role="menuitem"
+                                      className={`model-variant${model.id === selectedModel ? " is-selected" : ""}`}
+                                      onClick={() => onSelectModel(model.id)}
+                                      key={model.id}
+                                    >
+                                      <strong>{familyVariantLabel(family, model)}</strong>
+                                      <span className="model-check">
+                                        {model.id === selectedModel ? "✓" : ""}
+                                      </span>
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+              </div>
+            )}
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+type EffortSliderProps = {
+  efforts: string[];
+  activeIndex: number;
+  activeLabel: string;
+  onSelect: (index: number) => void;
+  vertical?: boolean;
+};
+
+function EffortSlider({
+  efforts,
+  activeIndex,
+  activeLabel,
+  onSelect,
+  vertical = false,
+}: EffortSliderProps) {
+  const max = Math.max(0, efforts.length - 1);
+  const progress = max > 0 ? (activeIndex / max) * 100 : 0;
+  return (
+    <div
+      className={`composer-effort-slider${vertical ? " is-vertical" : ""}`}
+      style={{ "--effort-progress": `${progress}%` } as CSSProperties}
+      title={`Reasoning: ${activeLabel}`}
+    >
+      <div className="composer-effort-track" aria-hidden="true">
+        {efforts.map((effort, index) => (
+          <span
+            className={`${index === activeIndex ? "is-active" : ""}${index === 0 ? " is-first" : ""}${index === max ? " is-last" : ""}`}
+            style={
+              vertical
+                ? { bottom: `${max > 0 ? (index / max) * 100 : 50}%` }
+                : { left: `${max > 0 ? (index / max) * 100 : 50}%` }
+            }
+            key={effort}
+          >
+            {index === activeIndex && (
+              <span className="composer-effort-label">{activeLabel}</span>
+            )}
+          </span>
+        ))}
+      </div>
+      <input
+        type="range"
+        min="0"
+        max={max}
+        step="1"
+        value={activeIndex}
+        onChange={(event) => onSelect(Number(event.currentTarget.value))}
+        aria-label="Reasoning erőssége"
+        aria-valuetext={activeLabel}
+        aria-orientation={vertical ? "vertical" : "horizontal"}
+      />
     </div>
   );
 }
@@ -6196,41 +6439,50 @@ function ChangeSummaryPanel({
   const added = files.reduce((total, file) => total + file.added, 0);
   const removed = files.reduce((total, file) => total + file.removed, 0);
   const statusLabel = (status: ChangeSummaryFile["status"]) =>
-    status === "added" ? "ÚJ" : status === "removed" ? "TÖRÖLT" : "MÓDOSÍTVA";
+    status === "added" ? "ÚJ" : status === "removed" ? "TÖRÖLT" : null;
   return (
     <aside className="trace-change-summary" aria-label="Fájlok és változások">
       <div className="trace-change-heading">
         <strong>FÁJLOK / VÁLTOZÁSOK</strong>
-        <span>{files.length} fájl</span>
+        <span
+          className="trace-change-totals"
+          aria-label={`${files.length} fájl, ${added} hozzáadott és ${removed} eltávolított sor`}
+        >
+          <span>{files.length} fájl</span>
+          <span className="trace-change-total-added">+{added}</span>
+          <span className="trace-change-total-removed">−{removed}</span>
+        </span>
       </div>
       <ul className="trace-change-list">
-        {files.map((file) => (
-          <li
-            key={`${file.status}:${file.path}`}
-            title={file.sourcePath ?? file.path}
-          >
-            {onPreviewImage && isPreviewableImagePath(file.path) ? (
-              <button
-                type="button"
-                className="trace-change-preview"
-                onClick={() => onPreviewImage(file.sourcePath ?? file.path)}
-                title="Előnézet megnyitása"
-              >
+        {files.map((file) => {
+          const label = statusLabel(file.status);
+          return (
+            <li
+              className={label ? "has-status" : undefined}
+              key={`${file.status}:${file.path}`}
+              title={file.sourcePath ?? file.path}
+            >
+              {onPreviewImage && isPreviewableImagePath(file.path) ? (
+                <button
+                  type="button"
+                  className="trace-change-preview"
+                  onClick={() => onPreviewImage(file.sourcePath ?? file.path)}
+                  title="Előnézet megnyitása"
+                >
+                  <code>{file.path}</code>
+                </button>
+              ) : (
                 <code>{file.path}</code>
-              </button>
-            ) : (
-              <code>{file.path}</code>
-            )}
-            <span className="trace-change-status">{statusLabel(file.status)}</span>
-            <span className="trace-change-added">+{file.added}</span>
-            <span className="trace-change-removed">−{file.removed}</span>
-          </li>
-        ))}
+              )}
+              {label && <span className="trace-change-status">{label}</span>}
+              <span className="trace-change-added">+{file.added}</span>
+              <span className="trace-change-removed">−{file.removed}</span>
+            </li>
+          );
+        })}
       </ul>
-      <div className="trace-change-footer" aria-label="Változási összesítő">
-        <span><i className="trace-change-dot is-added" />{added} hozzáadva</span>
-        <span><i className="trace-change-dot is-removed" />{removed} kivéve</span>
-        {onRollback && (
+      {onRollback && (
+        <div className="trace-change-footer">
           <button
             type="button"
             className="trace-change-rollback"
@@ -6240,8 +6492,8 @@ function ChangeSummaryPanel({
           >
             {rollbackBusy ? "Visszavonás…" : "↺ Visszavonás"}
           </button>
-        )}
-      </div>
+        </div>
+      )}
     </aside>
   );
 }
@@ -6926,15 +7178,35 @@ function TurnProgressCard({
   const answerActions = hasAnswer && !streaming && (onCopyAnswer || onRegenerate) ? (
     <div className="trace-answer-actions">
       {onCopyAnswer && (
-        <button type="button" onClick={() => void copyAnswer()}>
-          <span aria-hidden="true">{copiedAnswer ? "✓" : "⧉"}</span>
-          {copiedAnswer ? "Másolva" : "Másolás"}
+        <button
+          type="button"
+          aria-label={copiedAnswer ? "Válasz másolva" : "Válasz másolása"}
+          title={copiedAnswer ? "Másolva" : "Másolás"}
+          onClick={() => void copyAnswer()}
+        >
+          {copiedAnswer ? (
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path d="m3.25 8.25 3 3 6.5-6.5" />
+            </svg>
+          ) : (
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25" />
+              <path d="M10.75 5.25v-2A1.25 1.25 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6a1.25 1.25 0 0 0 1.25 1.25h2" />
+            </svg>
+          )}
         </button>
       )}
       {onRegenerate && (
-        <button type="button" onClick={() => answer && onRegenerate(answer)}>
-          <span aria-hidden="true">↻</span>
-          Újragenerálás
+        <button
+          type="button"
+          aria-label="Válasz újragenerálása"
+          title="Újragenerálás"
+          onClick={() => answer && onRegenerate(answer)}
+        >
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <path d="M13.25 5V2.25H10.5" />
+            <path d="M13 4.25A5.5 5.5 0 1 0 13.2 11" />
+          </svg>
         </button>
       )}
     </div>
@@ -7394,9 +7666,11 @@ function TurnProgressCard({
                   </span>
                 )}
                 {overallElapsed && <time>{overallElapsed}</time>}
-                {answerActions}
               </div>
               {traceView === "answer" && <div className="turn-progress-answer-body">
+                {answerActions && (
+                  <div className="turn-progress-answer-tools">{answerActions}</div>
+                )}
                 <div className="trace-answer-line">
                   {hasAnswer && (
                     // The wrapper is load-bearing: this row is a flex line so
@@ -8282,11 +8556,14 @@ function App() {
     },
   );
   const [composerQuotes, setComposerQuotes] = useState<QuoteReference[]>([]);
+  // In the composer, detailed mode is now synonymous with the multi-agent
+  // pipeline. Persisted historical single-agent turns can still render their
+  // old detailed trace; only creating a new one is no longer offered.
   const [showDetailedTrace, setShowDetailedTrace] = useState(false);
-  // The detailed tick opens a second choice: keep today's single-agent trace,
-  // or run the prompt as a chain of roles. Off by default, because a chain
-  // costs three times the wall clock and three times the reading.
-  const [pipelineMode, setPipelineMode] = useState(false);
+  const [composerControlFlip, setComposerControlFlip] = useState<{
+    phase: "out" | "in";
+    targetDetailed: boolean;
+  } | null>(null);
   const [pipelineRecipes, setPipelineRecipes] = useState<PipelineRecipe[]>([]);
   const [pipelineRecipeId, setPipelineRecipeId] = useState(() =>
     localStorage.getItem("min-pipeline-recipe") ?? "plan_code_review",
@@ -8299,7 +8576,15 @@ function App() {
   // means "keep what the preset recommends", so the picker never has to
   // pre-fill values the user did not choose.
   const [pipelineStageOverrides, setPipelineStageOverrides] = useState<
-    Record<string, { model?: string; effort?: string; provider?: string }>
+    Record<
+      string,
+      {
+        model?: string;
+        effort?: string;
+        provider?: AgentProviderId;
+        accessProfile?: AgentAccessProfile;
+      }
+    >
   >({});
   const stageOverrideKey = (index: number) =>
     `${activePipelineRecipe?.id ?? ""}:${index}`;
@@ -8307,8 +8592,14 @@ function App() {
     const stage = activePipelineRecipe?.stages[index];
     const override = pipelineStageOverrides[stageOverrideKey(index)];
     // A vendor switch invalidates the model that belonged to the old one.
-    if (field === "effort") return override?.effort ?? stage?.effort ?? "";
-    const vendor = stageProvider(index) === "anthropic" ? "anthropic" : "codex";
+    if (field === "effort") {
+      const allowed = providerEfforts(stageProvider(index));
+      const candidate = override?.effort ?? stage?.effort ?? "";
+      return allowed.includes(candidate)
+        ? candidate
+        : (allowed.includes("high") ? "high" : allowed[0] ?? "");
+    }
+    const vendor = stageProvider(index);
     const allowed = PIPELINE_MODELS[vendor];
     const switched = override?.provider && override.provider !== stage?.provider;
     const candidate = switched
@@ -8322,14 +8613,16 @@ function App() {
     pipelineStageOverrides[stageOverrideKey(index)]?.provider ??
     activePipelineRecipe?.stages[index]?.provider ??
     "anthropic";
+  const stageAccessProfile = (index: number) =>
+    pipelineStageOverrides[stageOverrideKey(index)]?.accessProfile ??
+    accessProfileOfModel(stageValue(index, "model")) ??
+    activePipelineRecipe?.stages[index]?.accessProfile;
   /** The values a stage may cycle through, in a stable order. */
   const stageChoices = (index: number, field: "model" | "effort") => {
     const stage = activePipelineRecipe?.stages[index];
     if (!stage) return [] as string[];
-    if (field === "effort") return FALLBACK_EFFORTS;
-    return PIPELINE_MODELS[
-      stageProvider(index) === "anthropic" ? "anthropic" : "codex"
-    ];
+    if (field === "effort") return providerEfforts(stageProvider(index));
+    return PIPELINE_MODELS[stageProvider(index)];
   };
   /** Stepping instead of a dropdown: the chain stays two lines tall. */
   const cycleStageValue = (
@@ -8338,14 +8631,26 @@ function App() {
     direction: 1 | -1,
   ) => {
     if (field === "vendor") {
-      const next = stageProvider(index) === "anthropic" ? "codex" : "anthropic";
+      const providers: AgentProviderId[] = [
+        "anthropic",
+        "codex",
+        "kimi",
+        "deepseek",
+      ];
+      const currentIndex = providers.indexOf(stageProvider(index));
+      const next =
+        providers[
+          (currentIndex + direction + providers.length) % providers.length
+        ] ?? providers[0];
       setPipelineStageOverrides((state) => ({
         ...state,
         [stageOverrideKey(index)]: {
           ...state[stageOverrideKey(index)],
           provider: next,
+          accessProfile: undefined,
           // The old vendor's model cannot run on the new one.
           model: undefined,
+          effort: undefined,
         },
       }));
       return;
@@ -8361,6 +8666,9 @@ function App() {
       [stageOverrideKey(index)]: {
         ...state[stageOverrideKey(index)],
         [field]: next,
+        ...(field === "model"
+          ? { accessProfile: accessProfileOfModel(next) }
+          : {}),
       },
     }));
   };
@@ -8422,7 +8730,7 @@ function App() {
           }}
           title="Gyártó — kattints a másikra"
         >
-          {stageProvider(index) === "anthropic" ? "Claude" : "ChatGPT"}
+          {PROVIDER_LABELS[stageProvider(index)]}
         </button>
         <button
           type="button"
@@ -8493,6 +8801,17 @@ function App() {
     useState<Record<string, string>>(loadLocalThreadIds);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [readingSettingsOpen, setReadingSettingsOpen] = useState(false);
+  const [providerSettingsOpen, setProviderSettingsOpen] = useState(false);
+  const [providerAuthStatuses, setProviderAuthStatuses] = useState<
+    Partial<Record<AgentAccessProfile, AgentAuthStatus>>
+  >({});
+  const [providerKeyDrafts, setProviderKeyDrafts] = useState<
+    Partial<Record<AgentAccessProfile, string>>
+  >({});
+  const [providerAuthBusy, setProviderAuthBusy] = useState<string | null>(null);
+  const [providerTestResults, setProviderTestResults] = useState<
+    Partial<Record<AgentAccessProfile, AgentConnectionResult>>
+  >({});
   // The Claude runtime used to have a settings panel of its own: an API-key
   // field, a model and effort dropdown, and a connection test. It was the
   // scaffolding of the API-key era. Auth is the Claude Code subscription now,
@@ -8523,7 +8842,11 @@ function App() {
   const [newProjectMenuOpen, setNewProjectMenuOpen] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [modelCatalog, setModelCatalog] =
-    useState<CodexModel[]>([...fallbackModels, ...claudeCodingModels]);
+    useState<CodexModel[]>([
+      ...fallbackModels,
+      ...claudeCodingModels,
+      ...externalCodingModels,
+    ]);
   const [modelsLoading, setModelsLoading] = useState(isTauri);
   const [selectedModel, setSelectedModel] = useState<string | null>(() => {
     if (
@@ -9401,6 +9724,26 @@ function App() {
   // A lánc-jelzők a *nézett* futásé: egy másik projektben futó lánc szakaszai
   // nem rajzolhatnak ide panelt.
   const pipelineProgress = viewedRun?.chain?.progress ?? null;
+  useEffect(() => {
+    if (!composerControlFlip) return;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      setShowDetailedTrace(composerControlFlip.targetDetailed);
+      setComposerControlFlip(null);
+      return;
+    }
+    const timeout = window.setTimeout(() => {
+      if (composerControlFlip.phase === "out") {
+        setShowDetailedTrace(composerControlFlip.targetDetailed);
+        setComposerControlFlip({
+          ...composerControlFlip,
+          phase: "in",
+        });
+        return;
+      }
+      setComposerControlFlip(null);
+    }, composerControlFlip.phase === "out" ? 145 : 165);
+    return () => window.clearTimeout(timeout);
+  }, [composerControlFlip]);
   const activeRunInputTarget = resolveRunInputTarget(
     activeConversationId,
     runsRef.current.values(),
@@ -10486,6 +10829,17 @@ function App() {
         label: "Claude",
         matches: (id: string) => id.startsWith("claude-"),
       },
+      {
+        key: "kimi",
+        label: "Kimi",
+        matches: (id: string) =>
+          id === "kimi-k3" || id === "k3" || id === "k3-256k",
+      },
+      {
+        key: "deepseek",
+        label: "DeepSeek",
+        matches: (id: string) => id === "deepseek-v4-flash",
+      },
       { key: "other", label: "Egyéb", matches: (_id: string) => true },
     ];
     return definitions
@@ -10508,6 +10862,8 @@ function App() {
             const index = [
               ...PIPELINE_MODELS.anthropic,
               ...PIPELINE_MODELS.codex,
+              ...PIPELINE_MODELS.kimi,
+              ...PIPELINE_MODELS.deepseek,
             ].indexOf(id);
             return index < 0 ? 50 : index;
           };
@@ -10523,7 +10879,20 @@ function App() {
     modelCatalog.find((model) => model.id === selectedModel) ??
     fallbackModels.find((model) => model.id === DEFAULT_MODEL) ??
     fallbackModels[0];
-  const selectedClaudeModel = Boolean(selectedModel?.startsWith("claude-"));
+  const selectedProvider = providerOfModel(selectedModel);
+  const selectedAccessProfile = accessProfileOfModel(selectedModel);
+  const composerImageProvider =
+    activeMode !== "general" && showDetailedTrace && activePipelineRecipe
+      ? stageProvider(0)
+      : selectedProvider;
+  const composerImageAccessProfile =
+    activeMode !== "general" && showDetailedTrace && activePipelineRecipe
+      ? stageAccessProfile(0)
+      : selectedAccessProfile;
+  const composerSupportsImages = providerSupportsImageInput(
+    composerImageProvider,
+    composerImageAccessProfile,
+  );
   // The chip names the model the way the chain's cells do — "Opus 5", "Sol" —
   // rather than "Claude Sonnet 5" or "GPT-5.6 Luna". The long form set the
   // width of the chip, and the chip sets the width of the menu under it.
@@ -12512,7 +12881,11 @@ function App() {
     void invoke<CodexModel[]>("codex_models")
       .then((models) => {
         if (active && models.length > 0)
-          setModelCatalog([...models, ...claudeCodingModels]);
+          setModelCatalog([
+            ...models,
+            ...claudeCodingModels,
+            ...externalCodingModels,
+          ]);
       })
       .catch(() => undefined)
       .finally(() => {
@@ -13238,7 +13611,7 @@ function App() {
         let inferredStepId: string | undefined;
         if (
           !planStepIdOverride &&
-          run.provider !== "anthropic" &&
+          run.provider === "codex" &&
           codexEvent.requestId &&
           run.chainRequestIds.has(codexEvent.requestId) &&
           run.plan.steps.length >= 2
@@ -13286,10 +13659,10 @@ function App() {
           // moves from one carried-plan file to the next. A reliable filename
           // match must outrank the stale first active step; Claude keeps its
           // TaskUpdate mapping as the authoritative path.
-          (run.provider !== "anthropic" ? inferredStepId : undefined) ??
+          (run.provider === "codex" ? inferredStepId : undefined) ??
           explicitActiveStepId ??
           inferredStepId;
-        if (planTrackingDiagnosticsEnabled() && run.provider === "anthropic") {
+        if (planTrackingDiagnosticsEnabled() && run.provider !== "codex") {
           console.debug("[plan-tracking] activity assignment", {
             requestId: run.requestId,
             eventType: codexEvent.eventType,
@@ -13603,6 +13976,126 @@ function App() {
   const notify = (message: string, sound?: AppSound) => {
     setToast(message);
     if (sound) playAppSound(sound);
+  };
+
+  const refreshProviderAuthStatuses = async () => {
+    if (!isTauri) return;
+    const entries = await Promise.all(
+      PROVIDER_CREDENTIALS.map(async (credential) => {
+        try {
+          const status = await invoke<AgentAuthStatus>("agent_auth_status", {
+            provider: credential.provider,
+            accessProfile: credential.key,
+          });
+          return [credential.key, status] as const;
+        } catch {
+          return [credential.key, undefined] as const;
+        }
+      }),
+    );
+    setProviderAuthStatuses(
+      Object.fromEntries(entries.filter((entry) => entry[1])) as Partial<
+        Record<AgentAccessProfile, AgentAuthStatus>
+      >,
+    );
+  };
+
+  const saveProviderKey = async (
+    credential: (typeof PROVIDER_CREDENTIALS)[number],
+  ) => {
+    const apiKey = providerKeyDrafts[credential.key]?.trim() ?? "";
+    if (!apiKey) {
+      notify("Az API-kulcs mező üres.", "notify");
+      return;
+    }
+    setProviderAuthBusy(`save:${credential.key}`);
+    try {
+      const status = await invoke<AgentAuthStatus>("agent_save_api_key", {
+        provider: credential.provider,
+        accessProfile: credential.key,
+        apiKey,
+      });
+      setProviderAuthStatuses((current) => ({
+        ...current,
+        [credential.key]: status,
+      }));
+      setProviderKeyDrafts((current) => ({ ...current, [credential.key]: "" }));
+      notify(`${credential.label}: kulcs elmentve`);
+    } catch (error) {
+      notify(`A kulcs nem menthető: ${String(error)}`, "notify");
+    } finally {
+      setProviderAuthBusy(null);
+    }
+  };
+
+  const deleteProviderKey = async (
+    credential: (typeof PROVIDER_CREDENTIALS)[number],
+  ) => {
+    setProviderAuthBusy(`delete:${credential.key}`);
+    try {
+      const status = await invoke<AgentAuthStatus>("agent_delete_api_key", {
+        provider: credential.provider,
+        accessProfile: credential.key,
+      });
+      setProviderAuthStatuses((current) => ({
+        ...current,
+        [credential.key]: status,
+      }));
+      setProviderTestResults((current) => ({
+        ...current,
+        [credential.key]: undefined,
+      }));
+      notify(`${credential.label}: kulcs törölve`);
+    } catch (error) {
+      notify(`A kulcs nem törölhető: ${String(error)}`, "notify");
+    } finally {
+      setProviderAuthBusy(null);
+    }
+  };
+
+  const testProviderConnection = async (
+    credential: (typeof PROVIDER_CREDENTIALS)[number],
+  ) => {
+    setProviderAuthBusy(`test:${credential.key}`);
+    try {
+      const result = await invoke<AgentConnectionResult>(
+        "agent_test_connection",
+        {
+          provider: credential.provider,
+          accessProfile: credential.key,
+          model: credential.model,
+          effort: credential.effort,
+          maxBudgetUsd: Number(claudeBudgetUsd),
+          maxTurns: 1,
+          cwd: activeProjectPathRef.current || null,
+        },
+      );
+      setProviderTestResults((current) => ({
+        ...current,
+        [credential.key]: result,
+      }));
+      notify(
+        result.success
+          ? `${credential.label}: kapcsolat rendben`
+          : `${credential.label}: ${result.error ?? "kapcsolati hiba"}`,
+        result.success ? undefined : "notify",
+      );
+    } catch (error) {
+      setProviderTestResults((current) => ({
+        ...current,
+        [credential.key]: {
+          provider: credential.provider,
+          accessProfile: credential.key,
+          success: false,
+          model: credential.model,
+          effort: credential.effort,
+          error: String(error),
+        },
+      }));
+      notify(`A kapcsolatteszt sikertelen: ${String(error)}`, "notify");
+    } finally {
+      setProviderAuthBusy(null);
+    }
   };
 
   const respondClaudeApproval = async (decision: string, reason?: string) => {
@@ -14991,10 +15484,10 @@ function App() {
         console.warn("Pipeline cancel by request failed", error);
       }
       // A leállítandó futás mondja meg, melyik runtime-ot kell megkérni.
-      await invoke(
-        stoppingRun?.provider === "anthropic" ? "claude_cancel" : "codex_cancel",
-        { requestId },
-      );
+      await invoke("agent_cancel", {
+        provider: stoppingRun?.provider ?? "codex",
+        requestId,
+      });
       finalizeCancellation();
       notify("A válaszgenerálás leállítva");
     } catch (error) {
@@ -15241,9 +15734,17 @@ function App() {
       requestSettings: {
         mode: activeModeRef.current,
         provider:
-          activeModeRef.current === "general" || !selectedClaudeModel
+          activeModeRef.current === "general"
             ? "codex"
-            : "anthropic",
+            : showDetailedTrace && activePipelineRecipe
+              ? stageProvider(0)
+              : selectedProvider,
+        accessProfile:
+          activeModeRef.current === "general"
+            ? null
+            : showDetailedTrace && activePipelineRecipe
+              ? stageAccessProfile(0) ?? null
+              : selectedAccessProfile ?? null,
         projectId:
           activeModeRef.current === "general" ? null : activeProjectData.id,
         projectPath:
@@ -15251,15 +15752,21 @@ function App() {
         conversationKey: threadKey,
         model: selectedModel,
         effort: effectiveEffort,
-        detailed: showDetailedTrace,
-        pipelineRecipeId: pipelineMode ? activePipelineRecipe?.id : null,
-        pipelineEnabled: showDetailedTrace && pipelineMode,
+        detailed:
+          activeModeRef.current !== "general" && showDetailedTrace,
+        pipelineRecipeId:
+          activeModeRef.current !== "general" && showDetailedTrace
+            ? activePipelineRecipe?.id
+            : null,
+        pipelineEnabled:
+          activeModeRef.current !== "general" && showDetailedTrace,
         maxBudgetUsd: Number(claudeBudgetUsd),
         maxTurns: Number(claudeMaxTurns),
         pipelineStageOverrides: activePipelineRecipe?.stages.map((_, index) => ({
           model: stageValue(index, "model") || undefined,
           effort: stageValue(index, "effort") || undefined,
-          provider: stageProvider(index) as "codex" | "anthropic",
+          provider: stageProvider(index),
+          accessProfile: stageAccessProfile(index),
         })),
       },
       createdAt: now,
@@ -15431,12 +15938,15 @@ function App() {
       await deleteFollowUp(followUp.id);
 
       let sessionId: string | null = null;
-      if (settings.provider === "anthropic") {
+      if (settings.provider !== "codex") {
         const status = await invoke<AgentConversationStatus | null>(
           "agent_conversation_status",
           { conversationId: followUp.conversationId },
         ).catch(() => null);
-        sessionId = status?.hasConflict ? null : (status?.activeSessionId ?? null);
+        sessionId =
+          status?.hasConflict || status?.provider !== settings.provider
+            ? null
+            : (status?.activeSessionId ?? null);
       } else {
         sessionId = conversation.threadId ?? null;
       }
@@ -15518,10 +16028,8 @@ function App() {
               prompt: followUp.modelPrompt || followUp.body,
               images: storedImages,
               provider: settings.provider,
-              runtime:
-                settings.provider === "anthropic"
-                  ? "claudeAgentBridge"
-                  : "codexAppServer",
+              runtime: runtimeOfProvider(settings.provider),
+              accessProfile: settings.accessProfile ?? undefined,
               conversationId: followUp.conversationId,
               sessionId,
               conversationContext: conversationContext || null,
@@ -15724,9 +16232,31 @@ function App() {
     const pendingImageSnapshot = pendingRegeneration ? [] : [...pendingImages];
     const requestMode = activeModeRef.current;
     const isGeneralMode = requestMode === "general";
-    const useClaude = !isGeneralMode && selectedClaudeModel;
+    const detailedRequest = !isGeneralMode && showDetailedTrace;
+    const runProvider: AgentProviderId = isGeneralMode
+      ? "codex"
+      : selectedProvider;
+    const useBridge = runProvider !== "codex";
     if (!text && quoteSnapshot.length === 0 && pendingImageSnapshot.length === 0)
       return;
+    const imageProvider =
+      detailedRequest && activePipelineRecipe
+        ? stageProvider(0)
+        : runProvider;
+    const imageAccessProfile =
+      detailedRequest && activePipelineRecipe
+        ? stageAccessProfile(0)
+        : selectedAccessProfile;
+    if (
+      pendingImageSnapshot.length > 0 &&
+      !providerSupportsImageInput(imageProvider, imageAccessProfile)
+    ) {
+      notify(
+        `${PROVIDER_LABELS[imageProvider]} ezen az útvonalon nem fogad képet. Válassz ChatGPT-t, Claude-ot vagy Kimi K3 Raw modellt.`,
+        "notify",
+      );
+      return;
+    }
     // Egy beszélgetésben egy kör: a beszélgetés lineáris, a következő kérdés
     // kontextusa az előző válasz. A szöveg a szerkesztőben marad, és a futás
     // végén magától elindul.
@@ -15940,9 +16470,10 @@ function App() {
         )
       : undefined;
     const clientTurnId = regeneration?.turnId ?? fallbackTurnId;
-    // Regeneration replays one turn, so it stays on the single-turn path even
-    // when the chain is selected; re-running a chain is a whole-run action.
-    const runPipeline = showDetailedTrace && pipelineMode && !regeneration;
+    // Regeneration replays one turn, so it stays on the compact single-turn
+    // path; re-running a chain is a whole-run action.
+    const runPipeline =
+      detailedRequest && Boolean(activePipelineRecipe) && !regeneration;
     const userSequence = regeneration?.source.sequence ?? nextTimelineSequence();
     const liveSequence =
       regeneration?.originalAnswer.sequence ?? nextTimelineSequence();
@@ -15981,14 +16512,14 @@ function App() {
           text,
           images: storedImages,
           quoteRefs: quoteSnapshot,
-          detailed: showDetailedTrace,
+          detailed: detailedRequest,
           sequence: userSequence,
           // User and assistant rows share one client turn identity. This is the
           // cross-device idempotency key even when cache/SQLite copies carry
           // different row UUIDs.
           turnId: clientTurnId,
         };
-    rememberDetailMode(userMessageId, showDetailedTrace);
+    rememberDetailMode(userMessageId, detailedRequest);
     const nextMessages = regeneration
       ? regeneration.messages.map((message, index) =>
           index === regeneration.answerIndex ? liveMessage : message,
@@ -16168,7 +16699,10 @@ function App() {
       projectPathKey: isGeneralMode
         ? null
         : normalizeConversationKey(activeProjectData.path),
-      provider: useClaude ? "anthropic" : "codex",
+      provider:
+        runPipeline && activePipelineRecipe
+          ? stageProvider(0)
+          : runProvider,
       clientTurnId,
       stageEpoch: 1,
       liveMessageId,
@@ -16262,22 +16796,37 @@ function App() {
       // than read off React state: the cached status can belong to another
       // conversation or not have loaded yet, and either way the turn would
       // silently start a new provider session.
-      let durableClaudeSessionId: string | null = null;
-      if (useClaude && isTauri && !regeneration) {
+      const sessionProvider: AgentProviderId =
+        runPipeline && activePipelineRecipe
+          ? stageProvider(0)
+          : runProvider;
+      let durableBridgeSessionId: string | null = null;
+      if (sessionProvider !== "codex" && isTauri && !regeneration) {
         try {
           const status = await invoke<AgentConversationStatus | null>(
             "agent_conversation_status",
             { conversationId: requestConversationId },
           );
-          if (status && !status.hasConflict)
-            durableClaudeSessionId = status.activeSessionId;
+          if (
+            status &&
+            !status.hasConflict &&
+            status.provider === sessionProvider
+          )
+            durableBridgeSessionId = status.activeSessionId;
         } catch (error) {
           console.warn("Agent conversation status unavailable", error);
         }
       }
-      const resumeClaudeSessionId = regeneration
+      const resumeBridgeSessionId = regeneration
         ? null
-        : (durableClaudeSessionId ?? claudeSessionIds[requestThreadKey] ?? null);
+        : (durableBridgeSessionId ??
+          claudeSessionIds[
+            bridgeSessionCacheKey(requestThreadKey, sessionProvider)
+          ] ??
+          (sessionProvider === "anthropic"
+            ? claudeSessionIds[requestThreadKey]
+            : null) ??
+          null);
       // A chain is its own call: the runner drives the stages, records each
       // answer, and returns them together. The ordinary single-turn path below
       // is untouched, which is what keeps the default behaviour identical.
@@ -16301,13 +16850,14 @@ function App() {
               placeholderRequestId: requestId,
               images: storedImages,
               cwd: isGeneralMode ? null : activeProjectData.path,
-              sessionId: resumeClaudeSessionId,
+              sessionId: resumeBridgeSessionId,
               conversationContext: rehydrationContext || null,
               maxBudgetUsd: Number(claudeBudgetUsd),
               stageOverrides: activePipelineRecipe.stages.map((_, index) => ({
                 model: stageValue(index, "model") || undefined,
                 effort: stageValue(index, "effort") || undefined,
                 provider: stageProvider(index),
+                accessProfile: stageAccessProfile(index),
               })),
             },
           });
@@ -16407,14 +16957,19 @@ function App() {
               })),
             ];
           });
-          const lastSession = [...run.stages]
+          const lastSessionStage = [...run.stages]
             .reverse()
-            .find((stage) => stage.sessionId)?.sessionId;
-          if (lastSession)
+            .find((stage) => stage.sessionId);
+          if (lastSessionStage?.sessionId) {
+            const lastSessionProvider = stageProvider(lastSessionStage.index);
             setClaudeSessionIds((current) => ({
               ...current,
-              [requestThreadKey]: lastSession,
+              [bridgeSessionCacheKey(
+                requestThreadKey,
+                lastSessionProvider,
+              )]: lastSessionStage.sessionId!,
             }));
+          }
           if (run.status === "failed" && run.error) notify(run.error);
           // The runner already dropped the outer request's answer, but a save
           // queued while its bubble was still on screen can land afterwards
@@ -16443,15 +16998,16 @@ function App() {
         }
         return;
       }
-      const response = useClaude
+      const response = useBridge
         ? await invoke<CodexResponse>("agent_send", {
             request: {
               prompt: codexPrompt,
               images: storedImages,
-              provider: "anthropic",
-              runtime: "claudeAgentBridge",
+              provider: runProvider,
+              runtime: runtimeOfProvider(runProvider),
+              accessProfile: selectedAccessProfile,
               conversationId: requestConversationId,
-              sessionId: resumeClaudeSessionId,
+              sessionId: resumeBridgeSessionId,
               conversationContext: rehydrationContext || null,
               model: selectedModel,
               // The reasoning slider, like every other model: the Claude panel
@@ -16483,7 +17039,7 @@ function App() {
                 ? null
                 : (threadIds[requestThreadKey] ?? null),
               conversationContext: rehydrationContext || null,
-              model: selectedClaudeModel ? DEFAULT_MODEL : selectedModel,
+              model: selectedModel,
               effort: effectiveEffort,
               cwd: isGeneralMode ? null : activeProjectData.path,
               requestId,
@@ -16526,12 +17082,12 @@ function App() {
         );
       }
       if (!isGeneralMode) {
-        if (useClaude) {
+        if (useBridge) {
           const sessionId = response.threadId || null;
           if (sessionId)
             setClaudeSessionIds((current) => ({
               ...current,
-              [requestThreadKey]: sessionId,
+              [bridgeSessionCacheKey(requestThreadKey, runProvider)]: sessionId,
             }));
         } else {
           setThreadIds((current) => ({
@@ -16658,7 +17214,7 @@ function App() {
           : "Codex válasz megérkezett",
       );
     } catch (error) {
-      const providerName = useClaude ? "Claude" : "Codex";
+      const providerName = PROVIDER_LABELS[runProvider];
       const errorDescription = describeThrownAgentError(error, providerName);
       const errorText = errorDescription.detail;
       // The native command performs snapshot finalization after the model has
@@ -16783,7 +17339,9 @@ function App() {
       (source.quoteRefs ?? []).map((quote) => [quote.id, quote.instruction]),
     );
     setComposerQuotes(source.quoteRefs ?? []);
-    setShowDetailedTrace(messageUsesDetailedTrace(source));
+    // New detailed single-agent turns are no longer created. Historical ones
+    // remain detailed in the timeline, but a regeneration uses compact EGY AI.
+    setShowDetailedTrace(false);
     window.setTimeout(() => composerFormRef.current?.requestSubmit(), 0);
   };
 
@@ -16929,11 +17487,10 @@ function App() {
     setReviewRerunChoiceTarget(null);
 
     // A re-run is a chain, and a chain is read in the detailed layout: the
-    // panel it draws has phases. Without this the composer still showed the
-    // plain single-agent settings, and the run rendered as if it were one.
+    // panel it draws has phases. Without this the composer would stay compact,
+    // and the run would render as if it were a single turn.
     selectPipelineRecipe(chainRecipe.id);
     setShowDetailedTrace(true);
-    setPipelineMode(true);
     // The elapsed clock counts from the plan's start, and the plan still held
     // the *original* run's timestamp — which is how a one-minute re-run came
     // to report an hour and twenty minutes. This round starts now.
@@ -17013,7 +17570,18 @@ function App() {
           placeholderRequestId: null,
           images: [],
           cwd: activeMode === "general" ? null : activeProjectData.path,
-          sessionId: claudeSessionIds[threadKey] ?? null,
+          sessionId:
+            claudeSessionIds[
+              bridgeSessionCacheKey(
+                threadKey,
+                (pipelineStageOverrides[
+                  `${chainRecipe.id}:${startStage}`
+                ]?.provider ??
+                  chainRecipe.stages[startStage]?.provider ??
+                  "anthropic") as AgentProviderId,
+              )
+            ] ??
+            null,
           conversationContext: null,
           maxBudgetUsd: Number(claudeBudgetUsd),
           stageOverrides: chainRecipe.stages.map((_, index) => ({
@@ -17026,6 +17594,14 @@ function App() {
             provider:
               pipelineStageOverrides[`${chainRecipe.id}:${index}`]?.provider ??
               undefined,
+            accessProfile:
+              pipelineStageOverrides[`${chainRecipe.id}:${index}`]
+                ?.accessProfile ??
+              accessProfileOfModel(
+                pipelineStageOverrides[`${chainRecipe.id}:${index}`]?.model ??
+                  chainRecipe.stages[index]?.model ??
+                  null,
+              ),
           })),
           startStage,
           seedArtifacts,
@@ -19269,6 +19845,130 @@ function App() {
                   type="button"
                   className="settings-option"
                   disabled={!isTauri}
+                  aria-expanded={providerSettingsOpen}
+                  onClick={() => {
+                    const opening = !providerSettingsOpen;
+                    setProviderSettingsOpen(opening);
+                    if (opening) void refreshProviderAuthStatuses();
+                  }}
+                >
+                  <span>
+                    <strong>AI providerek</strong>
+                    <span className="settings-option-hint">
+                      Kimi és DeepSeek API-kulcsok
+                    </span>
+                  </span>
+                  <span aria-hidden="true">
+                    {providerSettingsOpen ? "⌃" : "⌄"}
+                  </span>
+                </button>
+                {providerSettingsOpen && (
+                  <div className="settings-subpanel provider-settings-panel">
+                    <p className="provider-settings-intro">
+                      A kulcsok a Windows Credential Managerbe kerülnek. A Min
+                      nem vásárol kreditet és nem tölt fel egyenleget.
+                    </p>
+                    {PROVIDER_CREDENTIALS.map((credential) => {
+                      const status = providerAuthStatuses[credential.key];
+                      const result = providerTestResults[credential.key];
+                      const busy = providerAuthBusy?.endsWith(credential.key) ?? false;
+                      return (
+                        <section
+                          className="provider-credential-card"
+                          key={credential.key}
+                        >
+                          <div className="provider-credential-heading">
+                            <strong>{credential.label}</strong>
+                            <span
+                              className={status?.configured ? "is-configured" : ""}
+                            >
+                              {status?.configured
+                                ? status.preview || "Beállítva"
+                                : "Nincs kulcs"}
+                            </span>
+                          </div>
+                          <p>{credential.hint}</p>
+                          <label className="provider-key-field">
+                            <span>API-kulcs</span>
+                            <input
+                              type="password"
+                              value={providerKeyDrafts[credential.key] ?? ""}
+                              autoComplete="off"
+                              spellCheck={false}
+                              placeholder={
+                                status?.configured
+                                  ? "Új kulcs megadásával cserélhető"
+                                  : "Kulcs beillesztése"
+                              }
+                              disabled={busy}
+                              onChange={(event) =>
+                                setProviderKeyDrafts((current) => ({
+                                  ...current,
+                                  [credential.key]: event.target.value,
+                                }))
+                              }
+                            />
+                          </label>
+                          <div className="provider-settings-actions">
+                            <button
+                              type="button"
+                              className="settings-compact-button"
+                              disabled={
+                                busy ||
+                                !(providerKeyDrafts[credential.key]?.trim())
+                              }
+                              onClick={() => void saveProviderKey(credential)}
+                            >
+                              Mentés
+                            </button>
+                            <button
+                              type="button"
+                              className="settings-compact-button"
+                              disabled={busy || !status?.configured}
+                              title="Egy rövid, valós és esetleg díjköteles API-kérést küld."
+                              onClick={() => void testProviderConnection(credential)}
+                            >
+                              Teszt
+                            </button>
+                            <button
+                              type="button"
+                              className="settings-compact-button danger"
+                              disabled={busy || !status?.configured}
+                              onClick={() => void deleteProviderKey(credential)}
+                            >
+                              Törlés
+                            </button>
+                          </div>
+                          {result && (
+                            <div
+                              className={`provider-test-result ${
+                                result.success ? "is-success" : "is-error"
+                              }`}
+                              role="status"
+                            >
+                              <strong>
+                                {result.success ? "Kapcsolat rendben" : "Kapcsolati hiba"}
+                              </strong>
+                              <span>
+                                {result.success
+                                  ? result.text || `${result.model} válaszolt.`
+                                  : result.error || "Ismeretlen hiba"}
+                              </span>
+                            </div>
+                          )}
+                        </section>
+                      );
+                    })}
+                    <p className="provider-settings-footnote">
+                      A Teszt gomb egyetlen rövid, valós API-hívást végezhet, ezért
+                      minimális szolgáltatói költsége lehet. Automatikusan sosem fut.
+                    </p>
+                  </div>
+                )}
+                <button
+                  type="button"
+                  className="settings-option"
+                  disabled={!isTauri}
                   onClick={() => {
                     if (isTauri) {
                       void changeProjectsRoot();
@@ -19465,60 +20165,24 @@ function App() {
                   ))}
               </div>
             )}
-            <div className="composer-controls">
-              <div className="composer-controls-top">
-                {showDetailedTrace && pipelineRecipes.length > 0 && (
-                  <div
-                    className="composer-pipeline-switch mode-switch"
-                    role="tablist"
-                    aria-label="Részletes mód"
-                  >
-                    <button
-                      type="button"
-                      className={!pipelineMode ? "is-active" : ""}
-                      aria-pressed={!pipelineMode}
-                      onClick={() => setPipelineMode(false)}
-                    >
-                      EGY AI
-                    </button>
-                    <button
-                      type="button"
-                      className={pipelineMode ? "is-active" : ""}
-                      aria-pressed={pipelineMode}
-                      onClick={() => setPipelineMode(true)}
-                    >
-                      MULTI-AI
-                    </button>
-                  </div>
-                )}
-                <label
-                  className="composer-detail-toggle"
-                  title="Részletes terv, lépések és gondolkodás megjelenítése"
-                >
-                  <input
-                    type="checkbox"
-                    checked={showDetailedTrace}
-                    onChange={(event) =>
-                      setShowDetailedTrace(event.currentTarget.checked)
-                    }
-                    aria-label="Részletes terv, lépések és gondolkodás"
-                  />
-                  <span>Részletes</span>
-                </label>
-              </div>
-              {showDetailedTrace && pipelineMode && activePipelineRecipe && (
-                <div className="composer-stage-grid" aria-label="Lánc beállítása">
-                  {composerPlanStage &&
-                    renderComposerStageColumn(
-                      composerPlanStage,
-                      composerPlanStageIndex,
-                    )}
-                  {composerCodeStage
-                    ? renderComposerStageColumn(
-                        composerCodeStage,
-                        composerCodeStageIndex,
-                      )
-                    : (
+            <div className="composer-shell">
+              <div
+                className={`composer-controls${!showDetailedTrace ? " is-simple" : ""}${composerControlFlip ? ` is-flip-${composerControlFlip.phase}` : ""}`}
+                id="composer-multi-ai-settings"
+              >
+                {showDetailedTrace && activePipelineRecipe && (
+                  <div className="composer-stage-grid" aria-label="Lánc beállítása">
+                    {composerPlanStage &&
+                      renderComposerStageColumn(
+                        composerPlanStage,
+                        composerPlanStageIndex,
+                      )}
+                    {composerCodeStage
+                      ? renderComposerStageColumn(
+                          composerCodeStage,
+                          composerCodeStageIndex,
+                        )
+                      : (
                         <div className="composer-stage-col composer-code-toggle-col">
                           <span className="composer-stage-role">
                             <label
@@ -19543,26 +20207,77 @@ function App() {
                           <span className="composer-stage-placeholder">—</span>
                         </div>
                       )}
-                  {composerReviewStage &&
-                    renderComposerStageColumn(
-                      composerReviewStage,
-                      composerReviewStageIndex,
+                    {composerReviewStage &&
+                      renderComposerStageColumn(
+                        composerReviewStage,
+                        composerReviewStageIndex,
+                      )}
+                  </div>
+                )}
+                {!showDetailedTrace && (
+                  <div className="composer-simple-controls" aria-label="Modell és reasoning beállítása">
+                    <EffortSlider
+                      efforts={supportedEfforts}
+                      activeIndex={activeEffortIndex}
+                      activeLabel={activeEffortLabel}
+                      onSelect={selectEffortIndex}
+                      vertical
+                    />
+                    <ModelPicker
+                      open={modelMenuOpen}
+                      activeLabel={activeLabel}
+                      selectedModel={selectedModel}
+                      modelFamilies={modelFamilies}
+                      onToggle={toggleModelMenu}
+                      onSelectModel={selectModel}
+                    />
+                  </div>
+                )}
+                {pipelineProgress && (
+                  <div className="composer-pipeline-progress" role="status">
+                    {`${STAGE_ROLE_LABELS[pipelineProgress.role] ?? pipelineProgress.role} · ${pipelineProgress.agentLabel} · ${pipelineProgress.stageIndex + 1}/${pipelineProgress.stageCount}`}
+                    {/* A chain that is waiting on the user looks identical to one
+                        that is thinking, and that cost a whole run: the stage sat
+                        on an approval nobody knew about until it timed out. */}
+                    {(pendingClaudeApproval || pendingClaudeQuestion) && (
+                      <strong className="composer-pipeline-waiting"> · rád vár</strong>
                     )}
-                </div>
-              )}
-            {pipelineProgress && (
-              <div className="composer-pipeline-progress" role="status">
-                {`${STAGE_ROLE_LABELS[pipelineProgress.role] ?? pipelineProgress.role} · ${pipelineProgress.agentLabel} · ${pipelineProgress.stageIndex + 1}/${pipelineProgress.stageCount}`}
-                {/* A chain that is waiting on the user looks identical to one
-                    that is thinking, and that cost a whole run: the stage sat
-                    on an approval nobody knew about until it timed out. */}
-                {(pendingClaudeApproval || pendingClaudeQuestion) && (
-                  <strong className="composer-pipeline-waiting"> · rád vár</strong>
+                  </div>
                 )}
               </div>
-            )}
-            </div>
-            <div className={`composer${reviewCommentTarget ? " is-review-comment" : ""}`}>
+            <div
+              className={`composer${reviewCommentTarget ? " is-review-comment" : ""}${activeMode !== "general" && activePipelineRecipe ? " has-multi-ai-toggle" : ""}${showDetailedTrace ? " is-multi-ai-open" : ""}`}
+            >
+              {activeMode !== "general" && activePipelineRecipe && (
+                <button
+                  type="button"
+                  className="composer-multi-ai-toggle"
+                  aria-expanded={showDetailedTrace}
+                  aria-controls="composer-multi-ai-settings"
+                  aria-label={
+                    showDetailedTrace
+                      ? "Részletes MULTI-AI beállítások bezárása"
+                      : "Részletes MULTI-AI beállítások megnyitása"
+                  }
+                  title={
+                    showDetailedTrace
+                      ? "Részletes MULTI-AI bezárása"
+                      : "Részletes MULTI-AI megnyitása"
+                  }
+                  onClick={() => {
+                    if (composerControlFlip) return;
+                    setModelMenuOpen(false);
+                    setComposerControlFlip({
+                      phase: "out",
+                      targetDetailed: !showDetailedTrace,
+                    });
+                  }}
+                >
+                  <svg aria-hidden="true" viewBox="0 0 14 14">
+                    <path d="M2 4h9m-2.5-2.5L11 4 8.5 6.5M12 10H3m2.5 2.5L3 10l2.5-2.5" />
+                  </svg>
+                </button>
+              )}
               {reviewCommentTarget && (
                 <div className="composer-review-comment-banner">
                   <span>REVIEW KOMMENT</span>
@@ -19686,28 +20401,22 @@ function App() {
                     <button
                       type="button"
                       className="tool-button"
-                      title="Kép megnyitása"
+                      title={
+                        composerSupportsImages
+                          ? "Kép megnyitása"
+                          : `${PROVIDER_LABELS[composerImageProvider]} ezen az útvonalon nem fogad képet`
+                      }
                       aria-label="Kép megnyitása és csatolása"
-                      disabled={imagesPreparing || pendingImages.length >= MAX_IMAGE_ATTACHMENTS}
+                      disabled={
+                        imagesPreparing ||
+                        pendingImages.length >= MAX_IMAGE_ATTACHMENTS ||
+                        !composerSupportsImages
+                      }
                       onClick={() => imageInputRef.current?.click()}
                     >
                       ＋
                     </button>
                   )}
-                  <ModelPicker
-                    disabled={showDetailedTrace && pipelineMode}
-                    open={modelMenuOpen}
-                    loading={modelsLoading}
-                    activeLabel={activeLabel}
-                    selectedModel={selectedModel}
-                    modelFamilies={modelFamilies}
-                    activeEffortLabel={activeEffortLabel}
-                    supportedEfforts={supportedEfforts}
-                    activeEffortIndex={activeEffortIndex}
-                    onToggle={toggleModelMenu}
-                    onSelectModel={selectModel}
-                    onSelectEffort={selectEffortIndex}
-                  />
                 </div>
                 {viewingActiveRun && !activeTurnHasCompleted && (
                   <button
@@ -19740,6 +20449,7 @@ function App() {
                     : "↑"}
                 </button>
               </div>
+            </div>
             </div>
           </form>
         </section>

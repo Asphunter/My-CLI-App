@@ -1,9 +1,9 @@
 //! Provider-neutral contracts for coding-agent runtimes.
 //!
-//! The existing Codex app-server path remains the compatibility path for now.
-//! These types give the frontend and the future Claude bridge one stable shape
-//! without forcing a provider switch before the live Claude vertical slice is
-//! ready.
+//! Codex keeps its app-server path, while Claude, Kimi and DeepSeek use a
+//! common bridge contract. These types keep provider, runtime and access
+//! profile separate so compatible wire formats never make one vendor look
+//! like another.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,6 +14,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub enum AgentProvider {
     Codex,
     Anthropic,
+    Kimi,
+    #[serde(rename = "deepseek")]
+    DeepSeek,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -21,6 +24,41 @@ pub enum AgentProvider {
 pub enum AgentRuntimeKind {
     CodexAppServer,
     ClaudeAgentBridge,
+    CompatibleAgentBridge,
+}
+
+/// Billing/authentication route for providers that expose more than one API
+/// product. Provider identity deliberately stays separate from wire protocol:
+/// Kimi and DeepSeek are never labelled as Claude just because their endpoint
+/// can understand Anthropic Messages.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentAccessProfile {
+    Claude,
+    KimiCode,
+    KimiOpenPlatform,
+    #[serde(rename = "deepseekApi")]
+    DeepSeekApi,
+}
+
+impl AgentProvider {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Codex => "ChatGPT",
+            Self::Anthropic => "Claude",
+            Self::Kimi => "Kimi",
+            Self::DeepSeek => "DeepSeek",
+        }
+    }
+
+    pub fn default_runtime(self) -> AgentRuntimeKind {
+        match self {
+            Self::Codex => AgentRuntimeKind::CodexAppServer,
+            Self::Anthropic => AgentRuntimeKind::ClaudeAgentBridge,
+            Self::Kimi | Self::DeepSeek => AgentRuntimeKind::CompatibleAgentBridge,
+        }
+    }
+
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -220,6 +258,8 @@ pub struct AgentModelDescriptor {
 pub struct AgentRuntimeDescriptor {
     pub provider: AgentProvider,
     pub runtime: AgentRuntimeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_profile: Option<AgentAccessProfile>,
     pub display_name: String,
     pub capabilities: AgentCapabilities,
     pub models: Vec<AgentModelDescriptor>,
@@ -241,6 +281,8 @@ pub struct AgentTurnRequest {
     pub images: Vec<AgentImageAttachment>,
     pub provider: AgentProvider,
     pub runtime: AgentRuntimeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_profile: Option<AgentAccessProfile>,
     pub conversation_id: Option<String>,
     pub session_id: Option<String>,
     pub conversation_context: Option<String>,
@@ -312,6 +354,8 @@ pub struct AgentResponse {
 #[serde(rename_all = "camelCase")]
 pub struct AgentAuthStatus {
     pub provider: AgentProvider,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_profile: Option<AgentAccessProfile>,
     pub configured: bool,
     pub source: String,
     pub preview: Option<String>,
@@ -321,6 +365,8 @@ pub struct AgentAuthStatus {
 #[serde(rename_all = "camelCase")]
 pub struct AgentConnectionResult {
     pub provider: AgentProvider,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_profile: Option<AgentAccessProfile>,
     pub success: bool,
     pub model: String,
     pub effort: String,
@@ -441,10 +487,13 @@ pub fn from_codex_response(
 }
 
 pub fn from_claude_connection(
+    provider: AgentProvider,
+    access_profile: Option<AgentAccessProfile>,
     result: crate::claude::ClaudeConnectionResult,
 ) -> AgentConnectionResult {
     AgentConnectionResult {
-        provider: AgentProvider::Anthropic,
+        provider,
+        access_profile,
         success: result.success,
         model: result.model,
         effort: result.effort,
@@ -534,6 +583,7 @@ pub fn runtime_catalog() -> Vec<AgentRuntimeDescriptor> {
         AgentRuntimeDescriptor {
             provider: AgentProvider::Codex,
             runtime: AgentRuntimeKind::CodexAppServer,
+            access_profile: None,
             display_name: "Codex app-server".to_string(),
             capabilities: AgentCapabilities {
                 streaming: true,
@@ -549,6 +599,7 @@ pub fn runtime_catalog() -> Vec<AgentRuntimeDescriptor> {
         AgentRuntimeDescriptor {
             provider: AgentProvider::Anthropic,
             runtime: AgentRuntimeKind::ClaudeAgentBridge,
+            access_profile: Some(AgentAccessProfile::Claude),
             display_name: "Claude Agent SDK bridge".to_string(),
             capabilities: AgentCapabilities {
                 streaming: true,
@@ -595,6 +646,100 @@ pub fn runtime_catalog() -> Vec<AgentRuntimeDescriptor> {
             })
             .collect(),
         },
+        AgentRuntimeDescriptor {
+            provider: AgentProvider::Kimi,
+            runtime: AgentRuntimeKind::CompatibleAgentBridge,
+            access_profile: Some(AgentAccessProfile::KimiOpenPlatform),
+            display_name: "Kimi Open Platform · raw API".to_string(),
+            capabilities: AgentCapabilities {
+                streaming: true,
+                tools: true,
+                approvals: true,
+                questions: true,
+                sessions: true,
+                images: true,
+                cancellation: true,
+            },
+            models: vec![AgentModelDescriptor {
+                id: "kimi-k3".to_string(),
+                display_name: "Kimi K3 · API".to_string(),
+                description: "Kimi K3 a közvetlen, használatalapú Open Platform API-n.".to_string(),
+                supported_efforts: ["low", "high", "max"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                default_effort: Some("high".to_string()),
+            }],
+        },
+        AgentRuntimeDescriptor {
+            provider: AgentProvider::Kimi,
+            runtime: AgentRuntimeKind::CompatibleAgentBridge,
+            access_profile: Some(AgentAccessProfile::KimiCode),
+            display_name: "Kimi Code · előfizetés".to_string(),
+            capabilities: AgentCapabilities {
+                streaming: true,
+                tools: true,
+                approvals: true,
+                questions: true,
+                sessions: true,
+                // The subscription route's image behavior is not documented
+                // consistently enough to promise it before a live probe.
+                images: false,
+                cancellation: true,
+            },
+            models: [
+                (
+                    "k3",
+                    "Kimi K3 · Code",
+                    "Kimi K3 a Kimi Code előfizetéses keretén.",
+                ),
+                (
+                    "k3-256k",
+                    "Kimi K3 256K · Code",
+                    "Kimi K3 kisebb, takarékosabb Kimi Code kontextussal.",
+                ),
+            ]
+            .into_iter()
+            .map(|(id, display_name, description)| AgentModelDescriptor {
+                id: id.to_string(),
+                display_name: display_name.to_string(),
+                description: description.to_string(),
+                supported_efforts: ["low", "high", "max"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                default_effort: Some("high".to_string()),
+            })
+            .collect(),
+        },
+        AgentRuntimeDescriptor {
+            provider: AgentProvider::DeepSeek,
+            runtime: AgentRuntimeKind::CompatibleAgentBridge,
+            access_profile: Some(AgentAccessProfile::DeepSeekApi),
+            display_name: "DeepSeek API".to_string(),
+            capabilities: AgentCapabilities {
+                streaming: true,
+                tools: true,
+                approvals: true,
+                questions: true,
+                sessions: true,
+                // The documented Anthropic-compatible route does not accept
+                // image content. Keep the UI honest until a raw-route probe
+                // proves otherwise.
+                images: false,
+                cancellation: true,
+            },
+            models: vec![AgentModelDescriptor {
+                id: "deepseek-v4-flash".to_string(),
+                display_name: "DeepSeek V4 Flash".to_string(),
+                description: "Gyors, 1M kontextusú DeepSeek coding modell.".to_string(),
+                supported_efforts: ["none", "high", "max"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                default_effort: Some("high".to_string()),
+            }],
+        },
     ]
 }
 
@@ -612,6 +757,7 @@ mod tests {
             images: Vec::new(),
             provider: AgentProvider::Codex,
             runtime: AgentRuntimeKind::CodexAppServer,
+            access_profile: None,
             conversation_id: None,
             session_id: None,
             conversation_context: None,
@@ -641,12 +787,17 @@ mod tests {
     }
 
     #[test]
-    fn catalog_exposes_both_runtime_families() {
+    fn catalog_exposes_all_provider_routes() {
         let catalog = runtime_catalog();
 
-        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog.len(), 5);
         assert_eq!(catalog[0].provider, AgentProvider::Codex);
         assert_eq!(catalog[1].provider, AgentProvider::Anthropic);
+        assert!(catalog[0].capabilities.images);
+        assert!(catalog[1].capabilities.images);
+        assert!(catalog[2].capabilities.images);
+        assert!(!catalog[3].capabilities.images);
+        assert!(!catalog[4].capabilities.images);
         assert_eq!(
             catalog[1]
                 .models
@@ -665,6 +816,18 @@ mod tests {
             model.supported_efforts == ["low", "medium", "high", "xhigh", "max"]
                 && model.default_effort.as_deref() == Some("low")
         }));
+        assert_eq!(catalog[2].provider, AgentProvider::Kimi);
+        assert_eq!(
+            catalog[2].access_profile,
+            Some(AgentAccessProfile::KimiOpenPlatform)
+        );
+        assert_eq!(catalog[2].models[0].id, "kimi-k3");
+        assert_eq!(catalog[3].provider, AgentProvider::Kimi);
+        assert_eq!(catalog[4].provider, AgentProvider::DeepSeek);
+        assert_eq!(
+            catalog[4].models[0].supported_efforts,
+            ["none", "high", "max"]
+        );
     }
 
     #[test]
@@ -713,6 +876,7 @@ mod tests {
             images: Vec::new(),
             provider: AgentProvider::Codex,
             runtime: AgentRuntimeKind::CodexAppServer,
+            access_profile: None,
             conversation_id: Some("conversation".to_string()),
             session_id: None,
             conversation_context: None,
@@ -759,5 +923,22 @@ mod tests {
         assert_eq!(StageToolProfile::Full.as_wire(), "full");
         assert_eq!(StageToolProfile::ReadOnly.as_wire(), "read_only");
         assert_eq!(StageToolProfile::Reviewer.as_wire(), "reviewer");
+
+        assert_eq!(
+            serde_json::to_string(&AgentProvider::DeepSeek).unwrap(),
+            "\"deepseek\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentProvider>("\"deepseek\"").unwrap(),
+            AgentProvider::DeepSeek
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentAccessProfile::DeepSeekApi).unwrap(),
+            "\"deepseekApi\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentAccessProfile>("\"deepseekApi\"").unwrap(),
+            AgentAccessProfile::DeepSeekApi
+        );
     }
 }

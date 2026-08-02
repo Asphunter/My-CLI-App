@@ -13,7 +13,9 @@
 //! same-runtime stages continue the same session — across runtimes the text is
 //! all that survives.
 
-use crate::agent::{AgentProvider, AgentRuntimeKind, StageToolProfile};
+use crate::agent::{
+    AgentAccessProfile, AgentProvider, AgentRuntimeKind, StageToolProfile,
+};
 use serde::{Deserialize, Serialize};
 
 /// Per-artifact budget for the prompt handed to a stage. The existing
@@ -179,6 +181,8 @@ pub struct RecipeStage {
     pub provider: AgentProvider,
     pub runtime: AgentRuntimeKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_profile: Option<AgentAccessProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
@@ -280,6 +284,7 @@ pub fn builtin_recipes() -> Vec<Recipe> {
         role,
         provider: AgentProvider::Anthropic,
         runtime: AgentRuntimeKind::ClaudeAgentBridge,
+        access_profile: Some(AgentAccessProfile::Claude),
         model: Some(model.to_string()),
         effort: Some(effort.to_string()),
         max_turns: Some(max_turns),
@@ -288,6 +293,7 @@ pub fn builtin_recipes() -> Vec<Recipe> {
         role,
         provider: AgentProvider::Codex,
         runtime: AgentRuntimeKind::CodexAppServer,
+        access_profile: None,
         model: Some(model.to_string()),
         effort: Some(effort.to_string()),
         max_turns: Some(max_turns),
@@ -575,6 +581,8 @@ pub fn stage_agent_label(stage: &RecipeStage) -> String {
     let vendor = match stage.provider {
         AgentProvider::Anthropic => "Claude",
         AgentProvider::Codex => "Codex",
+        AgentProvider::Kimi => "Kimi",
+        AgentProvider::DeepSeek => "DeepSeek",
     };
     let Some(model) = stage.model.as_deref() else {
         return vendor.to_string();
@@ -586,6 +594,9 @@ pub fn stage_agent_label(stage: &RecipeStage) -> String {
         "claude-opus-4-6" => "Opus 4.6",
         "claude-fable-5" => "Fable 5",
         "claude-sonnet-5" => "Sonnet 5",
+        "kimi-k3" | "k3" => "K3",
+        "k3-256k" => "K3 256K",
+        "deepseek-v4-flash" => "V4 Flash",
         other => other,
     };
     // The card names the stage already, so the badge only has to answer "who
@@ -726,10 +737,12 @@ pub struct StageOverride {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
-    /// `anthropic` or `codex`. Switching the vendor switches the runtime with
-    /// it, since a Claude model cannot run on the Codex app-server.
+    /// Switching the provider switches the runtime with it; model IDs are not
+    /// portable between Codex, Claude, Kimi and DeepSeek.
     #[serde(default)]
     pub provider: Option<String>,
+    #[serde(default)]
+    pub access_profile: Option<AgentAccessProfile>,
 }
 
 /// Applies the GUI's per-stage choices onto the preset.
@@ -742,6 +755,7 @@ pub fn apply_stage_overrides(recipe: &mut Recipe, overrides: &[StageOverride]) {
             Some("anthropic") => {
                 stage.provider = AgentProvider::Anthropic;
                 stage.runtime = AgentRuntimeKind::ClaudeAgentBridge;
+                stage.access_profile = Some(AgentAccessProfile::Claude);
                 if stage
                     .model
                     .as_deref()
@@ -753,11 +767,36 @@ pub fn apply_stage_overrides(recipe: &mut Recipe, overrides: &[StageOverride]) {
             Some("codex") => {
                 stage.provider = AgentProvider::Codex;
                 stage.runtime = AgentRuntimeKind::CodexAppServer;
+                stage.access_profile = None;
                 if stage
                     .model
                     .as_deref()
                     .is_some_and(|model| model.starts_with("claude-"))
                 {
+                    stage.model = None;
+                }
+            }
+            Some("kimi") => {
+                stage.provider = AgentProvider::Kimi;
+                stage.runtime = AgentRuntimeKind::CompatibleAgentBridge;
+                stage.access_profile = over.access_profile.or_else(|| {
+                    if over.model.as_deref() == Some("kimi-k3") {
+                        Some(AgentAccessProfile::KimiOpenPlatform)
+                    } else {
+                        Some(AgentAccessProfile::KimiCode)
+                    }
+                });
+                if stage.model.as_deref().is_some_and(|model| {
+                    !matches!(model, "kimi-k3" | "k3" | "k3-256k")
+                }) {
+                    stage.model = None;
+                }
+            }
+            Some("deepseek") | Some("deepSeek") => {
+                stage.provider = AgentProvider::DeepSeek;
+                stage.runtime = AgentRuntimeKind::CompatibleAgentBridge;
+                stage.access_profile = Some(AgentAccessProfile::DeepSeekApi);
+                if stage.model.as_deref() != Some("deepseek-v4-flash") {
                     stage.model = None;
                 }
             }
@@ -925,15 +964,20 @@ where
     } = start;
     let mut artifacts = seed_artifacts;
     let mut stages = Vec::<StageRunResult>::new();
-    // Keyed by runtime: a stage continues the session of its own runtime, which
-    // is what lets a model switch inside one vendor keep the context while a
-    // vendor switch starts fresh and relies on the artifact block instead.
+    // Keyed by provider, runtime and billing/auth route. Two providers may use
+    // the same protocol bridge, but their sessions must never meet; Kimi Code
+    // and Kimi Open Platform are separate products as well.
     let mut session_by_runtime = std::collections::HashMap::<String, String>::new();
     if let Some(session) = initial_session {
-        session_by_runtime.insert(
-            format!("{:?}", AgentRuntimeKind::ClaudeAgentBridge),
-            session,
-        );
+        if let Some(stage) = recipe.stages.get(start_index) {
+            session_by_runtime.insert(
+                format!(
+                    "{:?}:{:?}:{:?}",
+                    stage.provider, stage.runtime, stage.access_profile
+                ),
+                session,
+            );
+        }
     }
     let mut status = RunStatus::Running;
     let mut error = None;
@@ -946,7 +990,10 @@ where
             status = RunStatus::Cancelled;
             break;
         }
-        let runtime_key = format!("{:?}", stage.runtime);
+        let runtime_key = format!(
+            "{:?}:{:?}:{:?}",
+            stage.provider, stage.runtime, stage.access_profile
+        );
         let execution = StageExecution {
             index,
             stage: stage.clone(),
@@ -1380,6 +1427,36 @@ mod tests {
         assert_ne!(seen[0].stage.model, seen[1].stage.model);
     }
 
+    #[test]
+    fn a_kimi_open_session_never_leaks_into_kimi_code() {
+        let recipe = {
+            let mut recipe = recipe_by_id("plan_code_review").expect("preset");
+            recipe.stages.truncate(2);
+            recipe.stages[0].provider = AgentProvider::Kimi;
+            recipe.stages[0].runtime = AgentRuntimeKind::CompatibleAgentBridge;
+            recipe.stages[0].access_profile = Some(AgentAccessProfile::KimiOpenPlatform);
+            recipe.stages[0].model = Some("kimi-k3".to_string());
+            recipe.stages[1].provider = AgentProvider::Kimi;
+            recipe.stages[1].runtime = AgentRuntimeKind::CompatibleAgentBridge;
+            recipe.stages[1].access_profile = Some(AgentAccessProfile::KimiCode);
+            recipe.stages[1].model = Some("k3".to_string());
+            recipe
+        };
+        let recorder = Recorder::with(vec![
+            ok("terv", Some("kimi-open-session")),
+            ok("kod", Some("kimi-code-session")),
+        ]);
+
+        recorder.run(&recipe, "Feladat.", None);
+        let seen = recorder.seen.borrow();
+
+        assert_eq!(seen[0].session_id, None);
+        assert_eq!(
+            seen[1].session_id, None,
+            "the two Kimi products use different credentials and session stores"
+        );
+    }
+
     /// Ugyanazon a futtatón is friss szemmel bírálunk: a kódoló session-jének
     /// folytatása nem független ellenőrzés, és a bírálandó munkát az
     /// artifact-blokk amúgy is átadja.
@@ -1585,12 +1662,14 @@ mod tests {
                     model: Some("claude-opus-5".to_string()),
                     effort: Some("high".to_string()),
                     provider: None,
+                    access_profile: None,
                 },
                 StageOverride::default(),
                 StageOverride {
                     model: None,
                     effort: None,
                     provider: Some("anthropic".to_string()),
+                    access_profile: None,
                 },
             ],
         );
@@ -1619,12 +1698,52 @@ mod tests {
                 model: None,
                 effort: None,
                 provider: Some("codex".to_string()),
+                access_profile: None,
             }],
         );
         assert_eq!(recipe.stages[0].provider, AgentProvider::Codex);
         assert_eq!(
             recipe.stages[0].model, None,
             "a Claude model id would fail on the Codex app-server at send time"
+        );
+    }
+
+    #[test]
+    fn provider_overrides_select_the_matching_external_profile() {
+        let mut recipe = recipe_by_id("plan_code_review").expect("preset");
+        apply_stage_overrides(
+            &mut recipe,
+            &[
+                StageOverride {
+                    model: Some("kimi-k3".to_string()),
+                    effort: Some("max".to_string()),
+                    provider: Some("kimi".to_string()),
+                    access_profile: Some(AgentAccessProfile::KimiOpenPlatform),
+                },
+                StageOverride {
+                    model: Some("deepseek-v4-flash".to_string()),
+                    effort: Some("high".to_string()),
+                    provider: Some("deepseek".to_string()),
+                    access_profile: Some(AgentAccessProfile::DeepSeekApi),
+                },
+            ],
+        );
+
+        assert_eq!(recipe.stages[0].provider, AgentProvider::Kimi);
+        assert_eq!(
+            recipe.stages[0].access_profile,
+            Some(AgentAccessProfile::KimiOpenPlatform)
+        );
+        assert_eq!(recipe.stages[0].model.as_deref(), Some("kimi-k3"));
+        assert_eq!(recipe.stages[0].effort.as_deref(), Some("max"));
+        assert_eq!(recipe.stages[1].provider, AgentProvider::DeepSeek);
+        assert_eq!(
+            recipe.stages[1].access_profile,
+            Some(AgentAccessProfile::DeepSeekApi)
+        );
+        assert_eq!(
+            recipe.stages[1].runtime,
+            AgentRuntimeKind::CompatibleAgentBridge
         );
     }
 

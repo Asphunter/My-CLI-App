@@ -1,6 +1,12 @@
 export type RunInputMode = "steer" | "follow_up";
 
-export type RunInputProvider = "codex" | "anthropic";
+export type RunInputProvider = "codex" | "anthropic" | "kimi" | "deepseek";
+
+export type RunInputAccessProfile =
+  | "claude"
+  | "kimiCode"
+  | "kimiOpenPlatform"
+  | "deepseekApi";
 
 export type RunInputStageRole = "plan" | "plan_review" | "code" | "review";
 
@@ -77,6 +83,7 @@ export type FollowUpRequestSettings = {
   conversationKey?: string | null;
   model?: string | null;
   effort?: string | null;
+  accessProfile?: RunInputAccessProfile | null;
   detailed: boolean;
   pipelineRecipeId?: string | null;
   pipelineEnabled: boolean;
@@ -86,6 +93,7 @@ export type FollowUpRequestSettings = {
     model?: string;
     effort?: string;
     provider?: RunInputProvider;
+    accessProfile?: RunInputAccessProfile;
   }>;
 };
 

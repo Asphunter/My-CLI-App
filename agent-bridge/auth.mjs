@@ -13,6 +13,10 @@ export function isSubscriptionAuth(env = process.env) {
   return env?.MIN_AGENT_AUTH_MODE === "subscription";
 }
 
+export function isExternalAuth(env = process.env) {
+  return env?.MIN_AGENT_AUTH_MODE === "external";
+}
+
 export function hasCredentials(env = process.env) {
   return isSubscriptionAuth(env) || Boolean(env?.ANTHROPIC_API_KEY);
 }
@@ -23,5 +27,5 @@ export function hasCredentials(env = process.env) {
  * stays the guard in that mode.
  */
 export function budgetOption(maxBudgetUsd, env = process.env) {
-  return isSubscriptionAuth(env) ? {} : { maxBudgetUsd };
+  return isSubscriptionAuth(env) || isExternalAuth(env) ? {} : { maxBudgetUsd };
 }

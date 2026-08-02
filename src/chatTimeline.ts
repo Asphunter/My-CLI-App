@@ -419,9 +419,23 @@ export const messageBelongsToWorkGroup = (
     const parentKey = parent?.id;
     return Boolean(parentKey && group.userMessageKey === parentKey);
   }
-  // Once both sides have explicit identities, a mismatch is authoritative.
-  // Falling through to a chronological guess is what mixed separate cards.
-  if (message.turnId) return turnKeys.has(message.turnId);
+  // A provider session id is not necessarily a turn id. DeepSeek reuses the
+  // same session id for consecutive requests, so that id can legitimately be
+  // present in more than one visual group. The user bucket is the per-request
+  // boundary: require it as well whenever both sides have one. Without this,
+  // the newest answer matched every older group carrying the same session id
+  // and was rendered in all of their VÁLASZ panels.
+  if (message.turnId) {
+    if (!turnKeys.has(message.turnId)) return false;
+    const messageUserKey = userMessageKeyAtIndex(messages, messageIndex);
+    if (
+      group.userMessageKey &&
+      messageUserKey &&
+      messageUserKey !== group.userMessageKey
+    )
+      return false;
+    return true;
+  }
   return Boolean(
     group.userMessageKey &&
       userMessageKeyAtIndex(messages, messageIndex) === group.userMessageKey,

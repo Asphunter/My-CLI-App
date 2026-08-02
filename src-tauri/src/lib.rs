@@ -214,8 +214,12 @@ async fn run_agent_turn_inner_impl(
                 let _ = store::record_agent_turn_failure(&request, "failed");
                 error
             })
-    } else if request.provider == agent::AgentProvider::Anthropic
-        && request.runtime == agent::AgentRuntimeKind::ClaudeAgentBridge
+    } else if matches!(
+        request.provider,
+        agent::AgentProvider::Anthropic
+            | agent::AgentProvider::Kimi
+            | agent::AgentProvider::DeepSeek
+    ) && request.runtime == request.provider.default_runtime()
     {
         let request_for_worker = request.clone();
         let cancellation = claude::begin_request(&request_id)?;
@@ -223,7 +227,12 @@ async fn run_agent_turn_inner_impl(
             claude::send(app, request_for_worker, cancellation)
         })
         .await
-        .map_err(|error| format!("A Claude agent háttérfeladata leállt: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "A {} agent háttérfeladata leállt: {error}",
+                request.provider.display_name()
+            )
+        })?;
         claude::end_request(&request_id);
         result
             .map(|response| {
@@ -655,7 +664,9 @@ fn agent_steer(
 ) -> Result<agent::AgentSteerQueued, agent::AgentSteerError> {
     let result = validate_pipeline_steer_target(&request).and_then(|_| match request.provider {
         agent::AgentProvider::Codex => codex::steer(&app, request.clone()),
-        agent::AgentProvider::Anthropic => claude::steer(&app, request.clone()),
+        agent::AgentProvider::Anthropic
+        | agent::AgentProvider::Kimi
+        | agent::AgentProvider::DeepSeek => claude::steer(&app, request.clone()),
     });
     if let Err(error) = &result {
         let _ = codex::emit_main_window(
@@ -934,6 +945,7 @@ async fn pipeline_send(
                         },
                         provider: execution.stage.provider,
                         runtime: execution.stage.runtime,
+                        access_profile: execution.stage.access_profile,
                         conversation_id: Some(request.conversation_id.clone()),
                         session_id: execution.session_id,
                         conversation_context: if execution.is_first {
@@ -1224,10 +1236,12 @@ fn agent_answer_checkpoint(
 fn agent_cancel(provider: Option<agent::AgentProvider>, request_id: String) -> Result<(), String> {
     match provider.unwrap_or(agent::AgentProvider::Codex) {
         agent::AgentProvider::Codex => codex::cancel_request(&request_id),
-        agent::AgentProvider::Anthropic => Err(
-            "A Claude bridge megszakítása a live coding runtime bekötésével aktiválódik."
-                .to_string(),
-        ),
+        agent::AgentProvider::Anthropic
+        | agent::AgentProvider::Kimi
+        | agent::AgentProvider::DeepSeek => {
+            mark_project_draining(&request_id);
+            claude::cancel_request(&request_id)
+        }
     }
 }
 
@@ -1239,8 +1253,10 @@ fn agent_approval_response(
 ) -> Result<(), String> {
     match provider.unwrap_or(agent::AgentProvider::Codex) {
         agent::AgentProvider::Codex => codex::respond_approval(&approval_id, &decision),
-        agent::AgentProvider::Anthropic => {
-            Err("A Claude approval UI a live coding runtime bekötésével aktiválódik.".to_string())
+        agent::AgentProvider::Anthropic
+        | agent::AgentProvider::Kimi
+        | agent::AgentProvider::DeepSeek => {
+            claude::respond_approval(&approval_id, &decision, None)
         }
     }
 }
@@ -1251,11 +1267,14 @@ fn agent_question_response(
     question_id: String,
     answer: serde_json::Value,
 ) -> Result<(), String> {
-    let _ = (provider, question_id, answer);
-    Err(
-        "A provider question-kezelés a live Claude coding runtime fázisában aktiválódik."
-            .to_string(),
-    )
+    match provider.unwrap_or(agent::AgentProvider::Codex) {
+        agent::AgentProvider::Codex => {
+            Err("A Codex app-server ezen az útvonalon nem kér strukturált választ.".to_string())
+        }
+        agent::AgentProvider::Anthropic
+        | agent::AgentProvider::Kimi
+        | agent::AgentProvider::DeepSeek => claude::respond_question(&question_id, answer),
+    }
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -1282,6 +1301,7 @@ fn claude_question_response(question_id: String, answer: serde_json::Value) -> R
 async fn agent_models(
     app: tauri::AppHandle,
     provider: Option<agent::AgentProvider>,
+    access_profile: Option<agent::AgentAccessProfile>,
 ) -> Result<Vec<agent::AgentModelDescriptor>, String> {
     match provider.unwrap_or(agent::AgentProvider::Codex) {
         agent::AgentProvider::Codex => tauri::async_runtime::spawn_blocking(move || {
@@ -1291,50 +1311,89 @@ async fn agent_models(
         .map_err(|error| {
             format!("A provider modellkatalógus háttérfeladata leállt: {error}")
         })?,
-        agent::AgentProvider::Anthropic => Ok(agent::runtime_catalog()
-            .into_iter()
-            .find(|runtime| runtime.provider == agent::AgentProvider::Anthropic)
-            .map(|runtime| runtime.models)
-            .unwrap_or_default()),
+        selected_provider => {
+            let mut models = Vec::new();
+            for runtime in agent::runtime_catalog().into_iter().filter(|runtime| {
+                runtime.provider == selected_provider
+                    && access_profile
+                        .map(|profile| runtime.access_profile == Some(profile))
+                        .unwrap_or(true)
+            }) {
+                for model in runtime.models {
+                    if !models
+                        .iter()
+                        .any(|existing: &agent::AgentModelDescriptor| existing.id == model.id)
+                    {
+                        models.push(model);
+                    }
+                }
+            }
+            Ok(models)
+        }
     }
 }
 
 #[tauri::command(rename_all = "camelCase")]
 fn agent_auth_status(
     provider: Option<agent::AgentProvider>,
+    access_profile: Option<agent::AgentAccessProfile>,
 ) -> Result<agent::AgentAuthStatus, String> {
-    match provider.unwrap_or(agent::AgentProvider::Anthropic) {
-        agent::AgentProvider::Codex => Ok(agent::AgentAuthStatus {
-            provider: agent::AgentProvider::Codex,
-            configured: true,
-            source: "codexAppServer".to_string(),
-            preview: None,
-        }),
-        agent::AgentProvider::Anthropic => {
-            let status = claude::auth_status()?;
-            Ok(agent::AgentAuthStatus {
-                provider: agent::AgentProvider::Anthropic,
-                configured: status.configured,
-                source: status.source,
-                preview: status.preview,
-            })
-        }
-    }
+    claude::provider_auth_status(
+        provider.unwrap_or(agent::AgentProvider::Anthropic),
+        access_profile,
+    )
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn agent_save_api_key(
+    provider: agent::AgentProvider,
+    access_profile: Option<agent::AgentAccessProfile>,
+    api_key: String,
+) -> Result<agent::AgentAuthStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        claude::save_provider_api_key(provider, access_profile, &api_key)
+    })
+    .await
+    .map_err(|error| format!("Az API-kulcs mentési háttérfeladata leállt: {error}"))?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn agent_delete_api_key(
+    provider: agent::AgentProvider,
+    access_profile: Option<agent::AgentAccessProfile>,
+) -> Result<agent::AgentAuthStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        claude::delete_provider_api_key(provider, access_profile)
+    })
+    .await
+    .map_err(|error| format!("Az API-kulcs törlési háttérfeladata leállt: {error}"))?
 }
 
 #[tauri::command(rename_all = "camelCase")]
 async fn agent_test_connection(
     provider: Option<agent::AgentProvider>,
+    access_profile: Option<agent::AgentAccessProfile>,
     model: Option<String>,
     effort: Option<String>,
     max_budget_usd: Option<f64>,
     max_turns: Option<u32>,
     cwd: Option<String>,
 ) -> Result<agent::AgentConnectionResult, String> {
-    match provider.unwrap_or(agent::AgentProvider::Anthropic) {
-        agent::AgentProvider::Anthropic => tauri::async_runtime::spawn_blocking(move || {
-            claude::test_connection(model, effort, max_budget_usd, max_turns, cwd)
-                .map(agent::from_claude_connection)
+    let provider = provider.unwrap_or(agent::AgentProvider::Anthropic);
+    match provider {
+        agent::AgentProvider::Anthropic
+        | agent::AgentProvider::Kimi
+        | agent::AgentProvider::DeepSeek => tauri::async_runtime::spawn_blocking(move || {
+            claude::test_connection(
+                provider,
+                access_profile,
+                model,
+                effort,
+                max_budget_usd,
+                max_turns,
+                cwd,
+            )
+            .map(|result| agent::from_claude_connection(provider, access_profile, result))
         })
         .await
         .map_err(|error| format!("A provider kapcsolat-teszt háttérfeladata leállt: {error}"))?,
@@ -1583,7 +1642,15 @@ async fn claude_test_connection(
     cwd: Option<String>,
 ) -> Result<claude::ClaudeConnectionResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        claude::test_connection(model, effort, max_budget_usd, max_turns, cwd)
+        claude::test_connection(
+            agent::AgentProvider::Anthropic,
+            Some(agent::AgentAccessProfile::Claude),
+            model,
+            effort,
+            max_budget_usd,
+            max_turns,
+            cwd,
+        )
     })
     .await
     .map_err(|error| format!("A Claude kapcsolat-teszt háttérfeladata leállt: {error}"))?
@@ -1898,6 +1965,8 @@ pub fn run() {
             claude_question_response,
             agent_models,
             agent_auth_status,
+            agent_save_api_key,
+            agent_delete_api_key,
             agent_test_connection,
             agent_shutdown,
             codex_rollback_snapshot,

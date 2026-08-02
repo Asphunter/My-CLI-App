@@ -31,6 +31,11 @@ use std::os::windows::process::CommandExt;
 
 const KEYRING_SERVICE: &str = "min-local-ai-workspace";
 const KEYRING_USER: &str = "claude-api-key";
+const KIMI_CODE_KEYRING_USER: &str = "kimi-code-api-key";
+const KIMI_OPEN_KEYRING_USER: &str = "kimi-open-platform-api-key";
+const DEEPSEEK_KEYRING_USER: &str = "deepseek-api-key";
+const KIMI_CODE_BASE_URL: &str = "https://api.kimi.com/coding/";
+const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/anthropic";
 const DEFAULT_MODEL: &str = "claude-sonnet-5";
 const DEFAULT_MAX_BUDGET_USD: f64 = 0.05;
 /// A tool-using coding turn needs several agent turns (read, edit, run the
@@ -60,22 +65,55 @@ enum AuthMode {
     Subscription,
     /// A pay-per-token API key from Windows Credential Manager.
     ApiKey,
+    /// A non-Anthropic provider key. The provider bills it itself, so the
+    /// Claude Agent SDK's notional USD budget must not be applied.
+    External,
 }
 
 /// The resolved credential for one bridge invocation.
 struct ResolvedAuth {
     mode: AuthMode,
     api_key: Option<String>,
+    provider: crate::agent::AgentProvider,
+    access_profile: Option<crate::agent::AgentAccessProfile>,
 }
 
 impl ResolvedAuth {
     fn apply(&self, command: &mut Command) {
+        use crate::agent::{AgentAccessProfile, AgentProvider};
+
+        // A desktop process may have inherited any of these from the shell.
+        // Clear all routes first so one provider can never receive another
+        // provider's credential or endpoint by accident.
+        command.env_remove("ANTHROPIC_API_KEY");
+        command.env_remove("ANTHROPIC_AUTH_TOKEN");
+        command.env_remove("ANTHROPIC_BASE_URL");
+        command.env_remove("MIN_KIMI_OPEN_API_KEY");
+        command.env(
+            "MIN_AGENT_PROVIDER",
+            match self.provider {
+                AgentProvider::Codex => "codex",
+                AgentProvider::Anthropic => "anthropic",
+                AgentProvider::Kimi => "kimi",
+                AgentProvider::DeepSeek => "deepseek",
+            },
+        );
+        command.env("MIN_AGENT_PROVIDER_LABEL", self.provider.display_name());
+        if let Some(profile) = self.access_profile {
+            command.env(
+                "MIN_AGENT_ACCESS_PROFILE",
+                match profile {
+                    AgentAccessProfile::Claude => "claude",
+                    AgentAccessProfile::KimiCode => "kimiCode",
+                    AgentAccessProfile::KimiOpenPlatform => "kimiOpenPlatform",
+                    AgentAccessProfile::DeepSeekApi => "deepseekApi",
+                },
+            );
+        }
         match self.mode {
             AuthMode::Subscription => {
                 // An inherited key would silently take precedence over the
                 // subscription, so both header variables are cleared.
-                command.env_remove("ANTHROPIC_API_KEY");
-                command.env_remove("ANTHROPIC_AUTH_TOKEN");
                 command.env("MIN_AGENT_AUTH_MODE", "subscription");
             }
             AuthMode::ApiKey => {
@@ -83,6 +121,29 @@ impl ResolvedAuth {
                     command.env("ANTHROPIC_API_KEY", key);
                 }
                 command.env("MIN_AGENT_AUTH_MODE", "apiKey");
+            }
+            AuthMode::External => {
+                let key = self.api_key.as_deref().unwrap_or_default();
+                match self.access_profile {
+                    Some(AgentAccessProfile::KimiCode) => {
+                        command.env("ANTHROPIC_BASE_URL", KIMI_CODE_BASE_URL);
+                        command.env("ANTHROPIC_API_KEY", key);
+                    }
+                    Some(AgentAccessProfile::KimiOpenPlatform) => {
+                        // main.mjs consumes and deletes the real key before it
+                        // spawns the Agent SDK child. The child talks only to a
+                        // loopback protocol adapter with this non-secret key.
+                        command.env("MIN_KIMI_OPEN_API_KEY", key);
+                        command.env("ANTHROPIC_API_KEY", "min-local-kimi-proxy");
+                    }
+                    Some(AgentAccessProfile::DeepSeekApi) => {
+                        command.env("ANTHROPIC_BASE_URL", DEEPSEEK_BASE_URL);
+                        command.env("ANTHROPIC_API_KEY", key);
+                        command.env("ANTHROPIC_AUTH_TOKEN", key);
+                    }
+                    _ => {}
+                }
+                command.env("MIN_AGENT_AUTH_MODE", "external");
             }
         }
     }
@@ -187,9 +248,9 @@ pub fn begin_request(request_id: &str) -> Result<Arc<AtomicBool>, String> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let mut requests = active_requests()
         .lock()
-        .map_err(|_| "A Claude-kérések állapota zárolva maradt.".to_string())?;
+        .map_err(|_| "Az agentkérések állapota zárolva maradt.".to_string())?;
     if requests.contains_key(request_id) {
-        return Err("Ehhez a Claude-kéréshez már tartozik futó folyamat.".to_string());
+        return Err("Ehhez az agentkéréshez már tartozik futó folyamat.".to_string());
     }
     requests.insert(
         request_id.to_string(),
@@ -288,7 +349,7 @@ fn handle_steer_status(
     let (pending, provider_turn_id) = {
         let mut requests = active_requests()
             .lock()
-            .map_err(|_| "A Claude-kérések állapota zárolva maradt.".to_string())?;
+            .map_err(|_| "Az agentkérések állapota zárolva maradt.".to_string())?;
         let Some(active) = requests.get_mut(request_id) else {
             return Ok(());
         };
@@ -326,7 +387,7 @@ fn handle_steer_status(
                 payload
                     .get("message")
                     .and_then(Value::as_str)
-                    .unwrap_or("A Claude nem fogadta el a menet közbeni üzenetet."),
+                    .unwrap_or("Az agent nem fogadta el a menet közbeni üzenetet."),
             ),
         )
     }
@@ -338,10 +399,13 @@ pub fn steer(
 ) -> Result<crate::agent::AgentSteerQueued, crate::agent::AgentSteerError> {
     use crate::agent::{AgentInputErrorCode, AgentProvider, AgentSteerError};
 
-    if request.provider != AgentProvider::Anthropic {
+    if !matches!(
+        request.provider,
+        AgentProvider::Anthropic | AgentProvider::Kimi | AgentProvider::DeepSeek
+    ) {
         return Err(AgentSteerError::new(
             AgentInputErrorCode::TargetChanged,
-            "A célzott futás nem Claude providerhez tartozik.",
+            "A célzott futás nem kompatibilis agentproviderhez tartozik.",
         ));
     }
     if request.text.trim().is_empty() {
@@ -354,19 +418,19 @@ pub fn steer(
         let mut requests = active_requests().lock().map_err(|_| {
             AgentSteerError::new(
                 AgentInputErrorCode::RuntimeFailed,
-                "A Claude-kérések állapota zárolva maradt.",
+                "Az agentkérések állapota zárolva maradt.",
             )
         })?;
         let active = requests.get_mut(&request.provider_request_id).ok_or_else(|| {
             AgentSteerError::new(
                 AgentInputErrorCode::NoActiveRun,
-                "A célzott Claude-kérés már nem aktív.",
+                "A célzott agentkérés már nem aktív.",
             )
         })?;
         if active.cancelled.load(Ordering::Acquire) {
             return Err(AgentSteerError::new(
                 AgentInputErrorCode::RunCancelled,
-                "A célzott Claude-kérést leállították.",
+                "A célzott agentkérést leállították.",
             ));
         }
         if active.accepted_inputs.contains(&request.input_id)
@@ -374,20 +438,20 @@ pub fn steer(
         {
             return Err(AgentSteerError::new(
                 AgentInputErrorCode::DuplicateInput,
-                "Ezt a menet közbeni üzenetet a Claude futás már megkapta.",
+                "Ezt a menet közbeni üzenetet az agentfutás már megkapta.",
             ));
         }
         if !active.turn_open {
             return Err(AgentSteerError::new(
                 AgentInputErrorCode::NoActiveTurn,
-                "A Claude provider turnje már nem fogad inputot.",
+                "A provider turnje már nem fogad inputot.",
             ));
         }
         let active_turn_id = active.provider_turn_id.as_deref().unwrap_or(request.provider_request_id.as_str());
         if active_turn_id != request.expected_provider_turn_id {
             return Err(AgentSteerError::new(
                 AgentInputErrorCode::TargetChanged,
-                "A célzott Claude turn közben megváltozott.",
+                "A célzott provider-turn közben megváltozott.",
             ));
         }
         active
@@ -399,11 +463,11 @@ pub fn steer(
     let _ = emit_input_status(app, &crate::agent::AgentInputStatusEvent::sending(&request));
     let write_result = writer
         .lock()
-        .map_err(|_| "A Claude bridge bemenete zárolva maradt.".to_string())
+        .map_err(|_| "Az agent bridge bemenete zárolva maradt.".to_string())
         .and_then(|mut stdin| {
             let stdin = stdin
                 .as_mut()
-                .ok_or_else(|| "A Claude bridge bemenete már lezárult.".to_string())?;
+                .ok_or_else(|| "Az agent bridge bemenete már lezárult.".to_string())?;
             write_bridge_request(
                 stdin,
                 bridge_request_with_context(
@@ -447,10 +511,10 @@ pub fn cancel_request(request_id: &str) -> Result<(), String> {
     let (cancelled, pid, writer) = {
         let requests = active_requests()
             .lock()
-            .map_err(|_| "A Claude-kérések állapota zárolva maradt.".to_string())?;
+            .map_err(|_| "Az agentkérések állapota zárolva maradt.".to_string())?;
         let request = requests
             .get(request_id)
-            .ok_or_else(|| "A Claude-kérés már befejeződött.".to_string())?;
+            .ok_or_else(|| "Az agentkérés már befejeződött.".to_string())?;
         (
             request.cancelled.clone(),
             request.pid,
@@ -482,16 +546,16 @@ pub fn end_request(request_id: &str) {
 fn send_to_request(request_id: &str, message_type: &str, payload: Value) -> Result<(), String> {
     let writer = active_requests()
         .lock()
-        .map_err(|_| "A Claude-kérések állapota zárolva maradt.".to_string())?
+        .map_err(|_| "Az agentkérések állapota zárolva maradt.".to_string())?
         .get(request_id)
         .map(|request| request.writer.clone())
-        .ok_or_else(|| "A Claude-kérés már befejeződött.".to_string())?;
+        .ok_or_else(|| "Az agentkérés már befejeződött.".to_string())?;
     let mut stdin = writer
         .lock()
-        .map_err(|_| "A Claude bridge bemenete zárolva maradt.".to_string())?;
+        .map_err(|_| "Az agent bridge bemenete zárolva maradt.".to_string())?;
     let stdin = stdin
         .as_mut()
-        .ok_or_else(|| "A Claude bridge bemenete már lezárult.".to_string())?;
+        .ok_or_else(|| "Az agent bridge bemenete már lezárult.".to_string())?;
     write_bridge_request(
         stdin,
         bridge_request_with_context(request_id, None, None, message_type, payload),
@@ -532,19 +596,48 @@ pub fn respond_question(question_id: &str, answer: Value) -> Result<(), String> 
     )
 }
 
-fn keyring_entry() -> Result<keyring::Entry, String> {
-    keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
+fn profile_label(profile: crate::agent::AgentAccessProfile) -> &'static str {
+    use crate::agent::AgentAccessProfile;
+    match profile {
+        AgentAccessProfile::Claude => "Claude",
+        AgentAccessProfile::KimiCode => "Kimi Code",
+        AgentAccessProfile::KimiOpenPlatform => "Kimi Open Platform",
+        AgentAccessProfile::DeepSeekApi => "DeepSeek",
+    }
+}
+
+fn keyring_user(profile: crate::agent::AgentAccessProfile) -> &'static str {
+    use crate::agent::AgentAccessProfile;
+    match profile {
+        AgentAccessProfile::Claude => KEYRING_USER,
+        AgentAccessProfile::KimiCode => KIMI_CODE_KEYRING_USER,
+        AgentAccessProfile::KimiOpenPlatform => KIMI_OPEN_KEYRING_USER,
+        AgentAccessProfile::DeepSeekApi => DEEPSEEK_KEYRING_USER,
+    }
+}
+
+fn keyring_entry_for(
+    profile: crate::agent::AgentAccessProfile,
+) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(KEYRING_SERVICE, keyring_user(profile))
         .map_err(|error| format!("Nem sikerült a Windows Credential Manager elérése: {error}"))
 }
 
-fn load_api_key() -> Result<Option<String>, String> {
-    match keyring_entry()?.get_password() {
+fn load_profile_api_key(
+    profile: crate::agent::AgentAccessProfile,
+) -> Result<Option<String>, String> {
+    match keyring_entry_for(profile)?.get_password() {
         Ok(value) if !value.trim().is_empty() => Ok(Some(value)),
         Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
         Err(error) => Err(format!(
-            "Nem sikerült a Claude API-kulcs olvasása a Windows Credential Managerből: {error}"
+            "Nem sikerült a {} API-kulcs olvasása a Windows Credential Managerből: {error}",
+            profile_label(profile)
         )),
     }
+}
+
+fn load_api_key() -> Result<Option<String>, String> {
+    load_profile_api_key(crate::agent::AgentAccessProfile::Claude)
 }
 
 /// Path of the Claude Code subscription login on this machine.
@@ -632,48 +725,211 @@ fn plan_label(plan: &str) -> String {
 ///
 /// The subscription login wins when present: `ANTHROPIC_API_KEY` would
 /// otherwise override it even though the user is logged in.
-fn resolve_auth() -> Result<ResolvedAuth, String> {
-    if subscription_plan().is_some() {
-        return Ok(ResolvedAuth {
-            mode: AuthMode::Subscription,
-            api_key: None,
-        });
-    }
-    match load_api_key()? {
-        Some(api_key) => Ok(ResolvedAuth {
-            mode: AuthMode::ApiKey,
-            api_key: Some(api_key),
-        }),
-        None => Err(
-            "Nincs Claude hitelesítés. Jelentkezz be a Claude Code előfizetéssel, vagy mentsd el az API-kulcsot a Beállításokban."
-                .to_string(),
-        ),
+pub fn effective_access_profile(
+    provider: crate::agent::AgentProvider,
+    explicit: Option<crate::agent::AgentAccessProfile>,
+    model: Option<&str>,
+) -> Result<Option<crate::agent::AgentAccessProfile>, String> {
+    use crate::agent::{AgentAccessProfile, AgentProvider};
+    let profile = explicit.or_else(|| match provider {
+        AgentProvider::Codex => None,
+        AgentProvider::Anthropic => Some(AgentAccessProfile::Claude),
+        AgentProvider::Kimi if model == Some("kimi-k3") => {
+            Some(AgentAccessProfile::KimiOpenPlatform)
+        }
+        AgentProvider::Kimi => Some(AgentAccessProfile::KimiCode),
+        AgentProvider::DeepSeek => Some(AgentAccessProfile::DeepSeekApi),
+    });
+    let valid = matches!(
+        (provider, profile),
+        (AgentProvider::Codex, None)
+            | (AgentProvider::Anthropic, Some(AgentAccessProfile::Claude))
+            | (AgentProvider::Kimi, Some(AgentAccessProfile::KimiCode))
+            | (AgentProvider::Kimi, Some(AgentAccessProfile::KimiOpenPlatform))
+            | (AgentProvider::DeepSeek, Some(AgentAccessProfile::DeepSeekApi))
+    );
+    if valid {
+        Ok(profile)
+    } else {
+        Err(format!(
+            "A(z) {} providerhez nem illik a kiválasztott hozzáférési profil.",
+            provider.display_name()
+        ))
     }
 }
 
-pub fn save_api_key(api_key: &str) -> Result<ClaudeAuthStatus, String> {
+fn validate_provider_model(
+    provider: crate::agent::AgentProvider,
+    access_profile: Option<crate::agent::AgentAccessProfile>,
+    model: &str,
+) -> Result<(), String> {
+    use crate::agent::{AgentAccessProfile, AgentProvider};
+    let valid = match (provider, access_profile) {
+        (AgentProvider::Anthropic, Some(AgentAccessProfile::Claude)) => {
+            model.starts_with("claude-")
+        }
+        (AgentProvider::Kimi, Some(AgentAccessProfile::KimiOpenPlatform)) => {
+            model == "kimi-k3"
+        }
+        (AgentProvider::Kimi, Some(AgentAccessProfile::KimiCode)) => {
+            matches!(model, "k3" | "k3-256k")
+        }
+        (AgentProvider::DeepSeek, Some(AgentAccessProfile::DeepSeekApi)) => {
+            model == "deepseek-v4-flash"
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "A(z) {model} modell nem futtatható a kiválasztott {} hozzáférési útvonalon.",
+            provider.display_name()
+        ))
+    }
+}
+
+fn resolve_auth_for(
+    provider: crate::agent::AgentProvider,
+    access_profile: Option<crate::agent::AgentAccessProfile>,
+    model: Option<&str>,
+) -> Result<ResolvedAuth, String> {
+    use crate::agent::{AgentAccessProfile, AgentProvider};
+    let access_profile = effective_access_profile(provider, access_profile, model)?;
+    if provider == AgentProvider::Anthropic && subscription_plan().is_some() {
+        return Ok(ResolvedAuth {
+            mode: AuthMode::Subscription,
+            api_key: None,
+            provider,
+            access_profile,
+        });
+    }
+    let profile = access_profile.ok_or_else(|| {
+        format!("A(z) {} providerhez nincs API-hozzáférési profil.", provider.display_name())
+    })?;
+    match load_profile_api_key(profile)? {
+        Some(api_key) => Ok(ResolvedAuth {
+            mode: if profile == AgentAccessProfile::Claude {
+                AuthMode::ApiKey
+            } else {
+                AuthMode::External
+            },
+            api_key: Some(api_key),
+            provider,
+            access_profile: Some(profile),
+        }),
+        None => Err(match profile {
+            AgentAccessProfile::Claude => "Nincs Claude hitelesítés. Jelentkezz be a Claude Code előfizetéssel, vagy mentsd el az API-kulcsot a Beállításokban.".to_string(),
+            AgentAccessProfile::KimiCode => "Nincs Kimi Code API-kulcs. A Kimi Code Console-ban létrehozott, előfizetéshez tartozó kulcsot mentsd el a Beállításokban.".to_string(),
+            AgentAccessProfile::KimiOpenPlatform => "Nincs Kimi Open Platform API-kulcs. A platform.kimi.ai oldalon létrehozott kulcsot mentsd el a Beállításokban.".to_string(),
+            AgentAccessProfile::DeepSeekApi => "Nincs DeepSeek API-kulcs. A platform.deepseek.com oldalon létrehozott kulcsot mentsd el a Beállításokban.".to_string(),
+        }),
+    }
+}
+
+pub fn provider_auth_status(
+    provider: crate::agent::AgentProvider,
+    access_profile: Option<crate::agent::AgentAccessProfile>,
+) -> Result<crate::agent::AgentAuthStatus, String> {
+    use crate::agent::{AgentAccessProfile, AgentProvider};
+    if provider == AgentProvider::Codex {
+        return Ok(crate::agent::AgentAuthStatus {
+            provider,
+            access_profile: None,
+            configured: true,
+            source: "codexAppServer".to_string(),
+            preview: None,
+        });
+    }
+    let profile = effective_access_profile(provider, access_profile, None)?
+        .ok_or_else(|| "Hiányzó provider hozzáférési profil.".to_string())?;
+    if profile == AgentAccessProfile::Claude {
+        let status = auth_status()?;
+        return Ok(crate::agent::AgentAuthStatus {
+            provider,
+            access_profile: Some(profile),
+            configured: status.configured,
+            source: status.source,
+            preview: status.preview,
+        });
+    }
+    let key = load_profile_api_key(profile)?;
+    Ok(crate::agent::AgentAuthStatus {
+        provider,
+        access_profile: Some(profile),
+        configured: key.is_some(),
+        source: if key.is_some() { "apiKey" } else { "none" }.to_string(),
+        preview: key.as_deref().map(api_key_preview),
+    })
+}
+
+fn validate_api_key(api_key: &str, profile: crate::agent::AgentAccessProfile) -> Result<&str, String> {
     let api_key = api_key.trim();
     if api_key.is_empty() {
-        return Err("A Claude API-kulcs nem lehet üres.".to_string());
+        return Err(format!("A {} API-kulcs nem lehet üres.", profile_label(profile)));
     }
     if api_key.len() > MAX_API_KEY_LENGTH {
-        return Err("A Claude API-kulcs túl hosszú.".to_string());
+        return Err(format!("A {} API-kulcs túl hosszú.", profile_label(profile)));
     }
     if api_key
         .chars()
         .any(|character| character == '\r' || character == '\n')
     {
-        return Err("A Claude API-kulcs nem tartalmazhat sortörést.".to_string());
+        return Err(format!(
+            "A {} API-kulcs nem tartalmazhat sortörést.",
+            profile_label(profile)
+        ));
     }
+    Ok(api_key)
+}
 
-    keyring_entry()?
+pub fn save_provider_api_key(
+    provider: crate::agent::AgentProvider,
+    access_profile: Option<crate::agent::AgentAccessProfile>,
+    api_key: &str,
+) -> Result<crate::agent::AgentAuthStatus, String> {
+    let profile = effective_access_profile(provider, access_profile, None)?
+        .ok_or_else(|| "Ehhez a providerhez nem menthető API-kulcs.".to_string())?;
+    let api_key = validate_api_key(api_key, profile)?;
+    keyring_entry_for(profile)?
+        .set_password(api_key)
+        .map_err(|error| {
+            format!(
+                "Nem sikerült a {} API-kulcs mentése: {error}",
+                profile_label(profile)
+            )
+        })?;
+    provider_auth_status(provider, Some(profile))
+}
+
+pub fn delete_provider_api_key(
+    provider: crate::agent::AgentProvider,
+    access_profile: Option<crate::agent::AgentAccessProfile>,
+) -> Result<crate::agent::AgentAuthStatus, String> {
+    let profile = effective_access_profile(provider, access_profile, None)?
+        .ok_or_else(|| "Ehhez a providerhez nincs törölhető API-kulcs.".to_string())?;
+    match keyring_entry_for(profile)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => {
+            provider_auth_status(provider, Some(profile))
+        }
+        Err(error) => Err(format!(
+            "Nem sikerült a {} API-kulcs törlése: {error}",
+            profile_label(profile)
+        )),
+    }
+}
+
+pub fn save_api_key(api_key: &str) -> Result<ClaudeAuthStatus, String> {
+    let profile = crate::agent::AgentAccessProfile::Claude;
+    let api_key = validate_api_key(api_key, profile)?;
+    keyring_entry_for(profile)?
         .set_password(api_key)
         .map_err(|error| format!("Nem sikerült a Claude API-kulcs mentése: {error}"))?;
     auth_status()
 }
 
 pub fn delete_api_key() -> Result<ClaudeAuthStatus, String> {
-    match keyring_entry()?.delete_credential() {
+    match keyring_entry_for(crate::agent::AgentAccessProfile::Claude)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => auth_status(),
         Err(error) => Err(format!("Nem sikerült a Claude API-kulcs törlése: {error}")),
     }
@@ -724,7 +980,7 @@ fn bridge_path() -> Result<PathBuf, String> {
     }
 
     Err(format!(
-        "A Claude bridge nem található. Keresett fájl: {}",
+        "Az agent bridge nem található. Keresett fájl: {}",
         source_candidate.display()
     ))
 }
@@ -826,18 +1082,18 @@ fn now_timestamp() -> String {
 
 fn write_bridge_request(writer: &mut impl Write, request: Value) -> Result<(), String> {
     serde_json::to_writer(&mut *writer, &request)
-        .map_err(|error| format!("A Claude bridge-kérés szerializálása sikertelen: {error}"))?;
+        .map_err(|error| format!("Az agent bridge-kérés szerializálása sikertelen: {error}"))?;
     writer
         .write_all(b"\n")
-        .map_err(|error| format!("A Claude bridge-kérés elküldése sikertelen: {error}"))?;
+        .map_err(|error| format!("Az agent bridge-kérés elküldése sikertelen: {error}"))?;
     writer
         .flush()
-        .map_err(|error| format!("A Claude bridge bemenetének flush-a sikertelen: {error}"))
+        .map_err(|error| format!("Az agent bridge bemenetének flush-a sikertelen: {error}"))
 }
 
 fn parse_bridge_message(line: &str) -> Result<BridgeMessage, String> {
     serde_json::from_str(line)
-        .map_err(|error| format!("A Claude bridge hibás JSONL választ küldött: {error}"))
+        .map_err(|error| format!("Az agent bridge hibás JSONL választ küldött: {error}"))
 }
 
 fn emit_main_window<T: Serialize>(
@@ -919,8 +1175,8 @@ fn emit_compat_event(
         ),
         sequence: message.sequence.unwrap_or_default(),
         timestamp: now_timestamp(),
-        provider: crate::agent::AgentProvider::Anthropic,
-        runtime: crate::agent::AgentRuntimeKind::ClaudeAgentBridge,
+        provider: request.provider,
+        runtime: request.runtime,
         event_type: normalized_event_type,
         payload: payload.clone(),
     };
@@ -1012,21 +1268,44 @@ pub fn send(
     request: crate::agent::AgentTurnRequest,
     cancellation: Arc<AtomicBool>,
 ) -> Result<crate::agent::AgentResponse, String> {
+    use crate::agent::{AgentAccessProfile, AgentProvider, AgentRuntimeKind};
+
+    let expected_runtime = request.provider.default_runtime();
+    if request.provider == AgentProvider::Codex || request.runtime != expected_runtime {
+        return Err(format!(
+            "A(z) {} provider nem futtatható a kiválasztott {:?} runtime-mal.",
+            request.provider.display_name(),
+            request.runtime
+        ));
+    }
+    let provider_label = request.provider.display_name();
     if cancellation.load(Ordering::Acquire) {
-        return Err("A Claude-kérés megszakítva.".to_string());
+        return Err(format!("A {provider_label}-kérés megszakítva."));
     }
     let request_id = request
         .request_id
         .clone()
-        .ok_or_else(|| "A Claude-kérés azonosítója hiányzik.".to_string())?;
-    let auth = resolve_auth()?;
+        .ok_or_else(|| format!("A {provider_label}-kérés azonosítója hiányzik."))?;
+    let access_profile = effective_access_profile(
+        request.provider,
+        request.access_profile,
+        request.model.as_deref(),
+    )?;
+    let auth = resolve_auth_for(request.provider, access_profile, request.model.as_deref())?;
     let cwd = bridge_cwd(request.cwd.clone())?;
     let bridge = bridge_path()?;
     let model = request
         .model
         .clone()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        .unwrap_or_else(|| match (request.provider, access_profile) {
+            (AgentProvider::Anthropic, _) => DEFAULT_MODEL.to_string(),
+            (AgentProvider::Kimi, Some(AgentAccessProfile::KimiCode)) => "k3".to_string(),
+            (AgentProvider::Kimi, _) => "kimi-k3".to_string(),
+            (AgentProvider::DeepSeek, _) => "deepseek-v4-flash".to_string(),
+            (AgentProvider::Codex, _) => DEFAULT_MODEL.to_string(),
+        });
+    validate_provider_model(request.provider, access_profile, &model)?;
     let effort = request
         .effort
         .clone()
@@ -1034,7 +1313,7 @@ pub fn send(
         .unwrap_or_else(|| "low".to_string());
     let max_budget_usd = request.max_budget_usd.unwrap_or(DEFAULT_MAX_BUDGET_USD);
     if !max_budget_usd.is_finite() || !(0.01..=5.0).contains(&max_budget_usd) {
-        return Err("A Claude coding budgetje 0.01 és 5.00 USD közé essen.".to_string());
+        return Err("Az agent coding budgetje 0.01 és 5.00 USD közé essen.".to_string());
     }
     let max_turns = request
         .max_turns
@@ -1068,15 +1347,15 @@ pub fn send(
 
         let mut spawned = command
             .spawn()
-            .map_err(|error| format!("A Claude bridge indítása sikertelen: {error}"))?;
+            .map_err(|error| format!("A {provider_label} bridge indítása sikertelen: {error}"))?;
         let stdin = spawned
             .stdin
             .take()
-            .ok_or_else(|| "A Claude bridge stdin csatornája nem nyitható meg.".to_string())?;
+            .ok_or_else(|| format!("A {provider_label} bridge stdin csatornája nem nyitható meg."))?;
         let stdout = spawned
             .stdout
             .take()
-            .ok_or_else(|| "A Claude bridge stdout csatornája nem nyitható meg.".to_string())?;
+            .ok_or_else(|| format!("A {provider_label} bridge stdout csatornája nem nyitható meg."))?;
         let writer = Arc::new(Mutex::new(Some(stdin)));
         attach_process(
             &request_id,
@@ -1092,17 +1371,17 @@ pub fn send(
             &ClaudeTransportStatus {
                 request_id: Some(request_id.clone()),
                 stage: "server-starting".to_string(),
-                detail: "A Claude coding bridge elindult.".to_string(),
+                detail: format!("A {provider_label} coding bridge elindult."),
                 session_id: request.session_id.clone(),
             },
         )?;
         {
             let mut stdin = writer
                 .lock()
-                .map_err(|_| "A Claude bridge bemenete zárolva maradt.".to_string())?;
+                .map_err(|_| "Az agent bridge bemenete zárolva maradt.".to_string())?;
             let stdin = stdin
                 .as_mut()
-                .ok_or_else(|| "A Claude bridge bemenete lezárult.".to_string())?;
+                .ok_or_else(|| "Az agent bridge bemenete lezárult.".to_string())?;
             write_bridge_request(
                 stdin,
                 bridge_request_with_context(
@@ -1110,7 +1389,27 @@ pub fn send(
                     request.conversation_id.as_deref(),
                     request.session_id.as_deref(),
                     "initialize",
-                    json!({ "cwd": cwd.to_string_lossy(), "client": "min", "provider": "anthropic" }),
+                    json!({
+                        "cwd": cwd.to_string_lossy(),
+                        "client": "min",
+                        "provider": match request.provider {
+                            AgentProvider::Anthropic => "anthropic",
+                            AgentProvider::Kimi => "kimi",
+                            AgentProvider::DeepSeek => "deepseek",
+                            AgentProvider::Codex => "codex",
+                        },
+                        "runtime": match request.runtime {
+                            AgentRuntimeKind::ClaudeAgentBridge => "claudeAgentBridge",
+                            AgentRuntimeKind::CompatibleAgentBridge => "compatibleAgentBridge",
+                            AgentRuntimeKind::CodexAppServer => "codexAppServer",
+                        },
+                        "accessProfile": access_profile.map(|profile| match profile {
+                            AgentAccessProfile::Claude => "claude",
+                            AgentAccessProfile::KimiCode => "kimiCode",
+                            AgentAccessProfile::KimiOpenPlatform => "kimiOpenPlatform",
+                            AgentAccessProfile::DeepSeekApi => "deepseekApi",
+                        }),
+                    }),
                 ),
             )?;
             write_bridge_request(
@@ -1152,7 +1451,7 @@ pub fn send(
         loop {
             let line = reader
                 .next_waiting_for_user(&cancellation, &request_id)?
-                .ok_or_else(|| "A Claude bridge lezárta a kapcsolatot.".to_string())?;
+                .ok_or_else(|| format!("A {provider_label} bridge lezárta a kapcsolatot."))?;
             let message = parse_bridge_message(line.trim_end())?;
             if message.request_id.as_deref() != Some(request_id.as_str()) {
                 continue;
@@ -1172,6 +1471,7 @@ pub fn send(
                     let rpc_started = std::time::Instant::now();
                     let storage_result = crate::store::agent_session_store_rpc(
                         request.conversation_id.as_deref(),
+                        request.provider,
                         &message.payload,
                     );
                     let rpc_elapsed = rpc_started.elapsed();
@@ -1192,10 +1492,10 @@ pub fn send(
                     {
                         let mut stdin = writer
                             .lock()
-                            .map_err(|_| "A Claude bridge bemenete zárolva maradt.".to_string())?;
+                            .map_err(|_| "Az agent bridge bemenete zárolva maradt.".to_string())?;
                         let stdin = stdin
                             .as_mut()
-                            .ok_or_else(|| "A Claude bridge bemenete lezárult.".to_string())?;
+                            .ok_or_else(|| "Az agent bridge bemenete lezárult.".to_string())?;
                         write_bridge_request(
                             stdin,
                             bridge_request_with_context(
@@ -1317,7 +1617,7 @@ pub fn send(
                         &app,
                         &request_id,
                         crate::agent::AgentInputErrorCode::NoActiveTurn,
-                        "A Claude turn lezárult az input elfogadása előtt.",
+                        "Az agent turnje lezárult az input elfogadása előtt.",
                     );
                     let payload_text = message
                         .payload
@@ -1347,7 +1647,7 @@ pub fn send(
                         &ClaudeTransportStatus {
                             request_id: Some(request_id.clone()),
                             stage: "turn-completed".to_string(),
-                            detail: "A Claude coding-turn lezárult.".to_string(),
+                            detail: format!("A {provider_label} coding-turn lezárult."),
                             session_id: session_id.clone(),
                         },
                     )?;
@@ -1358,7 +1658,7 @@ pub fn send(
                         .payload
                         .get("message")
                         .and_then(Value::as_str)
-                        .unwrap_or("A Claude coding-turn sikertelen.");
+                        .unwrap_or("Az agent coding-turnje sikertelen.");
                     let error_code = message
                         .payload
                         .get("errorCode")
@@ -1373,23 +1673,23 @@ pub fn send(
                             crate::agent::AgentInputErrorCode::RuntimeFailed
                         },
                         if error_code == "cancelled" {
-                            "A Claude futást az input elfogadása előtt leállították."
+                            "Az agentfutást az input elfogadása előtt leállították."
                         } else {
-                            "A Claude runtime az input elfogadása előtt leállt."
+                            "Az agent runtime az input elfogadása előtt leállt."
                         },
                     );
-                    return Err(format!("Claude [{error_code}]: {message_text}"));
+                    return Err(format!("{provider_label} [{error_code}]: {message_text}"));
                 }
                 Some(other) => {
-                    return Err(format!("Ismeretlen Claude bridge válasz: {other}"));
+                    return Err(format!("Ismeretlen {provider_label} bridge válasz: {other}"));
                 }
                 None => {}
             }
         }
 
         Ok(crate::agent::AgentResponse {
-            provider: crate::agent::AgentProvider::Anthropic,
-            runtime: crate::agent::AgentRuntimeKind::ClaudeAgentBridge,
+            provider: request.provider,
+            runtime: request.runtime,
             thread_id: session_id.clone(),
             session_id,
             text: crate::store::collapse_repeated_assistant_text("assistant", &final_text),
@@ -1422,9 +1722,9 @@ pub fn send(
                 crate::agent::AgentInputErrorCode::RuntimeFailed
             },
             if cancellation.load(Ordering::Acquire) {
-                "A Claude futást az input elfogadása előtt leállították."
+                "Az agentfutást az input elfogadása előtt leállították."
             } else {
-                "A Claude runtime az input elfogadása előtt leállt."
+                "Az agent runtime az input elfogadása előtt leállt."
             },
         );
     }
@@ -1455,7 +1755,7 @@ pub fn send(
             let mut report = crate::codex::stage_agent_workspace_snapshot(&guard_snapshot, report)
                 .map_err(|error| {
                     format!(
-                        "A Claude-válasz stagingje sikertelen: {error}. A snapshot azonosítója: {}.",
+                        "A {provider_label}-válasz stagingje sikertelen: {error}. A snapshot azonosítója: {}.",
                         crate::codex::agent_workspace_snapshot_id(&guard_snapshot)
                     )
                 })?;
@@ -1464,7 +1764,7 @@ pub fn send(
             Ok(response)
         }
         (Ok(_), Ok(report)) => {
-            let error = "A Claude-kérés megszakítva.".to_string();
+            let error = format!("A {provider_label}-kérés megszakítva.");
             match crate::codex::stage_agent_workspace_snapshot(&guard_snapshot, report) {
                 Ok(_) => Err(format!(
                     "{error} A részleges agent-változásokat elvetettem; a snapshot megmaradt: {}.",
@@ -1487,7 +1787,7 @@ pub fn send(
             )),
         },
         (Ok(_), Err(guard_error)) => Err(format!(
-            "A Claude-válasz után a workspace guard lezárása sikertelen: {guard_error}. A snapshot azonosítója: {}.",
+            "A {provider_label}-válasz után a workspace guard lezárása sikertelen: {guard_error}. A snapshot azonosítója: {}.",
             crate::codex::agent_workspace_snapshot_id(&guard_snapshot)
         )),
         (Err(error), Err(guard_error)) => Err(format!(
@@ -1498,16 +1798,32 @@ pub fn send(
 }
 
 pub fn test_connection(
+    provider: crate::agent::AgentProvider,
+    access_profile: Option<crate::agent::AgentAccessProfile>,
     model: Option<String>,
     effort: Option<String>,
     max_budget_usd: Option<f64>,
     max_turns: Option<u32>,
     cwd: Option<String>,
 ) -> Result<ClaudeConnectionResult, String> {
-    let auth = resolve_auth()?;
+    use crate::agent::{AgentAccessProfile, AgentProvider};
+
+    if provider == AgentProvider::Codex {
+        return Err("A Codex kapcsolatát az app-server transport kezeli.".to_string());
+    }
+    let access_profile = effective_access_profile(provider, access_profile, model.as_deref())?;
+    let auth = resolve_auth_for(provider, access_profile, model.as_deref())?;
+    let provider_label = provider.display_name();
     let model = model
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        .unwrap_or_else(|| match (provider, access_profile) {
+            (AgentProvider::Anthropic, _) => DEFAULT_MODEL.to_string(),
+            (AgentProvider::Kimi, Some(AgentAccessProfile::KimiCode)) => "k3".to_string(),
+            (AgentProvider::Kimi, _) => "kimi-k3".to_string(),
+            (AgentProvider::DeepSeek, _) => "deepseek-v4-flash".to_string(),
+            (AgentProvider::Codex, _) => DEFAULT_MODEL.to_string(),
+        });
+    validate_provider_model(provider, access_profile, &model)?;
     let effort = effort
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "low".to_string());
@@ -1520,7 +1836,11 @@ pub fn test_connection(
         .clamp(1, MAX_TURNS_CEILING);
     let cwd = bridge_cwd(cwd)?;
     let bridge = bridge_path()?;
-    let request_id = format!("claude-connection-{}", Uuid::new_v4());
+    let request_id = format!(
+        "{}-connection-{}",
+        provider_label.to_ascii_lowercase(),
+        Uuid::new_v4()
+    );
 
     let mut command = Command::new("node");
     command
@@ -1538,15 +1858,15 @@ pub fn test_connection(
 
     let mut child = command
         .spawn()
-        .map_err(|error| format!("A Claude bridge indítása sikertelen: {error}"))?;
+        .map_err(|error| format!("A {provider_label} bridge indítása sikertelen: {error}"))?;
     let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| "A Claude bridge stdin csatornája nem nyitható meg.".to_string())?;
+        .ok_or_else(|| format!("A {provider_label} bridge stdin csatornája nem nyitható meg."))?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "A Claude bridge stdout csatornája nem nyitható meg.".to_string())?;
+        .ok_or_else(|| format!("A {provider_label} bridge stdout csatornája nem nyitható meg."))?;
     let mut reader = BufReader::new(stdout);
 
     write_bridge_request(
@@ -1554,7 +1874,27 @@ pub fn test_connection(
         bridge_request(
             &request_id,
             "initialize",
-            json!({ "cwd": cwd.to_string_lossy(), "client": "min" }),
+            json!({
+                "cwd": cwd.to_string_lossy(),
+                "client": "min",
+                "provider": match provider {
+                    AgentProvider::Anthropic => "anthropic",
+                    AgentProvider::Kimi => "kimi",
+                    AgentProvider::DeepSeek => "deepseek",
+                    AgentProvider::Codex => "codex",
+                },
+                "runtime": if provider == AgentProvider::Anthropic {
+                    "claudeAgentBridge"
+                } else {
+                    "compatibleAgentBridge"
+                },
+                "accessProfile": access_profile.map(|profile| match profile {
+                    AgentAccessProfile::Claude => "claude",
+                    AgentAccessProfile::KimiCode => "kimiCode",
+                    AgentAccessProfile::KimiOpenPlatform => "kimiOpenPlatform",
+                    AgentAccessProfile::DeepSeekApi => "deepseekApi",
+                }),
+            }),
         ),
     )?;
     write_bridge_request(
@@ -1579,7 +1919,7 @@ pub fn test_connection(
         line.clear();
         let bytes = reader
             .read_line(&mut line)
-            .map_err(|error| format!("A Claude bridge válaszának olvasása sikertelen: {error}"))?;
+            .map_err(|error| format!("A {provider_label} bridge válaszának olvasása sikertelen: {error}"))?;
         if bytes == 0 {
             break;
         }
@@ -1638,7 +1978,7 @@ pub fn test_connection(
     let _ = child.kill();
     let _ = child.wait();
     connection_result.ok_or_else(|| {
-        "A Claude bridge a kapcsolat-teszt előtt leállt, eredmény nélkül.".to_string()
+        format!("A {provider_label} bridge a kapcsolat-teszt előtt leállt, eredmény nélkül.")
     })
 }
 
@@ -1679,13 +2019,13 @@ impl CancellableLineReader {
     fn next(&self, cancellation: &AtomicBool) -> Result<Option<String>, String> {
         loop {
             if cancellation.load(Ordering::Acquire) {
-                return Err("A Claude-kérés megszakítva.".to_string());
+                return Err("Az agentkérés megszakítva.".to_string());
             }
             match self.lines.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(line) => return line,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("A Claude bridge lezárta a kapcsolatot.".to_string())
+                    return Err("Az agent bridge lezárta a kapcsolatot.".to_string())
                 }
             }
         }
@@ -1775,6 +2115,8 @@ mod tests {
         let subscription = ResolvedAuth {
             mode: AuthMode::Subscription,
             api_key: Some("sk-ant-should-not-be-used".to_string()),
+            provider: crate::agent::AgentProvider::Anthropic,
+            access_profile: Some(crate::agent::AgentAccessProfile::Claude),
         };
         let mut command = Command::new("node");
         command.env("ANTHROPIC_API_KEY", "sk-ant-inherited");
@@ -1812,6 +2154,8 @@ mod tests {
         let api_key_auth = ResolvedAuth {
             mode: AuthMode::ApiKey,
             api_key: Some("sk-ant-live-key".to_string()),
+            provider: crate::agent::AgentProvider::Anthropic,
+            access_profile: Some(crate::agent::AgentAccessProfile::Claude),
         };
         let mut command = Command::new("node");
         api_key_auth.apply(&mut command);
@@ -1842,6 +2186,88 @@ mod tests {
         assert!(preview.starts_with("sk-ant-"));
         assert!(preview.ends_with("wxyz"));
         assert!(!preview.contains("abcdefghijklmnopqrstuvwxyz"));
+    }
+
+    #[test]
+    fn provider_models_resolve_to_separate_access_profiles() {
+        use crate::agent::{AgentAccessProfile, AgentProvider};
+
+        assert_eq!(
+            effective_access_profile(AgentProvider::Kimi, None, Some("kimi-k3"))
+                .expect("Kimi raw profile"),
+            Some(AgentAccessProfile::KimiOpenPlatform)
+        );
+        assert_eq!(
+            effective_access_profile(AgentProvider::Kimi, None, Some("k3"))
+                .expect("Kimi Code profile"),
+            Some(AgentAccessProfile::KimiCode)
+        );
+        assert_eq!(
+            effective_access_profile(
+                AgentProvider::DeepSeek,
+                None,
+                Some("deepseek-v4-flash")
+            )
+            .expect("DeepSeek profile"),
+            Some(AgentAccessProfile::DeepSeekApi)
+        );
+        assert!(effective_access_profile(
+            AgentProvider::DeepSeek,
+            Some(AgentAccessProfile::KimiCode),
+            Some("deepseek-v4-flash")
+        )
+        .is_err());
+
+        assert!(validate_provider_model(
+            AgentProvider::Kimi,
+            Some(AgentAccessProfile::KimiOpenPlatform),
+            "k3"
+        )
+        .is_err());
+        assert!(validate_provider_model(
+            AgentProvider::Kimi,
+            Some(AgentAccessProfile::KimiCode),
+            "k3-256k"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn external_auth_uses_only_the_selected_provider_route() {
+        use crate::agent::{AgentAccessProfile, AgentProvider};
+
+        let auth = ResolvedAuth {
+            mode: AuthMode::External,
+            api_key: Some("sk-external-secret".to_string()),
+            provider: AgentProvider::Kimi,
+            access_profile: Some(AgentAccessProfile::KimiOpenPlatform),
+        };
+        let mut command = Command::new("node");
+        command.env("ANTHROPIC_BASE_URL", "https://wrong.example");
+        auth.apply(&mut command);
+        let envs: std::collections::HashMap<String, Option<String>> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|item| item.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            envs.get("MIN_KIMI_OPEN_API_KEY"),
+            Some(&Some("sk-external-secret".to_string()))
+        );
+        assert_eq!(
+            envs.get("ANTHROPIC_API_KEY"),
+            Some(&Some("min-local-kimi-proxy".to_string()))
+        );
+        assert_eq!(envs.get("ANTHROPIC_BASE_URL"), Some(&None));
+        assert_eq!(
+            envs.get("MIN_AGENT_ACCESS_PROFILE"),
+            Some(&Some("kimiOpenPlatform".to_string()))
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { classifyConnectionError } from "./errors.mjs";
-import { budgetOption, hasCredentials, MISSING_CREDENTIALS_MESSAGE } from "./auth.mjs";
+import { budgetOption, hasCredentials } from "./auth.mjs";
 import { hasAnswer, normalizeQuestionAnswers } from "./questions.mjs";
 import { normalizeGuardPath } from "./paths.mjs";
 import {
@@ -27,6 +27,51 @@ import {
 import { shouldStartFreshSession } from "./recovery.mjs";
 import { streamedStringField } from "./streamingJson.mjs";
 import { TurnInputBroker } from "./turnInputBroker.mjs";
+import { startKimiOpenAdapter } from "./openaiAnthropicAdapter.mjs";
+import { createSdkPrompt } from "./multimodalPrompt.mjs";
+
+const PROVIDER = process.env.MIN_AGENT_PROVIDER || "anthropic";
+const PROVIDER_LABEL = process.env.MIN_AGENT_PROVIDER_LABEL
+  || (PROVIDER === "kimi" ? "Kimi" : PROVIDER === "deepseek" ? "DeepSeek" : "Claude");
+const ACCESS_PROFILE = process.env.MIN_AGENT_ACCESS_PROFILE || "claude";
+const RUNTIME = PROVIDER === "anthropic" ? "claudeAgentBridge" : "compatibleAgentBridge";
+let providerAdapter = null;
+let providerTransportError = null;
+let providerAdapterCloseTask = null;
+
+async function configureProviderTransport() {
+  if (ACCESS_PROFILE !== "kimiOpenPlatform") return;
+  const apiKey = process.env.MIN_KIMI_OPEN_API_KEY;
+  // The real Kimi key remains in this closure and is removed before the Agent
+  // SDK child is created. That child can only see the loopback URL and a dummy
+  // credential, never the upstream secret.
+  delete process.env.MIN_KIMI_OPEN_API_KEY;
+  const upstreamBaseUrl = process.env.MIN_AGENT_BRIDGE_TEST_MODE === "1"
+    ? process.env.MIN_KIMI_OPEN_UPSTREAM_BASE_URL || "https://api.moonshot.ai/v1"
+    : "https://api.moonshot.ai/v1";
+  providerAdapter = await startKimiOpenAdapter({ apiKey, upstreamBaseUrl });
+  process.env.ANTHROPIC_BASE_URL = providerAdapter.baseUrl;
+  process.env.ANTHROPIC_API_KEY = "min-local-kimi-proxy";
+  delete process.env.ANTHROPIC_AUTH_TOKEN;
+}
+
+try {
+  await configureProviderTransport();
+} catch (error) {
+  providerTransportError = error instanceof Error ? error.message : String(error);
+}
+
+function closeProviderTransport() {
+  if (!providerAdapter) return providerAdapterCloseTask ?? Promise.resolve();
+  const adapter = providerAdapter;
+  providerAdapter = null;
+  providerAdapterCloseTask = Promise.resolve(adapter.close()).catch((error) => {
+    diagnostic("provider adapter close failed", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+  });
+  return providerAdapterCloseTask;
+}
 
 const activeRequests = new Map();
 const dispatchTasks = new Set();
@@ -137,7 +182,7 @@ function diagnostic(message, details = {}) {
 function safeErrorMessage(error) {
   const message = error instanceof Error ? error.message : String(error);
   return message
-    .replace(/sk-ant-[A-Za-z0-9_-]+/g, "[redacted-api-key]")
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "[redacted-api-key]")
     .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s,;]+/gi, "$1[redacted]")
     .replace(/(anthropic_api_key\s*[:=]\s*)[^\s,;]+/gi, "$1[redacted]")
     .slice(0, 2000);
@@ -152,7 +197,44 @@ function bridgeError(request, code, message) {
 }
 
 function connectionPrompt() {
-  return "Reply with exactly: Claude kapcsolat rendben.";
+  return `Reply with exactly: ${PROVIDER_LABEL} kapcsolat rendben.`;
+}
+
+function missingCredentialsMessage() {
+  if (providerTransportError) {
+    return `A ${PROVIDER_LABEL} provider adaptere nem indult el: ${providerTransportError}`;
+  }
+  return `Nincs ${PROVIDER_LABEL} hitelesítés a bridge környezetében.`;
+}
+
+function providerReasoningOptions(effort) {
+  process.env.MIN_AGENT_EFFECTIVE_EFFORT = effort;
+  if (PROVIDER === "deepseek") {
+    if (effort === "none" || effort === "off") {
+      return { thinking: { type: "disabled" } };
+    }
+    return {
+      effort: effort === "max" ? "max" : "high",
+      thinking: {
+        type: "enabled",
+        budgetTokens: effort === "max" ? 32_768 : 16_384,
+      },
+    };
+  }
+  if (PROVIDER === "kimi") {
+    const normalized = ["low", "high", "max"].includes(effort) ? effort : "high";
+    return {
+      effort: normalized,
+      // K3 is an always-thinking model. Fixed budgets serialize cleanly on
+      // Anthropic-compatible routes; the raw adapter maps the selected effort
+      // to Kimi's native top-level reasoning_effort.
+      thinking: {
+        type: "enabled",
+        budgetTokens: normalized === "low" ? 4_096 : normalized === "max" ? 32_768 : 16_384,
+      },
+    };
+  }
+  return { effort, thinking: { type: "adaptive" } };
 }
 
 function normalizeCwd(value) {
@@ -222,7 +304,7 @@ function waitForInteraction(request, kind, payload, signal) {
     const abort = () => {
       if (!pendingInteractions.has(id)) return;
       pendingInteractions.delete(id);
-      reject(new Error("A felhasználó megszakította a Claude-eszköz kérést."));
+      reject(new Error(`A felhasználó megszakította a ${PROVIDER_LABEL}-eszköz kérését.`));
     };
     if (signal?.aborted) abort();
     else signal?.addEventListener("abort", abort, { once: true });
@@ -287,7 +369,7 @@ function sessionStoreRequest(turn, operation, key, extra = {}) {
         waitedMs: Date.now() - startedAt,
         pendingOps: pendingSessionStore.size,
       });
-      pending.reject(new Error("A Claude SessionStore művelete időtúllépés miatt megszakadt."));
+      pending.reject(new Error(`A ${PROVIDER_LABEL} SessionStore művelete időtúllépés miatt megszakadt.`));
     }, SESSION_STORE_TIMEOUT_MS);
     pendingSessionStore.set(operationId, {
       requestId: turn.request.requestId,
@@ -376,7 +458,7 @@ function isTransientOverload(message) {
 
 async function canUseToolForTurn(turn, toolName, input, options) {
   const cwd = turn.cwd;
-  if (options?.signal?.aborted) return deny("A Claude-kérés megszakadt.");
+  if (options?.signal?.aborted) return deny(`A ${PROVIDER_LABEL}-kérés megszakadt.`);
   if (sessionAllowedTools.has(toolName)) return allow();
   // A grant given in an earlier turn counts: the dialog promised it would.
   if (grantedTools(cwd).includes(toolName)) {
@@ -744,7 +826,7 @@ function handleSdkEvent(turn, event) {
       type: "session_started",
       request,
       sessionId: turn.sessionId,
-      payload: { provider: "anthropic", runtime: "claudeAgentBridge" },
+      payload: { provider: PROVIDER, runtime: RUNTIME, accessProfile: ACCESS_PROFILE },
     });
     emitAgentEvent(request, turn.sessionId, "turn/started", {
       turnId: turn.sessionId,
@@ -894,15 +976,20 @@ function handleSdkEvent(turn, event) {
   }
 }
 
-function createTurnPrompt(payload, hasResume) {
+function createTurnPrompt(payload, hasResume, cwd) {
   const prompt = typeof payload.prompt === "string" ? payload.prompt : "";
-  if (hasResume || typeof payload.conversationContext !== "string" || !payload.conversationContext.trim()) return prompt;
-  return `${payload.conversationContext}\n\n--- CURRENT USER REQUEST ---\n${prompt}`;
+  const contextualPrompt =
+    hasResume ||
+    typeof payload.conversationContext !== "string" ||
+    !payload.conversationContext.trim()
+      ? prompt
+      : `${payload.conversationContext}\n\n--- CURRENT USER REQUEST ---\n${prompt}`;
+  return createSdkPrompt(contextualPrompt, payload.images, cwd);
 }
 
 async function runConnectionTest(request) {
   const payload = request.payload ?? {};
-  if (!hasCredentials()) {
+  if (providerTransportError || !hasCredentials()) {
     writeMessage({
       type: "connection_result",
       request,
@@ -914,7 +1001,7 @@ async function runConnectionTest(request) {
         sessionId: null,
         totalCostUsd: null,
         errorCode: "missing_api_key",
-        error: MISSING_CREDENTIALS_MESSAGE,
+        error: missingCredentialsMessage(),
       },
     });
     return;
@@ -932,7 +1019,7 @@ async function runConnectionTest(request) {
       prompt: connectionPrompt(),
       options: {
         model,
-        effort,
+        ...providerReasoningOptions(effort),
         ...budgetOption(maxBudgetUsd),
         maxTurns,
         cwd,
@@ -953,7 +1040,7 @@ async function runConnectionTest(request) {
     const errors = Array.isArray(finalResult?.errors) ? finalResult.errors.filter((item) => typeof item === "string").join("; ") : null;
     const error = success
       ? null
-      : safeErrorMessage(errors ?? "A Claude connection test sikertelen.");
+      : safeErrorMessage(errors ?? `A ${PROVIDER_LABEL} connection test sikertelen.`);
     writeMessage({
       type: "connection_result",
       request,
@@ -993,7 +1080,7 @@ async function runConnectionTest(request) {
 
 async function runLiveTurn(request) {
   const payload = request.payload ?? {};
-  if (!hasCredentials()) {
+  if (providerTransportError || !hasCredentials()) {
     writeMessage({
       type: "turn_failed",
       request,
@@ -1001,7 +1088,7 @@ async function runLiveTurn(request) {
       payload: {
         code: "missing_api_key",
         errorCode: "missing_api_key",
-        message: MISSING_CREDENTIALS_MESSAGE,
+        message: missingCredentialsMessage(),
       },
     });
     return;
@@ -1098,11 +1185,10 @@ async function runLiveTurn(request) {
     while (true) {
       try {
         const stream = query({
-          prompt: createTurnPrompt(payload, Boolean(resumeForQuery)),
+          prompt: createTurnPrompt(payload, Boolean(resumeForQuery), cwd),
           options: {
             model,
-            effort,
-            thinking: { type: "adaptive" },
+            ...providerReasoningOptions(effort),
             ...budgetOption(maxBudgetUsd),
             maxTurns,
             cwd,
@@ -1153,9 +1239,9 @@ async function runLiveTurn(request) {
           turn.inputBroker.endAttempt(inputAttemptId);
           await inputTask;
         }
-        if (!finalResult) throw new Error("A Claude bridge nem adott turn eredményt.");
+        if (!finalResult) throw new Error(`A ${PROVIDER_LABEL} bridge nem adott turn eredményt.`);
         if (finalResult.subtype !== "success") {
-          const errors = Array.isArray(finalResult.errors) ? finalResult.errors.filter((item) => typeof item === "string").join("; ") : "A Claude turn sikertelen.";
+          const errors = Array.isArray(finalResult.errors) ? finalResult.errors.filter((item) => typeof item === "string").join("; ") : `A ${PROVIDER_LABEL} turn sikertelen.`;
           if (shouldStartFreshSession(resumeForQuery, errors)) {
             diagnostic("remote session missing in result; starting a new Claude session", {
               requestId: request.requestId,
@@ -1227,9 +1313,9 @@ async function runLiveTurn(request) {
       }
       break;
     }
-    if (!finalResult) throw new Error("A Claude bridge nem adott turn eredményt.");
+    if (!finalResult) throw new Error(`A ${PROVIDER_LABEL} bridge nem adott turn eredményt.`);
     if (finalResult.subtype !== "success") {
-      const errors = Array.isArray(finalResult.errors) ? finalResult.errors.filter((item) => typeof item === "string").join("; ") : "A Claude turn sikertelen.";
+      const errors = Array.isArray(finalResult.errors) ? finalResult.errors.filter((item) => typeof item === "string").join("; ") : `A ${PROVIDER_LABEL} turn sikertelen.`;
       const safeErrors = safeErrorMessage(errors);
       writeMessage({
         type: "turn_failed",
@@ -1282,7 +1368,7 @@ async function runLiveTurn(request) {
     const message = error instanceof Error ? error.message : String(error);
     if (abortController.signal.aborted) {
       turn.inputCloseCode = "run_cancelled";
-      writeMessage({ type: "turn_failed", request, sessionId: turn.sessionId, payload: { code: "cancelled", errorCode: "cancelled", message: "A Claude-kérés megszakadt." } });
+      writeMessage({ type: "turn_failed", request, sessionId: turn.sessionId, payload: { code: "cancelled", errorCode: "cancelled", message: `A ${PROVIDER_LABEL}-kérés megszakadt.` } });
     } else {
       turn.inputCloseCode = "runtime_failed";
       const safeMessage = safeErrorMessage(error);
@@ -1293,12 +1379,12 @@ async function runLiveTurn(request) {
     turn.inputBroker.close(
       turn.inputCloseCode,
       turn.inputCloseCode === "run_cancelled"
-        ? "A Claude futást az input elfogadása előtt leállították."
+        ? `A ${PROVIDER_LABEL} futást az input elfogadása előtt leállították.`
         : turn.inputCloseCode === "runtime_failed"
-          ? "A Claude runtime az input elfogadása előtt leállt."
-          : "A Claude turn lezárult az input elfogadása előtt.",
+          ? `A ${PROVIDER_LABEL} runtime az input elfogadása előtt leállt.`
+          : `A ${PROVIDER_LABEL} turn lezárult az input elfogadása előtt.`,
     );
-    rejectSessionStoreForRequest(request.requestId, "A Claude turn lezárult a SessionStore válasza előt.");
+    rejectSessionStoreForRequest(request.requestId, `A ${PROVIDER_LABEL} turn lezárult a SessionStore válasza előtt.`);
     activeRequests.delete(request.requestId);
   }
 }
@@ -1338,7 +1424,7 @@ async function dispatch(request) {
       payload: { inputId, code, message },
     });
     if (!turn || !turn.inputBroker) {
-      reject("no_active_turn", "A Claude turn már nem aktív.");
+      reject("no_active_turn", `A ${PROVIDER_LABEL} turn már nem aktív.`);
       return;
     }
     const expectedTurnId = typeof request.payload?.expectedProviderTurnId === "string"
@@ -1346,7 +1432,7 @@ async function dispatch(request) {
       : "";
     const activeTurnId = turn.sessionId ?? request.requestId;
     if (!expectedTurnId || expectedTurnId !== activeTurnId) {
-      reject("target_changed", "A célzott Claude turn közben megváltozott.");
+      reject("target_changed", `A célzott ${PROVIDER_LABEL} turn közben megváltozott.`);
       return;
     }
     const queued = turn.inputBroker.enqueue({
@@ -1364,8 +1450,8 @@ async function dispatch(request) {
     });
     if (!queued.accepted) {
       reject(queued.code, queued.code === "duplicate_input"
-        ? "Ezt az inputot a Claude futás már feldolgozta."
-        : "A Claude inputcsatornája nem fogadta el az üzenetet.");
+        ? `Ezt az inputot a ${PROVIDER_LABEL} futás már feldolgozta.`
+        : `A ${PROVIDER_LABEL} inputcsatornája nem fogadta el az üzenetet.`);
     }
     return;
   }
@@ -1404,7 +1490,9 @@ input.on("line", (line) => {
     })
     .finally(() => {
       dispatchTasks.delete(task);
-      if (shuttingDown && activeRequests.size === 0 && dispatchTasks.size === 0) process.exit(0);
+      if (shuttingDown && activeRequests.size === 0 && dispatchTasks.size === 0) {
+        void closeProviderTransport().finally(() => process.exit(0));
+      }
     });
   dispatchTasks.add(task);
 });
@@ -1413,9 +1501,10 @@ input.on("close", async () => {
   for (const turn of activeRequests.values()) turn?.abortController?.abort?.();
   for (const pending of pendingSessionStore.values()) {
     clearTimeout(pending.timeout);
-    pending.reject(new Error("A Claude bridge lezárult."));
+    pending.reject(new Error(`A ${PROVIDER_LABEL} bridge lezárult.`));
   }
   pendingSessionStore.clear();
   await Promise.allSettled([...dispatchTasks]);
+  await closeProviderTransport();
   process.exit(0);
 });

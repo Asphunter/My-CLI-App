@@ -1874,6 +1874,8 @@ fn agent_provider_wire(provider: crate::agent::AgentProvider) -> &'static str {
     match provider {
         crate::agent::AgentProvider::Codex => "openai",
         crate::agent::AgentProvider::Anthropic => "anthropic",
+        crate::agent::AgentProvider::Kimi => "kimi",
+        crate::agent::AgentProvider::DeepSeek => "deepseek",
     }
 }
 
@@ -1881,6 +1883,7 @@ fn agent_runtime_wire(runtime: crate::agent::AgentRuntimeKind) -> &'static str {
     match runtime {
         crate::agent::AgentRuntimeKind::CodexAppServer => "codex_app_server",
         crate::agent::AgentRuntimeKind::ClaudeAgentBridge => "claude_agent_bridge",
+        crate::agent::AgentRuntimeKind::CompatibleAgentBridge => "compatible_agent_bridge",
     }
 }
 
@@ -1927,7 +1930,7 @@ pub(crate) fn record_agent_turn_start(
     if !conversation_exists {
         return Ok(());
     }
-    if request.provider == crate::agent::AgentProvider::Anthropic {
+    if request.provider != crate::agent::AgentProvider::Codex {
         // Compare agent turn to agent turn. The local row for the message being
         // sent right now carries no provider session, and counting it as the
         // head made every follow-up look like a cross-device divergence — so
@@ -1949,11 +1952,11 @@ pub(crate) fn record_agent_turn_start(
                 .query_row(
                     "SELECT head_turn_id FROM agent_sessions
                      WHERE conversation_id = ?1
-                       AND provider = 'anthropic'
+                       AND provider = ?3
                      AND provider_session_id = ?2
                      AND status <> 'deleted'
                      LIMIT 1",
-                    params![conversation_id, provider_session_id],
+                    params![conversation_id, provider_session_id, provider],
                     |row| row.get::<_, Option<String>>(0),
                 )
                 .optional()
@@ -2518,9 +2521,11 @@ pub(crate) fn agent_conversation_status_from_connection(
         _ => connection
             .query_row(
                 "SELECT provider_session_id FROM agent_sessions
-                 WHERE conversation_id = ?1 AND status <> 'deleted'
+                 WHERE conversation_id = ?1
+                   AND provider = ?2
+                   AND status <> 'deleted'
                  ORDER BY updated_at DESC, rowid DESC LIMIT 1",
-                params![conversation_id],
+                params![conversation_id, provider],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -2553,9 +2558,11 @@ pub(crate) fn agent_conversation_status_from_connection(
                     // always read as unknown and the conflict indicator could
                     // never fire.
                     "SELECT head_turn_id FROM agent_sessions
-                     WHERE provider_session_id = ?1 AND status <> 'deleted'
+                     WHERE provider_session_id = ?1
+                       AND provider = ?2
+                       AND status <> 'deleted'
                      ORDER BY updated_at DESC LIMIT 1",
-                    params![session_id],
+                    params![session_id, provider],
                     |row| row.get::<_, Option<String>>(0),
                 )
                 .optional()
@@ -2564,7 +2571,7 @@ pub(crate) fn agent_conversation_status_from_connection(
         })
         .transpose()?
         .flatten();
-    let has_conflict = provider.as_deref() == Some("anthropic")
+    let has_conflict = provider.as_deref().is_some_and(|value| value != "openai")
         && agent_session_head_conflicts(
             session_head_turn_id.as_deref(),
             conversation_head_turn_id.as_deref(),
@@ -2634,10 +2641,17 @@ fn session_subpath(payload: &serde_json::Value) -> String {
         .to_string()
 }
 
-fn session_row_id(conversation_id: &str, provider_session_id: &str) -> String {
+fn session_row_id(
+    conversation_id: &str,
+    provider: crate::agent::AgentProvider,
+    provider_session_id: &str,
+) -> String {
     stable_id(
         "agent-session",
-        &format!("{conversation_id}:anthropic:{provider_session_id}"),
+        &format!(
+            "{conversation_id}:{}:{provider_session_id}",
+            agent_provider_wire(provider)
+        ),
     )
 }
 
@@ -2645,22 +2659,31 @@ fn ensure_agent_session(
     transaction: &Transaction<'_>,
     conversation_id: &str,
     project_key: &str,
+    provider: crate::agent::AgentProvider,
     provider_session_id: &str,
     now: &str,
 ) -> Result<String, String> {
-    let id = session_row_id(conversation_id, provider_session_id);
+    let id = session_row_id(conversation_id, provider, provider_session_id);
+    let provider_wire = agent_provider_wire(provider);
     transaction
         .execute(
             "INSERT INTO agent_sessions (
                  id, conversation_id, project_key, provider, provider_session_id,
                  head_turn_id, status, created_at, updated_at, origin_device_id, hlc
-             ) VALUES (?1, ?2, ?3, 'anthropic', ?4, NULL, 'active', ?5, ?5, NULL, NULL)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'active', ?6, ?6, NULL, NULL)
              ON CONFLICT(id) DO UPDATE SET
                  project_key = excluded.project_key,
                  status = CASE WHEN agent_sessions.status = 'deleted' THEN 'deleted' ELSE 'active' END,
                  updated_at = CASE WHEN agent_sessions.status = 'deleted'
                                    THEN agent_sessions.updated_at ELSE excluded.updated_at END",
-            params![id, conversation_id, project_key, provider_session_id, now],
+            params![
+                id,
+                conversation_id,
+                project_key,
+                provider_wire,
+                provider_session_id,
+                now
+            ],
         )
         .map_err(|error| format!("Az agent session nem menthető: {error}"))?;
     Ok(id)
@@ -2668,6 +2691,7 @@ fn ensure_agent_session(
 
 pub(crate) fn agent_session_store_rpc(
     conversation_id: Option<&str>,
+    provider: crate::agent::AgentProvider,
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let conversation_id = conversation_id
@@ -2695,6 +2719,7 @@ pub(crate) fn agent_session_store_rpc(
             &transaction,
             conversation_id,
             &project_key,
+            provider,
             &provider_session_id,
             &now,
         )?)
@@ -2805,12 +2830,12 @@ pub(crate) fn agent_session_store_rpc(
             let mut statement = transaction
                 .prepare(
                     "SELECT provider_session_id, updated_at FROM agent_sessions
-                     WHERE project_key = ?1 AND provider = 'anthropic' AND status <> 'deleted'
+                     WHERE project_key = ?1 AND provider = ?2 AND status <> 'deleted'
                      ORDER BY updated_at DESC, provider_session_id",
                 )
                 .map_err(|error| format!("A Claude sessionlista nem olvasható: {error}"))?;
             let rows = statement
-                .query_map(params![project_key], |row| {
+                .query_map(params![project_key, agent_provider_wire(provider)], |row| {
                     let session_id: String = row.get(0)?;
                     let mtime_text: String = row.get(1)?;
                     Ok(serde_json::json!({
@@ -2827,14 +2852,14 @@ pub(crate) fn agent_session_store_rpc(
             let mut statement = transaction
                 .prepare(
                     "SELECT provider_session_id, updated_at FROM agent_sessions
-                     WHERE project_key = ?1 AND provider = 'anthropic' AND status <> 'deleted'
+                     WHERE project_key = ?1 AND provider = ?2 AND status <> 'deleted'
                      ORDER BY updated_at DESC, provider_session_id",
                 )
                 .map_err(|error| {
                     format!("A Claude session summary lista nem olvasható: {error}")
                 })?;
             let rows = statement
-                .query_map(params![project_key], |row| {
+                .query_map(params![project_key, agent_provider_wire(provider)], |row| {
                     let session_id: String = row.get(0)?;
                     let mtime_text: String = row.get(1)?;
                     Ok(serde_json::json!({

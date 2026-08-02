@@ -285,6 +285,44 @@ test("a repeated fallback turn id cannot collapse two user sessions", () => {
   );
 });
 
+test("a reused provider session id cannot put the newest answer in an older panel", () => {
+  const messages = [
+    { id: "u1", role: "user" as const, text: "first", sequence: 10 },
+    {
+      id: "a1",
+      role: "assistant" as const,
+      text: "first answer",
+      sequence: 12,
+      turnId: "deepseek-session-1",
+      final: true,
+    },
+    { id: "u2", role: "user" as const, text: "second", sequence: 20 },
+    {
+      id: "a2",
+      role: "assistant" as const,
+      text: "second answer",
+      sequence: 22,
+      turnId: "deepseek-session-1",
+      final: true,
+    },
+  ];
+  const groups = buildWorkLogGroups({
+    messages,
+    activities: [
+      { id: 11, turnId: "deepseek-session-1" },
+      { id: 21, turnId: "deepseek-session-1" },
+    ],
+    planHistory: {},
+    commentary: [],
+  });
+
+  assert.equal(groups.length, 2);
+  assert.equal(messageBelongsToWorkGroup(messages, 1, groups[0]), true);
+  assert.equal(messageBelongsToWorkGroup(messages, 3, groups[0]), false);
+  assert.equal(messageBelongsToWorkGroup(messages, 1, groups[1]), false);
+  assert.equal(messageBelongsToWorkGroup(messages, 3, groups[1]), true);
+});
+
 test("sync merge cannot replace a settled plan with a stale live snapshot", () => {
   const settled = completedPlan("turn", 100);
   const stale = {

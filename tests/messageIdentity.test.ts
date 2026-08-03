@@ -503,3 +503,67 @@ test("an unfinished answer may still grow to the longer version", () => {
     "a live row is not settled, so the length heuristic must still apply",
   );
 });
+
+test("completed regeneration revisions collapse to the newest answer", () => {
+  const result = collapseAbandonedRegenerationRetries<TestMessage>([
+    {
+      id: "user-1",
+      role: "user",
+      text: "Teszt",
+      sequence: 10,
+      turnId: "request:original",
+    },
+    {
+      id: "answer-1",
+      role: "assistant",
+      text: "Első válasz",
+      sequence: 11,
+      turnId: "request:original",
+      final: true,
+    },
+    {
+      id: "answer-2",
+      role: "assistant",
+      text: "Második válasz",
+      sequence: 12,
+      turnId: "request:retry-1",
+      final: true,
+    },
+    {
+      id: "answer-3",
+      role: "assistant",
+      text: "Legújabb válasz",
+      sequence: 13,
+      turnId: "request:retry-2",
+      final: true,
+    },
+  ]);
+
+  assert.deepEqual(result.map((message) => message.id), ["user-1", "answer-3"]);
+});
+
+test("same-turn assistant blocks are not mistaken for regeneration", () => {
+  const result = collapseAbandonedRegenerationRetries<TestMessage>([
+    { id: "user-1", role: "user", text: "Teszt", turnId: "request:one" },
+    {
+      id: "answer-a",
+      role: "assistant",
+      text: "Első blokk",
+      turnId: "request:one",
+      final: true,
+    },
+    {
+      id: "answer-b",
+      role: "assistant",
+      text: "Második blokk",
+      turnId: "request:one",
+      final: true,
+    },
+  ]);
+
+  assert.deepEqual(result.map((message) => message.id), [
+    "user-1",
+    "answer-a",
+    "answer-b",
+  ]);
+});

@@ -1,5 +1,6 @@
 @echo off
-rem Egy kattintas: friss frontend- es Rust-build, majd inditas.
+rem Egy kattintas: friss frontend- es Rust-build, majd inditas. A debug app
+rem bezarasa utan automatikusan ujraepit es ujraindul; a CMD bezarasa allitja le.
 rem
 rem Miert nem eleg a min.exe-re mutato parancsikon: a nyers `cargo build`
 rem kihagyja a tauri CLI-t, ezert a tauri.conf.json `beforeBuildCommand`-ja sem
@@ -25,6 +26,7 @@ tasklist /FI "IMAGENAME eq min.exe" | find /I "min.exe" >nul && (
   exit /b 1
 )
 
+:rebuild
 echo [1/3] Frontend build ^(tsc + vite^)...
 call npm.cmd run build || goto :failed
 
@@ -38,9 +40,13 @@ if not exist "%LOCALAPPDATA%\min\cargo-target\debug\" mkdir "%LOCALAPPDATA%\min\
 copy /y "%BUILD_DIR%\debug\min.exe" "%SHORTCUT_EXE%" >nul || goto :failed
 
 echo.
-echo Indul a min...
-start "" "%SHORTCUT_EXE%"
-exit /b 0
+echo Indul a min... ^(az app bezarasa utan automatikusan ujraindul^)
+echo A ciklus leallitasahoz zard be ezt a CMD ablakot.
+"%SHORTCUT_EXE%"
+echo.
+echo A min bezarult. Ujraepites es ujrainditas...
+timeout /t 1 /nobreak >nul
+goto :rebuild
 
 :failed
 echo.

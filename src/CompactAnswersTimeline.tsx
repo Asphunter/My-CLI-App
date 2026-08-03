@@ -114,20 +114,17 @@ export default function CompactAnswersTimeline({
         Math.min(COMPACT_ANSWER_MAX_HEIGHT, window.innerHeight - 230),
       );
       const answerHeight = Math.max(
-        42,
+        34,
         Math.min(
           answerViewportLimit,
           answersList.scrollHeight + 2,
         ),
       );
-      const heading = thinkingPanel.querySelector<HTMLElement>(
-        ".trace-panel-heading",
-      );
       const thinkingList = thinkingPanel.querySelector<HTMLElement>(
         ".compact-thinking-list, .trace-thinking-empty",
       );
       const thinkingHeight =
-        (heading?.offsetHeight ?? 29) + (thinkingList?.scrollHeight ?? 42) + 8;
+        (thinkingList?.scrollHeight ?? 42) + 8;
       const expandedThinkingHeight = Math.max(
         COMPACT_TIMELINE_MIN_HEIGHT,
         Math.min(thinkingViewportLimit, Math.ceil(thinkingHeight)),
@@ -436,9 +433,6 @@ export default function CompactAnswersTimeline({
           aria-hidden={!thinkingExpanded}
           ref={thinkingPanelRef}
         >
-          <div className="trace-panel-heading trace-panel-heading-thinking">
-            <strong>GONDOLKODÁS MENETE</strong>
-          </div>
           {visibleTrace.length > 0 ? (
             <ul className="compact-thinking-list">
               {visibleTrace.map((section: CompactTraceSection) =>

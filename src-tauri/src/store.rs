@@ -2157,6 +2157,8 @@ fn record_agent_answer_in_connection(
     conversation_id: &str,
     request_id: &str,
     text: &str,
+    replace_message_id: Option<&str>,
+    replace_turn_id: Option<&str>,
 ) -> Result<(), String> {
     let normalized_text = collapse_repeated_assistant_text("assistant", text);
     let text = normalized_text.trim_end();
@@ -2164,8 +2166,16 @@ fn record_agent_answer_in_connection(
         return Ok(());
     }
 
-    let turn_id = format!("request:{request_id}");
-    let canonical_id = stable_id("agent-answer", &format!("{conversation_id}:{request_id}"));
+    let request_turn_id = format!("request:{request_id}");
+    let turn_id = replace_turn_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(request_turn_id.as_str());
+    let generated_id = stable_id("agent-answer", &format!("{conversation_id}:{request_id}"));
+    let canonical_id = replace_message_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(generated_id.as_str());
     let transaction = connection
         .transaction()
         .map_err(|error| format!("The agent answer transaction could not start: {error}"))?;
@@ -2176,9 +2186,10 @@ fn record_agent_answer_in_connection(
     transaction
         .execute(
             "DELETE FROM messages
-             WHERE conversation_id = ?1 AND role = 'assistant' AND turn_id = ?2
-               AND id <> ?3",
-            params![conversation_id, turn_id, canonical_id],
+             WHERE conversation_id = ?1 AND role = 'assistant'
+               AND (turn_id = ?2 OR turn_id = ?3)
+               AND id <> ?4",
+            params![conversation_id, turn_id, request_turn_id, canonical_id],
         )
         .map_err(|error| format!("The stale agent answer alias could not be removed: {error}"))?;
 
@@ -2273,6 +2284,45 @@ pub(crate) fn record_agent_answer_text(
                 conversation_id,
                 request_id,
                 &answer_text,
+                None,
+                None,
+            )
+        }) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if attempt < 5
+                    && (error.to_ascii_lowercase().contains("locked")
+                        || error.to_ascii_lowercase().contains("busy")) =>
+            {
+                last_error = Some(error);
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "A végleges agent válasz nem menthető.".to_string()))
+}
+
+pub(crate) fn record_agent_answer_text_replacing(
+    conversation_id: &str,
+    request_id: &str,
+    answer_text: &str,
+    replace_message_id: Option<&str>,
+    replace_turn_id: Option<&str>,
+) -> Result<(), String> {
+    if conversation_id.trim().is_empty() || request_id.trim().is_empty() {
+        return Ok(());
+    }
+    let mut last_error = None;
+    for attempt in 0..6 {
+        match open_local_store().and_then(|mut store| {
+            record_agent_answer_in_connection(
+                &mut store.connection,
+                conversation_id,
+                request_id,
+                answer_text,
+                replace_message_id,
+                replace_turn_id,
             )
         }) {
             Ok(()) => return Ok(()),
@@ -2309,7 +2359,13 @@ pub(crate) fn record_agent_answer(
         return Ok(());
     };
     let answer_text = agent_response_answer_text(response);
-    record_agent_answer_text(conversation_id, request_id, &answer_text)
+    record_agent_answer_text_replacing(
+        conversation_id,
+        request_id,
+        &answer_text,
+        request.replace_message_id.as_deref(),
+        request.replace_turn_id.as_deref(),
+    )
 }
 
 pub(crate) fn record_agent_turn_terminal(
@@ -8172,6 +8228,8 @@ mod tests {
             &conversation_id,
             "native-answer",
             "Végleges natív válasz",
+            None,
+            None,
         )
         .expect("checkpoint answer");
 
@@ -8233,6 +8291,8 @@ mod tests {
             &conversation_id,
             request_id,
             "CURRENT_OK",
+            None,
+            None,
         )
         .expect("replace stale alias");
 
@@ -8256,6 +8316,82 @@ mod tests {
                 "CURRENT_OK".to_string(),
                 11,
             )]
+        );
+    }
+
+    #[test]
+    fn regeneration_overwrites_the_original_durable_answer_row() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure_connection(&connection).expect("configure SQLite");
+        initialize_connection(&mut connection).expect("initialize schema");
+
+        let original_turn_id = "request:original";
+        let original_answer_id = "answer-original";
+        let mut snapshot = test_snapshot();
+        let conversation = snapshot
+            .conversations
+            .values_mut()
+            .next()
+            .expect("conversation");
+        conversation.messages[0].turn_id = Some(original_turn_id.to_string());
+        conversation.messages.push(LocalMessage {
+            id: Some(original_answer_id.to_string()),
+            role: "assistant".to_string(),
+            text: "Régi válasz".to_string(),
+            time: "2".to_string(),
+            code: Some(false),
+            live: Some(false),
+            final_message: Some(true),
+            item_id: None,
+            sequence: Some(2),
+            turn_id: Some(original_turn_id.to_string()),
+            hlc: None,
+            origin_device_id: None,
+            images: Vec::new(),
+            quote_refs: Vec::new(),
+            detailed: None,
+            change_summary: Vec::new(),
+            pipeline: None,
+            interaction: None,
+        });
+        save_snapshot_in_connection(&mut connection, snapshot).expect("save original turn");
+        let conversation_id: String = connection
+            .query_row(
+                "SELECT id FROM conversations WHERE title = 'Thread'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("conversation id");
+
+        record_agent_answer_in_connection(
+            &mut connection,
+            &conversation_id,
+            "regeneration-request",
+            "Új válasz",
+            Some(original_answer_id),
+            Some(original_turn_id),
+        )
+        .expect("replace original answer");
+
+        let rows: Vec<(String, String, String)> = connection
+            .prepare(
+                "SELECT id, body, turn_id FROM messages
+                 WHERE conversation_id = ?1 AND role = 'assistant'",
+            )
+            .expect("prepare answer rows")
+            .query_map(params![conversation_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .expect("query answer rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect answer rows");
+        assert_eq!(
+            rows,
+            vec![(
+                original_answer_id.to_string(),
+                "Új válasz".to_string(),
+                original_turn_id.to_string(),
+            )],
         );
     }
 
@@ -8288,6 +8424,8 @@ mod tests {
             &conversation_id,
             request_id,
             "CURRENT_CANONICAL_OK",
+            None,
+            None,
         )
         .expect("save canonical answer");
 

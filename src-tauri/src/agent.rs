@@ -290,6 +290,12 @@ pub struct AgentTurnRequest {
     pub effort: Option<String>,
     pub cwd: Option<String>,
     pub request_id: Option<String>,
+    /// Regeneration replaces this durable assistant row instead of appending
+    /// another answer after the same user prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_turn_id: Option<String>,
     pub max_budget_usd: Option<f64>,
     pub max_turns: Option<u32>,
     /// Which tools this turn may use. A planning or reviewing stage must be
@@ -765,6 +771,8 @@ mod tests {
             effort: None,
             cwd: None,
             request_id: None,
+            replace_message_id: None,
+            replace_turn_id: None,
             max_budget_usd: None,
             max_turns: None,
             tool_profile: None,
@@ -884,6 +892,8 @@ mod tests {
             effort: None,
             cwd: None,
             request_id: Some("request".to_string()),
+            replace_message_id: None,
+            replace_turn_id: None,
             max_budget_usd: None,
             max_turns: None,
             tool_profile: profile,

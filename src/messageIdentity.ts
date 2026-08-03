@@ -305,6 +305,8 @@ export const collapseAbandonedRegenerationRetries = <
   Message extends MessageIdentityLike & {
     images?: unknown[];
     quoteRefs?: unknown[];
+    pipeline?: unknown;
+    interaction?: unknown;
   },
 >(messages: Message[]) => {
   const output: Message[] = [];
@@ -342,7 +344,52 @@ export const collapseAbandonedRegenerationRetries = <
     }
     output.push(messages[index]);
   }
-  return output;
+  // A regeneration is one answer revision, not a new chat turn. Older builds
+  // persisted every retry under a fresh request turn while keeping the single
+  // original user row, so reload produced a stack of assistant-only bubbles.
+  // Consecutive settled, non-pipeline assistant rows with different turn ids
+  // are precisely that shape. Same-turn content blocks remain untouched.
+  const collapsed: Message[] = [];
+  let revisionStart: number | null = null;
+  let revisionTurnId: string | undefined;
+  for (const message of output) {
+    if (message.role === "user") {
+      collapsed.push(message);
+      revisionStart = null;
+      revisionTurnId = undefined;
+      continue;
+    }
+    const settledStandalone =
+      Boolean(message.text.trim()) &&
+      Boolean(message.final) &&
+      !message.live &&
+      !message.pipeline &&
+      !message.interaction &&
+      Boolean(message.turnId);
+    if (!settledStandalone) {
+      collapsed.push(message);
+      revisionStart = null;
+      revisionTurnId = undefined;
+      continue;
+    }
+    if (
+      revisionStart !== null &&
+      revisionTurnId &&
+      message.turnId &&
+      message.turnId !== revisionTurnId
+    ) {
+      collapsed.splice(revisionStart);
+      collapsed.push(message);
+      revisionTurnId = message.turnId;
+      continue;
+    }
+    if (revisionStart === null) {
+      revisionStart = collapsed.length;
+      revisionTurnId = message.turnId;
+    }
+    collapsed.push(message);
+  }
+  return collapsed;
 };
 
 /** Coalesce aliases while preserving the first row's timeline position. */

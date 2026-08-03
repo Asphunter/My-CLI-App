@@ -87,8 +87,10 @@ import { agentAnswerMessageId } from "./deterministicId";
 import CompactAnswersTimeline from "./CompactAnswersTimeline";
 import {
   buildCompactAnswerTimeline,
+  buildCompactTraceSections,
   looksHungarianNarrative,
   type CompactAnswerBlock,
+  type CompactTraceSection,
   type CompactTraceEvent,
 } from "./compactAnswerTimeline";
 import {
@@ -539,7 +541,6 @@ const revealPanelBottom = (panel: Element | null) => {
 };
 
 /** The composed answer tab, which is not one of the chain's stages. */
-const PIPELINE_ANSWER_TAB = -1;
 
 /** Where a running re-run draws itself: in its own panel, not below them all. */
 const LIVE_RERUN_SLOT = "__live-rerun-slot__";
@@ -690,6 +691,9 @@ type RunHandle = {
   provider: AgentProviderId;
   readonly clientTurnId: string;
   liveMessageId: string;
+  /** Durable row replaced by a regeneration; absent on ordinary turns. */
+  readonly replacementMessageId?: string;
+  readonly replacementTurnId?: string;
   /** A provider szálazonosítója; a requestId nélküli események tartaléka. */
   threadId?: string;
   turnId?: string;
@@ -6972,7 +6976,7 @@ function TurnProgressCard({
   // tervet: RAW = a teljes szöveg (élőben streamelve), DETAIL = a kiválasztott
   // lépés szelete.
   const [planContentView, setPlanContentView] = useState<"raw" | "detail">(
-    "raw",
+    () => (effectivePlannedSteps.length > 0 ? "detail" : "raw"),
   );
   useEffect(() => {
     if (
@@ -7242,9 +7246,10 @@ function TurnProgressCard({
     }
     return entries.slice(-80);
   }, [orderedActivities, stepActivities, stepCommentary]);
-  const [expandedInternalEntryId, setExpandedInternalEntryId] =
+  const [expandedTechnicalSectionId, setExpandedTechnicalSectionId] =
     useState<string | null>(null);
-  const visibleThinkingEntries = thinkingEntries;
+  const [expandedTraceDetailId, setExpandedTraceDetailId] =
+    useState<string | null>(null);
   const thinkingListRef = useRef<HTMLUListElement>(null);
   const inferredStartedAtRef = useRef<number | undefined>(plan.startedAt);
   const [clockNow, setClockNow] = useState(() => Date.now());
@@ -7259,7 +7264,6 @@ function TurnProgressCard({
     return () => window.clearInterval(timer);
   }, [streaming]);
   useEffect(() => {
-    if (!expanded) return;
     const list = thinkingListRef.current;
     if (!list) return;
     const frame = window.requestAnimationFrame(() => {
@@ -7267,7 +7271,7 @@ function TurnProgressCard({
         list.scrollTop = list.scrollHeight;
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [expanded, selectedStep.id, streaming, thinkingEntries]);
+  }, [selectedStep.id, streaming, thinkingEntries]);
   const recordedStepStarts = Object.values(plan.stepTimes ?? {})
     .map((timing) => timing.startedAt)
     .filter((value): value is number => Number.isFinite(value));
@@ -7382,60 +7386,6 @@ function TurnProgressCard({
       )}
     </div>
   ) : null;
-  type TraceView = "answer" | "steps";
-  const [traceView, setTraceView] = useState<TraceView>(
-    streaming ? (hasAnswer ? "answer" : "steps") : "answer",
-  );
-  const manualTraceViewRef = useRef(false);
-  const wasStreamingRef = useRef(streaming);
-  useEffect(() => {
-    // A completed answer is the primary view, including after a cold start
-    // where the persisted expansion flag may still be true. Only a live turn
-    // follows the phase flow; an answer-less historical card can still open
-    // its trace when explicitly expanded.
-    const enteredStreaming = streaming && !wasStreamingRef.current;
-    const leftStreaming = !streaming && wasStreamingRef.current;
-    wasStreamingRef.current = streaming;
-    if (enteredStreaming || leftStreaming) manualTraceViewRef.current = false;
-    if (manualTraceViewRef.current) return;
-    if (isPlanStage) {
-      // A terv-fázis a lépés-nézetben él: a RAW mutatja a születő tervet.
-      setTraceView("steps");
-    } else if (streaming) {
-      setTraceView(stageRole ? "steps" : hasAnswer ? "answer" : "steps");
-    } else if (hasAnswer) {
-      // Recovery can populate the answer after the first render. Do not leave
-      // the user on LÉPÉSEK just because the placeholder initially had no text.
-      setTraceView("answer");
-    } else {
-      setTraceView(expanded ? "steps" : "answer");
-    }
-  }, [expanded, hasAnswer, streaming]);
-  useEffect(() => {
-    if (!streaming || isPlanStage) return;
-    // Lánc-szakasz futása közben a LÉPÉSEK a nézet. A Claude a tool-hívások
-    // közti narrációját is a válasz-streambe küldi, és az első ilyen mondat
-    // átdobta a kártyát a VÁLASZ-ra — a szakasz kellős közepén, kész válasz
-    // nélkül, félkész mondatokat mutatva. A VÁLASZ fül kattintható marad, és a
-    // szakasz végén magától az lesz a nézet.
-    const nextView: TraceView = stageRole
-      ? "steps"
-      : hasAnswer
-        ? "answer"
-        : "steps";
-    setTraceView(nextView);
-    // Keep the durable expansion choice in sync so the completed card does
-    // not jump back to LÉPÉSEK after the live card is replaced in the timeline.
-    if ((nextView === "steps") !== expanded) onToggle();
-    // This is deliberately phase-driven. A later manual tab choice must not be
-    // immediately overwritten while the answer remains in the same phase.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasAnswer, streaming]);
-  const selectTraceView = (next: TraceView) => {
-    manualTraceViewRef.current = true;
-    setTraceView(next);
-    if ((next === "steps") !== expanded) onToggle();
-  };
   const selectStep = (stepId: string) => {
     followActiveStepRef.current = false;
     setSelectedStepId(stepId);
@@ -7694,6 +7644,16 @@ function TurnProgressCard({
         (activities.at(-1)?.id ?? Date.now()) + (index + 1) / 1000,
     });
   });
+  const detailedTraceSections = buildCompactTraceSections(
+    compactTrace.filter((item) => {
+      const record = compactTraceRecords.get(item.id);
+      if (record?.activity)
+        return activityBelongsToStep(record.activity, selectedStep.id);
+      if (record?.commentary)
+        return commentaryBelongsToStep(record.commentary, selectedStep.id);
+      return true;
+    }),
+  );
   const compactTimeline = buildCompactAnswerTimeline({
     answers: [],
     trace: compactTrace,
@@ -7779,162 +7739,74 @@ function TurnProgressCard({
     <>
       {runHeader}
       <article
-        className={`turn-progress-card trace-card trace-view-${traceView}${streaming ? " is-live" : ""}${answerInterrupted ? " is-interrupted" : ""}${runClasses}`}
+        className={`turn-progress-card trace-card detailed-trace-card${streaming ? " is-live" : ""}${answerInterrupted ? " is-interrupted" : ""}${runClasses}`}
         aria-label="Lépések és gondolkodás"
       >
-      {(hasAnswer || streaming) && (
-        <section
-          className="turn-progress-answer"
-          data-quote-selectable="true"
-          data-quote-anchor={answerAnchorId}
-          aria-label={traceView === "answer" ? "Válasz" : "Lépések és gondolkodás"}
+        <div
+          className={`compact-answer-status-rail detailed-answer-status-rail${
+            streaming
+              ? " is-running"
+              : answerInterrupted
+                ? " is-interrupted"
+                : " is-complete"
+          }`}
+          aria-label={
+            streaming
+              ? "Az AI dolgozik"
+              : answerInterrupted
+                ? "A válasz megszakítva"
+                : "A válasz kész"
+          }
         >
-          <div className="trace-answer-layout">
-            <div className="trace-answer-main">
-              <div className="turn-progress-answer-heading">
-                <div
-                  className="trace-view-switch"
-                  role="tablist"
-                  aria-label="Panel nézete"
-                >
-                  <button
-                    type="button"
-                    role="tab"
-                    className={`trace-view-option${traceView === "answer" ? " is-active" : ""}`}
-                    aria-selected={traceView === "answer"}
-                    // Amíg nincs válasz, a fül üres panelre vinne. Ott marad,
-                    // hogy a váltó ne ugráljon, de nem kattintható. A terv-
-                    // fázison a RAW nézet vette át a szerepét.
-                    disabled={!hasAnswer || isPlanStage}
-                    title={
-                      isPlanStage
-                        ? "A terv a LÉPÉSEK nézet RAW füle alatt olvasható"
-                        : hasAnswer
-                          ? undefined
-                          : "A válasz még készül"
-                    }
-                    onClick={() => selectTraceView("answer")}
-                  >
-                    VÁLASZ
-                  </button>
-                  <button
-                    type="button"
-                    role="tab"
-                    className={`trace-view-option${traceView === "steps" ? " is-active" : ""}`}
-                    aria-selected={traceView === "steps"}
-                    onClick={() => selectTraceView("steps")}
-                  >
-                    LÉPÉSEK
-                  </button>
-                </div>
-                {stageBadge(answer?.pipeline)}
-                {(streaming || !runPosition || answerInterrupted) && (
-                  <span className={answerInterrupted ? "is-interrupted" : undefined}>
-                    {streaming
-                      ? "készül"
-                      : answerInterrupted
-                        ? "megszakítva"
-                        : "kész"}
-                  </span>
-                )}
-                {overallElapsed && <time>{overallElapsed}</time>}
-              </div>
-              {traceView === "answer" && <div className="turn-progress-answer-body">
-                {answerActions && (
-                  <div className="turn-progress-answer-tools">{answerActions}</div>
-                )}
-                <div className="trace-answer-line">
-                  {hasAnswer && (
-                    // The wrapper is load-bearing: this row is a flex line so
-                    // the spinner can sit beside the text, and loose Markdown
-                    // blocks must stay one readable column.
-                    <div className="trace-answer-text">
-                      {answerParagraphs(
-                        answerBodyText,
-                        answerQuoteRefs,
-                        onQuoteJump,
-                      )}
-                    </div>
-                  )}
-                  {streaming && (
-                    <span className="trace-answer-spinner" aria-label="Válasz készül" />
-                  )}
-                </div>
-              </div>}
-            </div>
-            <ChangeSummaryPanel
-              files={changeSummary}
-              onRollback={onRollbackChanges}
-              rollbackBusy={rollbackBusy}
-              onPreviewImage={onPreviewImage}
-            />
+          <div className="compact-answer-provider-mark">
+            <ProviderMark provider={provider} />
           </div>
-        </section>
-      )}
+          <time>{overallElapsed || "0:00"}</time>
+        </div>
 
-      {traceView === "steps" && isPlanStage && streaming && !hasAnswer ? (
-        // A terv első másodpercei. Ilyenkor még semmi nincs, amit két panelbe
-        // lehetne rendezni: két „még nem kezdődött el" felirat rosszabb, mint
-        // egy pörgő jelzés. Az első betűvel felállnak a panelek, és a szöveg
-        // azonnal ömlik beléjük — a pontok pedig lépésekké válnak, ahogy
-        // megíródnak.
-        <div className="trace-content is-expanded">
-          <div
-            className="trace-plan-waiting"
-            role="status"
-            aria-label="A terv készül"
+        <div className="detailed-trace-grid">
+          <section
+            className="detailed-trace-lane detailed-answer-lane"
+            data-quote-selectable="true"
+            data-quote-anchor={answerAnchorId}
+            aria-label="Válasz"
           >
-            <span className="trace-answer-spinner" aria-hidden="true" />
-          </div>
-        </div>
-      ) : traceView === "steps" && !streaming &&
-        plannedSteps.length === 0 &&
-        activities.length === 0 &&
-        commentary.every((entry) => !entry.body.trim()) ? (
-        // A stage that only wrote text has no steps to show. An empty
-        // two-pane frame with a fake spinning step reads as a stage that
-        // failed to report; the honest state is one sentence.
-        <div className="trace-content is-expanded">
-          <p className="trace-empty-note">
-            Ez a szakasz nem használt eszközt és nem rögzített lépést — a
-            teljes kimenete a VÁLASZ fülön olvasható.
-          </p>
-        </div>
-      ) : traceView === "steps" && <div
-        className="trace-content is-expanded"
-        aria-hidden={false}
-      >
-          <section className="trace-steps-panel" aria-label="Lépések listája">
-            <div className="trace-panel-heading">
-              <strong>LÉPÉSEK</strong>
-              <span>
-                {/* A készülő terv pontjai nem elvégzett munka: amíg íródik,
-                    a fejléc sem számol el belőlük semmit. */}
-                {planDrafting || (isPlanStage && effectivePlannedSteps.length === 0)
-                  ? "készül"
-                  : `${completedStepCount}/${countableSteps.length} kész`}
-              </span>
+            {answerActions && (
+              <div className="detailed-answer-toolbar">
+                {answerActions}
+              </div>
+            )}
+            <div className="turn-progress-answer-body detailed-answer-body">
+              <div className="trace-answer-line">
+                {hasAnswer && (
+                  <div className="trace-answer-text">
+                    {answerParagraphs(
+                      answerBodyText,
+                      answerQuoteRefs,
+                      onQuoteJump,
+                    )}
+                  </div>
+                )}
+                {streaming && (
+                  <span className="trace-answer-spinner" aria-label="Válasz készül" />
+                )}
+              </div>
             </div>
+          </section>
+
+          <section
+            className="detailed-trace-lane detailed-steps-lane"
+            aria-label="Lépések listája"
+          >
             <div
-              className="trace-step-list"
+              className="trace-step-list detailed-step-list"
               data-quote-selectable="true"
               role="list"
             >
-              {isPlanStage && effectivePlannedSteps.length === 0 && (
-                <span className="trace-thinking-empty-text">
-                  A lépések a terv számozott pontjaiként születnek meg — a
-                  szöveg a RAW nézetben már olvasható.
-                </span>
-              )}
               {(isPlanStage && effectivePlannedSteps.length === 0
                 ? []
                 : steps
               ).map((step, stepIndex) => {
-                // Ami már írt magáról valamit, az olvasható — akkor is, ha a
-                // modell még nem jelölte késznek. A tiltás arra való, hogy egy
-                // el sem kezdett lépés üres panelre ne vigyen; egy nyomot
-                // hagyott lépésnél viszont épp az a dolga a listának, hogy
-                // vissza lehessen rá lépni.
                 const disabled =
                   planDrafting ||
                   (streaming &&
@@ -7964,8 +7836,6 @@ function TurnProgressCard({
                         planDrafting ? undefined : selectedStep.id === step.id
                       }
                     >
-                      {/* A terv pontjai nem munkafázisok: sorszámuk van, nem
-                          állapotuk. Az intenzitás-sáv a KÓD kártyáé marad. */}
                       <span
                         className={`trace-step-marker${isPlanStage ? " is-numbered" : ""}`}
                         aria-hidden="true"
@@ -7978,32 +7848,54 @@ function TurnProgressCard({
                   </div>
                 );
               })}
+              {isPlanStage && effectivePlannedSteps.length === 0 && (
+                <div className="trace-thinking-empty detailed-lane-empty">
+                  {streaming ? (
+                    <span className="trace-answer-spinner" aria-hidden="true" />
+                  ) : (
+                    <span className="trace-thinking-empty-text">
+                      A terv nem tartalmaz külön lépéslistát.
+                    </span>
+                  )}
+                </div>
+              )}
+              {!isPlanStage && steps.length === 0 && (
+                <div className="trace-thinking-empty detailed-lane-empty">
+                  <span className="trace-thinking-empty-text">
+                    Ez a szakasz nem rögzített külön lépést.
+                  </span>
+                </div>
+              )}
             </div>
-            {stageElapsed && (
-              <div className="trace-total-elapsed" aria-label="A szakasz teljes ideje">
-                <span>Összesen</span>
-                <time>{stageElapsed}</time>
+            {(stageElapsed || countableSteps.length > 0) && (
+              <div className="trace-total-elapsed detailed-steps-summary">
+                <span>
+                  {planDrafting
+                    ? "készül"
+                    : `${completedStepCount}/${countableSteps.length}`}
+                </span>
+                {stageElapsed && <time>{stageElapsed}</time>}
               </div>
             )}
           </section>
+
           <section
-            className="trace-thinking-panel"
+            className="detailed-trace-lane detailed-thinking-lane"
             data-quote-selectable="true"
             data-quote-anchor={quoteAnchor(`thinking:${selectedStep.id}`)}
             aria-label="Gondolkodás menete"
           >
-            <div className="trace-panel-heading trace-panel-heading-thinking">
-              <strong>GONDOLKODÁS MENETE</strong>
-              {isPlanStage && (
+            {isPlanStage ? (
+              <>
                 <div
-                  className="trace-view-switch"
+                  className="detailed-plan-view-toggle"
                   role="tablist"
                   aria-label="Terv nézete"
                 >
                   <button
                     type="button"
                     role="tab"
-                    className={`trace-view-option${planContentView === "raw" ? " is-active" : ""}`}
+                    className={planContentView === "raw" ? "is-active" : ""}
                     aria-selected={planContentView === "raw"}
                     onClick={() => setPlanContentView("raw")}
                   >
@@ -8012,145 +7904,188 @@ function TurnProgressCard({
                   <button
                     type="button"
                     role="tab"
-                    className={`trace-view-option${planContentView === "detail" ? " is-active" : ""}`}
+                    className={planContentView === "detail" ? "is-active" : ""}
                     aria-selected={planContentView === "detail"}
-                    // Lépések nélkül a DETAIL-nek nincs mit szeletelnie: a
-                    // váltó az első sornál ragadna. A lista a terv végén
-                    // születik meg, addig a RAW él.
                     disabled={effectivePlannedSteps.length === 0}
-                    title={
-                      effectivePlannedSteps.length === 0
-                        ? "A lépések a terv elkészültekor jönnek létre"
-                        : undefined
-                    }
                     onClick={() => setPlanContentView("detail")}
                   >
-                    DETAIL
+                    RÉSZLET
                   </button>
                 </div>
-              )}
-            </div>
-            {isPlanStage ? (
-              // A terv-fázisban a panel magát a tervet mutatja. RAW: a teljes
-              // szöveg, élőben streamelve; DETAIL: a kiválasztott lépés
-              // szelete a számozott pontok határai mentén.
-              <div className="trace-thinking-list trace-plan-content">
-                {(() => {
-                  const planText = answer?.text ?? "";
-                  if (!planText.trim())
-                    return (
-                      <div className="trace-thinking-empty">
-                        <span className="trace-thinking-empty-text">
-                          A terv még nem kezdett íródni.
-                        </span>
-                      </div>
-                    );
-                  if (planContentView === "raw")
-                    return answerParagraphs(planText);
-                  const stepIndex = steps.findIndex(
-                    (step) => step.id === selectedStep.id,
-                  );
-                  const slice = planStepSlice(planText, stepIndex);
-                  return slice
-                    ? answerParagraphs(slice)
-                    : (
-                        <div className="trace-thinking-empty">
-                          <span className="trace-thinking-empty-text">
-                            Ehhez a lépéshez nem találtam részletet a tervben —
-                            a RAW nézetben a teljes terv olvasható.
-                          </span>
+                <div className="trace-thinking-list trace-plan-content detailed-plan-content">
+                  {(() => {
+                    const planText = answer?.text ?? "";
+                    if (!planText.trim())
+                      return (
+                        <div className="trace-thinking-empty detailed-lane-empty">
+                          {streaming && (
+                            <span className="trace-answer-spinner" aria-hidden="true" />
+                          )}
                         </div>
                       );
-                })()}
-              </div>
-            ) : visibleThinkingEntries.length > 0 ? (
-              <ul className="trace-thinking-list" ref={thinkingListRef}>
-                {visibleThinkingEntries.map((entry) => (
-                  <li
-                    className={`trace-thinking-item${entry.kind === "internal" ? " is-internal" : ""}`}
-                    key={entry.id}
-                  >
-                    {entry.kind === "internal" ? (
-                      <>
+                    if (planContentView === "raw")
+                      return answerParagraphs(planText);
+                    const stepIndex = steps.findIndex(
+                      (step) => step.id === selectedStep.id,
+                    );
+                    const slice = planStepSlice(planText, stepIndex);
+                    return slice
+                      ? answerParagraphs(slice)
+                      : (
+                          <span className="trace-thinking-empty-text">
+                            Ehhez a lépéshez nincs külön tervrészlet.
+                          </span>
+                        );
+                  })()}
+                </div>
+              </>
+            ) : detailedTraceSections.length > 0 ? (
+              <ul
+                className="compact-thinking-list detailed-thinking-list"
+                ref={thinkingListRef}
+              >
+                {detailedTraceSections.map((section: CompactTraceSection) =>
+                  section.kind === "primary" ? (
+                    <li
+                      className={`trace-thinking-item compact-primary-trace${section.item.presentation === "narrative" ? " is-narrative" : " is-important"}`}
+                      key={section.id}
+                    >
+                      {section.item.presentation === "narrative" ? (
+                        <>
+                          <span className="trace-thinking-bullet">•</span>
+                          <p><InlineMarkdown text={section.item.summary ?? ""} /></p>
+                        </>
+                      ) : (
                         <button
                           type="button"
-                          className="trace-internal-line"
+                          className="compact-primary-toggle"
+                          disabled={
+                            !section.item.detail ||
+                            section.item.detail === section.item.summary
+                          }
                           onClick={() =>
-                            setExpandedInternalEntryId((current) =>
-                              current === entry.id ? null : entry.id,
+                            setExpandedTraceDetailId((current) =>
+                              current === section.item.id ? null : section.item.id,
                             )
                           }
-                          aria-expanded={expandedInternalEntryId === entry.id}
-                          title="A teljes belső gondolkodás megjelenítése"
+                          aria-expanded={expandedTraceDetailId === section.item.id}
                         >
                           <span className="trace-thinking-bullet">•</span>
-                          <span className="trace-internal-preview">
-                            <InlineMarkdown text={entry.body} />
+                          <span className="compact-technical-summary">
+                            {section.item.summary ?? ""}
                           </span>
-                          <span className="trace-internal-caret" aria-hidden="true">
-                            {expandedInternalEntryId === entry.id ? "▾" : "▸"}
-                          </span>
+                          {section.item.detail &&
+                            section.item.detail !== section.item.summary && (
+                              <span className="trace-internal-caret" aria-hidden="true">
+                                {expandedTraceDetailId === section.item.id ? "▾" : "▸"}
+                              </span>
+                            )}
                         </button>
-                        {entry.codeActivity && (
-                          <button
-                            type="button"
-                            className="trace-code-button"
-                            onClick={() => openInlineDiff(entry.codeActivity!)}
-                            aria-label="Kóddiff megnyitása"
-                            title="Kóddiff megnyitása"
-                          >
-                            &lt;/&gt;
-                          </button>
+                      )}
+                      {renderCompactTraceAction(section.item)}
+                      {section.item.presentation !== "narrative" &&
+                        expandedTraceDetailId === section.item.id && (
+                          <div className="compact-technical-detail">
+                            {section.item.detail ?? ""}
+                          </div>
                         )}
-                        {expandedInternalEntryId === entry.id &&
-                          entry.internalHistory &&
-                          entry.internalHistory.length > 0 && (
-                            <div
-                              className="trace-internal-history-body"
-                              data-quote-selectable="true"
-                            >
-                              {entry.internalHistory.map((line, index) => (
-                                // A gondolkodás képleteket és kód-chipeket is
-                                // hordoz; nyers szövegként ellentmondana a
-                                // panel többi sorának.
-                                <div key={`${entry.id}-history-${index}`}>
-                                  <InlineMarkdown text={line} />
-                                </div>
-                              ))}
-                            </div>
-                          )}
-                      </>
-                    ) : (
-                      <>
+                    </li>
+                  ) : (
+                    <li className="compact-technical-section" key={section.id}>
+                      <button
+                        type="button"
+                        className="compact-technical-toggle"
+                        onClick={() =>
+                          setExpandedTechnicalSectionId((current) =>
+                            current === section.id ? null : section.id,
+                          )
+                        }
+                        aria-expanded={expandedTechnicalSectionId === section.id}
+                      >
                         <span className="trace-thinking-bullet">•</span>
-                        <p><InlineMarkdown text={entry.body} /></p>
-                        {entry.codeActivity && (
-                          <button
-                            type="button"
-                            className="trace-code-button"
-                            onClick={() => openInlineDiff(entry.codeActivity!)}
-                            aria-label="Kóddiff megnyitása"
-                            title="Kóddiff megnyitása"
-                          >
-                            &lt;/&gt;
-                          </button>
-                        )}
-                      </>
-                    )}
-                  </li>
-                ))}
+                        <span className="compact-technical-label">{section.label}</span>
+                        <span className="trace-internal-caret" aria-hidden="true">
+                          {expandedTechnicalSectionId === section.id ? "▾" : "▸"}
+                        </span>
+                      </button>
+                      {expandedTechnicalSectionId === section.id && (
+                        <ul className="compact-technical-details">
+                          {section.items.map((item) => {
+                            const detail = item.detail?.trim() ?? "";
+                            const summary = item.summary?.trim() ?? "";
+                            const expandable = Boolean(detail && detail !== summary);
+                            const detailOpen = expandedTraceDetailId === item.id;
+                            return (
+                              <li className="compact-technical-item" key={item.id}>
+                                <div className="compact-technical-item-line">
+                                  <button
+                                    type="button"
+                                    className="compact-technical-item-toggle"
+                                    disabled={!expandable}
+                                    onClick={() =>
+                                      expandable &&
+                                      setExpandedTraceDetailId((current) =>
+                                        current === item.id ? null : item.id,
+                                      )
+                                    }
+                                    aria-expanded={expandable ? detailOpen : undefined}
+                                  >
+                                    <span className="compact-technical-kind" aria-hidden="true">
+                                      {item.presentation === "command"
+                                        ? "$"
+                                        : item.presentation === "file"
+                                          ? "F"
+                                          : item.presentation === "tool"
+                                            ? "T"
+                                            : item.presentation === "status"
+                                              ? "!"
+                                              : "·"}
+                                    </span>
+                                    <span className="compact-technical-summary">{summary}</span>
+                                    {expandable && (
+                                      <span className="trace-internal-caret" aria-hidden="true">
+                                        {detailOpen ? "▾" : "▸"}
+                                      </span>
+                                    )}
+                                  </button>
+                                  {renderCompactTraceAction(item)}
+                                </div>
+                                {detailOpen && (
+                                  <div className="compact-technical-detail">{detail}</div>
+                                )}
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      )}
+                    </li>
+                  ),
+                )}
               </ul>
             ) : (
-              <div className="trace-thinking-empty">
-                {!streaming && (
+              <div className="trace-thinking-empty detailed-lane-empty">
+                {streaming ? (
+                  <span className="trace-answer-spinner" aria-hidden="true" />
+                ) : (
                   <span className="trace-thinking-empty-text">
-                    Ehhez a lépéshez nem érkezett külön gondolkodási napló.
+                    Nem érkezett külön gondolkodási összefoglaló.
                   </span>
                 )}
               </div>
             )}
           </section>
-        </div>}
+        </div>
+
+        {changeSummary.length > 0 && (
+          <div className="detailed-change-summary">
+            <ChangeSummaryPanel
+              files={changeSummary}
+              onRollback={onRollbackChanges}
+              rollbackBusy={rollbackBusy}
+              onPreviewImage={onPreviewImage}
+            />
+          </div>
+        )}
 
 
       {inlineDiff && (
@@ -14054,6 +13989,8 @@ function App() {
             conversationId: checkpointConversationId,
             requestId: completedRequestId,
             text: checkpointAnswerText,
+            replaceMessageId: run.replacementMessageId,
+            replaceTurnId: run.replacementTurnId,
           }).catch(() => undefined);
         }
         // `turn/completed` is the durable answer boundary. Protect this
@@ -16887,6 +16824,8 @@ function App() {
       clientTurnId,
       stageEpoch: 1,
       liveMessageId,
+      replacementMessageId: regeneration?.originalAnswer.id,
+      replacementTurnId: regeneration?.turnId,
       turnId: clientTurnId,
       turnTiming: { startedAt: requestStartedAt },
       plan: initialPlan,
@@ -17198,6 +17137,8 @@ function App() {
               effort: effectiveEffort,
               cwd: activeProjectData.path,
               requestId,
+              replaceMessageId: regeneration?.originalAnswer.id,
+              replaceTurnId: regeneration?.turnId,
               maxBudgetUsd: Number(claudeBudgetUsd),
               maxTurns: Number(claudeMaxTurns),
             },
@@ -17225,6 +17166,8 @@ function App() {
               effort: effectiveEffort,
               cwd: isGeneralMode ? null : activeProjectData.path,
               requestId,
+              replaceMessageId: regeneration?.originalAnswer.id,
+              replaceTurnId: regeneration?.turnId,
             },
           });
       if (cancelledRequestIdsRef.current.delete(requestId)) return;
@@ -18445,22 +18388,21 @@ function App() {
       .map((slot) => stageForVersion(chain, selectedVersion, slot))
       .filter((item): item is ChainStage => Boolean(item));
     const lastStageIndex = chainSlots.at(-1) ?? 0;
-    // -1 is the composed answer: what the chain did, in the words of whoever
-    // did it, instead of the reviewer's opinion of the coder. A sávon a
-    // szakaszok után áll, mert a futás is oda ér ki.
+    // The result-producing stage is the useful default: TERV for a planning
+    // recipe, KÓD for an implementation recipe. VÁLASZ is no longer a separate
+    // tab because every stage shows its answer, steps and thinking together.
+    const outputStage =
+      runStages.find((item) => item.role === "code") ??
+      runStages.find((item) => item.role === "plan") ??
+      runStages.at(-1);
     const selectedStage = stage
-      ? (selectedStages[chainKey] ?? PIPELINE_ANSWER_TAB)
+      ? (selectedStages[chainKey] ?? outputStage?.stageIndex ?? lastStageIndex)
       : 0;
-    // Only the chosen phase draws itself; the others are one click away. The
-    // answer tab has no stage of its own, so the last one hosts it. Matched on
-    // the run as well as the slot: two versions own the same slot, and without
-    // the run id both of them would draw the panel.
+    // Only the chosen phase draws itself; the others are one click away.
+    // Matched on the run as well as the slot: two versions own the same slot,
+    // and without the run id both of them would draw the panel.
     const shownStage = stage
-      ? stageForVersion(
-          chain,
-          selectedVersion,
-          selectedStage === PIPELINE_ANSWER_TAB ? lastStageIndex : selectedStage,
-        )
+      ? stageForVersion(chain, selectedVersion, selectedStage)
       : undefined;
     if (
       stage &&
@@ -18489,27 +18431,20 @@ function App() {
           <span
             className="pipeline-run-tabs"
             role="tablist"
-            style={{ "--tab-count": runStages.length + 1 } as CSSProperties}
+            style={{ "--tab-count": runStages.length } as CSSProperties}
           >
             <span
               className="pipeline-run-slider"
               aria-hidden="true"
               style={{
-                transform: `translateX(${
-                  (selectedStage === PIPELINE_ANSWER_TAB
-                    ? runStages.length
-                    : Math.max(0, chainSlots.indexOf(selectedStage))) * 100
-                }%)`,
+                transform: `translateX(${Math.max(0, chainSlots.indexOf(selectedStage)) * 100}%)`,
               }}
             />
-            {[
-              ...runStages.map((item) => ({
+            {runStages.map((item) => ({
                 key: item.stageIndex,
                 label: `${item.stageIndex + 1}/${stage.stageCount} ${STAGE_ROLE_LABELS[item.role] ?? item.role}`,
                 agent: item.agent,
-              })),
-              { key: PIPELINE_ANSWER_TAB, label: "VÁLASZ", agent: "" },
-            ].map((item) => (
+              })).map((item) => (
               <button
                 key={item.key}
                 type="button"
@@ -18591,11 +18526,10 @@ function App() {
       atNewestVersion &&
       latestVersion < MAX_CHAIN_ITERATIONS &&
       !viewingActiveRun;
-    // On the answer and on the review, which are the two places the verdict is
-    // stated. The plan and the code tabs are what the run did, not what it
-    // concluded, and a call to action there reads as belonging to that phase.
+    // Keep the verdict visible both on the producing stage (the default view)
+    // and on the review stage that issued it.
     const footerBelongsHere =
-      selectedStage === PIPELINE_ANSWER_TAB || selectedStage === lastStageIndex;
+      selectedStage === outputStage?.stageIndex || selectedStage === lastStageIndex;
     // Az elfogadás is a sáv alján hangzik el, a maga zöldjével — a szöveg végi
     // nyers „VERDIKT: ELFOGAD" sor helyett ez az, amit az olvasó lát.
     const acceptedFooter =
@@ -18666,31 +18600,6 @@ function App() {
           )}
         </div>
       ) : acceptedFooter;
-    if (stage && selectedStage === PIPELINE_ANSWER_TAB) {
-      // Composed here rather than asked of a fourth model: the producing stage
-      // already wrote the answer, and the reviewer already said whether to
-      // trust it. PlanReview recipes have no coder, so the plan is the output.
-      const outputStage =
-        runStages.find((item) => item.role === "code") ??
-        runStages.find((item) => item.role === "plan");
-      const doer = messages.find(
-        (message) =>
-          message.pipeline?.runId === outputStage?.runId &&
-          message.pipeline?.stageIndex === outputStage?.stageIndex,
-      );
-      const answerText = (doer ?? groupAnswer).text;
-      return (
-        <Fragment key={entry.key}>
-          {runHeader}
-          <article className="trace-card in-run is-run-end pipeline-answer-card">
-            <div className="pipeline-answer-body">
-              {answerParagraphs(answerText)}
-            </div>
-            {runFooter}
-          </article>
-        </Fragment>
-      );
-    }
     // Mennyi ideig futott a lánc: a szakaszok terveinek legkorábbi indulása és
     // legkésőbbi zárása. A fejléc órája ebből mér, így bármelyik fülön ugyanaz
     // a teljes futásidő áll — a szakasz saját ideje a LÉPÉSEK alján marad.
@@ -19054,7 +18963,7 @@ function App() {
       <span
         className="pipeline-run-tabs"
         role="tablist"
-        style={{ "--tab-count": liveRunStages.length + 1 } as CSSProperties}
+        style={{ "--tab-count": liveRunStages.length } as CSSProperties}
       >
         <span
           className="pipeline-run-slider"
@@ -19099,16 +19008,6 @@ function App() {
             </button>
           );
         })}
-        {/* A szakaszok után, mert a futás is oda ér ki — és amíg tart, nincs
-            mit megnyitni alatta. */}
-        <button
-          type="button"
-          className="pipeline-run-tab"
-          disabled
-          title="A válasz a lánc végén készül el"
-        >
-          VÁLASZ
-        </button>
       </span>
       {liveRunResume && liveRunResume.iteration > 1 && (
         // Says which round is running, so a re-run is not mistaken for the
@@ -20298,41 +20197,6 @@ function App() {
                 ))}
               </div>
             )}
-            {viewingActiveRun && (
-              <div className="run-input-mode" role="group" aria-label="Futás közbeni küldés módja">
-                <button
-                  type="button"
-                  className={runInputMode === "steer" ? "is-active" : ""}
-                  disabled={!activeRunInputTarget}
-                  onClick={() => setRunInputMode("steer")}
-                >
-                  ⇢ TERELÉS
-                </button>
-                {pipelineStageQueueAvailable && !activeRunInputTarget && (
-                  <button
-                    type="button"
-                    className={runInputMode === "stage_next" ? "is-active" : ""}
-                    onClick={() => setRunInputMode("stage_next")}
-                  >
-                    KÖVETKEZŐ FÁZIS
-                  </button>
-                )}
-                <button
-                  type="button"
-                  className={runInputMode === "follow_up" ? "is-active" : ""}
-                  onClick={() => setRunInputMode("follow_up")}
-                >
-                  KÖVETKEZŐ ÜZENET
-                </button>
-                <span className="run-input-target">
-                  {activeRunInputTarget
-                    ? `${STAGE_ROLE_LABELS[activeRunInputTarget.stageRole ?? ""] ?? (activeMode === "general" ? "GENERAL" : "EGY AI")} · ${activeRunInputTarget.provider === "anthropic" ? "Claude" : "ChatGPT"}`
-                    : activeTurnHasCompleted
-                      ? "A válasz kész · mentés folyik"
-                      : "Következő fázis indul…"}
-                </span>
-              </div>
-            )}
             {activeStageInputs.length > 0 && (
               <div className="runtime-input-status" aria-live="polite">
                 {activeStageInputs.map((input) => (
@@ -20614,37 +20478,75 @@ function App() {
                       ＋
                     </button>
                   )}
+                  {viewingActiveRun && (
+                    <button
+                      type="button"
+                      className={`run-input-intent is-${runInputMode}`}
+                      aria-label={
+                        runInputMode === "follow_up"
+                          ? "Küldés a jelenlegi válasz után"
+                          : runInputMode === "stage_next"
+                            ? "Terelés küldése a következő fázisnak"
+                            : "Terelés küldése a most dolgozó AI-nak"
+                      }
+                      title="Kattintással váltás: most dolgozó AI / válasz után"
+                      onClick={() =>
+                        setRunInputMode((current) =>
+                          current === "follow_up"
+                            ? activeRunInputTarget
+                              ? "steer"
+                              : pipelineStageQueueAvailable
+                                ? "stage_next"
+                                : "follow_up"
+                            : "follow_up",
+                        )
+                      }
+                    >
+                      <span aria-hidden="true">
+                        {runInputMode === "follow_up" ? "↳" : "⇢"}
+                      </span>
+                      <span>
+                        {runInputMode === "follow_up"
+                          ? "UTÁNA"
+                          : runInputMode === "stage_next"
+                            ? "KÖV. FÁZIS"
+                            : "MOST"}
+                      </span>
+                    </button>
+                  )}
                 </div>
-                {viewingActiveRun && !activeTurnHasCompleted && (
+                <div className="composer-primary-actions">
                   <button
-                    type="button"
-                    className="stop-button"
-                    aria-label="Gondolkodás leállítása"
-                    title="Gondolkodás leállítása"
-                    disabled={isCancelling}
-                    onClick={() => void stopGeneration()}
+                    type="submit"
+                    className="send-button"
+                    aria-label={
+                      reviewCommentTarget
+                        ? "Komment küldése"
+                        : viewingActiveRun &&
+                            (runInputMode === "steer" || runInputMode === "stage_next")
+                          ? "Terelés küldése a futó AI-nak"
+                          : "Üzenet küldése"
+                    }
+                    disabled={imagesPreparing}
                   >
-                    ■
+                    {viewingActiveRun &&
+                    (runInputMode === "steer" || runInputMode === "stage_next")
+                      ? "⇢"
+                      : "↑"}
                   </button>
-                )}
-                <button
-                  type="submit"
-                  className="send-button"
-                  aria-label={
-                    reviewCommentTarget
-                      ? "Komment küldése"
-                      : viewingActiveRun &&
-                          (runInputMode === "steer" || runInputMode === "stage_next")
-                        ? "Terelés küldése a futó AI-nak"
-                        : "Üzenet küldése"
-                  }
-                  disabled={imagesPreparing}
-                >
-                  {viewingActiveRun &&
-                  (runInputMode === "steer" || runInputMode === "stage_next")
-                    ? "⇢"
-                    : "↑"}
-                </button>
+                  {viewingActiveRun && !activeTurnHasCompleted && (
+                    <button
+                      type="button"
+                      className="stop-button"
+                      aria-label="Gondolkodás leállítása"
+                      title="Gondolkodás leállítása"
+                      disabled={isCancelling}
+                      onClick={() => void stopGeneration()}
+                    >
+                      ■
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
             </div>

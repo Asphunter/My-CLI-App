@@ -957,6 +957,8 @@ async fn pipeline_send(
                         effort: execution.stage.effort.clone(),
                         cwd: request.cwd.clone(),
                         request_id: Some(request_id.clone()),
+                        replace_message_id: None,
+                        replace_turn_id: None,
                         max_budget_usd: request.max_budget_usd,
                         max_turns: execution.stage.max_turns,
                         tool_profile: Some(execution.stage.role.tool_profile()),
@@ -1228,8 +1230,16 @@ fn agent_answer_checkpoint(
     conversation_id: String,
     request_id: String,
     text: String,
+    replace_message_id: Option<String>,
+    replace_turn_id: Option<String>,
 ) -> Result<(), String> {
-    store::record_agent_answer_text(&conversation_id, &request_id, &text)
+    store::record_agent_answer_text_replacing(
+        &conversation_id,
+        &request_id,
+        &text,
+        replace_message_id.as_deref(),
+        replace_turn_id.as_deref(),
+    )
 }
 
 #[tauri::command(rename_all = "camelCase")]

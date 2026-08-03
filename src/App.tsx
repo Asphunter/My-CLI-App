@@ -42,7 +42,7 @@ import {
 import {
   numberedPlanLines,
   numberedPlanSteps,
-  planStepSlice,
+  planTextSegments,
 } from "./planText";
 import {
   buildWorkLogGroups,
@@ -547,7 +547,7 @@ const LIVE_RERUN_SLOT = "__live-rerun-slot__";
 
 const STAGE_ROLE_LABELS: Record<string, string> = {
   plan: "TERV",
-  plan_review: "TERV REVIEW",
+  plan_review: "REVIEW",
   code: "KÓD",
   review: "REVIEW",
 };
@@ -1308,14 +1308,18 @@ const answerTextParagraphs = (
           </ul>,
         ];
       const orderedItems = lines.map((line) =>
-        line.match(/^\s*\d+[.)]\s+(\S.*)$/)?.[1],
+        line.match(/^\s*(\d+)[.)]\s+(\S.*)$/),
       );
       if (orderedItems.every(Boolean))
         return [
-          <ol className="answer-list" key={`${keyPrefix}-ordered-${index}`}>
+          <ol
+            className="answer-list"
+            key={`${keyPrefix}-ordered-${index}`}
+            start={Number(orderedItems[0]![1])}
+          >
             {orderedItems.map((item, itemIndex) => (
               <li key={`${keyPrefix}-ordered-${index}-${itemIndex}`}>
-                {renderInline(item!)}
+                {renderInline(item![2])}
               </li>
             ))}
           </ol>,
@@ -1385,6 +1389,13 @@ const answerTextParagraphs = (
       return blocks;
     })
     .flat();
+
+const planStepBody = (text: string) => {
+  const lines = text.split(/\r?\n/);
+  if (lines.length > 0)
+    lines[0] = lines[0].replace(/^\s*\d+[.)]\s+/, "");
+  return lines.join("\n").trim();
+};
 
 /** Render full answer Markdown without dropping executable instructions. */
 const answerParagraphs = (
@@ -6715,8 +6726,14 @@ type TurnProgressCardProps = {
   /** A review says pass or fail in its colour rather than in a chip. */
   runTone?: "accepted" | "changes";
   runHeader?: ReactNode;
+  /** Number of real phases shown by the compact vertical phase rail. */
+  runStageCount?: number;
   /** What a run offers once it has a verdict, e.g. re-running after a reject. */
   runFooter?: ReactNode;
+  /** One chain-wide file list, reused below the steps in every phase. */
+  runChangeSummary?: ChangeSummaryFile[];
+  /** Reserve the same step-list height in every phase of one chain. */
+  runStepSlotCount?: number;
   /** Which chain stage this card belongs to; labels the pre-plan step. */
   stageRole?: string;
   /** A futás projektgyökere: az élő fájllista ehhez képest ír útvonalat. */
@@ -6763,7 +6780,10 @@ function TurnProgressCard({
   runPosition,
   runTone,
   runHeader,
+  runStageCount,
   runFooter,
+  runChangeSummary,
+  runStepSlotCount,
   stageRole,
   projectPath,
   liveFiles,
@@ -6856,6 +6876,9 @@ function TurnProgressCard({
       });
   // A terv-fázis kártyája nem naplót mutat, hanem magát a tervet.
   const isPlanStage = stageRole === "plan";
+  const isReviewStage = stageRole === "review" || stageRole === "plan_review";
+  const isCodeOrReviewStage = stageRole === "code" || isReviewStage;
+  const hasAnswer = Boolean(answer?.text.trim());
   // Íródó terv: a pontjai között nincs „épp ez fut", és nincs kiválasztott sem
   // — a lista egyszerűen egymás alá írja őket, ahogy megszületnek. A kiemelés
   // és a halványítás a kész terven, illetve a többi szakasz lépéslistáján
@@ -6967,7 +6990,8 @@ function TurnProgressCard({
         steps.find((step) => step.status === "inProgress") ??
         steps[0] ??
         steps[steps.length - 1])
-      : (lastTracedStep ??
+      : ((hasAnswer && isCodeOrReviewStage ? steps.at(-1) : undefined) ??
+        lastTracedStep ??
         (hasUnassignedTrace ? steps[0] : undefined) ??
         [...steps].reverse().find((step) => step.status === "completed") ??
         steps[0]);
@@ -6975,17 +6999,11 @@ function TurnProgressCard({
   // A terv-fázis GONDOLKODÁS MENETE panelje nem naplót mutat, hanem magát a
   // tervet: RAW = a teljes szöveg (élőben streamelve), DETAIL = a kiválasztott
   // lépés szelete.
-  const [planContentView, setPlanContentView] = useState<"raw" | "detail">(
-    () => (effectivePlannedSteps.length > 0 ? "detail" : "raw"),
+  const planContentRef = useRef<HTMLDivElement>(null);
+  const planSegments = useMemo(
+    () => planTextSegments(answer?.text ?? ""),
+    [answer?.text],
   );
-  useEffect(() => {
-    if (
-      isPlanStage &&
-      effectivePlannedSteps.length === 0 &&
-      planContentView === "detail"
-    )
-      setPlanContentView("raw");
-  }, [isPlanStage, planContentView, effectivePlannedSteps.length]);
   const [inlineDiff, setInlineDiff] = useState<InlineCodeDiff | null>(null);
   const followActiveStepRef = useRef(true);
 
@@ -7016,6 +7034,31 @@ function TurnProgressCard({
 
   const selectedStep =
     steps.find((step) => step.id === selectedStepId) ?? activeStep;
+  const selectedStepIndex = steps.findIndex(
+    (step) => step.id === selectedStep.id,
+  );
+  const finalAnswerStep = isCodeOrReviewStage ? steps.at(-1) : undefined;
+  const selectedIsFinalAnswerStep =
+    Boolean(finalAnswerStep) && selectedStep.id === finalAnswerStep?.id;
+  const selectedShowsFinalAnswer = isCodeOrReviewStage
+    ? selectedIsFinalAnswerStep
+    : !isPlanStage && hasAnswer;
+  const finalAnswerStepLabel = isReviewStage ? "VERDIKT" : "VÁLASZ";
+  useEffect(() => {
+    if (!isPlanStage || selectedStepIndex < 0) return;
+    const container = planContentRef.current;
+    const target = container?.querySelector<HTMLElement>(
+      `[data-plan-step-index="${selectedStepIndex}"]`,
+    );
+    if (!container || !target) return;
+    const frame = window.requestAnimationFrame(() => {
+      container.scrollTo({
+        top: Math.max(0, target.offsetTop - 6),
+        behavior: streaming ? "auto" : "smooth",
+      });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [isPlanStage, selectedStepIndex, streaming]);
   const orderedActivities = [...activities].sort(
     (left, right) => left.id - right.id,
   );
@@ -7311,7 +7354,6 @@ function TurnProgressCard({
     startedAtForDisplay !== undefined && stageElapsedEnd !== undefined
       ? formatElapsed(Math.max(0, stageElapsedEnd - startedAtForDisplay))
       : "";
-  const hasAnswer = Boolean(answer?.text.trim());
   const answerInterrupted = Boolean(
     answer?.interrupted || hasInterruptedAnswerMarker(answer?.text ?? ""),
   );
@@ -7338,6 +7380,27 @@ function TurnProgressCard({
       : filesFromActivities
         ? changeSummaryFromActivities(activities, projectPath)
         : [];
+  const displayedChangeSummary =
+    runChangeSummary && runChangeSummary.length > 0
+      ? runChangeSummary
+      : changeSummary;
+  const visibleStepCount =
+    isPlanStage && effectivePlannedSteps.length === 0 ? 0 : steps.length;
+  const reservedStepSlots = Math.max(
+    1,
+    visibleStepCount,
+    runStepSlotCount ?? 0,
+  );
+  const longestStepLabel = (isPlanStage && effectivePlannedSteps.length === 0
+    ? []
+    : steps
+  ).reduce((longest, step) => Math.max(longest, step.step.trim().length), 0);
+  // Measured against the app's 10 px UI face: label + marker + elapsed +
+  // paddings. CSS still caps this at 40% so the answer remains the primary pane.
+  const preferredStepLaneWidth = Math.max(
+    260,
+    Math.min(440, Math.ceil(86 + longestStepLabel * 5.2)),
+  );
   const [copiedAnswer, setCopiedAnswer] = useState(false);
   const copyAnswer = async () => {
     if (!answer?.text.trim()) return;
@@ -7400,10 +7463,6 @@ function TurnProgressCard({
     step.status === "pending"
       ? "inProgress"
       : step.status;
-  const countableSteps = steps;
-  const completedStepCount = countableSteps.filter(
-    (step) => displayStatus(step) === "completed",
-  ).length;
   /**
    * Hány esemény esik erre a lépésre — ez a sávok száma.
    *
@@ -7736,7 +7795,14 @@ function TurnProgressCard({
   }
 
   return (
-    <>
+    <div
+      className={`detailed-run-shell${runHeader ? " has-phase-rail" : ""}`}
+      style={
+        {
+          "--run-stage-count": Math.max(1, runStageCount ?? 1),
+        } as CSSProperties
+      }
+    >
       {runHeader}
       <article
         className={`turn-progress-card trace-card detailed-trace-card${streaming ? " is-live" : ""}${answerInterrupted ? " is-interrupted" : ""}${runClasses}`}
@@ -7758,42 +7824,23 @@ function TurnProgressCard({
                 : "A válasz kész"
           }
         >
-          <div className="compact-answer-provider-mark">
-            <ProviderMark provider={provider} />
-          </div>
+          {!runHeader && (
+            <div className="compact-answer-provider-mark">
+              <ProviderMark provider={provider} />
+            </div>
+          )}
           <time>{overallElapsed || "0:00"}</time>
         </div>
 
-        <div className="detailed-trace-grid">
-          <section
-            className="detailed-trace-lane detailed-answer-lane"
-            data-quote-selectable="true"
-            data-quote-anchor={answerAnchorId}
-            aria-label="Válasz"
-          >
-            {answerActions && (
-              <div className="detailed-answer-toolbar">
-                {answerActions}
-              </div>
-            )}
-            <div className="turn-progress-answer-body detailed-answer-body">
-              <div className="trace-answer-line">
-                {hasAnswer && (
-                  <div className="trace-answer-text">
-                    {answerParagraphs(
-                      answerBodyText,
-                      answerQuoteRefs,
-                      onQuoteJump,
-                    )}
-                  </div>
-                )}
-                {streaming && (
-                  <span className="trace-answer-spinner" aria-label="Válasz készül" />
-                )}
-              </div>
-            </div>
-          </section>
-
+        <div
+          className={`detailed-trace-grid${isPlanStage ? " is-plan-stage" : " is-work-stage"}`}
+          style={
+            {
+              "--detailed-step-slots": reservedStepSlots,
+              "--detailed-steps-width": `${preferredStepLaneWidth}px`,
+            } as CSSProperties
+          }
+        >
           <section
             className="detailed-trace-lane detailed-steps-lane"
             aria-label="Lépések listája"
@@ -7816,6 +7863,11 @@ function TurnProgressCard({
                 const currentStep =
                   !planDrafting && streaming && step.id === activeStep.id;
                 const elapsed = stepElapsedFor(step);
+                const finalAnswerRow = finalAnswerStep?.id === step.id;
+                const verdictRowClass =
+                  finalAnswerRow && isReviewStage && runTone
+                    ? ` is-verdict-step is-verdict-${runTone}`
+                    : "";
                 return (
                   <div
                     className="trace-step-target"
@@ -7828,7 +7880,7 @@ function TurnProgressCard({
                       className={
                         planDrafting
                           ? "trace-step-row is-plain"
-                          : `trace-step-row trace-step-row-${displayStatus(step)}${selectedStep.id === step.id ? " is-selected" : ""}${currentStep ? " is-current" : ""}${disabled ? " is-disabled" : ""}`
+                          : `trace-step-row trace-step-row-${displayStatus(step)}${selectedStep.id === step.id ? " is-selected" : ""}${currentStep ? " is-current" : ""}${disabled ? " is-disabled" : ""}${finalAnswerRow ? " is-final-answer-step" : ""}${verdictRowClass}`
                       }
                       onClick={() => selectStep(step.id)}
                       disabled={disabled}
@@ -7843,7 +7895,18 @@ function TurnProgressCard({
                         {isPlanStage ? `${stepIndex + 1}.` : stepIndicator(step)}
                       </span>
                       <span className="trace-step-name">{step.step}</span>
-                      {elapsed && <span className="trace-step-elapsed">{elapsed}</span>}
+                      {(elapsed || finalAnswerRow) && (
+                        <span className="trace-step-meta">
+                          {finalAnswerRow && (
+                            <span className="trace-step-final-mark">
+                              {finalAnswerStepLabel}
+                            </span>
+                          )}
+                          {elapsed && (
+                            <span className="trace-step-elapsed">{elapsed}</span>
+                          )}
+                        </span>
+                      )}
                     </button>
                   </div>
                 );
@@ -7866,80 +7929,89 @@ function TurnProgressCard({
                   </span>
                 </div>
               )}
+              {isReviewStage && runFooter}
+              {stageElapsed && (
+                <div className="trace-total-elapsed detailed-steps-total">
+                  <time>{stageElapsed}</time>
+                </div>
+              )}
             </div>
-            {(stageElapsed || countableSteps.length > 0) && (
-              <div className="trace-total-elapsed detailed-steps-summary">
-                <span>
-                  {planDrafting
-                    ? "készül"
-                    : `${completedStepCount}/${countableSteps.length}`}
-                </span>
-                {stageElapsed && <time>{stageElapsed}</time>}
+            {displayedChangeSummary.length > 0 && (
+              <div className="detailed-step-changes">
+                <ChangeSummaryPanel
+                  files={displayedChangeSummary}
+                  onRollback={onRollbackChanges}
+                  rollbackBusy={rollbackBusy}
+                  onPreviewImage={onPreviewImage}
+                />
               </div>
             )}
           </section>
 
           <section
-            className="detailed-trace-lane detailed-thinking-lane"
+            className={`detailed-trace-lane detailed-thinking-lane${isPlanStage ? " detailed-plan-lane" : ""}`}
             data-quote-selectable="true"
             data-quote-anchor={quoteAnchor(`thinking:${selectedStep.id}`)}
             aria-label="Gondolkodás menete"
           >
             {isPlanStage ? (
               <>
+                {answerActions && (
+                  <div className="detailed-answer-toolbar">
+                    {answerActions}
+                  </div>
+                )}
                 <div
-                  className="detailed-plan-view-toggle"
-                  role="tablist"
-                  aria-label="Terv nézete"
+                  ref={planContentRef}
+                  className="trace-thinking-list trace-plan-content detailed-plan-content"
+                  data-quote-anchor={answerAnchorId}
                 >
-                  <button
-                    type="button"
-                    role="tab"
-                    className={planContentView === "raw" ? "is-active" : ""}
-                    aria-selected={planContentView === "raw"}
-                    onClick={() => setPlanContentView("raw")}
-                  >
-                    RAW
-                  </button>
-                  <button
-                    type="button"
-                    role="tab"
-                    className={planContentView === "detail" ? "is-active" : ""}
-                    aria-selected={planContentView === "detail"}
-                    disabled={effectivePlannedSteps.length === 0}
-                    onClick={() => setPlanContentView("detail")}
-                  >
-                    RÉSZLET
-                  </button>
-                </div>
-                <div className="trace-thinking-list trace-plan-content detailed-plan-content">
-                  {(() => {
-                    const planText = answer?.text ?? "";
-                    if (!planText.trim())
-                      return (
-                        <div className="trace-thinking-empty detailed-lane-empty">
-                          {streaming && (
-                            <span className="trace-answer-spinner" aria-hidden="true" />
+                  {planSegments.length > 0 ? (
+                    planSegments.map((segment, segmentIndex) =>
+                      segment.kind === "step" ? (
+                        <section
+                          className={`detailed-plan-step${segment.stepIndex === selectedStepIndex ? " is-highlighted" : ""}`}
+                          data-plan-step-index={segment.stepIndex}
+                          key={`plan-step-${segment.stepIndex}`}
+                        >
+                          <span className="detailed-plan-step-number" aria-hidden="true">
+                            {segment.number}.
+                          </span>
+                          <div className="detailed-plan-step-body">
+                            {answerParagraphs(
+                              planStepBody(segment.text),
+                              answerQuoteRefs,
+                              onQuoteJump,
+                            )}
+                          </div>
+                        </section>
+                      ) : (
+                        <div
+                          className="detailed-plan-context"
+                          key={`plan-context-${segmentIndex}`}
+                        >
+                          {answerParagraphs(
+                            segment.text,
+                            answerQuoteRefs,
+                            onQuoteJump,
                           )}
                         </div>
-                      );
-                    if (planContentView === "raw")
-                      return answerParagraphs(planText);
-                    const stepIndex = steps.findIndex(
-                      (step) => step.id === selectedStep.id,
-                    );
-                    const slice = planStepSlice(planText, stepIndex);
-                    return slice
-                      ? answerParagraphs(slice)
-                      : (
-                          <span className="trace-thinking-empty-text">
-                            Ehhez a lépéshez nincs külön tervrészlet.
-                          </span>
-                        );
-                  })()}
+                      ),
+                    )
+                  ) : (
+                    <div className="trace-thinking-empty detailed-lane-empty">
+                      {streaming ? (
+                        <span className="trace-answer-spinner" aria-hidden="true" />
+                      ) : (
+                        <span className="trace-thinking-empty-text">
+                          A terv szövege nem érkezett meg.
+                        </span>
+                      )}
+                    </div>
+                  )}
                 </div>
               </>
-            ) : detailedTraceSections.length > 0 ? (
+            ) : (
               <ul
                 className="compact-thinking-list detailed-thinking-list"
                 ref={thinkingListRef}
@@ -8061,31 +8133,52 @@ function TurnProgressCard({
                     </li>
                   ),
                 )}
+                {selectedShowsFinalAnswer &&
+                  (hasAnswer || streaming || changeSummary.length > 0) && (
+                    <li
+                      className={`detailed-final-answer${isReviewStage && runTone ? ` is-verdict-${runTone}` : ""}`}
+                      data-quote-anchor={answerAnchorId}
+                    >
+                      {answerActions && (
+                        <div className="detailed-final-answer-toolbar">
+                          {answerActions}
+                        </div>
+                      )}
+                      <div className="turn-progress-answer-body detailed-final-answer-body">
+                        {hasAnswer && (
+                          <div className="trace-answer-text">
+                            {answerParagraphs(
+                              answerBodyText,
+                              answerQuoteRefs,
+                              onQuoteJump,
+                            )}
+                          </div>
+                        )}
+                        {streaming && (
+                          <span
+                            className="trace-answer-spinner"
+                            aria-label="Válasz készül"
+                          />
+                        )}
+                      </div>
+                    </li>
+                  )}
+                {detailedTraceSections.length === 0 &&
+                  !(selectedShowsFinalAnswer && (hasAnswer || streaming)) && (
+                    <li className="trace-thinking-empty detailed-lane-empty">
+                      {streaming ? (
+                        <span className="trace-answer-spinner" aria-hidden="true" />
+                      ) : (
+                        <span className="trace-thinking-empty-text">
+                          Ehhez a lépéshez nem érkezett külön összefoglaló.
+                        </span>
+                      )}
+                    </li>
+                  )}
               </ul>
-            ) : (
-              <div className="trace-thinking-empty detailed-lane-empty">
-                {streaming ? (
-                  <span className="trace-answer-spinner" aria-hidden="true" />
-                ) : (
-                  <span className="trace-thinking-empty-text">
-                    Nem érkezett külön gondolkodási összefoglaló.
-                  </span>
-                )}
-              </div>
             )}
           </section>
         </div>
-
-        {changeSummary.length > 0 && (
-          <div className="detailed-change-summary">
-            <ChangeSummaryPanel
-              files={changeSummary}
-              onRollback={onRollbackChanges}
-              rollbackBusy={rollbackBusy}
-              onPreviewImage={onPreviewImage}
-            />
-          </div>
-        )}
 
 
       {inlineDiff && (
@@ -8141,9 +8234,8 @@ function TurnProgressCard({
           </section>
         </div>
       )}
-      {runFooter}
       </article>
-    </>
+    </div>
   );
 }
 
@@ -18433,16 +18525,9 @@ function App() {
             role="tablist"
             style={{ "--tab-count": runStages.length } as CSSProperties}
           >
-            <span
-              className="pipeline-run-slider"
-              aria-hidden="true"
-              style={{
-                transform: `translateX(${Math.max(0, chainSlots.indexOf(selectedStage)) * 100}%)`,
-              }}
-            />
             {runStages.map((item) => ({
                 key: item.stageIndex,
-                label: `${item.stageIndex + 1}/${stage.stageCount} ${STAGE_ROLE_LABELS[item.role] ?? item.role}`,
+                label: STAGE_ROLE_LABELS[item.role] ?? item.role,
                 agent: item.agent,
               })).map((item) => (
               <button
@@ -18452,14 +18537,15 @@ function App() {
                 aria-selected={item.key === selectedStage}
                 // The phase that carries the verdict says so in the strip as
                 // well, so a run's outcome is readable without opening it.
-                className={`pipeline-run-tab${item.key === selectedStage ? " is-active" : ""}${
+                className={`pipeline-run-tab is-complete${item.key === selectedStage ? " is-active" : ""}${
                   item.key === lastStageIndex && runVerdict?.verdict
                     ? runVerdict.verdict === "accepted"
                       ? " is-verdict-accepted"
                       : " is-verdict-changes"
                     : ""
                 }`}
-                title={item.agent}
+                aria-label={`${item.label}: ${item.agent}`}
+                title={`${item.label} · ${item.agent}`}
                 onClick={() => {
                   setSelectedStages((current) => ({
                     ...current,
@@ -18483,7 +18569,11 @@ function App() {
                   );
                 }}
               >
-                {item.label}
+                <span className="compact-answer-provider-mark pipeline-stage-provider-mark">
+                  <ProviderMark
+                    provider={normalizeAgentProvider(item.agent) ?? "codex"}
+                  />
+                </span>
               </button>
             ))}
           </span>
@@ -18530,29 +18620,29 @@ function App() {
     // and on the review stage that issued it.
     const footerBelongsHere =
       selectedStage === outputStage?.stageIndex || selectedStage === lastStageIndex;
-    // Az elfogadás is a sáv alján hangzik el, a maga zöldjével — a szöveg végi
-    // nyers „VERDIKT: ELFOGAD" sor helyett ez az, amit az olvasó lát.
+    const rawVerdictConclusion = runVerdict?.verdictSummary?.trim() ?? "";
+    const hasUsefulVerdictConclusion =
+      rawVerdictConclusion.length > 0 &&
+      !/^(ELFOGAD|JAVÍTÁST KÉR|CHANGES REQUESTED)$/i.test(rawVerdictConclusion);
+    const verdictConclusion = hasUsefulVerdictConclusion
+      ? rawVerdictConclusion
+      : runVerdict?.verdict === "accepted"
+        ? planReviewRecipe
+          ? "A terv megfelel."
+          : "A megoldás megfelel."
+        : "Javítás szükséges.";
+    // A verdikt konklúziója közvetlenül a VERDIKT lépés alá kerül. A színe már
+    // kimondja az állapotot, ezért nem ismételjük elé, hogy „a bíráló...".
     const acceptedFooter =
       runVerdict?.verdict === "accepted" && footerBelongsHere ? (
         <div className="pipeline-answer-next is-accepted">
-          <span>
-            {runVerdict.verdictSummary?.trim() &&
-            runVerdict.verdictSummary.trim().toUpperCase() !== "ELFOGAD"
-              ? `A bíráló elfogadta: ${runVerdict.verdictSummary.trim()}`
-              : planReviewRecipe
-                ? "A bíráló elfogadta a tervet."
-                : "A bíráló elfogadta a megoldást."}
-          </span>
+          <span>{verdictConclusion}</span>
         </div>
       ) : undefined;
     const runFooter =
       rejected && atNewestVersion && footerBelongsHere ? (
         <div className="pipeline-answer-next">
-          <span>
-            {latestVersion < MAX_CHAIN_ITERATIONS
-              ? "A bíráló javítást kér."
-              : `A lánc ${MAX_CHAIN_ITERATIONS} kört futott, és még mindig javítást kér. Innen érdemesebb kézbe venni.`}
-          </span>
+          <span>{verdictConclusion}</span>
           {latestVersion < MAX_CHAIN_ITERATIONS && (
             <button
               type="button"
@@ -18616,6 +18706,44 @@ function App() {
           return chainPlan ? [chainPlan] : [];
         })
       : [];
+    const chainStepCounts = stage
+      ? messages.flatMap((message, index) => {
+          if (message.role !== "assistant" || !message.pipeline) return [];
+          if (chainKeyOf(message.pipeline) !== chainKey) return [];
+          const group = workGroupForMessage(message, index);
+          const chainPlan = group
+            ? planForWorkGroup(group, message.turnId)
+            : message.turnId
+              ? planHistory[message.turnId]
+              : undefined;
+          const storedCount = (chainPlan?.steps ?? []).filter(
+            (step) =>
+              step.id !== "client-pre-plan" &&
+              !step.id.startsWith("client-fallback"),
+          ).length;
+          const writtenPlanCount =
+            message.pipeline.stageRole === "plan"
+              ? numberedPlanSteps(message.text).length
+              : 0;
+          return [Math.max(storedCount, writtenPlanCount)];
+        })
+      : [];
+    const chainStepSlotCount = Math.max(
+      1,
+      plan.steps.length,
+      ...chainStepCounts,
+    );
+    const chainChangeSummary = stage
+      ? [...messages]
+          .reverse()
+          .find(
+            (message) =>
+              message.role === "assistant" &&
+              message.pipeline &&
+              chainKeyOf(message.pipeline) === chainKey &&
+              Boolean(message.changeSummary?.length),
+          )?.changeSummary
+      : undefined;
     const chainStarts = [plan, ...chainPlans]
       .map((item) => item.startedAt)
       .filter((value): value is number => Number.isFinite(value));
@@ -18646,7 +18774,10 @@ function App() {
             : undefined
         }
         runHeader={runHeader}
+        runStageCount={runStages.length}
         runFooter={runFooter}
+        runChangeSummary={chainChangeSummary}
+        runStepSlotCount={chainStepSlotCount}
         plan={plan}
         activities={entry.group.activities}
         commentary={groupCommentary}
@@ -18921,10 +19052,15 @@ function App() {
     ? (livePipelineRecipe?.stages.map((stage, index) => ({
         index,
         role: stage.role,
+        provider: stage.provider,
       })) ??
       Array.from({ length: pipelineProgress.stageCount }, (_, index) => ({
         index,
         role: index === pipelineProgress.stageIndex ? pipelineProgress.role : "",
+        provider:
+          index === pipelineProgress.stageIndex
+            ? pipelineProgress.provider
+            : selectedProvider,
       })))
     : [];
   const liveShownStage = pipelineProgress
@@ -18965,11 +19101,6 @@ function App() {
         role="tablist"
         style={{ "--tab-count": liveRunStages.length } as CSSProperties}
       >
-        <span
-          className="pipeline-run-slider"
-          aria-hidden="true"
-          style={{ transform: `translateX(${liveShownStage * 100}%)` }}
-        />
         {liveRunStages.map((stage) => {
           // A szakasz akkor „fut", ha elindult és még nem jelentett vissza.
           // A `phase` eddig sehol nem számított, ezért egy befejezett kódolás
@@ -18990,7 +19121,8 @@ function App() {
               role="tab"
               aria-selected={stage.index === liveShownStage}
               disabled={!done && !running}
-              className={`pipeline-run-tab${stage.index === liveShownStage ? " is-active" : ""}${running ? " is-running" : ""}${stageSettled && pipelineProgress.phase === "failed" ? " is-failed" : ""}`}
+              className={`pipeline-run-tab${stage.index === liveShownStage ? " is-active" : ""}${done ? " is-complete" : " is-future"}${running ? " is-running" : ""}${stageSettled && pipelineProgress.phase === "failed" ? " is-failed" : ""}`}
+              aria-label={`${STAGE_ROLE_LABELS[stage.role] ?? stage.role}: ${stage.provider}`}
               title={
                 running
                   ? "Ez a szakasz dolgozik"
@@ -19004,7 +19136,9 @@ function App() {
                 setLiveStageChoice(running ? null : stage.index)
               }
             >
-              {`${stage.index + 1}/${pipelineProgress.stageCount} ${STAGE_ROLE_LABELS[stage.role] ?? stage.role}`}
+              <span className="compact-answer-provider-mark pipeline-stage-provider-mark">
+                <ProviderMark provider={stage.provider} />
+              </span>
             </button>
           );
         })}
@@ -19023,6 +19157,13 @@ function App() {
     pipelineProgress && liveShownStage !== pipelineProgress.stageIndex ? (
       <TurnProgressCard
         runPosition="end"
+        runHeader={liveRunHeader}
+        runStageCount={liveRunStages.length}
+        runStepSlotCount={Math.max(
+          activePlan.steps.length,
+          numberedPlanSteps(viewedRun?.planText ?? "").length,
+        )}
+        runChangeSummary={liveAnswer?.changeSummary}
         stageRole={liveRunStages[liveShownStage]?.role || undefined}
         projectPath={activeProjectPath}
         liveFiles
@@ -19121,14 +19262,16 @@ function App() {
     (!activeTurnHasCompleted || Boolean(pipelineProgress)) && (
       <div className="live-turn-anchor">
         {liveFinishedStagePanel ? (
-          <>
-            {liveRunHeader}
-            {liveFinishedStagePanel}
-          </>
+          liveFinishedStagePanel
         ) : (
         <TurnProgressCard
           runPosition={pipelineProgress ? "end" : undefined}
           runHeader={liveRunHeader}
+          runStageCount={liveRunStages.length}
+          runStepSlotCount={Math.max(
+            activePlan.steps.length,
+            numberedPlanSteps(viewedRun?.planText ?? "").length,
+          )}
           stageRole={pipelineProgress?.role}
           projectPath={activeProjectPath}
           liveFiles

@@ -2,8 +2,8 @@
  * A terv szövegének olvasása.
  *
  * A lánc terv-szakasza egy MD-fájlt ír, és minden más ebből él: a LÉPÉSEK
- * listája a számozott fő pontokból, a DETAIL nézet egy pont szeletéből, a
- * kódoló szakasz pedig ugyanezt a listát örökli. Egy szöveg, egy lista.
+ * listája a számozott fő pontokból, a RAW nézet pedig ugyanezeket külön
+ * kiemelhető blokkokként tartja meg. Egy szöveg, egy lista.
  */
 
 const NUMBERED_LINE = /^(\d+)[.)]\s+\S/;
@@ -46,18 +46,17 @@ const mainStepRun = (lines: string[]): number[] => {
   return best.map((row) => row.index);
 };
 
-/**
- * A terv szövegének az a szelete, ami az adott sorszámú ponthoz tartozik: a
- * számozott sorától a futam következő pontjáig; az utolsó pontnál a következő
- * fejlécig vagy számozott sorig (hogy a Kockázatok ne ragadjon hozzá).
- */
-export const planStepSlice = (text: string, stepIndex: number) => {
-  const lines = text.split(/\r?\n/);
+type PlanStepRange = {
+  from: number;
+  to: number;
+};
+
+const planStepRanges = (lines: string[]): PlanStepRange[] => {
   const starts = mainStepRun(lines);
-  if (stepIndex < 0 || stepIndex >= starts.length) return "";
-  const from = starts[stepIndex];
-  let to = stepIndex + 1 < starts.length ? starts[stepIndex + 1] : lines.length;
-  if (stepIndex + 1 >= starts.length) {
+  return starts.map((from, stepIndex) => {
+    if (stepIndex + 1 < starts.length)
+      return { from, to: starts[stepIndex + 1] };
+    let to = lines.length;
     for (let index = from + 1; index < lines.length; index += 1) {
       const trimmed = lines[index].trim();
       if (HEADING_LINE.test(trimmed) || NUMBERED_LINE.test(trimmed)) {
@@ -65,7 +64,53 @@ export const planStepSlice = (text: string, stepIndex: number) => {
         break;
       }
     }
-  }
+    return { from, to };
+  });
+};
+
+export type PlanTextSegment =
+  | { kind: "context"; text: string }
+  | { kind: "step"; text: string; stepIndex: number; number: number };
+
+/**
+ * The complete plan as renderable blocks. Numbered main steps stay distinct so
+ * the UI can highlight one of them without replacing the full RAW document.
+ */
+export const planTextSegments = (text: string): PlanTextSegment[] => {
+  const lines = text.split(/\r?\n/);
+  const ranges = planStepRanges(lines);
+  if (ranges.length === 0)
+    return text.trim() ? [{ kind: "context", text: text.trim() }] : [];
+  const segments: PlanTextSegment[] = [];
+  let cursor = 0;
+  ranges.forEach((range, stepIndex) => {
+    const before = lines.slice(cursor, range.from).join("\n").trim();
+    if (before) segments.push({ kind: "context", text: before });
+    const stepText = lines.slice(range.from, range.to).join("\n").trim();
+    if (stepText)
+      segments.push({
+        kind: "step",
+        text: stepText,
+        stepIndex,
+        number: stepIndex + 1,
+      });
+    cursor = range.to;
+  });
+  const after = lines.slice(cursor).join("\n").trim();
+  if (after) segments.push({ kind: "context", text: after });
+  return segments;
+};
+
+/**
+ * A terv szövegének az a szelete, ami az adott sorszámú ponthoz tartozik: a
+ * számozott sorától a futam következő pontjáig; az utolsó pontnál a következő
+ * fejlécig vagy számozott sorig (hogy a Kockázatok ne ragadjon hozzá).
+ */
+export const planStepSlice = (text: string, stepIndex: number) => {
+  const lines = text.split(/\r?\n/);
+  const ranges = planStepRanges(lines);
+  if (stepIndex < 0 || stepIndex >= ranges.length) return "";
+  const { from, to } = ranges[stepIndex];
   return lines.slice(from, to).join("\n").trim();
 };
 
@@ -77,8 +122,8 @@ export const numberedPlanLines = (text: string) => {
 
 /**
  * Egy terv-pont rövid címe. A pontok `1. **Cím** – hosszú magyarázat` alakúak;
- * a LÉPÉSEK listába a cím való, a magyarázat a RAW nézetbe és a DETAIL
- * szeletébe. Cím nélkül a hat pont hat bekezdésként állt egymás alatt: a lista
+ * a LÉPÉSEK listába a cím való, a magyarázat pedig a teljes RAW terv
+ * kiemelhető blokkjába. Cím nélkül a hat pont hat bekezdésként állt egymás alatt: a lista
  * a terv szó szerinti másolata volt.
  */
 export const planStepTitle = (line: string) => {

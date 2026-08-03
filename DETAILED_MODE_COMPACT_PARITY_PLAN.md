@@ -1,158 +1,105 @@
-# Részletes mód – kompakt GUI-paritási fejlesztési terv
+# Részletes mód – végleges kompakt GUI-rehaul terv
 
 ## Cél
 
-A Részletes mód tartsa meg a teljes TERV → KÓD → REVIEW munkafolyamatot, de vizuálisan ugyanazt a letisztult nyelvet használja, mint a Nem-Részletes mód:
+A Részletes mód tartsa meg a TERV → KÓD → REVIEW munkafolyamat teljes
+funkcionalitását, de ugyanazt a nyugodt, fekete, minimális vizuális nyelvet
+használja, mint a Nem-Részletes mód. A széles desktop felületet két hasznos
+oszlop töltse ki; ne legyen külön, állandó VÁLASZ panel.
 
-- nincs VÁLASZ/LÉPÉSEK nézetváltó;
-- nincs külön „LÉPÉSEK” vagy „GONDOLKODÁS MENETE” fejlécpanel;
-- a provider ikon, a teljes futás számlálója, a kész/megszakított szín és a futó animáció a bal oldali státuszsávban él;
-- a VÁLASZ, a lépések és a kompakt gondolkodási kivonat egyszerre látható három oszlopban;
-- a fájl- és változásösszegzés a három oszlop alatt, teljes szélességben jelenik meg;
-- a TERV, KÓD és REVIEW szakaszfülek változatlanul megmaradnak.
+## Végleges döntések
 
-## Jelenlegi felület problémái
+- A user bubble szövege normál, nem félkövér.
+- Minden AI-válasz elsődleges szövege fehér.
+- A TERV/KÓD/REVIEW választóban nincs `1/3`, `2/3`, `3/3`; csak a fázisnév.
+- A választó egyetlen minimalista slider/track, nem három külön gombdoboz.
+- A REVIEW fül teljes háttere zöld vagy piros a verdikt szerint.
+- A provider ikon, futásanimáció és számláló a bal oldali státuszsávban marad.
+- Nincs külön LÉPÉSEK, GONDOLKODÁS MENETE vagy VÁLASZ fejlécpanel.
 
-1. A VÁLASZ/LÉPÉSEK kapcsoló ugyanannak a futásnak két felét kölcsönösen elrejti.
-2. A LÉPÉSEK és GONDOLKODÁS MENETE dedikált fejlécei magasságot és vizuális zajt adnak, információt alig.
-3. A fájlváltozások oldalsó panelje kiszorítja az éppen olvasott tartalmat.
-4. Az állapot, idő, szakaszjelvény és nézetváltó egy központi fejlécbe torlódik.
-5. A Részletes kártya több egymásba ágyazott keretet és háttérszínt használ, miközben a Nem-Részletes mód egyetlen nyugodt olvasófelület.
-6. A futó animáció a kártyát hangsúlyozza ahelyett, hogy a ténylegesen dolgozó AI-t jelezné.
-7. A panelek egymás alatt vagy egymást váltva jelennek meg, ezért a széles desktop felület nagy része kihasználatlan.
+## Közös kétoszlopos váz
 
-## Megtartandó funkciók
+Desktopon:
 
-- TERV/KÓD/REVIEW szakaszfülek és szakaszállapotok;
-- provider- és modellazonosság;
-- teljes futásidő és szakaszidő;
-- kész, fut, megszakítva és review verdict állapotok;
-- válaszmásolás és újragenerálás;
-- lépéskiválasztás, aktív lépés követése és lépésenkénti idő;
-- intenzitásjelzés és eszköz-/reasoning-események;
-- terv RAW és kiválasztott lépés DETAIL nézete;
-- magyar narratív kivonatok elsődleges megjelenítése;
-- belső/technikai gondolkodás összecsukott sorai és lenyitása;
-- inline kóddiff, quote anchorok és visszaugrás;
-- fájllista, képelőnézet, rollback és hozzáadás/törlés számlálók;
-- pipeline verdict és újrafuttatási műveletek;
-- történeti, élő és megszakított futások helyes visszaállítása.
+1. Bal oldal: LÉPÉSEK.
+2. Jobb oldal: az adott fázis olvasófelülete.
 
-## Új információs architektúra
+A lépéssorok finom sötét háttérrel, vékony elválasztással és kompakt
+magassággal különülnek el. A kijelölt sor bézs éllel és enyhe bézs tónussal
+kap fókuszt. A panelek saját belső scrollt használnak, ezért egy hosszú trace
+nem nyújtja korlátlanul a beszélgetést.
 
-### 1. Futásfejléc
+## TERV
 
-A meglévő TERV/KÓD/REVIEW tabsáv marad a kártya felett. Nem kerül mellé új „Részletes” fejléc.
+- Bal oldalon a számozott tervlépések vannak.
+- Jobb oldalon mindig a teljes RAW terv látszik; nincs RAW/RÉSZLET kapcsoló és
+  nincs duplikált részletpanel.
+- Egy bal oldali lépésre kattintva a hozzá tartozó teljes jobb oldali bekezdés
+  finom bézs highlightot kap, és szükség esetén a panel odagörget.
+- A számozást a kliens egyszer rendereli; nem fordulhat elő `1. 1. 1.`.
 
-### 2. Bal oldali AI-státuszsáv
+## KÓD
 
-Ugyanaz a komponensnyelv, mint a Nem-Részletes módban:
+- Bal oldalon a KÓD lépései vannak.
+- Jobb oldalon a kijelölt lépés kompakt gondolkodási folyamata jelenik meg.
+- A végső VÁLASZ az utolsó lépés folyamának végén jelenik meg, nem külön
+  oszlopban.
+- Az utolsó lépéssor kis `VÁLASZ` jelölést kap.
+- A FÁJLOK / VÁLTOZÁSOK összegzés a végső válasz alatt, a Nem-Részletes mód
+  kompakt komponensével jelenik meg; nem lesz teljes szélességű külön sáv.
 
-- provider ikon;
-- futás közben bézs orbit + finom pulzálás;
-- alatta `mm:ss` számláló;
-- zöld kész, piros megszakított állapot;
-- nincs teljes kártyát körbefutó loading keret.
+## REVIEW
 
-### 3. Háromoszlopos főfelület
+- A struktúra azonos a KÓD fáziséval: LÉPÉSEK balra, gondolkodási folyamat
+  jobbra.
+- A végső válasz az utolsó, `VERDIKT` jelölt lépés folyamának végén van.
+- A verdikt lépéssor teljes háttere finom zöld vagy piros tónust kap, erősebb
+  azonos színű bal éllel.
+- Maga a gondolkodási panel fekete marad; nem kap teljes zöld/piros hátteret.
 
-Desktop alaparány: `36% / 28% / 36%`.
+## Szín- és tipográfiai rendszer
 
-#### Bal oszlop – Válasz
-
-- nincs „VÁLASZ” felirat;
-- a szöveg azonnal a panel tetején kezdődik;
-- másolás és regenerate a jobb felső sarok kompakt ikonsorában;
-- élő válasznál a szöveg mellett kis inline spinner maradhat;
-- a TERV szakaszban itt olvasható a teljes, streamelt tervszöveg is.
-
-#### Középső oszlop – Lépések
-
-- nincs „LÉPÉSEK” fejlécpanel;
-- a lista rögtön az első lépéssel indul;
-- megmarad a sorszám, státusz, intenzitás, kijelölés és idő;
-- az összesített szakaszidő a lista alján marad;
-- a kijelölt lépés továbbra is a jobb oldali gondolkodási tartalmat vezérli.
-
-#### Jobb oszlop – Gondolkodási kivonat
-
-- nincs „GONDOLKODÁS MENETE” fejlécpanel;
-- elsődlegesen csak a felhasználónak szánt magyar narratív mondatok látszanak;
-- a technikai/internal részletek egysoros, lenyitható sorok;
-- az eszköz- és fájlesemények megtartják az inline diff gombot;
-- TERV szakaszban egy apró RAW/DETAIL vezérlő marad, fejlécpanel nélkül;
-- üres technikai napló nem hoz létre nagy üres sub-panelt.
-
-### 4. Fájlok és változások
-
-- a három oszlop alatt, teljes szélességben;
-- csak akkor jelenik meg, ha ténylegesen van változás;
-- megtartja a fájlnevet, státuszt, `+/-` számokat, preview-t és rollbacket;
-- a lista saját kompakt keretet kaphat, de nem szűkíti a három fő oszlopot.
-
-## Színrendszer
-
-- Tree: `#000000`;
-- VÁLASZ és részletes futáskártya olvasófelülete: `#000000`;
-- Chat háttér: `#555C64`;
-- Részletes/Nem-Részletes Switch háttere: `#000000`;
-- bézs rendszer-szín: `rgb(150, 146, 116)`;
-- Tree/chat függőleges elválasztó és projektfejléc alsó vonala: bézs;
-- a lépések és gondolkodás oszlopát csak vékony, sötét/bézsbe hajló szeparátor választja el, külön „doboz a dobozban” hatás nélkül.
+- Tree, chat háttér, válaszfelületek: `#000000`.
+- User bubble és input: `#A59B7C`.
+- Elsődleges AI-válaszszöveg: `#FFFFFF`.
+- Fókusz és válaszél: `#A59B7C`.
+- Másodlagos metaadat: tompa hidegszürke.
+- Verdikt: visszafogott, de egyértelmű zöld/piros felület fehér felirattal.
 
 ## Reszponzív viselkedés
 
-- `>= 1180 px`: három oszlop egymás mellett;
-- `800–1179 px`: VÁLASZ teljes szélességben felül, LÉPÉSEK és gondolkodás két oszlopban alul;
-- `< 800 px`: egy oszlop, sorrendben VÁLASZ → LÉPÉSEK → gondolkodás → fájlok;
-- minden oszlop saját belső scrollt kap, a teljes kártya nem nyúlik korlátlanul.
+- Széles desktop: körülbelül `33% / 67%` LÉPÉSEK/tartalom arány.
+- Közepes szélesség: a bal oszlop kissé szélesebb arányt kap.
+- Keskeny nézet: a két oszlop egymás alá törik, előbb a lépések, utána a
+  tartalom.
 
-## Megvalósítási fázisok
+## Megvalósítás
 
-### Fázis 1 – szín- és shell-paritás
-
-- globális háttérváltozók átállítása;
-- Tree, VÁLASZ és Switch mélyfekete;
-- bézs Tree/chat és fejléc-elválasztók;
-- teljes kártya-loading kikapcsolása részletes módban.
-
-### Fázis 2 – háromoszlopos részletes kártya
-
-- VÁLASZ/LÉPÉSEK state és kapcsoló eltávolítása a renderelésből;
-- a három lane egyidejű renderelése;
-- dedikált LÉPÉSEK/GONDOLKODÁS fejlécek eltávolítása;
-- válasz actionök kompakt sarokpozíciója;
-- status rail és provider animáció öröklése.
-
-### Fázis 3 – kompakt gondolkodás és tervnézet
-
-- magyar narráció elsődleges lane-je;
-- internal/technikai sorok lenyitása;
-- RAW/DETAIL kis méretű, fejléc nélküli vezérlő;
-- üres és streaming állapotok tömörítése.
-
-### Fázis 4 – fájlváltozások alul
-
-- ChangeSummaryPanel kivétele az oldalsó oszlopból;
-- teljes szélességű alsó elhelyezés;
-- kompakt lista, preview és rollback ellenőrzése.
-
-### Fázis 5 – kompatibilitás és takarítás
-
-- történeti részletes futások;
-- chain stage-ek és review verdict színek;
-- megszakítás és restart utáni visszaállítás;
-- elavult trace-view CSS/state eltávolítása.
+- [x] Tervszöveg felbontása külön kiemelhető, de egyetlen RAW dokumentumban
+  maradó lépésblokkokra.
+- [x] Hibás újrainduló ordered-list számozás javítása.
+- [x] Külön VÁLASZ oszlop eltávolítása.
+- [x] Fázisonkénti kétoszlopos renderelés.
+- [x] KÓD/REVIEW végső válaszának utolsó lépésbe ágyazása.
+- [x] Kompakt fájlváltozás-panel beágyazása.
+- [x] Minimalista fázisslider és verdiktfelületek.
+- [x] Statikus, timeline- és parser-tesztek frissítése és futtatása.
+- [x] Production build és Rust regressziós tesztek.
+- [x] Valódi GUI indítása, My VNA-new / Planning megnyitása és screenshotok.
+- [x] Vizuális/működési hibák javítása, újrabuild és újraellenőrzés.
 
 ## Elfogadási kritériumok
 
-1. A TERV, KÓD és REVIEW tabok továbbra is ugyanazt a szakaszt nyitják meg.
-2. Desktopon a VÁLASZ, lépések és gondolkodás egyszerre látható.
-3. Nincs VÁLASZ/LÉPÉSEK kapcsoló és nincs LÉPÉSEK/GONDOLKODÁS fejlécpanel.
-4. A bal oldali provider ikon és számláló ugyanúgy viselkedik, mint Nem-Részletes módban.
-5. A technikai részletek alapból nem uralják a gondolkodási oszlopot, de lenyithatók.
-6. A fájlváltozások nem csökkentik egyik fő oszlop szélességét sem.
-7. A terv RAW és lépésenkénti DETAIL tartalma továbbra is elérhető.
-8. Copy, regenerate, quote jump, diff preview és rollback működik.
-9. A teljes build, a timeline tesztek és a Rust tesztek zöldek.
-10. A változtatás nem módosítja a pipeline végrehajtási vagy tartósítási szemantikáját.
+1. A fázisok között váltva mindig a helyes történeti tartalom jelenik meg.
+2. TERV-ben egy kattintás a helyes RAW bekezdést emeli ki és görgeti láthatóvá.
+3. KÓD és REVIEW alatt nincs harmadik, duplikált VÁLASZ oszlop.
+4. A végső válasz csak az utolsó lépésnél jelenik meg, az actionök működnek.
+5. A REVIEW fül és verdiktsor színe megfelel az elfogadott/javítást kér
+   állapotnak.
+6. A user bubble normál súlyú, az AI-válaszok fehérek.
+7. A fájlváltozás-panel nem uralja a teljes kártyaszélességet.
+8. Nincs vízszintes túlcsordulás, egymásba futó szöveg vagy indokolatlan üres
+   panel.
+9. Build, frontend tesztek és Rust tesztek zöldek.
+10. A végleges GUI-t a projekt `Screenshots` mappájában rögzített képek alapján
+    külön vizuálisan is ellenőriztük.

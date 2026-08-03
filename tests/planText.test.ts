@@ -5,6 +5,7 @@ import {
   numberedPlanLines,
   numberedPlanSteps,
   planStepSlice,
+  planTextSegments,
   planStepTitle,
 } from "../src/planText.ts";
 
@@ -112,6 +113,33 @@ test("az utolsó lépés szelete a következő fejlécig tart, nem a kockázatok
   assert.ok(slice.startsWith("4. **`README.md`"));
   assert.ok(!slice.includes("Kockázatok"));
   assert.ok(!slice.includes("Eltérés"));
+});
+
+test("a teljes RAW tervben a fő lépések külön kiemelhető blokkok maradnak", () => {
+  const segments = planTextSegments(PLAN_WITH_NUMBERED_RISKS);
+  const steps = segments.filter((segment) => segment.kind === "step");
+  assert.equal(steps.length, 4);
+  assert.deepEqual(
+    steps.map((segment) => segment.kind === "step" && segment.stepIndex),
+    [0, 1, 2, 3],
+  );
+  assert.deepEqual(
+    steps.map((segment) => segment.kind === "step" && segment.number),
+    [1, 2, 3, 4],
+  );
+  assert.ok(
+    segments.some(
+      (segment) =>
+        segment.kind === "context" && segment.text.includes("## Kockázatok"),
+    ),
+  );
+});
+
+test("számozott fő lépések nélkül a teljes szöveg egy kontextusblokk", () => {
+  assert.deepEqual(planTextSegments("Egyszerű tervszöveg."), [
+    { kind: "context", text: "Egyszerű tervszöveg." },
+  ]);
+  assert.deepEqual(planTextSegments("  "), []);
 });
 
 test("a terv lépésszámát a modell dönti el, nem a kliens csonkolja", () => {

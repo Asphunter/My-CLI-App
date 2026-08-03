@@ -2815,3 +2815,781 @@ textarea::placeholder { color: var(--faint); }
 .detailed-answer-body strong {
   color: #fbe7c5 !important;
 }
+
+/* Detailed mode v2: the phase is a two-column workspace. The result no longer
+   occupies a permanent third lane; PLAN owns the right pane, while CODE and
+   REVIEW append their final answer to the last step's trace. */
+:root { --tick4-on-answer: #fff; }
+
+.user-message .message-body,
+.user-message .message-body p,
+.user-message .message-body span,
+.user-message .message-body small,
+.user-message .message-body strong {
+  font-weight: 400 !important;
+}
+
+.compact-answer-body,
+.compact-answer-body p,
+.compact-answer-body strong,
+.pipeline-answer-body,
+.pipeline-answer-body p,
+.pipeline-answer-body strong,
+.turn-progress-answer-body,
+.turn-progress-answer-body p,
+.turn-progress-answer-body strong,
+.detailed-plan-content,
+.detailed-plan-content p,
+.detailed-plan-content strong,
+.detailed-final-answer-body,
+.detailed-final-answer-body p,
+.detailed-final-answer-body strong {
+  color: #fff !important;
+}
+
+.detailed-trace-grid {
+  grid-template-columns: minmax(250px, 33fr) minmax(0, 67fr);
+  min-height: 112px;
+  background: #000;
+}
+
+.detailed-trace-lane {
+  min-height: 112px;
+  max-height: min(420px, calc(100vh - 210px));
+  background: #000;
+}
+
+.detailed-steps-lane {
+  order: 1;
+  padding: 8px 7px 0;
+  border-right: 1px solid #252b30;
+  border-left: 0;
+}
+
+.detailed-thinking-lane {
+  order: 2;
+  padding: 8px 8px 7px;
+}
+
+.detailed-plan-lane {
+  box-shadow: inset 3px 0 0 #a59b7c;
+}
+
+.detailed-step-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 2px 7px 0;
+}
+
+.detailed-step-list .trace-step-target { min-width: 0; }
+
+.detailed-step-list .trace-step-row {
+  grid-template-columns: 20px minmax(0, 1fr) max-content;
+  min-height: 29px;
+  padding: 4px 7px;
+  border: 1px solid #171d21;
+  border-radius: 4px;
+  background: #050607;
+  box-shadow: none;
+  color: #abb3b8;
+  transition: border-color .14s ease, background-color .14s ease, color .14s ease;
+}
+
+.detailed-step-list .trace-step-row:hover,
+.detailed-step-list .trace-step-row:focus-visible {
+  border-color: #46483d;
+  background: #090b0c;
+  color: #fff;
+}
+
+.detailed-step-list .trace-step-row.is-selected,
+.detailed-step-list .trace-step-row.is-selected:not(.trace-step-row-inProgress) {
+  border-color: rgba(165, 155, 124, .62);
+  background: rgba(165, 155, 124, .11);
+  box-shadow: inset 2px 0 0 #a59b7c;
+  color: #fff;
+}
+
+.detailed-step-list .trace-step-row-inProgress {
+  border-color: rgba(165, 155, 124, .74);
+  background: rgba(165, 155, 124, .13);
+  box-shadow: inset 2px 0 0 #a59b7c;
+  color: #fff;
+}
+
+.detailed-step-list .trace-step-row-completed .trace-step-name,
+.detailed-step-list .trace-step-row.is-selected .trace-step-name {
+  color: inherit;
+}
+
+.trace-step-meta {
+  display: flex;
+  min-width: 31px;
+  align-items: flex-end;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.trace-step-final-mark {
+  color: #d9d1b5;
+  font-size: 7px;
+  font-weight: 800;
+  letter-spacing: .08em;
+  line-height: 1;
+}
+
+.detailed-step-list .trace-step-row.is-verdict-accepted {
+  border-color: rgba(94, 189, 125, .7) !important;
+  background: rgba(42, 102, 62, .58) !important;
+  box-shadow: inset 3px 0 0 #67c486 !important;
+  color: #fff;
+}
+
+.detailed-step-list .trace-step-row.is-verdict-changes {
+  border-color: rgba(222, 112, 102, .72) !important;
+  background: rgba(118, 55, 49, .62) !important;
+  box-shadow: inset 3px 0 0 #df776d !important;
+  color: #fff;
+}
+
+.detailed-plan-content {
+  position: relative;
+  display: block;
+  padding: 2px 58px 10px 10px;
+  scroll-behavior: smooth;
+}
+
+.detailed-plan-context {
+  padding: 4px 8px 7px;
+  color: #fff;
+}
+
+.detailed-plan-context + .detailed-plan-step,
+.detailed-plan-step + .detailed-plan-context {
+  margin-top: 5px;
+}
+
+.detailed-plan-step {
+  display: grid;
+  grid-template-columns: 25px minmax(0, 1fr);
+  gap: 2px;
+  margin: 2px 0;
+  padding: 7px 9px 7px 6px;
+  border: 1px solid transparent;
+  border-left: 2px solid transparent;
+  border-radius: 3px;
+  color: #fff;
+  transition: border-color .16s ease, background-color .16s ease;
+}
+
+.detailed-plan-step.is-highlighted {
+  border-color: rgba(165, 155, 124, .32);
+  border-left-color: #a59b7c;
+  background: rgba(165, 155, 124, .105);
+}
+
+.detailed-plan-step-number {
+  padding-top: 1px;
+  color: #d6ceb2;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.detailed-plan-step-body { min-width: 0; }
+.detailed-plan-step-body > :first-child,
+.detailed-plan-context > :first-child { margin-top: 0; }
+.detailed-plan-step-body > :last-child,
+.detailed-plan-context > :last-child { margin-bottom: 0; }
+
+.detailed-answer-toolbar {
+  top: 5px;
+  right: 7px;
+  background: linear-gradient(90deg, transparent, #000 24%);
+}
+
+.detailed-thinking-list {
+  min-height: 0;
+  padding: 1px 3px 8px;
+}
+
+.detailed-thinking-list .compact-primary-trace.is-narrative p,
+.detailed-thinking-list .compact-primary-toggle,
+.detailed-thinking-list .compact-technical-detail {
+  color: #fff;
+}
+
+.detailed-final-answer {
+  position: relative;
+  margin: 8px 2px 2px;
+  padding: 9px 48px 8px 11px;
+  border-top: 1px solid #252b30;
+  border-left: 3px solid #a59b7c;
+  background: #000;
+  list-style: none;
+}
+
+.detailed-final-answer.is-verdict-accepted { border-left-color: #67c486; }
+.detailed-final-answer.is-verdict-changes { border-left-color: #df776d; }
+
+.detailed-final-answer-toolbar {
+  position: absolute;
+  z-index: 2;
+  top: 7px;
+  right: 5px;
+  padding-left: 10px;
+  background: linear-gradient(90deg, transparent, #000 24%);
+}
+
+.detailed-final-answer-toolbar .trace-answer-actions { margin: 0; }
+.detailed-final-answer-body { padding: 0; background: #000; }
+.detailed-final-answer-body .trace-answer-text { min-width: 0; }
+
+.detailed-inline-changes { padding: 2px 0 0; }
+.detailed-inline-changes .trace-change-summary {
+  width: max-content;
+  min-width: 220px;
+  max-width: min(520px, 100%);
+  margin: 8px 0 0;
+}
+
+/* The phase chooser is one quiet track with one moving indicator. */
+.pipeline-run-header {
+  min-height: 31px;
+  padding: 3px 10px 2px;
+  border-color: #171d21;
+  background: #000;
+}
+
+.pipeline-run-header::before { display: none; }
+
+.pipeline-run-tabs {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(var(--tab-count, 3), minmax(72px, 1fr));
+  width: min(330px, 100%);
+  gap: 0;
+  padding: 0 0 4px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.pipeline-run-tabs::before {
+  position: absolute;
+  right: 0;
+  bottom: 1px;
+  left: 0;
+  height: 1px;
+  background: #2a2f33;
+  content: "";
+}
+
+.pipeline-run-slider {
+  top: auto;
+  bottom: 0;
+  left: 0;
+  z-index: 4;
+  width: calc(100% / var(--tab-count, 3));
+  height: 2px;
+  border-radius: 2px;
+  background: #a59b7c;
+  box-shadow: 0 0 6px rgba(165, 155, 124, .34);
+  pointer-events: none;
+}
+
+.pipeline-run-tab {
+  z-index: 2;
+  min-height: 23px;
+  padding: 3px 10px;
+  border-radius: 3px 3px 0 0;
+  color: #747c82;
+  font-size: 8px;
+  font-weight: 750;
+  letter-spacing: .1em;
+}
+
+.pipeline-run-tab.is-active { color: #fff; }
+.pipeline-run-tab.is-verdict-accepted {
+  background: rgba(40, 105, 62, .78) !important;
+  color: #fff;
+}
+.pipeline-run-tab.is-verdict-changes {
+  background: rgba(125, 57, 50, .8) !important;
+  color: #fff;
+}
+.pipeline-run-tab.is-verdict-accepted.is-active,
+.pipeline-run-tab.is-verdict-changes.is-active {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .28);
+}
+
+@media (max-width: 860px) {
+  .detailed-trace-grid { grid-template-columns: minmax(210px, 38fr) minmax(0, 62fr); }
+}
+
+@media (max-width: 680px) {
+  .detailed-trace-grid { display: block; }
+  .detailed-trace-lane {
+    min-height: 80px;
+    max-height: 320px;
+    border-right: 0;
+    border-left: 0;
+  }
+  .detailed-steps-lane { border-bottom: 1px solid #252b30; }
+  .detailed-plan-lane { box-shadow: inset 3px 0 0 #a59b7c; }
+  .pipeline-run-tabs { width: 100%; }
+}
+
+/* Detailed mode v3 — the phase selector is the provider rail. The reference
+   image intentionally has no phase header and no nested card chrome: one black
+   work surface, one warm outer edge, compact grey step strips and a wide
+   reading pane. */
+.detailed-run-shell {
+  position: relative;
+  width: calc(100% - 29px);
+  max-width: none;
+  margin: 7px 0 8px 29px;
+  --run-stage-count: 1;
+}
+
+.live-turn-anchor .detailed-run-shell { margin-top: 0; }
+
+.detailed-run-shell .detailed-trace-card {
+  width: 100%;
+  max-width: none;
+  margin: 0 !important;
+  overflow: visible;
+  border: 1px solid #151a1e !important;
+  border-radius: 2px !important;
+  background: #000 !important;
+  box-shadow: none;
+}
+
+/* The beige edge belongs to the full detailed card — never to the right pane. */
+.detailed-run-shell .detailed-trace-card::before,
+.detailed-run-shell .detailed-trace-card.is-verdict-accepted::before,
+.detailed-run-shell .detailed-trace-card.is-verdict-changes::before {
+  position: absolute;
+  z-index: 5;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  display: block !important;
+  width: 3px;
+  border-radius: 2px 0 0 2px;
+  background: #a59b7c !important;
+  box-shadow: none !important;
+  content: "";
+  pointer-events: none;
+}
+
+.detailed-run-shell .detailed-trace-card.is-verdict-accepted,
+.detailed-run-shell .detailed-trace-card.is-verdict-changes {
+  border-color: #151a1e !important;
+  background: #000 !important;
+}
+
+.detailed-trace-grid {
+  position: relative;
+  --detailed-steps-track: clamp(260px, var(--detailed-steps-width, 320px), 40%);
+  grid-template-columns:
+    var(--detailed-steps-track)
+    minmax(0, 1fr);
+  min-height: 140px;
+  align-items: stretch;
+  background: #000;
+}
+
+.detailed-trace-lane {
+  min-height: 140px;
+  box-sizing: border-box;
+  background: #000;
+}
+
+.detailed-steps-lane {
+  display: flex;
+  min-width: 0;
+  width: auto;
+  max-width: none;
+  order: 1;
+  overflow-x: hidden;
+  overflow-y: visible;
+  padding: 7px 7px 8px 8px;
+  border: 0;
+  border-right: 1px solid #20262a;
+  flex-direction: column;
+}
+
+.detailed-thinking-lane,
+.detailed-plan-lane {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: var(--detailed-steps-track);
+  order: 2;
+  overflow-x: hidden;
+  overflow-y: auto;
+  min-height: 0;
+  max-height: none;
+  padding: 7px 7px 8px 8px;
+  border: 0;
+  background: #000;
+  box-shadow: none !important;
+}
+
+/* The right column owns the only vertical scrollbar. Legacy detailed/compact
+   containers must grow naturally inside it, otherwise the answer looks like a
+   second panel and Chromium draws two short, nested scrollbars. */
+.detailed-run-shell .detailed-thinking-list,
+.detailed-run-shell .detailed-plan-content {
+  max-height: none !important;
+  flex: 0 0 auto;
+  overflow: visible !important;
+}
+
+.detailed-run-shell .detailed-final-answer-body,
+.detailed-run-shell .turn-progress-answer-body {
+  max-height: none !important;
+  overflow: visible !important;
+}
+
+.detailed-step-list {
+  display: flex;
+  min-height: calc(var(--detailed-step-slots, 1) * 32px + 11px);
+  box-sizing: border-box;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0;
+}
+
+.detailed-step-list .trace-step-target {
+  min-width: 0;
+  border: 0;
+}
+
+.detailed-step-list .trace-step-row,
+.detailed-step-list .trace-step-row.is-selected,
+.detailed-step-list .trace-step-row.is-selected:not(.trace-step-row-inProgress) {
+  grid-template-columns: 18px minmax(0, 1fr) max-content;
+  min-height: 28px;
+  padding: 3px 6px;
+  border: 0;
+  border-radius: 1px;
+  background: #2c2c2c;
+  box-shadow: none;
+  color: #b6bdc1;
+}
+
+.detailed-step-list .trace-step-row:hover,
+.detailed-step-list .trace-step-row:focus-visible {
+  border: 0;
+  background: #353535;
+  color: #fff;
+  outline: 0;
+}
+
+.detailed-step-list .trace-step-row.is-selected,
+.detailed-step-list .trace-step-row-inProgress {
+  border-color: transparent !important;
+  background: #333331 !important;
+  box-shadow: inset 3px 0 0 #a59b7c !important;
+  color: #fff;
+}
+
+.detailed-step-list .trace-step-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detailed-step-list .trace-step-marker {
+  color: #a59b7c;
+}
+
+.detailed-step-list .trace-step-elapsed {
+  color: #7f898f;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.detailed-step-list .trace-step-row.is-verdict-accepted {
+  border: 1px solid #51cc78 !important;
+  background: #173e23 !important;
+  box-shadow: inset 3px 0 0 #67dc8a !important;
+  color: #fff;
+}
+
+.detailed-step-list .trace-step-row.is-verdict-changes {
+  border: 1px solid #e06666 !important;
+  background: #4a2020 !important;
+  box-shadow: inset 3px 0 0 #ef7777 !important;
+  color: #fff;
+}
+
+.detailed-step-list > .pipeline-answer-next {
+  display: flex;
+  margin: 0;
+  padding: 1px 4px 0 2px;
+  border: 0;
+  background: transparent;
+  color: #79dc99;
+  font-size: 9px;
+  line-height: 1.42;
+}
+
+.detailed-step-list > .pipeline-answer-next:not(.is-accepted) {
+  color: #ef8b83;
+}
+
+.detailed-step-list > .pipeline-answer-next button {
+  padding: 2px 7px;
+}
+
+.detailed-steps-total,
+.trace-total-elapsed.detailed-steps-total {
+  display: flex;
+  min-height: 12px;
+  justify-content: flex-end;
+  margin: 0;
+  padding: 0 4px;
+  border: 0;
+  color: #fff;
+  background: transparent;
+}
+
+.detailed-steps-total time {
+  color: #fff !important;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.detailed-step-changes {
+  flex: 0 0 auto;
+  min-width: 0;
+  margin-top: 8px;
+}
+
+.detailed-step-changes .trace-change-summary {
+  width: max-content;
+  min-width: min(240px, 100%);
+  max-width: 100%;
+  margin: 0;
+  box-sizing: border-box;
+}
+
+.detailed-step-changes .trace-change-list {
+  max-height: 150px;
+}
+
+.detailed-step-changes .trace-change-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Internal narration stays available, but visually recedes behind the actual
+   answer. The separator is structural, not another labelled sub-panel. */
+.detailed-thinking-list {
+  min-height: 0;
+  padding: 0 3px 10px;
+}
+
+.detailed-thinking-list > li:not(.detailed-final-answer),
+.detailed-thinking-list > li:not(.detailed-final-answer) p,
+.detailed-thinking-list > li:not(.detailed-final-answer) button,
+.detailed-thinking-list > li:not(.detailed-final-answer) .compact-technical-detail {
+  color: #828b91;
+}
+
+.detailed-final-answer {
+  margin: 10px 0 0;
+  padding: 10px 48px 4px 0;
+  border-top: 1px solid #30363a;
+  border-left: 0;
+  border-radius: 0;
+  background: #000;
+}
+
+.detailed-final-answer:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.detailed-final-answer.is-verdict-accepted,
+.detailed-final-answer.is-verdict-changes { border-left: 0; }
+
+.detailed-plan-content {
+  padding: 2px 58px 10px 3px;
+}
+
+/* Vertical provider rail: actual recipe length, completed colours, disabled
+   future providers, orbit only on the running phase and verdict on REVIEW. */
+.detailed-run-shell .pipeline-run-header {
+  position: absolute;
+  z-index: 8;
+  top: 0;
+  left: -29px;
+  display: block;
+  width: 21px;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.detailed-run-shell .pipeline-run-header::before,
+.detailed-run-shell .pipeline-run-tabs::before,
+.detailed-run-shell .pipeline-run-slider { display: none; }
+
+.detailed-run-shell .pipeline-run-tabs {
+  position: relative;
+  display: flex;
+  width: 21px;
+  gap: 9px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  flex-direction: column;
+}
+
+.detailed-run-shell .pipeline-run-tabs::after {
+  position: absolute;
+  z-index: 0;
+  top: 10px;
+  bottom: 10px;
+  left: 10px;
+  width: 1px;
+  background: rgba(165, 155, 124, .58);
+  content: "";
+  pointer-events: none;
+}
+
+.detailed-run-shell .pipeline-run-tab {
+  position: relative;
+  display: grid;
+  width: 21px;
+  min-width: 21px;
+  height: 21px;
+  min-height: 21px;
+  flex: 0 0 21px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid #39434b;
+  border-radius: 6px;
+  background: #050607;
+  box-shadow: 0 2px 7px rgba(0, 0, 0, .38);
+  color: #fff;
+  cursor: pointer;
+}
+
+.detailed-run-shell .pipeline-run-tab.is-active {
+  border-color: #a59b7c;
+  color: #fff;
+}
+
+.detailed-run-shell .pipeline-run-tab:disabled,
+.detailed-run-shell .pipeline-run-tab.is-future {
+  opacity: .3;
+  cursor: default;
+}
+
+.detailed-run-shell .pipeline-stage-provider-mark {
+  width: 19px;
+  height: 19px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  box-shadow: none;
+}
+
+.detailed-run-shell .pipeline-stage-provider-mark svg {
+  width: 15px;
+  height: 15px;
+}
+
+.detailed-run-shell .pipeline-run-tab.is-running::after {
+  inset: -3px;
+  z-index: -1;
+  padding: 2px;
+  border-radius: 8px;
+  background: conic-gradient(from var(--stage-sweep, 0turn), transparent 0turn .57turn, rgba(165, 155, 124, .34) .68turn, #d7ceaf .86turn, transparent 1turn);
+}
+
+.detailed-run-shell .pipeline-run-tab.is-verdict-accepted {
+  border: 2px solid #2ee174 !important;
+  background: #050607 !important;
+  box-shadow: 0 0 9px rgba(46, 225, 116, .45);
+}
+
+.detailed-run-shell .pipeline-run-tab.is-verdict-changes {
+  border: 2px solid #ff5360 !important;
+  background: #050607 !important;
+  box-shadow: 0 0 9px rgba(255, 83, 96, .45);
+}
+
+.detailed-run-shell .pipeline-run-version {
+  position: absolute;
+  top: 4px;
+  left: 26px;
+  z-index: 3;
+  white-space: nowrap;
+}
+
+.detailed-run-shell.has-phase-rail .detailed-answer-status-rail {
+  top: calc(var(--run-stage-count) * 30px + 6px);
+  left: -29px;
+  width: 21px;
+  min-width: 21px;
+  align-items: center;
+}
+
+.detailed-run-shell:not(.has-phase-rail) .detailed-answer-status-rail {
+  left: -29px;
+  width: 21px;
+  min-width: 21px;
+}
+
+.detailed-run-shell .detailed-answer-status-rail time {
+  width: 21px;
+  color: #fff;
+  text-align: center;
+}
+
+.detailed-run-shell .detailed-answer-status-rail.is-complete time { color: #72d493; }
+.detailed-run-shell .detailed-answer-status-rail.is-interrupted time { color: #ee737d; }
+
+@media (max-width: 900px) {
+  .detailed-trace-grid {
+    --detailed-steps-track: max(220px, 38%);
+    grid-template-columns: minmax(220px, 38%) minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 680px) {
+  .detailed-run-shell {
+    width: calc(100% - 29px);
+    margin-left: 29px;
+  }
+  .detailed-trace-grid { display: block; }
+  .detailed-thinking-lane,
+  .detailed-plan-lane {
+    position: static;
+    max-height: 260px;
+  }
+  .detailed-steps-lane {
+    border-right: 0;
+    border-bottom: 1px solid #20262a;
+  }
+  .detailed-run-shell .pipeline-run-header,
+  .detailed-run-shell.has-phase-rail .detailed-answer-status-rail,
+  .detailed-run-shell:not(.has-phase-rail) .detailed-answer-status-rail {
+    left: -29px;
+  }
+}

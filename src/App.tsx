@@ -4,6 +4,7 @@ import {
   memo,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useReducer,
   useRef,
@@ -5683,7 +5684,6 @@ function EffortSlider({
           "--effort-thumb-left": `calc(${progress}% + ${thumbOffset}px)`,
         } as CSSProperties
       }
-      title={`${PROVIDER_LABELS[provider]} · ${shortModelLabel(modelId)} · Reasoning: ${activeLabel}. Görgő: AI-váltás · jobb klikk az ikonon: modellválasztás.`}
       data-provider={provider}
       data-model={modelId}
       onWheel={handleWheel}
@@ -6772,7 +6772,6 @@ function TurnProgressCard({
   quoteAnchorPrefix,
   onQuoteJump,
   compact = false,
-  onCopyAnswer,
   onRegenerate,
   onRollbackChanges,
   rollbackBusy,
@@ -6791,6 +6790,36 @@ function TurnProgressCard({
   runCompletedAt,
   provider = "codex",
 }: TurnProgressCardProps) {
+  const detailedShellRef = useRef<HTMLDivElement>(null);
+  const [detailedPromptWidth, setDetailedPromptWidth] = useState<number>();
+  useLayoutEffect(() => {
+    const shell = detailedShellRef.current;
+    const stream = shell?.closest(".message-stream");
+    if (!shell || !stream) return;
+    const prompt = Array.from(
+      stream.querySelectorAll<HTMLElement>(".user-message .message-body"),
+    )
+      .filter(
+        (candidate) =>
+          Boolean(
+            candidate.compareDocumentPosition(shell) &
+              Node.DOCUMENT_POSITION_FOLLOWING,
+          ),
+      )
+      .at(-1);
+    if (!prompt) return;
+
+    const measurePromptEdge = () => {
+      const width = prompt.getBoundingClientRect().right - shell.getBoundingClientRect().left;
+      setDetailedPromptWidth(Math.max(0, Math.round(width * 10) / 10));
+    };
+    measurePromptEdge();
+    const observer = new ResizeObserver(measurePromptEdge);
+    observer.observe(prompt);
+    observer.observe(shell);
+    return () => observer.disconnect();
+  }, [compact, quoteAnchorPrefix]);
+
   const quoteAnchor = (suffix: string) =>
     `${quoteAnchorPrefix}:${suffix}`;
   const quotesForAnchor = (anchorId: string) =>
@@ -7043,7 +7072,7 @@ function TurnProgressCard({
   const selectedShowsFinalAnswer = isCodeOrReviewStage
     ? selectedIsFinalAnswerStep
     : !isPlanStage && hasAnswer;
-  const finalAnswerStepLabel = isReviewStage ? "VERDIKT" : "VÁLASZ";
+  const finalAnswerStepLabel = "VÁLASZ";
   useEffect(() => {
     if (!isPlanStage || selectedStepIndex < 0) return;
     const container = planContentRef.current;
@@ -7401,52 +7430,19 @@ function TurnProgressCard({
     260,
     Math.min(440, Math.ceil(86 + longestStepLabel * 5.2)),
   );
-  const [copiedAnswer, setCopiedAnswer] = useState(false);
-  const copyAnswer = async () => {
-    if (!answer?.text.trim()) return;
-    try {
-      if (onCopyAnswer) await onCopyAnswer(answer);
-      else await writeTextToClipboard(answer.text);
-      setCopiedAnswer(true);
-      window.setTimeout(() => setCopiedAnswer(false), 1400);
-    } catch {
-      setCopiedAnswer(false);
-    }
-  };
-  const answerActions = hasAnswer && !streaming && (onCopyAnswer || onRegenerate) ? (
+  const answerActions = hasAnswer && !streaming && onRegenerate ? (
     <div className="trace-answer-actions">
-      {onCopyAnswer && (
-        <button
-          type="button"
-          aria-label={copiedAnswer ? "Válasz másolva" : "Válasz másolása"}
-          title={copiedAnswer ? "Másolva" : "Másolás"}
-          onClick={() => void copyAnswer()}
-        >
-          {copiedAnswer ? (
-            <svg viewBox="0 0 16 16" aria-hidden="true">
-              <path d="m3.25 8.25 3 3 6.5-6.5" />
-            </svg>
-          ) : (
-            <svg viewBox="0 0 16 16" aria-hidden="true">
-              <rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25" />
-              <path d="M10.75 5.25v-2A1.25 1.25 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6a1.25 1.25 0 0 0 1.25 1.25h2" />
-            </svg>
-          )}
-        </button>
-      )}
-      {onRegenerate && (
-        <button
-          type="button"
-          aria-label="Válasz újragenerálása"
-          title="Újragenerálás"
-          onClick={() => answer && onRegenerate(answer)}
-        >
-          <svg viewBox="0 0 16 16" aria-hidden="true">
-            <path d="M13.25 5V2.25H10.5" />
-            <path d="M13 4.25A5.5 5.5 0 1 0 13.2 11" />
-          </svg>
-        </button>
-      )}
+      <button
+        type="button"
+        aria-label="Válasz újragenerálása"
+        title="Újragenerálás"
+        onClick={() => answer && onRegenerate(answer)}
+      >
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M13.25 5V2.25H10.5" />
+          <path d="M13 4.25A5.5 5.5 0 1 0 13.2 11" />
+        </svg>
+      </button>
     </div>
   ) : null;
   const selectStep = (stepId: string) => {
@@ -7463,61 +7459,6 @@ function TurnProgressCard({
     step.status === "pending"
       ? "inProgress"
       : step.status;
-  /**
-   * Hány esemény esik erre a lépésre — ez a sávok száma.
-   *
-   * Korábban csak a `reasoning` aktivitások számítottak, és a Claude
-   * gondolkodása nem ilyenként érkezik: a narrációja commentary-ként jön, a
-   * munkája eszközhívásként. A sáv ezért Claude-nál mindig egyetlen vonal
-   * maradt, akkor is, amikor a panelben három sor állt — a ChatGPT-nél meg
-   * rendesen nőtt. A sáv attól sáv, hogy ugyanazt számolja, amit a
-   * GONDOLKODÁS MENETE mutat.
-   */
-  const reasoningCountFor = (stepId: string) => {
-    const stepItems = orderedActivities.filter((activity) =>
-      activityBelongsToStep(activity, stepId),
-    );
-    const thoughts = stepItems.filter(
-      (activity) =>
-        activity.kind === "reasoning" && Boolean(activity.body?.trim()),
-    ).length;
-    const tools = stepItems.filter(
-      (activity) =>
-        (activity.kind === "file" ||
-          activity.kind === "command" ||
-          activity.kind === "tool") &&
-        Boolean(activity.detail?.trim()),
-    ).length;
-    const narration = commentary.filter(
-      (entry) =>
-        commentaryBelongsToStep(entry, stepId) && Boolean(entry.body?.trim()),
-    ).length;
-    return thoughts + tools + narration;
-  };
-  const stepIndicator = (step: PlanStep) => {
-    const currentStatus = displayStatus(step);
-    if (currentStatus === "inProgress")
-      return <span className="trace-step-spinner" aria-label="Fut" />;
-    if (currentStatus === "error")
-      return <span className="trace-step-error-indicator">!</span>;
-    if (currentStatus !== "completed") return null;
-    const count = reasoningCountFor(step.id);
-    const barCount = Math.min(8, Math.max(1, count));
-    return (
-      <span
-        className="trace-step-intensity"
-        aria-label={`${count} gondolkodási esemény`}
-        title={`${count} gondolkodási esemény`}
-      >
-        {Array.from({ length: barCount }, (_, index) => (
-          <span
-            className="trace-step-intensity-line"
-            key={`${step.id}-bar-${index}`}
-          />
-        ))}
-      </span>
-    );
-  };
   const stepElapsedFor = (step: PlanStep) => {
     const timing = plan.stepTimes?.[step.id];
     const currentStatus = displayStatus(step);
@@ -7796,10 +7737,14 @@ function TurnProgressCard({
 
   return (
     <div
+      ref={detailedShellRef}
       className={`detailed-run-shell${runHeader ? " has-phase-rail" : ""}`}
       style={
         {
           "--run-stage-count": Math.max(1, runStageCount ?? 1),
+          "--detailed-prompt-width": detailedPromptWidth
+            ? `${detailedPromptWidth}px`
+            : "720px",
         } as CSSProperties
       }
     >
@@ -7888,16 +7833,13 @@ function TurnProgressCard({
                         planDrafting ? undefined : selectedStep.id === step.id
                       }
                     >
-                      <span
-                        className={`trace-step-marker${isPlanStage ? " is-numbered" : ""}`}
-                        aria-hidden="true"
-                      >
-                        {isPlanStage ? `${stepIndex + 1}.` : stepIndicator(step)}
+                      <span className="trace-step-marker is-numbered" aria-hidden="true">
+                        <span className="detailed-step-index">{stepIndex + 1}</span>
                       </span>
                       <span className="trace-step-name">{step.step}</span>
-                      {(elapsed || finalAnswerRow) && (
+                      {(elapsed || (finalAnswerRow && !isReviewStage)) && (
                         <span className="trace-step-meta">
-                          {finalAnswerRow && (
+                          {finalAnswerRow && !isReviewStage && (
                             <span className="trace-step-final-mark">
                               {finalAnswerStepLabel}
                             </span>
@@ -8064,22 +8006,21 @@ function TurnProgressCard({
                     </li>
                   ) : (
                     <li className="compact-technical-section" key={section.id}>
-                      <button
-                        type="button"
-                        className="compact-technical-toggle"
-                        onClick={() =>
-                          setExpandedTechnicalSectionId((current) =>
-                            current === section.id ? null : section.id,
-                          )
-                        }
-                        aria-expanded={expandedTechnicalSectionId === section.id}
-                      >
+                      <div className="compact-technical-heading">
                         <span className="trace-thinking-bullet">•</span>
-                        <span className="compact-technical-label">{section.label}</span>
-                        <span className="trace-internal-caret" aria-hidden="true">
-                          {expandedTechnicalSectionId === section.id ? "▾" : "▸"}
-                        </span>
-                      </button>
+                        <button
+                          type="button"
+                          className="compact-technical-toggle"
+                          onClick={() =>
+                            setExpandedTechnicalSectionId((current) =>
+                              current === section.id ? null : section.id,
+                            )
+                          }
+                          aria-expanded={expandedTechnicalSectionId === section.id}
+                        >
+                          <span className="compact-technical-label">{section.label}</span>
+                        </button>
+                      </div>
                       {expandedTechnicalSectionId === section.id && (
                         <ul className="compact-technical-details">
                           {section.items.map((item) => {
@@ -18519,7 +18460,7 @@ function App() {
     // who went back to v1 is looking at what v1 concluded.
     const runVerdict = stageForVersion(chain, selectedVersion, lastStageIndex);
     const runHeader = stage ? (
-        <div className="pipeline-run-header" data-run-id={chainKey}>
+        <div className="pipeline-run-header is-history" data-run-id={chainKey}>
           <span
             className="pipeline-run-tabs"
             role="tablist"
@@ -19095,7 +19036,7 @@ function App() {
     return "Ez a szakasz akkor lesz olvasható, ha a lánc befejeződött.";
   };
   const liveRunHeader = pipelineProgress ? (
-    <div className="pipeline-run-header" data-run-id={pipelineProgress.runId}>
+    <div className="pipeline-run-header is-live" data-run-id={pipelineProgress.runId}>
       <span
         className="pipeline-run-tabs"
         role="tablist"

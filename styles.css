@@ -1098,7 +1098,8 @@ textarea::placeholder { color: var(--faint); }
 .compact-primary-toggle:disabled { cursor: default; }
 .compact-primary-toggle:hover:not(:disabled), .compact-primary-toggle:focus-visible:not(:disabled) { color: var(--text); outline: 0; }
 .compact-technical-section { min-width: 0; color: #9aa8a1; }
-.compact-technical-toggle { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; align-items: center; gap: 5px; width: 100%; min-width: 0; padding: 1px; border: 0; background: transparent; color: #9aa8a1; font-size: 8px; line-height: 1.3; text-align: left; cursor: pointer; }
+.compact-technical-heading { display: grid; grid-template-columns: 10px minmax(0, max-content); align-items: center; gap: 5px; min-width: 0; }
+.compact-technical-toggle { display: inline-block; width: fit-content; max-width: 100%; min-width: 0; padding: 1px 0; border: 0; background: transparent; color: #9aa8a1; font-size: 8px; line-height: 1.3; text-align: left; cursor: pointer; }
 .compact-technical-toggle:hover, .compact-technical-toggle:focus-visible { color: var(--text); outline: 0; }
 .compact-technical-label, .compact-technical-summary { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .compact-technical-details { display: grid; gap: 3px; margin: 4px 0 2px 6px; padding: 5px 0 3px 7px; border-left: 1px solid #40534a; list-style: none; }
@@ -3150,6 +3151,8 @@ textarea::placeholder { color: var(--faint); }
   width: calc(100% - 29px);
   max-width: none;
   margin: 7px 0 8px 29px;
+  --detailed-fade-line: linear-gradient(90deg, #a59b7c 0%, rgba(165, 155, 124, .72) 46%, transparent 100%);
+  --detailed-code-fade-line: linear-gradient(90deg, rgba(165, 155, 124, .52) 0%, rgba(165, 155, 124, .3) 46%, transparent 100%);
   --run-stage-count: 1;
 }
 
@@ -3160,13 +3163,13 @@ textarea::placeholder { color: var(--faint); }
   max-width: none;
   margin: 0 !important;
   overflow: visible;
-  border: 1px solid #151a1e !important;
-  border-radius: 2px !important;
+  border: 0 !important;
+  border-radius: 0 !important;
   background: #000 !important;
   box-shadow: none;
 }
 
-/* The beige edge belongs to the full detailed card — never to the right pane. */
+/* The outer warm edge is the LÉPÉSEK column's left leg. */
 .detailed-run-shell .detailed-trace-card::before,
 .detailed-run-shell .detailed-trace-card.is-verdict-accepted::before,
 .detailed-run-shell .detailed-trace-card.is-verdict-changes::before {
@@ -3193,6 +3196,7 @@ textarea::placeholder { color: var(--faint); }
 .detailed-trace-grid {
   position: relative;
   --detailed-steps-track: clamp(260px, var(--detailed-steps-width, 320px), 40%);
+  --detailed-answer-rule-width: min(100%, max(0px, calc(var(--detailed-prompt-width, 720px) - var(--detailed-steps-track))));
   grid-template-columns:
     var(--detailed-steps-track)
     minmax(0, 1fr);
@@ -3215,9 +3219,13 @@ textarea::placeholder { color: var(--faint); }
   order: 1;
   overflow-x: hidden;
   overflow-y: visible;
-  padding: 7px 7px 8px 8px;
+  padding: 7px 7px 12px 8px;
   border: 0;
-  border-right: 1px solid #20262a;
+  background-color: #000;
+  background-image: var(--detailed-fade-line);
+  background-repeat: no-repeat;
+  background-position: left bottom;
+  background-size: 52% 1px;
   flex-direction: column;
 }
 
@@ -3233,10 +3241,60 @@ textarea::placeholder { color: var(--faint); }
   overflow-y: auto;
   min-height: 0;
   max-height: none;
-  padding: 7px 7px 8px 8px;
+  padding: 28px 7px 28px 8px;
   border: 0;
-  background: #000;
-  box-shadow: none !important;
+  background-color: #000;
+  box-shadow: inset 3px 0 0 #a59b7c !important;
+}
+
+/* The answer's top and bottom guards belong to the fixed grid, not to its
+   scrolling contents. Their second background keeps the centre divider
+   continuous through both guards. */
+.detailed-trace-grid::before,
+.detailed-trace-grid::after {
+  position: absolute;
+  z-index: 2;
+  left: var(--detailed-steps-track);
+  width: calc(100% - var(--detailed-steps-track));
+  background-repeat: no-repeat;
+  content: "";
+  pointer-events: none;
+}
+
+.detailed-trace-grid::before {
+  top: 0;
+  height: 28px;
+  background-image:
+    var(--detailed-fade-line),
+    linear-gradient(#a59b7c, #a59b7c),
+    linear-gradient(180deg, #000 0%, rgba(0, 0, 0, .9) 34%, transparent 100%);
+  background-position: left top, left top, left top;
+  background-size: var(--detailed-answer-rule-width) 1px, 3px 100%, 100% 100%;
+}
+
+.detailed-trace-grid::after {
+  bottom: 0;
+  height: 28px;
+  background-image:
+    var(--detailed-fade-line),
+    linear-gradient(#a59b7c, #a59b7c),
+    linear-gradient(0deg, #000 0%, rgba(0, 0, 0, .9) 34%, transparent 100%);
+  background-position: left bottom, left top, left top;
+  background-size: var(--detailed-answer-rule-width) 1px, 3px 100%, 100% 100%;
+}
+
+/* The steps column has its own fixed top rule. The answer rules above are
+   anchored to the grid so they do not move with the answer scrollbar. */
+.detailed-steps-lane::before {
+  position: absolute;
+  z-index: 5;
+  top: 0;
+  left: 0;
+  width: 52%;
+  height: 1px;
+  background: var(--detailed-fade-line);
+  content: "";
+  pointer-events: none;
 }
 
 /* The right column owns the only vertical scrollbar. Legacy detailed/compact
@@ -3262,6 +3320,7 @@ textarea::placeholder { color: var(--faint); }
   flex: 0 0 auto;
   flex-direction: column;
   gap: 4px;
+  margin-bottom: 10px;
   padding: 0;
 }
 
@@ -3278,7 +3337,7 @@ textarea::placeholder { color: var(--faint); }
   padding: 3px 6px;
   border: 0;
   border-radius: 1px;
-  background: #2c2c2c;
+  background: #29343d;
   box-shadow: none;
   color: #b6bdc1;
 }
@@ -3286,7 +3345,7 @@ textarea::placeholder { color: var(--faint); }
 .detailed-step-list .trace-step-row:hover,
 .detailed-step-list .trace-step-row:focus-visible {
   border: 0;
-  background: #353535;
+  background: #32414c;
   color: #fff;
   outline: 0;
 }
@@ -3294,9 +3353,18 @@ textarea::placeholder { color: var(--faint); }
 .detailed-step-list .trace-step-row.is-selected,
 .detailed-step-list .trace-step-row-inProgress {
   border-color: transparent !important;
-  background: #333331 !important;
+  background: #303b43 !important;
   box-shadow: inset 3px 0 0 #a59b7c !important;
   color: #fff;
+}
+
+.detailed-step-list .trace-step-row-completed:not(.is-selected):not(.is-verdict-accepted):not(.is-verdict-changes) {
+  background: #242e36;
+  color: #929da4;
+}
+
+.detailed-step-list .trace-step-row-completed:not(.is-selected) .trace-step-marker {
+  color: #7f877c;
 }
 
 .detailed-step-list .trace-step-name {
@@ -3366,9 +3434,22 @@ textarea::placeholder { color: var(--faint); }
 }
 
 .detailed-step-changes {
+  position: relative;
   flex: 0 0 auto;
   min-width: 0;
   margin-top: 8px;
+  padding-top: 12px;
+}
+
+.detailed-step-changes::before {
+  position: absolute;
+  top: 0;
+  left: -8px;
+  width: 52%;
+  height: 1px;
+  background: var(--detailed-fade-line);
+  content: "";
+  pointer-events: none;
 }
 
 .detailed-step-changes .trace-change-summary {
@@ -3377,6 +3458,14 @@ textarea::placeholder { color: var(--faint); }
   max-width: 100%;
   margin: 0;
   box-sizing: border-box;
+  border: 0;
+  border-radius: 0;
+  background: #000;
+  box-shadow: none;
+}
+
+.detailed-step-changes .trace-change-heading {
+  border-bottom: 0;
 }
 
 .detailed-step-changes .trace-change-list {
@@ -3406,8 +3495,7 @@ textarea::placeholder { color: var(--faint); }
 .detailed-final-answer {
   margin: 10px 0 0;
   padding: 10px 48px 4px 0;
-  border-top: 1px solid #30363a;
-  border-left: 0;
+  border: 0;
   border-radius: 0;
   background: #000;
 }
@@ -3415,14 +3503,83 @@ textarea::placeholder { color: var(--faint); }
 .detailed-final-answer:first-child {
   margin-top: 0;
   padding-top: 0;
-  border-top: 0;
 }
 
 .detailed-final-answer.is-verdict-accepted,
-.detailed-final-answer.is-verdict-changes { border-left: 0; }
+.detailed-final-answer.is-verdict-changes { border: 0; }
+
+.detailed-thinking-lane .answer-heading-1,
+.detailed-thinking-lane .answer-heading-2,
+.detailed-plan-lane .answer-heading-1,
+.detailed-plan-lane .answer-heading-2 {
+  border-bottom: 0;
+}
+
+/* Keep prose at a comfortable reading measure while code and tables may still
+   use the wider answer surface. */
+.detailed-thinking-lane .trace-answer-text > p,
+.detailed-thinking-lane .trace-answer-text > .answer-list,
+.detailed-thinking-lane .trace-answer-text > .answer-blockquote,
+.detailed-thinking-lane .trace-answer-text > .answer-quote-backlinks,
+.detailed-thinking-list > li:not(.detailed-final-answer),
+.detailed-plan-lane .detailed-plan-context,
+.detailed-plan-lane .detailed-plan-step {
+  max-width: min(100%, 1000px);
+}
+
+/* Answer code follows the same open, black treatment as FILES / CHANGES:
+   no fixed card frame, only short fading rules above and below. */
+.detailed-thinking-lane .answer-code-block,
+.detailed-plan-lane .answer-code-block {
+  position: relative;
+  overflow: visible;
+  padding: 8px 0 10px;
+  border: 0;
+  border-radius: 0;
+  background-color: #000;
+  box-shadow: none;
+}
+
+.detailed-thinking-lane .answer-code-block::before,
+.detailed-thinking-lane .answer-code-block::after,
+.detailed-plan-lane .answer-code-block::before,
+.detailed-plan-lane .answer-code-block::after {
+  position: absolute;
+  left: -11px;
+  width: var(--detailed-answer-rule-width);
+  height: 1px;
+  background: var(--detailed-code-fade-line);
+  content: "";
+  pointer-events: none;
+}
+
+.detailed-thinking-lane .answer-code-block::before,
+.detailed-plan-lane .answer-code-block::before { top: 0; }
+
+.detailed-thinking-lane .answer-code-block::after,
+.detailed-plan-lane .answer-code-block::after { bottom: 0; }
+
+.detailed-thinking-lane .answer-code-block .code-header,
+.detailed-plan-lane .answer-code-block .code-header {
+  border-bottom: 0;
+  background: transparent;
+}
 
 .detailed-plan-content {
   padding: 2px 58px 10px 3px;
+}
+
+/* Keep the single regenerate action pinned to the answer panel corner. */
+.detailed-answer-toolbar {
+  right: 7px;
+  left: auto;
+  transform: none;
+}
+
+.detailed-final-answer-toolbar {
+  right: 5px;
+  left: auto;
+  transform: none;
 }
 
 /* Vertical provider rail: actual recipe length, completed colours, disabled
@@ -3492,6 +3649,23 @@ textarea::placeholder { color: var(--faint); }
 .detailed-run-shell .pipeline-run-tab.is-active {
   border-color: #a59b7c;
   color: #fff;
+}
+
+/* Historical phase browsing only. The live selector keeps its running orbit;
+   after completion this right-pointing marker shows the phase being read. */
+.detailed-run-shell .pipeline-run-header.is-history .pipeline-run-tab.is-active::before {
+  position: absolute;
+  top: 50%;
+  right: calc(100% + 4px);
+  width: 0;
+  height: 0;
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+  border-left: 7px solid #d7ceaf;
+  content: "";
+  filter: drop-shadow(0 0 3px rgba(215, 206, 175, .38));
+  pointer-events: none;
+  transform: translateY(-50%);
 }
 
 .detailed-run-shell .pipeline-run-tab:disabled,
@@ -3572,12 +3746,125 @@ textarea::placeholder { color: var(--faint); }
   }
 }
 
+/* Compact instrument-style timeline for the detailed LÉPÉSEK lane. */
+.detailed-step-list {
+  min-height: calc(var(--detailed-step-slots, 1) * 27px + 8px);
+  gap: 1px;
+}
+
+.detailed-step-list .trace-step-target {
+  position: relative;
+}
+
+/* One-pixel separators borrow the panel rules' left-to-right fade. */
+.detailed-step-list .trace-step-target + .trace-step-target::before {
+  position: absolute;
+  top: -1px;
+  right: 4px;
+  left: 4px;
+  height: 1px;
+  background: linear-gradient(90deg, rgba(105, 119, 128, .34) 0%, rgba(105, 119, 128, .16) 52%, transparent 100%);
+  content: "";
+  pointer-events: none;
+}
+
+.detailed-step-list .trace-step-row,
+.detailed-step-list .trace-step-row:hover,
+.detailed-step-list .trace-step-row:focus-visible,
+.detailed-step-list .trace-step-row.is-selected,
+.detailed-step-list .trace-step-row.is-selected:not(.trace-step-row-inProgress),
+.detailed-step-list .trace-step-row-inProgress,
+.detailed-step-list .trace-step-row-completed:not(.is-selected):not(.is-verdict-accepted):not(.is-verdict-changes),
+.detailed-step-list .trace-step-row.is-verdict-accepted,
+.detailed-step-list .trace-step-row.is-verdict-changes {
+  grid-template-columns: 21px minmax(0, 1fr) max-content;
+  min-height: 26px;
+  padding: 2px 4px;
+  border: 0 !important;
+  border-radius: 0;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.detailed-step-list .trace-step-row.is-current::after { display: none; }
+
+.detailed-step-list .trace-step-row:hover,
+.detailed-step-list .trace-step-row:focus-visible,
+.detailed-step-list .trace-step-row.is-selected,
+.detailed-step-list .trace-step-row-inProgress {
+  color: #fff;
+  outline: 0;
+}
+
+.detailed-step-list .trace-step-row-completed:not(.is-selected):not(.is-verdict-accepted):not(.is-verdict-changes) {
+  color: #929da4;
+}
+
+.detailed-step-list .trace-step-marker,
+.detailed-step-list .trace-step-row-completed:not(.is-selected) .trace-step-marker,
+.detailed-step-list .trace-step-row.is-selected .trace-step-marker.is-numbered {
+  position: relative;
+  display: flex;
+  width: 21px;
+  height: 21px;
+  min-height: 21px;
+  box-sizing: border-box;
+  flex: 0 0 21px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid #39434b;
+  border-radius: 6px;
+  background: #050607;
+  box-shadow: 0 2px 7px rgba(0, 0, 0, .38);
+  color: #a59b7c;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  line-height: 21px;
+  text-align: center;
+}
+
+.detailed-step-list .detailed-step-index {
+  display: block;
+  width: 100%;
+  color: #a59b7c;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 19px;
+  text-align: center;
+}
+
+.detailed-step-list .trace-step-target:has(+ .trace-step-target) .trace-step-marker::after {
+  position: absolute;
+  top: 21px;
+  left: 10px;
+  width: 1px;
+  height: 6px;
+  background: #303638;
+  content: "";
+  pointer-events: none;
+}
+
+.detailed-step-list .trace-step-row.is-selected .trace-step-marker,
+.detailed-step-list .trace-step-row-inProgress .trace-step-marker {
+  border-color: #a59b7c;
+}
+
+.detailed-step-list .trace-step-row.is-verdict-accepted { color: #79d596; }
+.detailed-step-list .trace-step-row.is-verdict-changes { color: #ec8b83; }
+
 @media (max-width: 680px) {
   .detailed-run-shell {
     width: calc(100% - 29px);
     margin-left: 29px;
   }
   .detailed-trace-grid { display: block; }
+  .detailed-trace-grid::before,
+  .detailed-trace-grid::after {
+    left: 0;
+    width: 100%;
+  }
   .detailed-thinking-lane,
   .detailed-plan-lane {
     position: static;
@@ -3585,7 +3872,7 @@ textarea::placeholder { color: var(--faint); }
   }
   .detailed-steps-lane {
     border-right: 0;
-    border-bottom: 1px solid #20262a;
+    border-bottom: 0;
   }
   .detailed-run-shell .pipeline-run-header,
   .detailed-run-shell.has-phase-rail .detailed-answer-status-rail,

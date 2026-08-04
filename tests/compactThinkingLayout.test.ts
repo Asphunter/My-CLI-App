@@ -80,6 +80,8 @@ test("a KÓD és REVIEW végső válasza az utolsó lépés folyamába kerül", 
   assert.match(app, /className=\{`detailed-final-answer/);
   assert.match(app, /trace-step-final-mark/);
   assert.match(app, /is-verdict-step is-verdict-/);
+  assert.match(app, /finalAnswerRow && !isReviewStage/);
+  assert.doesNotMatch(app, /const finalAnswerStepLabel = isReviewStage \? "VERDIKT"/);
 });
 
 test("a fázisválasztó felirat nélküli, vertikális provider rail", () => {
@@ -92,6 +94,26 @@ test("a fázisválasztó felirat nélküli, vertikális provider rail", () => {
   assert.match(styles, /\.detailed-run-shell \.pipeline-run-tab\.is-verdict-accepted\s*\{[^}]*#2ee174/s);
 });
 
+test("a lezárt futás kiválasztott fázisát bal oldali, jobbra mutató nyíl jelöli", () => {
+  assert.match(app, /className="pipeline-run-header is-history"/);
+  assert.match(app, /className="pipeline-run-header is-live"/);
+  assert.match(
+    styles,
+    /\.pipeline-run-header\.is-history \.pipeline-run-tab\.is-active::before\s*\{[^}]*right:\s*calc\(100% \+ 4px\)[^}]*border-left:\s*7px solid #d7ceaf/s,
+  );
+  assert.doesNotMatch(
+    styles,
+    /\.pipeline-run-header\.is-live \.pipeline-run-tab\.is-active::before/,
+  );
+});
+
+test("a reasoning slider nem jelenít meg natív hover üzenetet", () => {
+  assert.doesNotMatch(
+    app,
+    /title=\{`\$\{PROVIDER_LABELS\[provider\]\}[^`]*Reasoning:/,
+  );
+});
+
 test("a kért fekete Tree és válaszfelület a pontos szürke chat-háttéren marad", () => {
   assert.match(styles, /--chat-bg:\s*#000/);
   assert.match(styles, /--tick4-answer-bg:\s*#000/);
@@ -100,17 +122,125 @@ test("a kért fekete Tree és válaszfelület a pontos szürke chat-háttéren m
   assert.match(styles, /\.composer-multi-ai-toggle[^}]*background:\s*#000/s);
   assert.match(styles, /\.compact-answer-card::before,[\s\S]*width:\s*3px;[\s\S]*background:\s*#a59b7c\s*!important;/);
   assert.match(styles, /\.detailed-run-shell \.detailed-trace-card::before,[\s\S]*background:\s*#a59b7c\s*!important;/);
-  assert.match(styles, /\.detailed-plan-lane\s*\{[^}]*box-shadow:\s*none\s*!important/s);
-  assert.match(styles, /\.detailed-final-answer\s*\{[^}]*border-left:\s*0/s);
+  assert.match(styles, /\.detailed-thinking-lane,[\s\S]*box-shadow:\s*inset 3px 0 0 #a59b7c\s*!important/s);
+  assert.match(styles, /\.detailed-final-answer\s*\{[^}]*border:\s*0/s);
 });
 
-test("a részletes lépések szürke sorok, számláló nélkül és alattuk van a fájllista", () => {
-  assert.match(styles, /\.detailed-step-list \.trace-step-row,[\s\S]*background:\s*#2c2c2c/);
+test("a részletes nézet fade vonalakkal zár, a fájlpanel pedig keret nélküli", () => {
+  assert.match(
+    styles,
+    /\.detailed-run-shell \.detailed-trace-card\s*\{[^}]*border:\s*0\s*!important/s,
+  );
+  assert.match(
+    styles,
+    /\.detailed-run-shell\s*\{[^}]*--detailed-fade-line:\s*linear-gradient\(90deg, #a59b7c/,
+  );
+  assert.match(
+    styles,
+    /\.detailed-steps-lane::before\s*\{[^}]*width:\s*52%;[^}]*background:\s*var\(--detailed-fade-line\)/s,
+  );
+  assert.match(
+    styles,
+    /--detailed-answer-rule-width:\s*min\(100%, max\(0px, calc\(var\(--detailed-prompt-width, 720px\) - var\(--detailed-steps-track\)\)\)\)/,
+  );
+  assert.match(app, /\.user-message \.message-body/);
+  assert.match(app, /prompt\.getBoundingClientRect\(\)\.right - shell\.getBoundingClientRect\(\)\.left/);
+  assert.match(app, /"--detailed-prompt-width": detailedPromptWidth/);
+  assert.match(
+    styles,
+    /\.detailed-thinking-lane,[\s\S]*box-shadow:\s*inset 3px 0 0 #a59b7c !important/,
+  );
+  assert.match(
+    styles,
+    /\.detailed-steps-lane\s*\{[^}]*background-image:\s*var\(--detailed-fade-line\)[^}]*background-position:\s*left bottom[^}]*background-size:\s*52% 1px/s,
+  );
+  assert.match(
+    styles,
+    /\.detailed-trace-grid::before\s*\{[^}]*top:\s*0;[^}]*height:\s*28px;[^}]*linear-gradient\(180deg, #000 0%, rgba\(0, 0, 0, \.9\) 34%, transparent 100%\);[^}]*background-size:\s*var\(--detailed-answer-rule-width\) 1px, 3px 100%, 100% 100%/s,
+  );
+  assert.match(
+    styles,
+    /\.detailed-trace-grid::after\s*\{[^}]*bottom:\s*0;[^}]*height:\s*28px;[^}]*linear-gradient\(0deg, #000 0%, rgba\(0, 0, 0, \.9\) 34%, transparent 100%\);[^}]*background-size:\s*var\(--detailed-answer-rule-width\) 1px, 3px 100%, 100% 100%/s,
+  );
+  assert.match(
+    styles,
+    /\.detailed-thinking-lane,[\s\S]*padding:\s*28px 7px 28px 8px/,
+  );
+  assert.match(
+    styles,
+    /\.detailed-step-list\s*\{[^}]*margin-bottom:\s*10px/s,
+  );
+  assert.match(
+    styles,
+    /\.detailed-step-changes::before\s*\{[^}]*background:\s*var\(--detailed-fade-line\)/s,
+  );
+  assert.match(
+    styles,
+    /\.detailed-step-changes \.trace-change-summary\s*\{[^}]*border:\s*0[^}]*background:\s*#000/s,
+  );
+  assert.match(
+    styles,
+    /\.detailed-step-changes \.trace-change-heading\s*\{[^}]*border-bottom:\s*0/s,
+  );
+  assert.match(
+    styles,
+    /\.detailed-thinking-lane \.answer-code-block,[\s\S]*position:\s*relative;[\s\S]*overflow:\s*visible;[\s\S]*border:\s*0;[\s\S]*border-radius:\s*0;[\s\S]*background-color:\s*#000;[\s\S]*box-shadow:\s*none;/,
+  );
+  assert.match(
+    styles,
+    /\.detailed-thinking-lane \.answer-code-block::before,[\s\S]*left:\s*-11px;[\s\S]*width:\s*var\(--detailed-answer-rule-width\);[\s\S]*background:\s*var\(--detailed-code-fade-line\)/,
+  );
+  assert.match(
+    styles,
+    /\.detailed-thinking-lane \.answer-code-block \.code-header,[\s\S]*border-bottom:\s*0;[\s\S]*background:\s*transparent;/,
+  );
+  assert.match(
+    styles,
+    /\.detailed-thinking-lane \.answer-heading-1,[\s\S]*border-bottom:\s*0/,
+  );
+  assert.match(
+    styles,
+    /\.detailed-thinking-lane \.trace-answer-text > p,[\s\S]*max-width:\s*min\(100%, 1000px\)/,
+  );
+  assert.match(
+    styles,
+    /\.detailed-answer-toolbar\s*\{[^}]*right:\s*7px;[^}]*left:\s*auto;[^}]*transform:\s*none/s,
+  );
+  assert.match(
+    styles,
+    /\.detailed-final-answer-toolbar\s*\{[^}]*right:\s*5px;[^}]*left:\s*auto;[^}]*transform:\s*none/s,
+  );
+  assert.doesNotMatch(app, /aria-label=\{copiedAnswer/);
+});
+
+test("a részletes lépések kompakt számozott timeline-on és fade szeparátorokkal jelennek meg", () => {
+  assert.match(styles, /\.detailed-step-list\s*\{[^}]*gap:\s*1px/s);
+  assert.match(styles, /\.trace-step-target \+ \.trace-step-target::before\s*\{[^}]*height:\s*1px;[^}]*linear-gradient/s);
+  assert.match(app, /className="detailed-step-index">\{stepIndex \+ 1\}<\/span>/);
+  assert.match(styles, /\.detailed-step-list \.trace-step-marker,[\s\S]*width:\s*21px;[\s\S]*align-items:\s*center;[\s\S]*justify-content:\s*center;[\s\S]*border-radius:\s*6px/);
+  assert.match(styles, /\.detailed-step-list \.detailed-step-index\s*\{[^}]*color:\s*#a59b7c;[^}]*font-size:\s*9px;[^}]*text-align:\s*center/s);
+  assert.match(styles, /\.detailed-step-list \.trace-step-row,[\s\S]*background:\s*transparent !important/);
   assert.match(app, /className="detailed-step-changes"/);
   assert.match(app, /className="trace-total-elapsed detailed-steps-total"/);
   assert.doesNotMatch(app, /completedStepCount/);
   assert.doesNotMatch(app, /detailed-steps-summary/);
   assert.doesNotMatch(app, /className="detailed-inline-changes"/);
+});
+
+test("a technikai részleteket csak a felirat nyitja és nincs mellette nyíl", () => {
+  assert.match(app, /className="compact-technical-heading"/);
+  assert.match(
+    app,
+    /className="compact-technical-heading"[\s\S]*?className="trace-thinking-bullet"[\s\S]*?<button[\s\S]*?className="compact-technical-toggle"[\s\S]*?className="compact-technical-label"/,
+  );
+  assert.doesNotMatch(
+    app,
+    /className="compact-technical-label"[^<]*<\/span>\s*<span className="trace-internal-caret"/,
+  );
+  assert.match(
+    styles,
+    /\.compact-technical-toggle\s*\{[^}]*width:\s*fit-content;[^}]*max-width:\s*100%/s,
+  );
 });
 
 test("a verdikt konklúziója a REVIEW utolsó lépése alatt marad", () => {

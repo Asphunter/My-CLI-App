@@ -11,9 +11,11 @@ chcp 65001 >nul
 cd /d "%~dp0"
 
 rem A build sajat mappaba megy, es csak a kesz exe kerul a parancsikon helyere.
-rem A `%LOCALAPPDATA%\min\cargo-target` alatt ezen a gepen az archivum-lepes
-rem rendszeresen fajlzarba utkozik ("failed to remove temporary directory"),
-rem ezert epitunk mashol. Ha ez a mappa kiurul, az elso futas hosszabb lesz.
+rem A LOCALAPPDATA alatt (pl. `%LOCALAPPDATA%\min\...`) ezen a gepen a cargo
+rem archivum-lepese rendszeresen fajlzarba utkozik ("failed to remove temporary
+rem directory", os error 32), ezert a Temp alatt epitunk - ott nincs zar.
+rem Cserebe a Windows Temp-takaritasa neha kitorolhet fajlokat a cache-bol;
+rem ezt lentebb automatikus cache-torles + teljes ujraepites kezeli.
 set "BUILD_DIR=%LOCALAPPDATA%\Temp\min-cargo-target"
 set "SHORTCUT_EXE=%LOCALAPPDATA%\min\cargo-target\debug\min.exe"
 set "CARGO_TARGET_DIR=%BUILD_DIR%"
@@ -32,8 +34,23 @@ call npm.cmd run build || goto :failed
 
 echo.
 echo [2/3] Rust build ^(custom-protocol^)...
+call cargo build --manifest-path src-tauri/Cargo.toml --features custom-protocol && goto :install
+
+rem A build elhasalt. Ha kornyezeti hiba (a Temp-takaritas kitorolt fajlokat a
+rem cache-bol, vagy fajlzar), a cache torlese + teljes ujraepites megoldja;
+rem kodhibanal viszont ertelmetlen lenne a cache-t eldobni. A megkulonboztetes:
+rem gyors ujrafuttatas naploba, es a naplo jellegzetes hibaszovegei dontenek.
+echo.
+echo A Rust build elhasalt - a hiba okanak vizsgalata...
+set "BUILD_LOG=%TEMP%\min-build-probe.log"
+call cargo build --manifest-path src-tauri/Cargo.toml --features custom-protocol > "%BUILD_LOG%" 2>&1
+if not errorlevel 1 goto :install
+findstr /C:"couldn't read" /C:"failed to remove temporary directory" "%BUILD_LOG%" >nul || goto :failed
+echo Serult build cache - torles es teljes ujraepites ^(tobb perc is lehet^)...
+rmdir /s /q "%BUILD_DIR%" 2>nul
 call cargo build --manifest-path src-tauri/Cargo.toml --features custom-protocol || goto :failed
 
+:install
 echo.
 echo [3/3] Telepites a parancsikon helyere...
 if not exist "%LOCALAPPDATA%\min\cargo-target\debug\" mkdir "%LOCALAPPDATA%\min\cargo-target\debug"

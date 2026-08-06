@@ -16,6 +16,23 @@ use tauri::{Emitter, Manager, WindowEvent};
 /// already rendered the last provider event.
 static ACTIVE_WORK: AtomicUsize = AtomicUsize::new(0);
 
+/// Requests which still have the right to block window closing. A cancelled
+/// provider may keep draining after STOP, but that request is no longer work
+/// the user asked the app to protect from an accidental close.
+fn close_blocking_work() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static WORK: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<String>>,
+    > = std::sync::OnceLock::new();
+    WORK.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn active_close_blocking_count() -> usize {
+    close_blocking_work()
+        .lock()
+        .map(|work| work.len())
+        .unwrap_or_else(|_| active_work_count())
+}
+
 fn active_work_count() -> usize {
     ACTIVE_WORK.load(Ordering::SeqCst)
 }
@@ -46,6 +63,27 @@ fn set_taskbar_terminal(app: &tauri::AppHandle, success: bool) {
             let overlay = success.then(success_overlay_icon);
             let _ = window.set_overlay_icon(overlay);
         }
+    }
+}
+
+#[cfg(desktop)]
+fn acknowledge_work_cancellation(app: &tauri::AppHandle, request_ids: &[String]) {
+    // A provider folyamata a megszakítási jel után még néhány másodpercig
+    // ürítheti a csatornáit. A felhasználó szempontjából azonban a futás már
+    // leállt, ezért a Windows tálca ne mutasson addig indeterminate állapotot.
+    let remaining = close_blocking_work()
+        .lock()
+        .map(|mut work| {
+            for request_id in request_ids {
+                work.remove(request_id);
+            }
+            work.len()
+        })
+        .unwrap_or_else(|_| active_work_count());
+    if remaining == 0 {
+        set_taskbar_terminal(app, false);
+    } else {
+        set_taskbar_running(app);
     }
 }
 
@@ -83,17 +121,23 @@ fn success_overlay_icon() -> tauri::image::Image<'static> {
 
 struct WorkActivity {
     app: tauri::AppHandle,
+    close_key: String,
     completed: bool,
 }
 
 impl WorkActivity {
-    fn new(app: &tauri::AppHandle) -> Self {
+    fn new(app: &tauri::AppHandle, close_key: impl Into<String>) -> Self {
+        let close_key = close_key.into();
+        if let Ok(mut work) = close_blocking_work().lock() {
+            work.insert(close_key.clone());
+        }
         if ACTIVE_WORK.fetch_add(1, Ordering::SeqCst) == 0 {
             #[cfg(desktop)]
             set_taskbar_running(app);
         }
         Self {
             app: app.clone(),
+            close_key,
             completed: false,
         }
     }
@@ -105,6 +149,9 @@ impl WorkActivity {
 
 impl Drop for WorkActivity {
     fn drop(&mut self) {
+        if let Ok(mut work) = close_blocking_work().lock() {
+            work.remove(&self.close_key);
+        }
         let previous = ACTIVE_WORK.fetch_sub(1, Ordering::SeqCst);
         if previous <= 1 {
             #[cfg(desktop)]
@@ -118,7 +165,6 @@ async fn codex_send(
     app: tauri::AppHandle,
     mut request: codex::CodexRequest,
 ) -> Result<codex::CodexResponse, String> {
-    let mut activity = WorkActivity::new(&app);
     let request_id = request.request_id.clone().unwrap_or_else(|| {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -127,6 +173,7 @@ async fn codex_send(
         format!("request-{stamp}")
     });
     request.request_id = Some(request_id.clone());
+    let mut activity = WorkActivity::new(&app, request_id.clone());
     let cancellation = codex::begin_request(&request_id)?;
     let result =
         tauri::async_runtime::spawn_blocking(move || codex::send(app, request, cancellation))
@@ -161,10 +208,18 @@ async fn run_agent_turn(
 /// that the project is busy — by itself.
 async fn run_agent_turn_inner(
     app: tauri::AppHandle,
-    request: agent::AgentTurnRequest,
+    mut request: agent::AgentTurnRequest,
     claims_project: bool,
 ) -> Result<agent::AgentResponse, String> {
-    let mut activity = WorkActivity::new(&app);
+    let request_id = request.request_id.clone().unwrap_or_else(|| {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        format!("agent-request-{stamp}")
+    });
+    request.request_id = Some(request_id.clone());
+    let mut activity = WorkActivity::new(&app, request_id);
     let result = run_agent_turn_inner_impl(app, request, claims_project).await;
     activity.finish(result.is_ok());
     result
@@ -746,7 +801,9 @@ fn pipeline_run_for_request(request_id: &str) -> Option<String> {
 }
 
 #[tauri::command(rename_all = "camelCase")]
-fn pipeline_cancel(run_id: String) -> Result<(), String> {
+fn pipeline_cancel(app: tauri::AppHandle, run_id: String) -> Result<(), String> {
+    #[cfg(desktop)]
+    acknowledge_work_cancellation(&app, &pipeline_request_ids(&run_id));
     cancel_pipeline_run(&run_id)
 }
 
@@ -757,7 +814,17 @@ fn pipeline_cancel(run_id: String) -> Result<(), String> {
 /// is not torn out by a flag, and eight minutes of coding is a long time to
 /// watch something you have already stopped.
 #[tauri::command(rename_all = "camelCase")]
-fn pipeline_cancel_request(request_id: String) -> Result<bool, String> {
+fn pipeline_cancel_request(app: tauri::AppHandle, request_id: String) -> Result<bool, String> {
+    #[cfg(desktop)]
+    if let Some(run_id) = pipeline_run_for_request(&request_id) {
+        acknowledge_work_cancellation(&app, &pipeline_request_ids(&run_id));
+    } else {
+        acknowledge_work_cancellation(&app, std::slice::from_ref(&request_id));
+    }
+    cancel_pipeline_request_by_id(request_id)
+}
+
+fn cancel_pipeline_request_by_id(request_id: String) -> Result<bool, String> {
     mark_project_draining(&request_id);
     let Some(run_id) = pipeline_run_for_request(&request_id) else {
         return Ok(false);
@@ -789,9 +856,35 @@ fn cancel_pipeline_run(run_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn pipeline_request_ids(run_id: &str) -> Vec<String> {
+    pipeline_runs_by_request()
+        .lock()
+        .map(|runs| {
+            runs
+                .iter()
+                .filter(|(_, value)| value.as_str() == run_id)
+                .map(|(key, _)| key.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[tauri::command]
 fn pipeline_recipes() -> Vec<pipeline::Recipe> {
     pipeline::recipes_for_frontend()
+}
+
+fn pipeline_stage_roster(recipe: &pipeline::Recipe) -> Vec<store::LocalMessagePipelineStage> {
+    recipe
+        .stages
+        .iter()
+        .enumerate()
+        .map(|(index, stage)| store::LocalMessagePipelineStage {
+            stage_index: index as i64,
+            stage_role: stage.role.as_wire().to_string(),
+            stage_agent: pipeline::stage_agent_label(stage),
+        })
+        .collect()
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -828,7 +921,12 @@ async fn pipeline_send(
         ));
     }
 
-    let mut activity = WorkActivity::new(&app);
+    let close_key = request
+        .placeholder_request_id
+        .clone()
+        .or_else(|| request.request_ids.first().cloned())
+        .unwrap_or_else(|| format!("pipeline:{}", request.recipe_id));
+    let mut activity = WorkActivity::new(&app, close_key);
 
     // The chain holds the project for its whole length, not stage by stage:
     // between two stages the tree is mid-work, and a turn starting there would
@@ -888,6 +986,7 @@ async fn pipeline_send(
         _ => None,
     };
     let stage_count = recipe.stages.len() as i64;
+    let stage_roster = pipeline_stage_roster(&recipe);
     // Everything with a side effect lives in this closure; `run_stages` owns the
     // chain logic itself and is tested without any of this.
     let outcome = {
@@ -897,6 +996,7 @@ async fn pipeline_send(
         let cancel_run_id = run_id.clone();
         let chain_id = chain_id.clone();
         let recipe_id = recipe.id.clone();
+        let stage_roster_for_runner = stage_roster.clone();
         pipeline::run_stages_from(
             &recipe,
             &request.prompt,
@@ -918,6 +1018,7 @@ async fn pipeline_send(
                 let run_id = run_id.clone();
                 let chain_id = chain_id.clone();
                 let recipe_id = recipe_id.clone();
+                let stage_roster = stage_roster_for_runner.clone();
                 let request_id = request.request_ids[execution.index].clone();
                 let root_request_id = request
                     .placeholder_request_id
@@ -989,8 +1090,16 @@ async fn pipeline_send(
                         effort: execution.stage.effort.clone(),
                         cwd: request.cwd.clone(),
                         request_id: Some(request_id.clone()),
-                        replace_message_id: None,
-                        replace_turn_id: None,
+                        replace_message_id: if execution.is_first {
+                            request.replace_message_id.clone()
+                        } else {
+                            None
+                        },
+                        replace_turn_id: if execution.is_first {
+                            request.replace_turn_id.clone()
+                        } else {
+                            None
+                        },
                         max_budget_usd: request.max_budget_usd,
                         max_turns: execution.stage.max_turns,
                         tool_profile: Some(execution.stage.role.tool_profile()),
@@ -1046,6 +1155,11 @@ async fn pipeline_send(
                     let _ = store::label_pipeline_stage_answer(
                         &request.conversation_id,
                         &request_id,
+                        if execution.is_first {
+                            request.replace_message_id.as_deref()
+                        } else {
+                            None
+                        },
                         &store::LocalMessagePipeline {
                             run_id: run_id.clone(),
                             recipe_id: Some(recipe_id.clone()),
@@ -1055,6 +1169,7 @@ async fn pipeline_send(
                             stage_count,
                             stage_role: execution.stage.role.as_wire().to_string(),
                             stage_agent: agent_label.clone(),
+                            stage_roster,
                             verdict: None,
                             verdict_summary: None,
                         },
@@ -1083,10 +1198,14 @@ async fn pipeline_send(
         let agent_label = pipeline::stage_agent_label(stage);
         // Deterministic: the frontend allocated one id per stage in order.
         let request_id = request.request_ids[stage_result.index].clone();
-        let answer_message_id = if stage_result.succeeded {
-            store::label_pipeline_stage_answer(
+        let answer_message_id = store::label_pipeline_stage_answer(
                 &request.conversation_id,
                 &request_id,
+                if stage_result.index == start_stage {
+                    request.replace_message_id.as_deref()
+                } else {
+                    None
+                },
                 &store::LocalMessagePipeline {
                     run_id: run_id.clone(),
                     recipe_id: Some(recipe.id.clone()),
@@ -1096,6 +1215,7 @@ async fn pipeline_send(
                     stage_count,
                     stage_role: stage.role.as_wire().to_string(),
                     stage_agent: agent_label.clone(),
+                    stage_roster: stage_roster.clone(),
                     verdict: stage_result
                         .review
                         .as_ref()
@@ -1112,10 +1232,7 @@ async fn pipeline_send(
                 },
             )
             .ok()
-            .flatten()
-        } else {
-            None
-        };
+            .flatten();
         stages.push(pipeline::PipelineStageResult {
             index: stage_result.index as i64,
             role: stage_result.role,
@@ -1126,6 +1243,50 @@ async fn pipeline_send(
             error: stage_result.error.clone(),
             review: stage_result.review.clone(),
             session_id: stage_result.session_id.clone(),
+            answer_message_id,
+        });
+    }
+    // STOP can arrive after the frontend has opened the live chain panel but
+    // before the runner enters its first provider stage. The cancelled outcome
+    // then legitimately contains zero stage results. Returning that empty list
+    // makes the frontend remove its placeholder without anything to replace it,
+    // so a three-stage run disappears or looks like a plain single-model turn.
+    // Persist one cancelled current-stage record; stage_count and recipe_id let
+    // history reconstruct the disabled phases that never started.
+    if outcome.status == pipeline::RunStatus::Cancelled && stages.is_empty() {
+        let stage = &recipe.stages[start_stage];
+        let request_id = request.request_ids[start_stage].clone();
+        let agent_label = pipeline::stage_agent_label(stage);
+        let answer_message_id = store::label_pipeline_stage_answer(
+            &request.conversation_id,
+            &request_id,
+            request.replace_message_id.as_deref(),
+            &store::LocalMessagePipeline {
+                run_id: run_id.clone(),
+                recipe_id: Some(recipe.id.clone()),
+                chain_id: chain_id.clone(),
+                iteration,
+                stage_index: start_stage as i64,
+                stage_count,
+                stage_role: stage.role.as_wire().to_string(),
+                stage_agent: agent_label.clone(),
+                stage_roster: stage_roster.clone(),
+                verdict: None,
+                verdict_summary: None,
+            },
+        )
+        .ok()
+        .flatten();
+        stages.push(pipeline::PipelineStageResult {
+            index: start_stage as i64,
+            role: stage.role,
+            agent_label,
+            request_id,
+            succeeded: false,
+            text: String::new(),
+            error: None,
+            review: None,
+            session_id: None,
             answer_message_id,
         });
     }
@@ -1272,7 +1433,13 @@ fn agent_answer_checkpoint(
 }
 
 #[tauri::command(rename_all = "camelCase")]
-fn agent_cancel(provider: Option<agent::AgentProvider>, request_id: String) -> Result<(), String> {
+fn agent_cancel(
+    app: tauri::AppHandle,
+    provider: Option<agent::AgentProvider>,
+    request_id: String,
+) -> Result<(), String> {
+    #[cfg(desktop)]
+    acknowledge_work_cancellation(&app, std::slice::from_ref(&request_id));
     match provider.unwrap_or(agent::AgentProvider::Codex) {
         agent::AgentProvider::Codex => codex::cancel_request(&request_id),
         agent::AgentProvider::Anthropic
@@ -1317,7 +1484,9 @@ fn agent_question_response(
 }
 
 #[tauri::command(rename_all = "camelCase")]
-fn claude_cancel(request_id: String) -> Result<(), String> {
+fn claude_cancel(app: tauri::AppHandle, request_id: String) -> Result<(), String> {
+    #[cfg(desktop)]
+    acknowledge_work_cancellation(&app, std::slice::from_ref(&request_id));
     mark_project_draining(&request_id);
     claude::cancel_request(&request_id)
 }
@@ -1598,7 +1767,9 @@ fn codex_respond_approval(approval_id: String, decision: String) -> Result<(), S
 }
 
 #[tauri::command(rename_all = "camelCase")]
-fn codex_cancel(request_id: String) -> Result<(), String> {
+fn codex_cancel(app: tauri::AppHandle, request_id: String) -> Result<(), String> {
+    #[cfg(desktop)]
+    acknowledge_work_cancellation(&app, std::slice::from_ref(&request_id));
     mark_project_draining(&request_id);
     codex::cancel_request(&request_id)
 }
@@ -1967,7 +2138,7 @@ pub fn run() {
             let event_window = window.clone();
             window.on_window_event(move |event| {
                 if let WindowEvent::CloseRequested { api, .. } = event {
-                    if active_work_count() > 0 {
+                    if active_close_blocking_count() > 0 {
                         api.prevent_close();
                         let _ = event_window.emit(
                             "app-close-blocked",
@@ -2360,12 +2531,12 @@ mod tests {
 
         assert!(!pipeline_run_is_cancelled(run_id));
         assert!(
-            pipeline_cancel_request("req-placeholder".to_string()).expect("cancel"),
+            cancel_pipeline_request_by_id("req-placeholder".to_string()).expect("cancel"),
             "a known request must report that it stopped something",
         );
         assert!(pipeline_run_is_cancelled(run_id));
         assert!(
-            !pipeline_cancel_request("req-unknown".to_string()).expect("cancel"),
+            !cancel_pipeline_request_by_id("req-unknown".to_string()).expect("cancel"),
             "an unknown request stops nothing and must say so, so the caller can fall back",
         );
 

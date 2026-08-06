@@ -45,6 +45,7 @@ import {
   numberedPlanLines,
   numberedPlanSteps,
   planTextSegments,
+  withoutLeadingStepNumber,
 } from "./planText";
 import {
   buildWorkLogGroups,
@@ -78,6 +79,18 @@ import {
   type AppMode,
   type ConversationScope,
 } from "./conversationScope";
+import {
+  mergePipelineStageTiming,
+  pipelineChainTimingBounds,
+} from "./pipelineTiming";
+import {
+  detailedAnswerPanelHeight,
+  DETAILED_ANSWER_MAX_HEIGHT,
+} from "./detailedLayout";
+import {
+  resolveRegenerationRequestSettings,
+  type RegenerationRequestSettings,
+} from "./regenerationSettings";
 import {
   acceptTerminalAgentEvent,
   agentEventIdentity,
@@ -468,8 +481,17 @@ type MessagePipeline = {
   stageCount: number;
   stageRole: string;
   stageAgent: string;
+  /** Full effective recipe, including per-stage model overrides. */
+  stageRoster?: Array<{
+    stageIndex: number;
+    stageRole: string;
+    stageAgent: string;
+  }>;
   /** Persisted outcome of this phase; a stopped phase must not look completed. */
   stageStatus?: "running" | "completed" | "failed" | "cancelled";
+  /** Wall-clock bounds captured from pipeline progress events. */
+  stageStartedAt?: number;
+  stageCompletedAt?: number;
   verdict?: string;
   verdictSummary?: string;
 };
@@ -487,6 +509,67 @@ const chainKeyOf = (pipeline: MessagePipeline) =>
 /** Rows written before versioning existed are the first and only iteration. */
 const iterationOf = (pipeline: MessagePipeline) =>
   pipeline.iteration && pipeline.iteration > 0 ? pipeline.iteration : 1;
+
+const PIPELINE_STATUS_RANK: Record<
+  NonNullable<MessagePipeline["stageStatus"]>,
+  number
+> = {
+  running: 0,
+  completed: 1,
+  cancelled: 2,
+  failed: 3,
+};
+
+/** Merge the lifecycle fields instead of letting a verdict-bearing stale row win whole. */
+const mergeMessagePipeline = (
+  existing: MessagePipeline | undefined,
+  incoming: MessagePipeline | undefined,
+) => {
+  if (!existing) return incoming;
+  if (!incoming) return existing;
+  const preferred = existing.verdict
+    ? existing
+    : incoming.verdict
+      ? incoming
+      : existing;
+  const secondary = preferred === existing ? incoming : existing;
+  const timing = mergePipelineStageTiming(
+    {
+      startedAt: existing.stageStartedAt,
+      completedAt: existing.stageCompletedAt,
+    },
+    {
+      startedAt: incoming.stageStartedAt,
+      completedAt: incoming.stageCompletedAt,
+    },
+  );
+  const statuses = [existing.stageStatus, incoming.stageStatus].filter(
+    (status): status is NonNullable<MessagePipeline["stageStatus"]> =>
+      Boolean(status),
+  );
+  return {
+    ...secondary,
+    ...preferred,
+    stageStatus: statuses.sort(
+      (left, right) => PIPELINE_STATUS_RANK[right] - PIPELINE_STATUS_RANK[left],
+    )[0],
+    stageStartedAt: timing.startedAt,
+    stageCompletedAt: timing.completedAt,
+    verdict: existing.verdict ?? incoming.verdict,
+    verdictSummary:
+      existing.verdictSummary?.trim() || incoming.verdictSummary?.trim() ||
+      undefined,
+  } satisfies MessagePipeline;
+};
+
+const pipelineVerdictOutcome = (
+  verdict: string | undefined,
+): "accepted" | "changes" | undefined =>
+  verdict === "accepted"
+    ? "accepted"
+    : verdict === "changes_requested" || verdict === "changes"
+      ? "changes"
+      : undefined;
 
 /** v1 plus two re-runs. Mirrors `MAX_CHAIN_ITERATIONS` in the runner. */
 const MAX_CHAIN_ITERATIONS = 3;
@@ -529,6 +612,19 @@ const PIPELINE_MODEL_LABELS: Record<string, string> = {
 /** The chain is read at a glance, so the vendor prefix is dropped. */
 const shortModelLabel = (modelId: string) =>
   PIPELINE_MODEL_LABELS[modelId] ?? modelId;
+
+const pipelineStageRoster = (recipe: PipelineRecipe) =>
+  recipe.stages.map((stage, stageIndex) => ({
+    stageIndex,
+    stageRole: stage.role,
+    stageAgent: [
+      PROVIDER_LABELS[stage.provider],
+      stage.model ? shortModelLabel(stage.model) : "",
+      stage.effort ?? "",
+    ]
+      .filter(Boolean)
+      .join(" · "),
+  }));
 
 /** Scrolls so the end of a freshly opened phase is visible, composer and all. */
 const revealPanelBottom = (panel: Element | null) => {
@@ -732,6 +828,7 @@ type RunHandle = {
     /** Recipe captured at send time; never read from the current composer. */
     recipe?: PipelineRecipe;
     progress?: PipelineProgressEvent | null;
+    stageTimings?: Record<number, PlanStepTiming>;
     resume?: {
       chainKey: string;
       startStage: number;
@@ -2856,11 +2953,7 @@ const mergeMessages = (
         // spread nélküle hagyta volna a sort — a lánc-panel erre esett szét
         // különálló kártyákra projektváltás után. A verdiktes példány a
         // teljesebb: a címke a lánc végén, a verdikt ismeretében készül.
-        pipeline:
-          (existing.pipeline?.verdict ? existing.pipeline : undefined) ??
-          (message.pipeline?.verdict ? message.pipeline : undefined) ??
-          existing.pipeline ??
-          message.pipeline,
+        pipeline: mergeMessagePipeline(existing.pipeline, message.pipeline),
       };
     },
   );
@@ -6841,6 +6934,7 @@ function TurnProgressCard({
   provider = "codex",
 }: TurnProgressCardProps) {
   const detailedShellRef = useRef<HTMLDivElement>(null);
+  const detailedGridRef = useRef<HTMLDivElement>(null);
   const [detailedPromptWidth, setDetailedPromptWidth] = useState<number>();
   useLayoutEffect(() => {
     const shell = detailedShellRef.current;
@@ -7731,6 +7825,43 @@ function TurnProgressCard({
       return true;
     }),
   );
+  useLayoutEffect(() => {
+    const grid = detailedGridRef.current;
+    const content = isPlanStage
+      ? planContentRef.current
+      : thinkingListRef.current;
+    const lane = content?.closest<HTMLElement>(".detailed-thinking-lane");
+    if (!grid || !content || !lane) return;
+
+    const measureDetailedAnswerHeight = () => {
+      const laneStyle = window.getComputedStyle(lane);
+      const verticalPadding =
+        Number.parseFloat(laneStyle.paddingTop) +
+        Number.parseFloat(laneStyle.paddingBottom);
+      const nextHeight = `${detailedAnswerPanelHeight(
+        content.scrollHeight,
+        verticalPadding,
+      )}px`;
+      if (
+        grid.style.getPropertyValue("--detailed-answer-height") !== nextHeight
+      )
+        grid.style.setProperty("--detailed-answer-height", nextHeight);
+    };
+
+    measureDetailedAnswerHeight();
+    const observer = new ResizeObserver(measureDetailedAnswerHeight);
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [
+    answerBodyText,
+    detailedTraceSections.length,
+    expandedTechnicalSectionId,
+    expandedTraceDetailId,
+    isPlanStage,
+    planSegments.length,
+    selectedStep.id,
+    streaming,
+  ]);
   const compactTimeline = buildCompactAnswerTimeline({
     answers: [],
     trace: compactTrace,
@@ -7845,16 +7976,18 @@ function TurnProgressCard({
                 {runCounterGlyph}
               </span>
             )}
-            <span>{overallElapsed || "0:00"}</span>
+            <span>{overallElapsed || (streaming ? "0:00" : "—")}</span>
           </time>
         </div>
 
         <div
+          ref={detailedGridRef}
           className={`detailed-trace-grid${isPlanStage ? " is-plan-stage" : " is-work-stage"}`}
           style={
             {
               "--detailed-step-slots": reservedStepSlots,
               "--detailed-steps-width": `${preferredStepLaneWidth}px`,
+              "--detailed-answer-max-height": `${DETAILED_ANSWER_MAX_HEIGHT}px`,
             } as CSSProperties
           }
         >
@@ -7912,7 +8045,9 @@ function TurnProgressCard({
                       >
                         <span className="detailed-step-index">{stepIndex + 1}</span>
                       </span>
-                      <span className="trace-step-name">{step.step}</span>
+                      <span className="trace-step-name">
+                        {withoutLeadingStepNumber(step.step)}
+                      </span>
                       {(elapsed || (finalAnswerRow && !isReviewStage)) && (
                         <span className="trace-step-meta">
                           {finalAnswerRow && !isReviewStage && (
@@ -7972,13 +8107,11 @@ function TurnProgressCard({
             data-quote-anchor={quoteAnchor(`thinking:${selectedStep.id}`)}
             aria-label="Gondolkodás menete"
           >
+            {answerActions && (
+              <div className="detailed-answer-toolbar">{answerActions}</div>
+            )}
             {isPlanStage ? (
               <>
-                {answerActions && (
-                  <div className="detailed-answer-toolbar">
-                    {answerActions}
-                  </div>
-                )}
                 <div
                   ref={planContentRef}
                   className="trace-thinking-list trace-plan-content detailed-plan-content"
@@ -8162,11 +8295,6 @@ function TurnProgressCard({
                       className={`detailed-final-answer${isReviewStage && runTone ? ` is-verdict-${runTone}` : ""}`}
                       data-quote-anchor={answerAnchorId}
                     >
-                      {answerActions && (
-                        <div className="detailed-final-answer-toolbar">
-                          {answerActions}
-                        </div>
-                      )}
                       <div className="turn-progress-answer-body detailed-final-answer-body">
                         {hasAnswer && (
                           <div className="trace-answer-text">
@@ -9489,6 +9617,10 @@ function App() {
   const regenerationTargetRef = useRef<{
     source: Message;
     answer: Message;
+    requestSettings: RegenerationRequestSettings<
+      AgentProviderId,
+      AgentAccessProfile
+    >;
   } | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const quoteInputRefs = useRef<Record<string, HTMLTextAreaElement | null>>({});
@@ -11224,6 +11356,7 @@ function App() {
     // trace attribute those events to the turn that is actually running.
     const unlisten = listen<PipelineProgressEvent>("pipeline-progress", (event) => {
       const progress = event.payload;
+      const progressReceivedAt = Date.now();
       // A szakasz requestId-je a külső kérés-azonosító + `-stage-N`; ha a
       // stage-id-t egyik run sem ismeri (pl. straggler egy lezárt lánctól), a
       // külső azonosító még köthető. Az „első run" fallback csak egyetlen
@@ -11236,8 +11369,32 @@ function App() {
           ? (runsRef.current.values().next().value as RunHandle)
           : undefined);
       const progressRun = runForProgress(progress.requestId);
+      let receivedStageTiming: PlanStepTiming | undefined;
       if (progressRun) {
-        progressRun.chain = { ...progressRun.chain, progress };
+        const previousTiming =
+          progressRun.chain?.stageTimings?.[progress.stageIndex] ?? {};
+        receivedStageTiming =
+          progress.phase === "started"
+            ? {
+                ...previousTiming,
+                startedAt: previousTiming.startedAt ?? progressReceivedAt,
+              }
+            : {
+                startedAt:
+                  previousTiming.startedAt ??
+                  progressRun.plan.startedAt ??
+                  progressReceivedAt,
+                completedAt:
+                  previousTiming.completedAt ?? progressReceivedAt,
+              };
+        progressRun.chain = {
+          ...progressRun.chain,
+          progress,
+          stageTimings: {
+            ...progressRun.chain?.stageTimings,
+            [progress.stageIndex]: receivedStageTiming,
+          },
+        };
         progressRun.provider = progress.provider;
         progressRun.stageEpoch = progress.stageEpoch;
         if (progress.phase === "started") {
@@ -11263,17 +11420,22 @@ function App() {
       // újrafuttatásnál egyáltalán nem), a korábbi kör bírálata pedig
       // kicsúszott a kártyája alól és nyers üzenetsorként jelent meg. A
       // verdikt nem itt derül ki, azt továbbra is a futás vége írja rá.
-      if (progress.phase === "finished" && progressRun) {
+      if (progress.phase !== "started" && progressRun) {
         const stageTurnId = `request:${progress.requestId}`;
         const resume = progressRun.chain?.resume;
+        const stageStatus: MessagePipeline["stageStatus"] =
+          progress.phase === "finished"
+            ? "completed"
+            : progress.status === "cancelled"
+              ? "cancelled"
+              : "failed";
         writeOwnedMessages(progressRun.ownerConversationId, (current) =>
           current.map((message) =>
             message.role === "assistant" &&
-            message.turnId === stageTurnId &&
-            !message.pipeline
+            message.turnId === stageTurnId
               ? {
                   ...message,
-                  pipeline: {
+                  pipeline: mergeMessagePipeline(message.pipeline, {
                     runId: progress.runId,
                     recipeId: progressRun.chain?.recipe?.id,
                     chainId: resume?.chainKey ?? progress.runId,
@@ -11282,8 +11444,10 @@ function App() {
                     stageCount: progress.stageCount,
                     stageRole: progress.role,
                     stageAgent: progress.agentLabel,
-                    stageStatus: progress.status,
-                  },
+                    stageStatus,
+                    stageStartedAt: receivedStageTiming?.startedAt,
+                    stageCompletedAt: receivedStageTiming?.completedAt,
+                  }),
                 }
               : message,
           ),
@@ -11306,7 +11470,9 @@ function App() {
         // naming it here makes the live bubble and the stored row one row.
         chainRun.turnId = `request:${progress.requestId}`;
         syncRunAliases();
-        const stageStartedAt = Date.now();
+        const stageStartedAt =
+          chainRun.chain?.stageTimings?.[progress.stageIndex]?.startedAt ??
+          progressReceivedAt;
         // A kódoló szakasz lépéslistája maga a terv: a terv-szakasz számozott
         // fő pontjai. Enélkül a KÓD alatt egy „0. lépés" placeholder állt,
         // miközben a terv tíz lépést vett fel — a lista sosem látszott.
@@ -16305,11 +16471,16 @@ function App() {
               stageCount: run.recipe.stages.length,
               stageRole: stage.role,
               stageAgent: stage.agentLabel,
+              stageRoster: pipelineStageRoster(run.recipe),
               stageStatus: stage.succeeded
                 ? "completed"
                 : run.status === "cancelled"
                   ? "cancelled"
                   : "failed",
+              stageStartedAt:
+                runHandle.chain?.stageTimings?.[stage.index]?.startedAt,
+              stageCompletedAt:
+                runHandle.chain?.stageTimings?.[stage.index]?.completedAt,
               verdict: stage.review?.verdict,
               verdictSummary: stage.review?.summary,
             },
@@ -16547,9 +16718,17 @@ function App() {
     const requestMode = activeModeRef.current;
     const isGeneralMode = requestMode === "general";
     const detailedRequest = !isGeneralMode && showDetailedTrace;
+    const regenerationSettings = pendingRegeneration?.requestSettings;
     const runProvider: AgentProviderId = isGeneralMode
       ? "codex"
-      : selectedProvider;
+      : (regenerationSettings?.provider ?? selectedProvider);
+    const runAccessProfile = regenerationSettings
+      ? regenerationSettings.accessProfile
+      : selectedAccessProfile;
+    const runModel = regenerationSettings
+      ? regenerationSettings.model
+      : selectedModel;
+    const runEffort = regenerationSettings?.effort ?? effectiveEffort;
     const useBridge = runProvider !== "codex";
     if (!text && quoteSnapshot.length === 0 && pendingImageSnapshot.length === 0)
       return;
@@ -16560,7 +16739,7 @@ function App() {
     const imageAccessProfile =
       detailedRequest && activePipelineRecipe
         ? stageAccessProfile(0)
-        : selectedAccessProfile;
+        : runAccessProfile;
     if (
       pendingImageSnapshot.length > 0 &&
       !providerSupportsImageInput(imageProvider, imageAccessProfile)
@@ -16775,7 +16954,7 @@ function App() {
       messagesRef.current,
       false,
     );
-    const regeneration = pendingRegeneration
+    const regenerationBase = pendingRegeneration
       ? beginAssistantRegeneration(
           previousMessages,
           pendingRegeneration.source,
@@ -16783,11 +16962,25 @@ function App() {
           fallbackTurnId,
         )
       : undefined;
+    // `beginAssistantRegeneration` resolves the authoritative stored user row,
+    // but the mode of the retry comes from the composer as it stands now. This
+    // lets a compact answer be retried either as another compact answer or as
+    // a full multi-stage run without inheriting the old turn's layout.
+    const regeneration = regenerationBase
+      ? {
+          ...regenerationBase,
+          source: { ...regenerationBase.source, detailed: detailedRequest },
+          messages: regenerationBase.messages.map((message, index) =>
+            index === regenerationBase.sourceIndex
+              ? { ...message, detailed: detailedRequest }
+              : message,
+          ),
+        }
+      : undefined;
     const clientTurnId = regeneration?.turnId ?? fallbackTurnId;
-    // Regeneration replays one turn, so it stays on the compact single-turn
-    // path; re-running a chain is a whole-run action.
-    const runPipeline =
-      detailedRequest && Boolean(activePipelineRecipe) && !regeneration;
+    // The current composer mode owns the retry. In detailed mode regeneration
+    // is a real pipeline run; in compact mode it remains a single fresh turn.
+    const runPipeline = detailedRequest && Boolean(activePipelineRecipe);
     const pipelineStageOverridesSnapshot: PipelineStageOverride[] =
       runPipeline && activePipelineRecipe
         ? activePipelineRecipe.stages.map((_, index) => ({
@@ -16822,6 +17015,8 @@ function App() {
           interrupted: false,
           changeSummary: undefined,
           provider: runProvider,
+          pipeline: undefined,
+          interaction: undefined,
         }
       : {
           id: liveMessageId,
@@ -17162,7 +17357,7 @@ function App() {
       // A chain is its own call: the runner drives the stages, records each
       // answer, and returns them together. The ordinary single-turn path below
       // is untouched, which is what keeps the default behaviour identical.
-      if (runPipeline && activePipelineRecipe && isTauri && !regeneration) {
+      if (runPipeline && activePipelineRecipe && isTauri) {
         const stageRequestIds = activePipelineRecipe.stages.map(
           (_, index) => `${requestId}-stage-${index}`,
         );
@@ -17180,6 +17375,8 @@ function App() {
               planFile: planFileNameFor(activeThread, 1),
               requestIds: stageRequestIds,
               placeholderRequestId: requestId,
+              replaceMessageId: regeneration?.originalAnswer.id ?? null,
+              replaceTurnId: regeneration?.turnId ?? null,
               images: storedImages,
               cwd: isGeneralMode ? null : activeProjectData.path,
               // A TERV minden új láncnál tiszta sessiont nyit. A KÓD ugyanazt
@@ -17249,11 +17446,16 @@ function App() {
               stageCount: run.recipe.stages.length,
               stageRole: stage.role,
               stageAgent: stage.agentLabel,
+              stageRoster: pipelineStageRoster(run.recipe),
               stageStatus: stage.succeeded
                 ? "completed"
                 : run.status === "cancelled"
                   ? "cancelled"
                   : "failed",
+              stageStartedAt:
+                runHandle.chain?.stageTimings?.[stage.index]?.startedAt,
+              stageCompletedAt:
+                runHandle.chain?.stageTimings?.[stage.index]?.completedAt,
               verdict: stage.review?.verdict,
               verdictSummary: stage.review?.summary,
             },
@@ -17340,15 +17542,15 @@ function App() {
               images: storedImages,
               provider: runProvider,
               runtime: runtimeOfProvider(runProvider),
-              accessProfile: selectedAccessProfile,
+              accessProfile: runAccessProfile,
               conversationId: requestConversationId,
               sessionId: resumeBridgeSessionId,
               conversationContext: rehydrationContext || null,
-              model: selectedModel,
+              model: runModel,
               // The reasoning slider, like every other model: the Claude panel
               // used to carry an effort of its own, and being set it always
               // won — moving the slider changed nothing for a Claude turn.
-              effort: effectiveEffort,
+              effort: runEffort,
               cwd: activeProjectData.path,
               requestId,
               replaceMessageId: regeneration?.originalAnswer.id,
@@ -17376,8 +17578,8 @@ function App() {
                 ? null
                 : (threadIds[requestThreadKey] ?? null),
               conversationContext: rehydrationContext || null,
-              model: selectedModel,
-              effort: effectiveEffort,
+              model: runModel,
+              effort: runEffort,
               cwd: isGeneralMode ? null : activeProjectData.path,
               requestId,
               replaceMessageId: regeneration?.originalAnswer.id,
@@ -17669,7 +17871,29 @@ function App() {
       notify("Csak a legutóbbi válasz generálható újra");
       return;
     }
-    regenerationTargetRef.current = { source, answer };
+    const answerStageIndex = answer.pipeline?.stageIndex;
+    const regenerationStageIndex = answerStageIndex ?? 0;
+    const visibleStageSettings =
+      showDetailedTrace &&
+      activePipelineRecipe?.stages[regenerationStageIndex]
+        ? {
+            provider: stageProvider(regenerationStageIndex),
+            accessProfile: stageAccessProfile(regenerationStageIndex) ?? null,
+            model: stageValue(regenerationStageIndex, "model") ?? null,
+            effort:
+              stageValue(regenerationStageIndex, "effort") || effectiveEffort,
+          }
+        : undefined;
+    const requestSettings = resolveRegenerationRequestSettings(
+      {
+        provider: selectedProvider,
+        accessProfile: selectedAccessProfile ?? null,
+        model: selectedModel,
+        effort: effectiveEffort,
+      },
+      visibleStageSettings,
+    );
+    regenerationTargetRef.current = { source, answer, requestSettings };
     inputDraftRef.current = source.text;
     if (inputRef.current) {
       inputRef.current.value = source.text;
@@ -17679,9 +17903,9 @@ function App() {
       (source.quoteRefs ?? []).map((quote) => [quote.id, quote.instruction]),
     );
     setComposerQuotes(source.quoteRefs ?? []);
-    // New detailed single-agent turns are no longer created. Historical ones
-    // remain detailed in the timeline, but a regeneration uses compact EGY AI.
-    setShowDetailedTrace(false);
+    // Keep the composer's current mode until submit snapshots it. A compact
+    // answer can therefore be regenerated as a full detailed pipeline when
+    // the user has opened the three-stage rail.
     window.setTimeout(() => composerFormRef.current?.requestSubmit(), 0);
   };
 
@@ -18000,11 +18224,16 @@ function App() {
           stageCount: run.recipe.stages.length,
           stageRole: stageResult.role,
           stageAgent: stageResult.agentLabel,
+          stageRoster: pipelineStageRoster(run.recipe),
           stageStatus: stageResult.succeeded
             ? "completed"
             : run.status === "cancelled"
               ? "cancelled"
               : "failed",
+          stageStartedAt:
+            rerunRun.chain?.stageTimings?.[stageResult.index]?.startedAt,
+          stageCompletedAt:
+            rerunRun.chain?.stageTimings?.[stageResult.index]?.completedAt,
           verdict: stageResult.review?.verdict,
           verdictSummary: stageResult.review?.summary,
         },
@@ -18086,6 +18315,14 @@ function App() {
     }
     if (!event.shiftKey) {
       event.preventDefault();
+      // Részletes (láncos) futás alatt az Enter nem küld a futó AI-nak: egy
+      // véletlen leütés a fázis addigi gondolkodását dobná el. A ⇢ gomb marad
+      // a szándékos terelés útja.
+      if (
+        pipelineProgress &&
+        (runInputMode === "steer" || runInputMode === "stage_next")
+      )
+        return;
       event.currentTarget.form?.requestSubmit();
     }
   };
@@ -18329,11 +18566,16 @@ function App() {
   };
   type ChainStage = {
     stageIndex: number;
+    stageCount: number;
     role: string;
     agent: string;
     iteration: number;
     runId: string;
+    recipeId?: string;
+    stageRoster?: MessagePipeline["stageRoster"];
     status?: MessagePipeline["stageStatus"];
+    startedAt?: number;
+    completedAt?: number;
     verdict?: string;
     verdictSummary?: string;
   };
@@ -18358,11 +18600,16 @@ function App() {
     const stages = stagesByChain.get(key) ?? [];
     stages.push({
       stageIndex: stage.stageIndex,
+      stageCount: stage.stageCount,
       role: stage.stageRole,
       agent: stage.stageAgent,
       iteration: iterationOf(stage),
       runId: stage.runId,
+      recipeId: stage.recipeId,
+      stageRoster: stage.stageRoster,
       status: stage.stageStatus,
+      startedAt: stage.stageStartedAt,
+      completedAt: stage.stageCompletedAt,
       verdict: stage.verdict,
       verdictSummary: stage.verdictSummary,
     });
@@ -18600,12 +18847,51 @@ function App() {
     const selectedVersion = stage
       ? (selectedVersions[chainKey] ?? latestVersion)
       : 1;
-    const chainSlots = slotsOfChain(chain);
+    const storedChainSlots = slotsOfChain(chain);
+    const expectedStageCount = Math.max(
+      ...chain.map((item) => item.stageCount || 0),
+      (storedChainSlots.at(-1) ?? -1) + 1,
+    );
+    const chainSlots = Array.from(
+      { length: expectedStageCount },
+      (_, index) => index,
+    );
     // The strip is built from the chain's slots, so a re-run that skipped the
     // planner still shows a TERV tab -- filled by the version that wrote it.
     const runStages = chainSlots
       .map((slot) => stageForVersion(chain, selectedVersion, slot))
       .filter((item): item is ChainStage => Boolean(item));
+    const chainRecipe = pipelineRecipes.find(
+      (recipe) => recipe.id === chain.find((item) => item.recipeId)?.recipeId,
+    );
+    const chainRoster = chain.find((item) => item.stageRoster?.length)
+      ?.stageRoster;
+    // A STOP may happen in the first provider call, before KÓD or REVIEW ever
+    // create an answer row. They still belong to the run: render their recipe
+    // slots as disabled future phases instead of making a three-stage run look
+    // like an ordinary single-model answer.
+    const runStageTabs = chainSlots.map((slot) => {
+      const stored = stageForVersion(chain, selectedVersion, slot);
+      if (stored) return { ...stored, pending: false };
+      const rosterStage = chainRoster?.find(
+        (item) => item.stageIndex === slot,
+      );
+      const recipeStage = chainRecipe?.stages[slot];
+      const provider = recipeStage?.provider ?? "codex";
+      const model = recipeStage?.model ?? "";
+      return {
+        stageIndex: slot,
+        stageCount: expectedStageCount,
+        role: rosterStage?.stageRole ?? recipeStage?.role ?? `stage-${slot + 1}`,
+        agent:
+          rosterStage?.stageAgent ??
+          `${PROVIDER_LABELS[provider]}${model ? ` · ${shortModelLabel(model)}` : ""}`,
+        iteration: selectedVersion,
+        runId: stage?.runId ?? "",
+        recipeId: stage?.recipeId,
+        pending: true,
+      };
+    });
     const lastStageIndex = chainSlots.at(-1) ?? 0;
     // The result-producing stage is the useful default: TERV for a planning
     // recipe, KÓD for an implementation recipe. VÁLASZ is no longer a separate
@@ -18650,22 +18936,24 @@ function App() {
           <span
             className="pipeline-run-tabs"
             role="tablist"
-            style={{ "--tab-count": runStages.length } as CSSProperties}
+            style={{ "--tab-count": runStageTabs.length } as CSSProperties}
           >
-            {runStages.map((item) => ({
+            {runStageTabs.map((item) => ({
                 key: item.stageIndex,
                 label: STAGE_ROLE_LABELS[item.role] ?? item.role,
                 agent: item.agent,
                 status: item.status,
+                pending: item.pending,
               })).map((item) => (
               <button
                 key={item.key}
                 type="button"
                 role="tab"
                 aria-selected={item.key === selectedStage}
+                disabled={item.pending}
                 // The phase that carries the verdict says so in the strip as
                 // well, so a run's outcome is readable without opening it.
-                className={`pipeline-run-tab${item.status === "failed" ? " is-failed" : item.status === "cancelled" ? " is-stopped" : " is-complete"}${item.key === selectedStage ? " is-active" : ""}${
+                className={`pipeline-run-tab${item.pending ? " is-future" : item.status === "failed" ? " is-failed" : item.status === "cancelled" ? " is-stopped" : " is-complete"}${item.key === selectedStage ? " is-active" : ""}${
                   item.key === lastStageIndex && runVerdict?.verdict
                     ? runVerdict.verdict === "accepted"
                       ? " is-verdict-accepted"
@@ -18673,7 +18961,7 @@ function App() {
                     : ""
                 }`}
                 aria-label={`${item.label}: ${item.agent}`}
-                title={`${item.label} · ${item.agent}${item.status === "cancelled" ? " · leállítva" : item.status === "failed" ? " · hibára futott" : ""}`}
+                title={`${item.label} · ${item.agent}${item.pending ? " · nem indult el" : item.status === "cancelled" ? " · leállítva" : item.status === "failed" ? " · hibára futott" : ""}`}
                 onClick={() => {
                   setSelectedStages((current) => ({
                     ...current,
@@ -18872,16 +19160,18 @@ function App() {
               Boolean(message.changeSummary?.length),
           )?.changeSummary
       : undefined;
-    const chainStarts = [plan, ...chainPlans]
-      .map((item) => item.startedAt)
-      .filter((value): value is number => Number.isFinite(value));
-    const chainEnds = [plan, ...chainPlans]
-      .map((item) => item.completedAt)
-      .filter((value): value is number => Number.isFinite(value));
-    const chainStartedAt =
-      stage && chainStarts.length > 0 ? Math.min(...chainStarts) : undefined;
-    const chainCompletedAt =
-      stage && chainEnds.length > 0 ? Math.max(...chainEnds) : undefined;
+    const selectedIterationTiming = pipelineChainTimingBounds(
+      stage
+        ? chain
+            .filter((item) => item.iteration === selectedVersion)
+            .map((item) => ({
+              startedAt: item.startedAt,
+              completedAt: item.completedAt,
+            }))
+        : [],
+    );
+    const chainStartedAt = selectedIterationTiming.startedAt;
+    const chainCompletedAt = selectedIterationTiming.completedAt;
     const chainInterrupted = stage
       ? messages.some(
           (message) =>
@@ -18897,13 +19187,9 @@ function App() {
         );
     const chainOutcome: TurnProgressCardProps["runOutcome"] = chainInterrupted
       ? "stopped"
-      : (stage ? runVerdict?.verdict : groupAnswer.pipeline?.verdict) ===
-          "accepted"
-        ? "accepted"
-        : (stage ? runVerdict?.verdict : groupAnswer.pipeline?.verdict) ===
-            "changes"
-          ? "changes"
-          : undefined;
+      : pipelineVerdictOutcome(
+          stage ? runVerdict?.verdict : groupAnswer.pipeline?.verdict,
+        );
     return (
       <TurnProgressCard
         key={entry.key}
@@ -19273,7 +19559,7 @@ function App() {
               role="tab"
               aria-selected={stage.index === liveShownStage}
               disabled={!done && !running}
-              className={`pipeline-run-tab${stage.index === liveShownStage ? " is-active" : ""}${done ? " is-complete" : " is-future"}${running ? " is-running" : ""}${stageSettled && pipelineProgress.phase === "failed" ? " is-failed" : ""}`}
+              className={`pipeline-run-tab${stage.index === liveShownStage ? " is-active" : ""}${done ? " is-complete" : running ? "" : " is-future"}${running ? " is-running" : ""}${stageSettled && pipelineProgress.phase === "failed" ? " is-failed" : ""}`}
               aria-label={`${STAGE_ROLE_LABELS[stage.role] ?? stage.role}: ${stage.provider}`}
               title={
                 running
@@ -19314,11 +19600,7 @@ function App() {
           liveAnswer?.interrupted ||
           hasInterruptedAnswerMarker(liveAnswer?.text ?? "")
             ? "stopped"
-            : liveAnswer?.pipeline?.verdict === "accepted"
-            ? "accepted"
-            : liveAnswer?.pipeline?.verdict === "changes"
-              ? "changes"
-              : undefined
+            : pipelineVerdictOutcome(liveAnswer?.pipeline?.verdict)
         }
         runStageCount={liveRunStages.length}
         runStepSlotCount={Math.max(
@@ -19433,11 +19715,7 @@ function App() {
             liveAnswer?.interrupted ||
             hasInterruptedAnswerMarker(liveAnswer?.text ?? "")
               ? "stopped"
-              : liveAnswer?.pipeline?.verdict === "accepted"
-              ? "accepted"
-              : liveAnswer?.pipeline?.verdict === "changes"
-                ? "changes"
-                : undefined
+              : pipelineVerdictOutcome(liveAnswer?.pipeline?.verdict)
           }
           runStageCount={liveRunStages.length}
           runStepSlotCount={Math.max(
@@ -20609,17 +20887,19 @@ function App() {
                     />
                   </div>
                 )}
-                {pipelineProgress && (
-                  <div className="composer-pipeline-progress" role="status">
-                    {`${STAGE_ROLE_LABELS[pipelineProgress.role] ?? pipelineProgress.role} · ${pipelineProgress.agentLabel} · ${pipelineProgress.stageIndex + 1}/${pipelineProgress.stageCount}`}
-                    {/* A chain that is waiting on the user looks identical to one
-                        that is thinking, and that cost a whole run: the stage sat
-                        on an approval nobody knew about until it timed out. */}
-                    {(pendingClaudeApproval || pendingClaudeQuestion) && (
+                {/* A chain that is waiting on the user looks identical to one
+                    that is thinking, and that cost a whole run: the stage sat
+                    on an approval nobody knew about until it timed out. Only
+                    that warning earns a line here — the roster itself already
+                    reads from the stage rows above. */}
+                {pipelineProgress &&
+                  (pendingClaudeApproval || pendingClaudeQuestion) && (
+                    <div className="composer-pipeline-progress" role="status">
+                      {STAGE_ROLE_LABELS[pipelineProgress.role] ??
+                        pipelineProgress.role}
                       <strong className="composer-pipeline-waiting"> · rád vár</strong>
-                    )}
-                  </div>
-                )}
+                    </div>
+                  )}
               </div>
             <div
               className={`composer${reviewCommentTarget ? " is-review-comment" : ""}${activeMode !== "general" && activePipelineRecipe ? " has-multi-ai-toggle" : ""}${showDetailedTrace ? " is-multi-ai-open" : ""}`}

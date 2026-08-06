@@ -693,6 +693,12 @@ pub struct PipelineRunRequest {
     /// second copy of that answer.
     #[serde(default)]
     pub placeholder_request_id: Option<String>,
+    /// Regeneration may turn an earlier single answer into a full chain. The
+    /// first stage replaces that answer in place; later stages append normally.
+    #[serde(default)]
+    pub replace_message_id: Option<String>,
+    #[serde(default)]
+    pub replace_turn_id: Option<String>,
     /// Where the chain starts. A re-run after a rejected review resumes at the
     /// coding stage: the plan was already accepted, and re-planning costs a
     /// model call only to risk drifting away from what the reviewer agreed to.

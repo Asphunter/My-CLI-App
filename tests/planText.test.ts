@@ -7,6 +7,7 @@ import {
   planStepSlice,
   planTextSegments,
   planStepTitle,
+  withoutLeadingStepNumber,
 } from "../src/planText.ts";
 
 const PLAN = [
@@ -33,6 +34,15 @@ test("a generikus lepés előtag helyett a konkrét cím látszik", () => {
   assert.deepEqual(numberedPlanSteps("### 1. lépés: Csomagváz és SCPI-réteg"), [
     { id: "carried-plan-0", step: "Csomagváz és SCPI-réteg" },
   ]);
+});
+
+test("a GUI saját indexe mellől eltűnik a provider duplikált sorszáma", () => {
+  assert.equal(
+    withoutLeadingStepNumber("0. Terv előkészítése és feladatértelmezése"),
+    "Terv előkészítése és feladatértelmezése",
+  );
+  assert.equal(withoutLeadingStepNumber("### 12) Kalibráció"), "Kalibráció");
+  assert.equal(withoutLeadingStepNumber("SOLT mérés"), "SOLT mérés");
 });
 
 test("a cím határa a vastag fej, a gondolatjel vagy a kettőspont", () => {

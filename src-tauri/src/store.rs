@@ -459,6 +459,14 @@ pub struct PendingFollowUp {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct LocalMessagePipelineStage {
+    pub stage_index: i64,
+    pub stage_role: String,
+    pub stage_agent: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct LocalMessagePipeline {
     pub run_id: String,
     /// The recipe that produced this stage. Optional for messages written
@@ -480,6 +488,10 @@ pub struct LocalMessagePipeline {
     pub stage_role: String,
     /// Human-facing agent label for the badge, e.g. "Claude · Opus 5".
     pub stage_agent: String,
+    /// Full effective recipe after GUI overrides, so phases that never started
+    /// still keep their chosen provider/model after STOP and reload.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stage_roster: Vec<LocalMessagePipelineStage>,
     /// Only a review stage has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict: Option<String>,
@@ -2262,6 +2274,21 @@ fn record_agent_answer_in_connection(
             params![canonical_id, conversation_id, text, sequence, turn_id, now],
         )
         .map_err(|error| format!("The final agent answer could not be saved: {error}"))?;
+    if replace_message_id.is_some() {
+        // A regeneration is an ordinary fresh agent turn, even when the row it
+        // replaces came from a pipeline stage. Keeping the old pipeline JSON
+        // would show the previous stage/model badge after the new model ran.
+        transaction
+            .execute(
+                "UPDATE messages
+                 SET pipeline_json = NULL, interaction_json = NULL
+                 WHERE id = ?1 AND conversation_id = ?2",
+                params![canonical_id, conversation_id],
+            )
+            .map_err(|error| {
+                format!("The regenerated answer metadata could not be cleared: {error}")
+            })?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("The final agent answer commit failed: {error}"))?;
@@ -4194,18 +4221,23 @@ pub(crate) fn forget_pipeline_placeholder_answer(
 pub(crate) fn label_pipeline_stage_answer(
     conversation_id: &str,
     request_id: &str,
+    answer_message_id: Option<&str>,
     pipeline: &LocalMessagePipeline,
 ) -> Result<Option<String>, String> {
     let store = open_local_store()?;
     let pipeline_json = serde_json::to_string(pipeline)
         .map_err(|error| format!("A pipeline-metaadat nem szerializálható: {error}"))?;
     let turn_id = format!("request:{request_id}");
+    let answer_message_id = answer_message_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     store
         .connection
         .execute(
             "UPDATE messages SET pipeline_json = ?1
-             WHERE conversation_id = ?2 AND role = 'assistant' AND turn_id = ?3",
-            params![pipeline_json, conversation_id, turn_id],
+             WHERE conversation_id = ?2 AND role = 'assistant'
+               AND (turn_id = ?3 OR id = ?4)",
+            params![pipeline_json, conversation_id, turn_id, answer_message_id],
         )
         .map_err(|error| format!("A szakasz-válasz megjelölése sikertelen: {error}"))?;
     // Handed back to the UI so it renders the row that was just stored instead
@@ -4214,9 +4246,11 @@ pub(crate) fn label_pipeline_stage_answer(
         .connection
         .query_row(
             "SELECT id FROM messages
-             WHERE conversation_id = ?1 AND role = 'assistant' AND turn_id = ?2
-             ORDER BY sequence DESC LIMIT 1",
-            params![conversation_id, turn_id],
+             WHERE conversation_id = ?1 AND role = 'assistant'
+               AND (turn_id = ?2 OR id = ?3)
+             ORDER BY CASE WHEN id = ?3 THEN 0 ELSE 1 END, sequence DESC
+             LIMIT 1",
+            params![conversation_id, turn_id, answer_message_id],
             |row| row.get::<_, String>(0),
         )
         .optional()
@@ -5798,9 +5832,10 @@ pub(crate) fn save_snapshot_in_connection(
                              WHEN excluded.quote_refs_json <> '[]' THEN excluded.quote_refs_json
                              ELSE messages.quote_refs_json
                          END,
-                         -- The sender's layout choice is written once; a later
-                         -- copy that never learned it must not erase it.
-                         detailed = COALESCE(messages.detailed, excluded.detailed),
+                         -- NULL means that this copy never learned the layout.
+                         -- An explicit value is authoritative: regeneration may
+                         -- intentionally turn an older detailed row compact.
+                         detailed = COALESCE(excluded.detailed, messages.detailed),
                          change_summary_json = CASE
                              WHEN excluded.change_summary_json <> '[]'
                                  THEN excluded.change_summary_json
@@ -7421,8 +7456,8 @@ mod tests {
                 origin_device_id: None,
                 images: Vec::new(),
                 quote_refs: Vec::new(),
-                // The sender chose the compact layout for this turn.
-                detailed: Some(false),
+                // The original turn used the detailed layout.
+                detailed: Some(true),
                 change_summary: Vec::new(),
                 pipeline: None,
                 interaction: None,
@@ -7456,6 +7491,20 @@ mod tests {
         }
         save_snapshot_in_connection(&mut connection, snapshot).expect("save conversation");
 
+        let mut regenerated = load_snapshot_from_connection(&connection).expect("load original");
+        regenerated
+            .conversations
+            .values_mut()
+            .next()
+            .expect("conversation")
+            .messages
+            .iter_mut()
+            .find(|message| message.id.as_deref() == Some(question_id.as_str()))
+            .expect("question")
+            .detailed = Some(false);
+        save_snapshot_in_connection(&mut connection, regenerated)
+            .expect("save compact regeneration");
+
         let loaded = load_snapshot_from_connection(&connection).expect("load snapshot");
         let messages = &loaded
             .conversations
@@ -7475,7 +7524,7 @@ mod tests {
         assert_eq!(
             question.detailed,
             Some(false),
-            "the sender's trace layout must survive, otherwise another device falls back to the detailed one"
+            "an explicit compact regeneration must replace the old detailed layout"
         );
         assert_eq!(
             answer.change_summary.len(),
@@ -8351,8 +8400,19 @@ mod tests {
             quote_refs: Vec::new(),
             detailed: None,
             change_summary: Vec::new(),
-            pipeline: None,
-            interaction: None,
+            pipeline: Some(LocalMessagePipeline {
+                run_id: "old-run".to_string(),
+                recipe_id: Some("plan_code_review".to_string()),
+                chain_id: "old-chain".to_string(),
+                iteration: 1,
+                stage_index: 0,
+                stage_count: 3,
+                stage_role: "plan".to_string(),
+                stage_agent: "Régi modell".to_string(),
+                verdict: None,
+                verdict_summary: None,
+            }),
+            interaction: Some(serde_json::json!({ "kind": "steer" })),
         });
         save_snapshot_in_connection(&mut connection, snapshot).expect("save original turn");
         let conversation_id: String = connection
@@ -8393,6 +8453,14 @@ mod tests {
                 original_turn_id.to_string(),
             )],
         );
+        let stale_metadata: (Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT pipeline_json, interaction_json FROM messages WHERE id = ?1",
+                params![original_answer_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("regenerated metadata");
+        assert_eq!(stale_metadata, (None, None));
     }
 
     #[test]

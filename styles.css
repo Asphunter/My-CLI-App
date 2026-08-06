@@ -784,7 +784,7 @@ textarea::placeholder { color: var(--faint); }
 /* The compact stage block sits beside the composer and shares its bottom edge,
    so a taller input grows upward without leaving the controls floating at its
    top. */
-.composer-shell > .composer-controls { position: absolute; top: 0; right: calc(100% + 10px); bottom: 0; z-index: 2; }
+.composer-shell > .composer-controls { position: absolute; top: auto; right: calc(100% + 10px); bottom: 0; z-index: 2; height: var(--composer-control-height); }
 .composer-shell > .composer-controls:has(.composer-model-variants) { z-index: 120; }
 /* One grid child, so the two-column composer layout stays two columns however
    many controls the detailed mode adds. */
@@ -793,11 +793,12 @@ textarea::placeholder { color: var(--faint); }
   --composer-control-effort-width: 80px;
   --composer-control-column-gap: 6px;
   --composer-control-row-height: 27px;
+  --composer-control-height: calc(3 * var(--composer-control-row-height));
   --composer-control-width: 131px;
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  height: 100%;
+  height: var(--composer-control-height);
 }
 .composer-simple-controls {
   position: relative;
@@ -3244,9 +3245,15 @@ textarea::placeholder { color: var(--faint); }
   grid-template-columns:
     var(--detailed-steps-track)
     minmax(0, 1fr);
-  min-height: 140px;
+  min-height: var(--detailed-answer-height, 140px);
   align-items: stretch;
-  background: #000;
+  /* A középső elválasztót a grid maga húzza végig: a válasz-sáv inset
+     árnyéka csak a saját (max-height-tel sapkázott) magasságáig ér, és a
+     hosszabb bal oszlop mellett szakadás látszott a FÁJLOK panel szintjén. */
+  background:
+    linear-gradient(#a59b7c, #a59b7c) var(--detailed-steps-track) 0 / 3px 100%
+      no-repeat,
+    #000;
 }
 
 .detailed-trace-lane {
@@ -3278,13 +3285,14 @@ textarea::placeholder { color: var(--faint); }
   position: absolute;
   top: 0;
   right: 0;
-  bottom: 0;
+  bottom: auto;
   left: var(--detailed-steps-track);
+  height: 100%;
   order: 2;
   overflow-x: hidden;
   overflow-y: auto;
   min-height: 0;
-  max-height: none;
+  max-height: var(--detailed-answer-max-height, 320px);
   padding: 28px 7px 28px 8px;
   border: 0;
   background-color: #000;
@@ -3529,6 +3537,11 @@ textarea::placeholder { color: var(--faint); }
   padding: 0 3px 10px;
 }
 
+.detailed-thinking-list .compact-technical-heading {
+  width: fit-content;
+  max-width: calc(100% - 34px);
+}
+
 .detailed-thinking-list > li:not(.detailed-final-answer),
 .detailed-thinking-list > li:not(.detailed-final-answer) p,
 .detailed-thinking-list > li:not(.detailed-final-answer) button,
@@ -3615,6 +3628,7 @@ textarea::placeholder { color: var(--faint); }
 
 /* Keep the single regenerate action pinned to the answer panel corner. */
 .detailed-answer-toolbar {
+  top: 7px;
   right: 7px;
   left: auto;
   transform: none;
@@ -3946,6 +3960,7 @@ textarea::placeholder { color: var(--faint); }
   .detailed-thinking-lane,
   .detailed-plan-lane {
     position: static;
+    height: auto;
     max-height: 260px;
   }
   .detailed-steps-lane {

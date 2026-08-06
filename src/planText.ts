@@ -120,15 +120,22 @@ export const numberedPlanLines = (text: string) => {
 };
 
 /**
+ * A részletes GUI maga rajzolja ki a lépés sorszámát. A provider todo-címe
+ * ettől még kezdődhet `0.` vagy `1)` előtaggal; megjelenítéskor ezt levesszük,
+ * hogy ne legyen belőle például `1  0. Terv előkészítése`.
+ */
+export const withoutLeadingStepNumber = (text: string) =>
+  text.replace(/^\s*(?:#{1,6}\s+)?\d+[.)]\s+/, "").trim();
+
+/**
  * Egy terv-pont rövid címe. A pontok `1. **Cím** – hosszú magyarázat` alakúak;
  * a LÉPÉSEK listába a cím való, a magyarázat pedig a teljes RAW terv
  * kiemelhető blokkjába. Cím nélkül a hat pont hat bekezdésként állt egymás alatt: a lista
  * a terv szó szerinti másolata volt.
  */
 export const planStepTitle = (line: string) => {
-  const body = line
+  const body = withoutLeadingStepNumber(line)
     .replace(/^#+\s*/, "")
-    .replace(/^\d+[.)]\s+/, "")
     // A model gyakran `1. lepés: Konkrét cim` alakot ir. A generikus
     // "lepés" nem cim; a kettoespont utani resz az, amit a listan latni kell.
     .replace(/^(?:lépés|lepes|step)\s*(?::|[–—-])\s*/i, "")

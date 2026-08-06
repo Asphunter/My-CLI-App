@@ -47,7 +47,7 @@ test("a részletes mód két oszlopban mutatja a lépéseket és az aktuális ta
   );
   assert.match(
     styles,
-    /\.detailed-thinking-lane,[\s\S]*\.detailed-plan-lane \{[\s\S]*position: absolute;[\s\S]*bottom: 0;[\s\S]*left: var\(--detailed-steps-track\);[\s\S]*overflow-y: auto/,
+    /\.detailed-thinking-lane,[\s\S]*\.detailed-plan-lane \{[\s\S]*position: absolute;[\s\S]*bottom: auto;[\s\S]*left: var\(--detailed-steps-track\);[\s\S]*height: 100%;[\s\S]*overflow-y: auto/,
   );
   assert.match(
     styles,
@@ -61,7 +61,7 @@ test("a részletes mód két oszlopban mutatja a lépéseket és az aktuális ta
 
 test("a részletes pipeline nem tart külön VÁLASZ fület", () => {
   assert.doesNotMatch(app, /PIPELINE_ANSWER_TAB/);
-  assert.match(app, /style=\{\{ "--tab-count": runStages\.length \}/);
+  assert.match(app, /style=\{\{ "--tab-count": runStageTabs\.length \}/);
   assert.match(app, /style=\{\{ "--tab-count": liveRunStages\.length \}/);
   assert.doesNotMatch(app, /className="pipeline-run-slider"/);
 });
@@ -243,11 +243,15 @@ test("a részletes nézet fade vonalakkal zár, a fájlpanel pedig keret nélkü
   );
   assert.match(
     styles,
-    /\.detailed-answer-toolbar\s*\{[^}]*right:\s*7px;[^}]*left:\s*auto;[^}]*transform:\s*none/s,
+    /\.detailed-answer-toolbar\s*\{[^}]*top:\s*7px;[^}]*right:\s*7px;[^}]*left:\s*auto;[^}]*transform:\s*none/s,
+  );
+  assert.doesNotMatch(
+    app,
+    /className="detailed-final-answer-toolbar"/,
   );
   assert.match(
     styles,
-    /\.detailed-final-answer-toolbar\s*\{[^}]*right:\s*5px;[^}]*left:\s*auto;[^}]*transform:\s*none/s,
+    /\.detailed-thinking-list \.compact-technical-heading\s*\{[^}]*width:\s*fit-content;[^}]*max-width:\s*calc\(100% - 34px\)/s,
   );
   assert.doesNotMatch(app, /aria-label=\{copiedAnswer/);
 });
@@ -304,4 +308,49 @@ test("a user bubble normál betűsúlyt használ", () => {
     styles,
     /\.user-message \.message-body,[\s\S]*\.user-message \.message-body strong\s*\{\s*font-weight:\s*400\s*!important;/,
   );
+});
+
+test("a lezárt pipeline csak mért időt mutat, a reviewer javításkérése pedig FAIL", () => {
+  assert.match(app, /overallElapsed \|\| \(streaming \? "0:00" : "—"\)/);
+  assert.match(app, /verdict === "changes_requested" \|\| verdict === "changes"/);
+  assert.match(app, /progress\.phase === "finished"[\s\S]*\? "completed"/);
+  assert.match(app, /stageStartedAt: receivedStageTiming\?\.startedAt/);
+  assert.match(app, /stageCompletedAt: receivedStageTiming\?\.completedAt/);
+});
+
+test("a Részletes composer három vezérlősora nem nyúlik a textarea magasságával", () => {
+  assert.match(
+    styles,
+    /\.composer-shell > \.composer-controls\s*\{[^}]*top:\s*auto;[^}]*bottom:\s*0;[^}]*height:\s*var\(--composer-control-height\)/s,
+  );
+  assert.match(
+    styles,
+    /--composer-control-height:\s*calc\(3 \* var\(--composer-control-row-height\)\)/,
+  );
+  assert.match(
+    styles,
+    /\.composer-stage-grid\s*\{[^}]*grid-template-rows:\s*repeat\(3, var\(--composer-control-row-height\)\)[^}]*height:\s*100%/s,
+  );
+});
+
+test("a kevés lépéses VÁLASZ tartalom szerint nő, majd 320 px-nél görget", () => {
+  assert.match(app, /const measureDetailedAnswerHeight = \(\) =>/);
+  assert.match(app, /detailedAnswerPanelHeight\([\s\S]*content\.scrollHeight/);
+  assert.match(app, /observer\.observe\(content\)/);
+  assert.match(app, /ref=\{detailedGridRef\}/);
+  assert.match(
+    styles,
+    /min-height:\s*var\(--detailed-answer-height, 140px\)/,
+  );
+  assert.match(
+    styles,
+    /\.detailed-thinking-lane,[\s\S]*height:\s*100%;[\s\S]*overflow-y:\s*auto;[\s\S]*max-height:\s*var\(--detailed-answer-max-height, 320px\)/,
+  );
+});
+
+test("a megszakított pipeline a még el nem indult fázisokat is megőrzi", () => {
+  assert.match(app, /const expectedStageCount = Math\.max/);
+  assert.match(app, /const runStageTabs = chainSlots\.map/);
+  assert.match(app, /disabled=\{item\.pending\}/);
+  assert.match(app, /item\.pending \? " is-future"/);
 });

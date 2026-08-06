@@ -6,13 +6,22 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import { classifyConnectionError } from "./errors.mjs";
 import { budgetOption, hasCredentials } from "./auth.mjs";
 import { hasAnswer, normalizeQuestionAnswers } from "./questions.mjs";
-import { normalizeGuardPath } from "./paths.mjs";
+import {
+  commandAppearsOutsideWorkspace,
+  containsForbiddenPath,
+  normalizeGuardPath,
+} from "./paths.mjs";
 import {
   classifyTool,
+  alignChecklistToExpectedPlan,
   ENABLED_TOOLS,
+  expectedPlanTitleFor,
+  expectedPlanTitlesFromPrompt,
+  isChecklistMetaTask,
   PLAN_TOOLS,
   planFromTasks,
   planFromTodos,
+  updatedChecklistTask,
   taskKeyForUpdate,
   toolsForProfile,
 } from "./policy.mjs";
@@ -29,6 +38,7 @@ import { streamedStringField } from "./streamingJson.mjs";
 import { TurnInputBroker } from "./turnInputBroker.mjs";
 import { startKimiOpenAdapter } from "./openaiAnthropicAdapter.mjs";
 import { createSdkPrompt } from "./multimodalPrompt.mjs";
+import { reasoningOptionsForProvider } from "./reasoning.mjs";
 
 const PROVIDER = process.env.MIN_AGENT_PROVIDER || "anthropic";
 const PROVIDER_LABEL = process.env.MIN_AGENT_PROVIDER_LABEL
@@ -209,32 +219,7 @@ function missingCredentialsMessage() {
 
 function providerReasoningOptions(effort) {
   process.env.MIN_AGENT_EFFECTIVE_EFFORT = effort;
-  if (PROVIDER === "deepseek") {
-    if (effort === "none" || effort === "off") {
-      return { thinking: { type: "disabled" } };
-    }
-    return {
-      effort: effort === "max" ? "max" : "high",
-      thinking: {
-        type: "enabled",
-        budgetTokens: effort === "max" ? 32_768 : 16_384,
-      },
-    };
-  }
-  if (PROVIDER === "kimi") {
-    const normalized = ["low", "high", "max"].includes(effort) ? effort : "high";
-    return {
-      effort: normalized,
-      // K3 is an always-thinking model. Fixed budgets serialize cleanly on
-      // Anthropic-compatible routes; the raw adapter maps the selected effort
-      // to Kimi's native top-level reasoning_effort.
-      thinking: {
-        type: "enabled",
-        budgetTokens: normalized === "low" ? 4_096 : normalized === "max" ? 32_768 : 16_384,
-      },
-    };
-  }
-  return { effort, thinking: { type: "adaptive" } };
+  return reasoningOptionsForProvider(PROVIDER, effort);
 }
 
 function normalizeCwd(value) {
@@ -244,12 +229,6 @@ function normalizeCwd(value) {
   // prefix has to go or every containment check against an absolute file_path
   // fails and in-project edits are denied.
   return normalizeGuardPath(candidate);
-}
-
-function isInside(root, candidate) {
-  const resolvedRoot = normalizeGuardPath(root);
-  const resolvedCandidate = normalizeGuardPath(candidate);
-  return resolvedCandidate === resolvedRoot || resolvedCandidate.startsWith(`${resolvedRoot}${path.sep}`);
 }
 
 function candidateInputPaths(toolName, input, cwd) {
@@ -262,24 +241,6 @@ function candidateInputPaths(toolName, input, cwd) {
     if (path.isAbsolute(pattern)) values.push(pattern);
   }
   return values.map((value) => path.resolve(cwd, value));
-}
-
-function containsForbiddenPath(candidate, cwd) {
-  if (!isInside(cwd, candidate)) return true;
-  const relative = path.relative(cwd, candidate).replaceAll("\\", "/").toLowerCase();
-  return relative.split("/").some((segment) =>
-    [".git", ".min", "conversation audits", "artifacts"].includes(segment),
-  );
-}
-
-function commandAppearsOutsideWorkspace(command, cwd) {
-  if (typeof command !== "string" || !command.trim()) return false;
-  if (/\.git(?:[\\/]|$)|\.min(?:[\\/]|$)|conversation audits/i.test(command)) return true;
-  const windowsPaths = command.match(/[A-Za-z]:[\\/][^\s"';&|<>]*/g) ?? [];
-  const unixPaths = command.match(/(?:^|\s)(\/(?:[^\s"';&|<>]+))/g) ?? [];
-  return [...windowsPaths, ...unixPaths.map((value) => value.trim())].some((value) =>
-    containsForbiddenPath(path.resolve(cwd, value), cwd),
-  );
 }
 
 function deny(message) {
@@ -614,13 +575,26 @@ function toolItemFor(toolName, input, id, cwd) {
  * nem módosítanak semmit.
  */
 function planFromChecklistCall(turn, toolName, input, toolUseId) {
-  if (toolName === "TodoWrite") return planFromTodos(input);
+  if (toolName === "TodoWrite") {
+    return alignChecklistToExpectedPlan(
+      planFromTodos(input),
+      turn.expectedPlanTitles,
+    );
+  }
   const text = (value) => (typeof value === "string" && value.trim() ? value.trim() : "");
   if (toolName === "TaskCreate") {
     const key = toolUseId ?? randomUUID();
+    const subject = text(input?.subject);
+    const expectedTitle = expectedPlanTitleFor(subject, turn.expectedPlanTitles);
     turn.tasks.set(key, {
       planId: `claude-task:${key}`,
-      subject: text(input?.subject),
+      // Keep the tool internally so TaskUpdate/result ids still resolve, but
+      // do not let an invented "0. preparation" phase replace the accepted
+      // planner list in the GUI.
+      hidden:
+        isChecklistMetaTask(subject)
+        || (turn.expectedPlanTitles.length > 0 && !expectedTitle),
+      subject: expectedTitle ?? subject,
       activeForm: text(input?.activeForm),
       status: "pending",
     });
@@ -639,13 +613,13 @@ function planFromChecklistCall(turn, toolName, input, toolUseId) {
       activeForm: "",
       status: "pending",
     };
-    const status = text(input?.status) || existing.status;
-    turn.tasks.set(key, {
-      planId: existing.planId ?? `claude-task:${key}`,
-      subject: text(input?.subject) || existing.subject,
-      activeForm: text(input?.activeForm) || existing.activeForm,
-      status,
-    });
+    const updated = updatedChecklistTask(
+      existing,
+      input,
+      `claude-task:${key}`,
+    );
+    const status = updated.status;
+    turn.tasks.set(key, updated);
     if (/^(in_progress|inprogress|running|active)$/i.test(status))
       turn.lastActiveTaskKey = key;
     return planFromTasks(turn.tasks);
@@ -1125,6 +1099,7 @@ async function runLiveTurn(request) {
     tasks: new Map(),
     taskKeyById: new Map(),
     lastActiveTaskKey: null,
+    expectedPlanTitles: expectedPlanTitlesFromPrompt(payload.prompt),
     // content_block index → a készülő fájlírás: az azonosítója, az eddig
     // megérkezett nyers JSON és a fájl útvonala, amint kiderül. Ebből él az
     // élő kódnézet, amíg a hívás tart; a blokk lezárásakor kiürül.
@@ -1133,6 +1108,13 @@ async function runLiveTurn(request) {
     inputCloseCode: "no_active_turn",
     inputBroker: null,
   };
+  diagnostic("turn checklist contract", {
+    requestId: request.requestId,
+    expectedPlanTitles: turn.expectedPlanTitles,
+    hasCodingRole:
+      typeof payload.prompt === "string"
+      && payload.prompt.includes("[SZEREP]\nTe vagy a kódoló."),
+  });
   turn.inputBroker = new TurnInputBroker({
     onAccepted: (entry, attemptId) => {
       writeMessage({
@@ -1184,8 +1166,18 @@ async function runLiveTurn(request) {
     let overloadRetries = 0;
     while (true) {
       try {
+        const inputAttemptId = `${request.requestId}:attempt-${++turn.inputAttemptSequence}`;
+        // A late streamInput() call on a query that started with a string makes
+        // the CLI a single-user-turn process. The steer text still arrives, but
+        // its following permission callbacks hit a closed transport. Starting
+        // with this open iterable makes the whole stage bidirectional from its
+        // first user message onward.
+        const inputStream = turn.inputBroker.beginAttempt(
+          inputAttemptId,
+          createTurnPrompt(payload, Boolean(resumeForQuery), cwd),
+        );
         const stream = query({
-          prompt: createTurnPrompt(payload, Boolean(resumeForQuery), cwd),
+          prompt: inputStream,
           options: {
             model,
             ...providerReasoningOptions(effort),
@@ -1221,23 +1213,20 @@ async function runLiveTurn(request) {
             env: { ...process.env, CLAUDE_AGENT_SDK_CLIENT_APP: "min-local-ai-workspace/0.1.0" },
           },
         });
-        const inputAttemptId = `${request.requestId}:attempt-${++turn.inputAttemptSequence}`;
-        const inputTask = stream
-          .streamInput(turn.inputBroker.beginAttempt(inputAttemptId))
-          .catch((error) => {
-            if (!abortController.signal.aborted) abortController.abort(error);
-            throw error;
-          });
         finalResult = null;
         try {
           for await (const event of stream) {
             if (typeof event?.session_id === "string") turn.sessionId = event.session_id;
             handleSdkEvent(turn, event);
-            if (event?.type === "result") finalResult = event;
+            if (event?.type === "result") {
+              finalResult = event;
+              if (turn.inputBroker.recordResult(inputAttemptId)) {
+                turn.inputBroker.finishAttempt(inputAttemptId);
+              }
+            }
           }
         } finally {
           turn.inputBroker.endAttempt(inputAttemptId);
-          await inputTask;
         }
         if (!finalResult) throw new Error(`A ${PROVIDER_LABEL} bridge nem adott turn eredményt.`);
         if (finalResult.subtype !== "success") {

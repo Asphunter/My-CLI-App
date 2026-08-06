@@ -427,6 +427,37 @@ fn append_plan_file(cwd: &str, plan_file: &str, text: &str) -> Result<(), String
         .map_err(|error| format!("A terv-fájl nem írható: {error}"))
 }
 
+/// A futás közben elfogadott felhasználói utasításokat ugyanabba a naplóba írja,
+/// amelyet a teljes lánc snapshotja is tartalmaz.
+fn append_accepted_pipeline_inputs(
+    cwd: &str,
+    plan_file: &str,
+    inputs: &[pipeline::PipelineRunInput],
+) -> Result<(), String> {
+    if inputs.is_empty() {
+        return Ok(());
+    }
+    let body = inputs
+        .iter()
+        .map(|entry| {
+            format!(
+                "- [{} · {}] {}",
+                entry.accepted_at_role,
+                entry.accepted_at,
+                entry.text.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    append_plan_file(
+        cwd,
+        plan_file,
+        &format!(
+            "\n\n## Futás közben hozzáadott felhasználói utasítások\n\n{body}\n"
+        ),
+    )
+}
+
 /// A lezárult kör naplóbejegyzése: mit kért a bíráló, és mire jutott ez a kör.
 fn plan_journal_entry(
     iteration: i64,
@@ -906,6 +937,7 @@ async fn pipeline_send(
                             provider: execution.stage.provider,
                             request_id: request_id.clone(),
                             stage_epoch,
+                            plan_text: execution.carried_plan.clone(),
                             phase,
                             status,
                         }
@@ -1143,6 +1175,28 @@ async fn pipeline_send(
         .ok()
         .and_then(|mut inputs| inputs.remove(&run_id))
         .unwrap_or_default();
+    // Every workspace write must happen before the chain is staged. Writing the
+    // accepted-input journal afterwards changes the restored base hash, so the
+    // frontend can no longer apply the staged implementation and a queued turn
+    // starts from an empty/stale workspace.
+    if let (Some(cwd), Some(plan_file)) =
+        (request.cwd.as_deref(), request.plan_file.as_deref())
+    {
+        if let Err(error) =
+            append_accepted_pipeline_inputs(cwd, plan_file, &accepted_run_inputs)
+        {
+            let _ = codex::emit_main_window(
+                &app,
+                "codex-transport",
+                &serde_json::json!({
+                    "requestId": request.request_ids.first(),
+                    "stage": "plan-file-error",
+                    "detail": error,
+                    "threadId": null,
+                }),
+            );
+        }
+    }
     // Whatever the chain wrote is now staged and the tree is back at its base,
     // exactly as a single turn leaves it. The staged report goes back to the
     // frontend, which applies it the same way it applies a single turn's —
@@ -1172,31 +1226,6 @@ async fn pipeline_send(
         (None, guard) => guard,
     };
     store::finish_pipeline_run(&run_id, status.as_wire(), run_error.as_deref())?;
-    if let (Some(cwd), Some(plan_file)) =
-        (request.cwd.as_deref(), request.plan_file.as_deref())
-    {
-        if !accepted_run_inputs.is_empty() {
-            let body = accepted_run_inputs
-                .iter()
-                .map(|entry| {
-                    format!(
-                        "- [{} · {}] {}",
-                        entry.accepted_at_role,
-                        entry.accepted_at,
-                        entry.text.trim()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let _ = append_plan_file(
-                cwd,
-                plan_file,
-                &format!(
-                    "\n\n## Futás közben hozzáadott felhasználói utasítások\n\n{body}\n"
-                ),
-            );
-        }
-    }
     activity.finish(status == pipeline::RunStatus::Completed);
     Ok(pipeline::PipelineRunResult {
         run_id,
@@ -2068,6 +2097,50 @@ mod tests {
             "## Terv\n\n## v1 bírálat\n"
         );
         assert!(append_plan_file(&cwd, "../kifele.md", "x").is_err());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn accepted_pipeline_inputs_are_part_of_the_staged_plan_journal() {
+        let root = std::env::temp_dir().join(format!(
+            "min-accepted-pipeline-inputs-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("accepted input fixture");
+        let cwd = root.to_string_lossy().to_string();
+        write_plan_file(&cwd, "tervek/live-input.md", "## Terv\n")
+            .expect("initial plan file");
+
+        append_accepted_pipeline_inputs(
+            &cwd,
+            "tervek/live-input.md",
+            &[
+                pipeline::PipelineRunInput {
+                    input_id: "now".to_string(),
+                    accepted_at_stage: 1,
+                    accepted_at_role: "code".to_string(),
+                    text: "  Írd ki a MOST markert.  ".to_string(),
+                    accepted_at: "00:01".to_string(),
+                    carried: false,
+                },
+                pipeline::PipelineRunInput {
+                    input_id: "next".to_string(),
+                    accepted_at_stage: 2,
+                    accepted_at_role: "review".to_string(),
+                    text: "A review ezzel kezdődjön.".to_string(),
+                    accepted_at: "00:02".to_string(),
+                    carried: false,
+                },
+            ],
+        )
+        .expect("accepted inputs append before snapshot staging");
+
+        let text = std::fs::read_to_string(root.join("tervek/live-input.md"))
+            .expect("journal readable");
+        assert!(text.contains("## Futás közben hozzáadott felhasználói utasítások"));
+        assert!(text.contains("- [code · 00:01] Írd ki a MOST markert."));
+        assert!(text.contains("- [review · 00:02] A review ezzel kezdődjön."));
 
         std::fs::remove_dir_all(&root).ok();
     }

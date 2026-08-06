@@ -89,12 +89,20 @@ impl StageRole {
                  fájlt és azt, hogy mi változik. A pontok számát te határozd meg a \
                  feladat érdemi bontása alapján; egy pont egy összefüggő munkaegység \
                  legyen, ne bontsd apró részlépésekre. \
+                 Mindig adj legalább egy számozott tervlépést, egyszerű ellenőrző vagy \
+                 kérdező feladatnál is; ebben a szerepben ne a végső választ add meg a terv helyett. \
+                 A válasz legelső nem üres sora kötelezően `1. <konkrét lépéscím> — ...` \
+                 alakú legyen: ne írj elé bevezetőt vagy címsort. Akkor se hajtsd végre itt az \
+                 eredeti feladatot, ha az azonnali végrehajtást vagy pontos végső választ kér; \
+                 ezt majd a KÓD szakasz teljesíti. \
                  Az eredeti feladat számszerű követelményeit (tartományok, mértékegységek, \
                  darabszámok, nevesített értékek) szó szerint tartsd meg, és a tervben is \
                  ugyanabban a mennyiségben és egységben nevezd meg őket, ahogy a feladat \
                  kimondta — átváltani szabad, de a feladat szerinti alakot is írd ki. \
                  Ha bármelyiket mégis átértelmezed, azt `## Eltérés a feladattól` cím alatt, \
                  tételesen és indoklással írd le. A végén sorold fel a kockázatokat. \
+                 A lépéscímekben a felhasználó saját terminológiáját használd; ne alkoss \
+                 új magyar címkét egy egyszerű `MOST`, `KÖV. FÁZIS` vagy `UTÁNA` kérésre. \
                  Ne írd meg a kódot, csak a tervet."
             }
             Self::PlanReview => {
@@ -109,8 +117,15 @@ impl StageRole {
                  a befejezettet jelöld késznek — a felület ebből mutatja a \
                  felhasználónak, hol tartasz. Ha a terv egy lépése hibás \
                  vagy megvalósíthatatlan, térj el tőle, és a végén írd meg, miben és miért. \
+                 A checklistet mindig az ebben a promptban kapott aktuális tervből építsd fel; \
+                 korábbi menetből megmaradt todo-listát ne folytass. \
+                 Az eredeti feladat és a futás közben elfogadott üzenetek minden pontos \
+                 literálját tartsd be: fájlnév, fájltartalom, parancs, kötelező első sor és \
+                 kért ellenőrző token karakterpontosan teljesüljön. \
                  Futtasd le az érintett teszteket, és az eredményt írd bele az \
-                 összefoglalóba. A végén röviden foglald össze, mit változtattál."
+                 összefoglalóba. A saját változtatásaidból származó elkerülhető warningot, \
+                 hibás karakterkódolást vagy generált cache-fájlt ne hagyd kész állapotban. \
+                 A végén röviden foglald össze, mit változtattál."
             }
             Self::Review => {
                 "Te vagy a bíráló, és NEM te írtad ezt a kódot. Fájlt nem módosíthatsz. \
@@ -127,7 +142,13 @@ impl StageRole {
                  minden tervezett lépés, van-e nem kezelt hibaút vagy mellékhatás, és \
                  szerepel-e ugyanez a hiba máshol is. Ha tudsz parancsot futtatni, \
                  ellenőrizd a teszteket magad, és a megállapításaidat bizonyítékra \
-                 alapozd, ne feltételezésre. Az utolsó sorod pontosan ez legyen: \
+                 alapozd, ne feltételezésre. Az elkerülhető teszt/compiler warning, \
+                 felhasználói kimenetben látható hibás karakterkódolás és véletlenül \
+                 bekerült cache/build artifact valódi minőségi hiba; ne nevezd a futást \
+                 fenntartás nélkül zöldnek, amíg ilyen maradt. Ha a felhasználó pontos \
+                 első sort, checklist-elemet vagy PASS/FAIL tokent kért, azt az előírt \
+                 helyen karakterpontosan add vissza, és a verdikt indoklásában is nevezd meg. \
+                 Az utolsó sorod pontosan ez legyen: \
                  `VERDIKT: ELFOGAD` vagy `VERDIKT: JAVÍTANDÓ`, utána egyetlen mondat \
                  indoklás."
             }
@@ -447,6 +468,15 @@ pub fn stage_prompt_with_comments(
 
     prompt.push_str("[SZEREP]\n");
     prompt.push_str(role.instruction());
+    prompt.push_str(
+        "\n\n[NYELV ÉS STÍLUS]\n\
+         A felhasználó nyelvén válaszolj. Magyar kérésnél természetes, műszaki magyar \
+         megfogalmazást használj; ne találj ki szó szerinti, idegenül hangzó magyar \
+         címkéket belső angol fogalmak fordítására. Legyél tömör, de a bizonyítékokat \
+         és a szükséges mérnöki részleteket ne hagyd el. Küldés előtt olvasd át a \
+         felhasználónak szánt szöveget elütések, értelmetlen szóösszetételek és \
+         fölösleges ismétlés szempontjából.",
+    );
     prompt.push_str("\n\n[STRICT STEP TRACKING PROTOCOL]\n");
     match role {
         StageRole::Code => prompt.push_str(
@@ -692,6 +722,33 @@ pub struct PipelineRunRequest {
     pub run_inputs: Vec<PipelineRunInput>,
 }
 
+/// A planner response is an artifact for the coder, not an ordinary answer.
+/// Accept both `1. ...` and markdown-heading `### 1. ...` forms, but never let
+/// a direct answer or an inherited old todo-list drive the coding stage.
+fn has_numbered_plan_step(text: &str) -> bool {
+    text.lines().any(|line| {
+        let candidate = line.trim().trim_start_matches('#').trim_start();
+        let digit_count = candidate
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .count();
+        if digit_count == 0 {
+            return false;
+        }
+        let remainder = &candidate[digit_count..];
+        let Some(marker) = remainder.chars().next() else {
+            return false;
+        };
+        if marker != '.' && marker != ')' {
+            return false;
+        }
+        remainder[marker.len_utf8()..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PipelineRunInput {
@@ -874,6 +931,11 @@ pub struct PipelineProgress {
     pub provider: AgentProvider,
     pub request_id: String,
     pub stage_epoch: u64,
+    /// The accepted plan that the coding stage is about to execute. Carrying
+    /// it on the progress event avoids a UI race with the separately stored
+    /// plan message, especially for valid one-step plans.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_text: Option<String>,
     pub phase: &'static str,
     pub status: RunStatus,
 }
@@ -888,6 +950,10 @@ pub struct StageExecution {
     pub index: usize,
     pub stage: RecipeStage,
     pub prompt: String,
+    /// The newest plan artifact, when this is the coding stage. This is kept
+    /// separate from the composed prompt so the UI does not have to parse an
+    /// internal prompt envelope to render the carried plan.
+    pub carried_plan: Option<String>,
     /// The session this stage should continue, if one of its runtime is open.
     pub session_id: Option<String>,
     /// Only the first stage carries the user's attachments and context.
@@ -994,6 +1060,15 @@ where
             "{:?}:{:?}:{:?}",
             stage.provider, stage.runtime, stage.access_profile
         );
+        let carried_plan = (stage.role == StageRole::Code)
+            .then(|| {
+                artifacts
+                    .iter()
+                    .rev()
+                    .find(|artifact| artifact.role == StageRole::Plan)
+                    .map(|artifact| artifact.text.clone())
+            })
+            .flatten();
         let execution = StageExecution {
             index,
             stage: stage.clone(),
@@ -1006,6 +1081,7 @@ where
                     .then_some(user_comments.as_deref())
                     .flatten(),
             ),
+            carried_plan,
             // A bíráló nem folytatja a kódoló menetét. Két okból: aki a kódot
             // írta, annak a session-je nem független szem, a bírálandó munkát
             // pedig az artifact-blokk amúgy is átadja. Mellékhatásként a
@@ -1030,6 +1106,12 @@ where
                 "A(z) {} szakasz üres választ adott. Ellenőrizd a szakaszhoz választott modellt.",
                 stage.role.label()
             )),
+            Ok(outcome)
+                if stage.role == StageRole::Plan
+                    && !has_numbered_plan_step(&outcome.text) =>
+            {
+                Err("A TERV szakasz nem adott számozott tervlépést; a KÓD nem indulhat el megbízható terv nélkül.".to_string())
+            }
             other => other,
         };
         match outcome {
@@ -1149,6 +1231,25 @@ mod tests {
     }
 
     #[test]
+    fn planner_prompt_requires_a_real_numbered_plan_in_natural_user_language() {
+        let prompt = stage_prompt(StageRole::Plan, "Ellenőrizd a fájlt.", &[]);
+        assert!(prompt.contains("legalább egy számozott tervlépést"));
+        assert!(prompt.contains("természetes, műszaki magyar"));
+        assert!(prompt.contains("ne a végső választ add meg a terv helyett"));
+        assert!(prompt.contains("legelső nem üres sora"));
+        assert!(prompt.contains("azonnali végrehajtást"));
+    }
+
+    #[test]
+    fn numbered_plan_detection_accepts_plain_and_markdown_heading_steps() {
+        assert!(has_numbered_plan_step("1. Első lépés"));
+        assert!(has_numbered_plan_step("### 1. Első lépés"));
+        assert!(has_numbered_plan_step("2) Második lépés"));
+        assert!(!has_numbered_plan_step("FOLLOW-UP-MISSING"));
+        assert!(!has_numbered_plan_step("## Kockázatok"));
+    }
+
+    #[test]
     fn coding_and_review_prompts_require_ordered_explicit_step_tracking() {
         let code = stage_prompt(StageRole::Code, "Feladat.", &[]);
         let plan_review = stage_prompt(StageRole::PlanReview, "Feladat.", &[]);
@@ -1158,6 +1259,22 @@ mod tests {
             assert!(prompt.contains("exact plan/review title"));
             assert!(prompt.contains("one item in_progress at a time") || prompt.contains("complete checklist"));
         }
+    }
+
+    #[test]
+    fn v4_stage_prompts_protect_literal_outputs_and_release_quality() {
+        let plan = stage_prompt(StageRole::Plan, "UTÁNA hozz létre egy markert.", &[]);
+        assert!(plan.contains("felhasználó saját terminológiáját"));
+        assert!(plan.contains("`MOST`, `KÖV. FÁZIS` vagy `UTÁNA`"));
+
+        let code = stage_prompt(StageRole::Code, "A fájl tartalma pontosan OK legyen.", &[]);
+        assert!(code.contains("karakterpontosan teljesüljön"));
+        assert!(code.contains("elkerülhető warningot"));
+
+        let review = stage_prompt(StageRole::Review, "Az első sor legyen PASS.", &[]);
+        assert!(review.contains("PASS/FAIL tokent"));
+        assert!(review.contains("hibás karakterkódolás"));
+        assert!(review.contains("értelmetlen szóösszetételek"));
     }
 
     #[test]
@@ -1393,6 +1510,25 @@ mod tests {
     }
 
     #[test]
+    fn coding_execution_carries_even_a_one_step_plan_as_ui_data() {
+        let mut recipe = recipe_by_id("plan_code_review").expect("preset");
+        recipe.stages.truncate(2);
+        let recorder = Recorder::with(vec![
+            ok("1. Hordozott tervlepes", Some("plan-session")),
+            ok("KÃ©sz.", Some("code-session")),
+        ]);
+
+        recorder.run(&recipe, "Feladat.", None);
+        let seen = recorder.seen.borrow();
+
+        assert_eq!(seen[0].carried_plan, None);
+        assert_eq!(
+            seen[1].carried_plan.as_deref(),
+            Some("1. Hordozott tervlepes")
+        );
+    }
+
+    #[test]
     fn u1_a_model_switch_inside_one_vendor_continues_the_same_session() {
         // Its own recipe rather than the preset: the preset may well run the
         // same model on both authoring stages — it does today — and then it
@@ -1404,7 +1540,7 @@ mod tests {
             recipe
         };
         let recorder = Recorder::with(vec![
-            ok("terv", Some("claude-session-1")),
+            ok("1. terv", Some("claude-session-1")),
             ok("kod", Some("claude-session-1")),
             ok("VERDIKT: ELFOGAD - rendben.", Some("codex-session-9")),
         ]);
@@ -1443,7 +1579,7 @@ mod tests {
             recipe
         };
         let recorder = Recorder::with(vec![
-            ok("terv", Some("kimi-open-session")),
+            ok("1. terv", Some("kimi-open-session")),
             ok("kod", Some("kimi-code-session")),
         ]);
 
@@ -1472,7 +1608,7 @@ mod tests {
             recipe
         };
         let recorder = Recorder::with(vec![
-            ok("terv", Some("claude-session-1")),
+            ok("1. terv", Some("claude-session-1")),
             ok("kod", Some("claude-session-1")),
             ok("VERDIKT: ELFOGAD - rendben.", Some("claude-session-1")),
         ]);
@@ -1505,7 +1641,7 @@ mod tests {
     fn u2_each_stage_sees_the_task_and_everything_produced_before_it() {
         let recipe = recipe_by_id("plan_code_review").expect("preset");
         let recorder = Recorder::with(vec![
-            ok("A TERVEM: olvasd a math.js-t", None),
+            ok("1. A TERVEM: olvasd a math.js-t", None),
             ok("A KODOM: kijavitottam", None),
             ok("VERDIKT: ELFOGAD - jo.", None),
         ]);
@@ -1531,7 +1667,7 @@ mod tests {
     fn u3_a_failed_stage_stops_the_chain_and_keeps_what_came_before() {
         let recipe = recipe_by_id("plan_code_review").expect("preset");
         let recorder = Recorder::with(vec![
-            ok("terv", None),
+            ok("1. terv", None),
             Err("A kodolo elhasalt.".to_string()),
             ok("ez sosem fut", None),
         ]);
@@ -1545,8 +1681,29 @@ mod tests {
         assert_eq!(outcome.status, RunStatus::Failed);
         assert_eq!(outcome.error.as_deref(), Some("A kodolo elhasalt."));
         assert_eq!(outcome.stages.len(), 2);
-        assert!(outcome.stages[0].succeeded && outcome.stages[0].text == "terv");
+        assert!(outcome.stages[0].succeeded && outcome.stages[0].text == "1. terv");
         assert!(!outcome.stages[1].succeeded);
+    }
+
+    #[test]
+    fn a_direct_planner_answer_cannot_launch_the_coding_stage() {
+        let recipe = recipe_by_id("plan_code_review").expect("preset");
+        let recorder = Recorder::with(vec![
+            ok("FOLLOW-UP-MISSING", None),
+            ok("ez nem futhat le", None),
+        ]);
+        let outcome = recorder.run(&recipe, "Ellenőrizd a markerfájlt.", None);
+
+        assert_eq!(recorder.seen.borrow().len(), 1);
+        assert_eq!(outcome.status, RunStatus::Failed);
+        assert_eq!(outcome.stages.len(), 1);
+        assert!(!outcome.stages[0].succeeded);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("nem adott számozott tervlépést")),
+        );
     }
 
     #[test]
@@ -1554,7 +1711,7 @@ mod tests {
         let recipe = recipe_by_id("plan_code_review").expect("preset");
         // Every stage has to answer something, or the chain stops before the
         // later stages this test is about.
-        let recorder = Recorder::with(vec![ok("terv", None), ok("kod", None), ok("review", None)]);
+        let recorder = Recorder::with(vec![ok("1. terv", None), ok("kod", None), ok("review", None)]);
         recorder.run(&recipe, "Feladat.", None);
         let seen = recorder.seen.borrow();
         assert!(seen[0].is_first);
@@ -1565,7 +1722,7 @@ mod tests {
     fn u7_a_review_asking_for_changes_still_completes_the_run() {
         let recipe = recipe_by_id("plan_code_review").expect("preset");
         let recorder = Recorder::with(vec![
-            ok("terv", None),
+            ok("1. terv", None),
             ok("kod", None),
             ok("VERDIKT: JAVÍTANDÓ - a teszt nem futott le.", None),
         ]);
@@ -1591,7 +1748,7 @@ mod tests {
         // What an unknown model name actually did: a turn that ended cleanly
         // and said nothing at all.
         let recorder = Recorder::with(vec![
-            ok("terv", None),
+            ok("1. terv", None),
             ok(
                 "   
   ", None,
@@ -1615,7 +1772,7 @@ mod tests {
         // Pressing stop cancels the provider request, so the stage comes back
         // with an error. That is the user's doing, not a broken run.
         let recorder = Recorder::with(vec![
-            ok("terv", None),
+            ok("1. terv", None),
             Err("A Claude-kérés megszakítva.".to_string()),
         ]);
         recorder.stop_after.set(Some(2));
@@ -1636,7 +1793,7 @@ mod tests {
     #[test]
     fn l7_stopping_a_chain_starts_no_further_stage() {
         let recipe = recipe_by_id("plan_code_review").expect("preset");
-        let recorder = Recorder::with(vec![ok("terv", None), ok("kod", None)]);
+        let recorder = Recorder::with(vec![ok("1. terv", None), ok("kod", None)]);
         // A provider turn cannot be torn out mid-flight today, so the promise
         // is that nothing further starts once the user has said stop.
         recorder.stop_after.set(Some(2));

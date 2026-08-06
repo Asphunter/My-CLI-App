@@ -34,6 +34,7 @@ import {
   reopenLiveFiles,
   selectLiveFile,
   touchLiveFile,
+  removeLiveFile,
   liveFilePathKey,
   wholeFileHighlight,
   type LiveFileMode,
@@ -334,6 +335,13 @@ type PipelineRecipeStage = {
   maxTurns?: number;
 };
 
+type PipelineStageOverride = {
+  model?: string;
+  effort?: string;
+  provider?: AgentProviderId;
+  accessProfile?: AgentAccessProfile;
+};
+
 type PipelineRecipeBoundaryRole = "plan" | "code";
 type PipelineRecipeReviewTarget = "plan" | "implementation";
 
@@ -416,6 +424,7 @@ type PipelineProgressEvent = {
   provider: AgentProviderId;
   requestId: string;
   stageEpoch: number;
+  planText?: string | null;
   phase: "started" | "finished" | "failed";
   status: "running" | "completed" | "failed" | "cancelled";
 };
@@ -459,6 +468,8 @@ type MessagePipeline = {
   stageCount: number;
   stageRole: string;
   stageAgent: string;
+  /** Persisted outcome of this phase; a stopped phase must not look completed. */
+  stageStatus?: "running" | "completed" | "failed" | "cancelled";
   verdict?: string;
   verdictSummary?: string;
 };
@@ -1085,6 +1096,33 @@ const runtimeOfProvider = (provider: AgentProviderId) =>
     : provider === "anthropic"
       ? "claudeAgentBridge"
       : "compatibleAgentBridge";
+
+/** A run owns the exact stage choices that were visible when it was sent. */
+const recipeWithStageOverrides = (
+  recipe: PipelineRecipe,
+  overrides: PipelineStageOverride[],
+): PipelineRecipe => ({
+  ...recipe,
+  stages: recipe.stages.map((stage, index) => {
+    const override = overrides[index];
+    const provider = override?.provider ?? stage.provider;
+    const providerChanged = provider !== stage.provider;
+    const model =
+      override?.model ??
+      (providerChanged ? PIPELINE_MODELS[provider][0] : stage.model);
+    return {
+      ...stage,
+      provider,
+      runtime: runtimeOfProvider(provider),
+      model,
+      effort: override?.effort ?? stage.effort,
+      accessProfile:
+        override?.accessProfile ??
+        accessProfileOfModel(model ?? null) ??
+        (providerChanged ? undefined : stage.accessProfile),
+    };
+  }),
+});
 
 const providerSupportsImageInput = (
   provider: AgentProviderId,
@@ -3101,8 +3139,17 @@ const mergeWorkItems = (
     // from the first copy, but fill private payloads from whichever copy has
     // them (normally the local secondary list).
     const existing = merged[existingIndex];
+    const statusRank: Record<WorkItemStatus, number> = {
+      running: 0,
+      done: 1,
+      error: 2,
+    };
+    const structural =
+      statusRank[item.status] >= statusRank[existing.status] ? item : existing;
     merged[existingIndex] = {
       ...existing,
+      ...structural,
+      id: existing.id,
       planStepId: existing.planStepId ?? item.planStepId,
       body: existing.body?.trim() ? existing.body : item.body,
       code: existing.code?.trim() ? existing.code : item.code,
@@ -6725,6 +6772,8 @@ type TurnProgressCardProps = {
   runPosition?: "start" | "middle" | "end";
   /** A review says pass or fail in its colour rather than in a chip. */
   runTone?: "accepted" | "changes";
+  /** Chain-wide result shown beside the elapsed time, independent of the open phase. */
+  runOutcome?: "accepted" | "changes" | "stopped";
   runHeader?: ReactNode;
   /** Number of real phases shown by the compact vertical phase rail. */
   runStageCount?: number;
@@ -6778,6 +6827,7 @@ function TurnProgressCard({
   onPreviewImage,
   runPosition,
   runTone,
+  runOutcome,
   runHeader,
   runStageCount,
   runFooter,
@@ -6936,9 +6986,9 @@ function TurnProgressCard({
       : [];
   // A terv kártyáján a terv pontjai a lépések — a tervező menet közbeni
   // munkafolyamat-todo-i nem. Amíg a szövegben nincs két számozott pont,
-  // a lista „készül".
+  // a lista „készül". Egyetlen számozott pont is teljes, érvényes terv.
   const effectivePlannedSteps = isPlanStage
-    ? derivedPlanSteps.length >= 2
+    ? derivedPlanSteps.length >= 1
       ? derivedPlanSteps
       : []
     : plannedSteps;
@@ -7386,6 +7436,33 @@ function TurnProgressCard({
   const answerInterrupted = Boolean(
     answer?.interrupted || hasInterruptedAnswerMarker(answer?.text ?? ""),
   );
+  const runCounterState = streaming
+    ? "running"
+    : answerInterrupted || runOutcome === "stopped"
+      ? "stopped"
+      : runOutcome === "accepted"
+        ? "passed"
+        : runOutcome === "changes"
+          ? "failed"
+          : "complete";
+  const runCounterGlyph =
+    runCounterState === "passed"
+      ? "✓"
+      : runCounterState === "failed"
+        ? "×"
+        : runCounterState === "stopped"
+          ? "■"
+          : "";
+  const runCounterLabel =
+    runCounterState === "running"
+      ? "Az AI dolgozik"
+      : runCounterState === "stopped"
+        ? "A futás leállítva"
+        : runCounterState === "passed"
+          ? "A futás eredménye: PASS"
+          : runCounterState === "failed"
+            ? "A futás eredménye: FAIL"
+            : "A válasz kész";
   // A verdikt a kártya alján, színes sávként hangzik el; a nyers záró sor
   // ilyenkor kétszer mondaná ugyanazt.
   const answerBodyText = answer?.pipeline?.verdict
@@ -7754,27 +7831,22 @@ function TurnProgressCard({
         aria-label="Lépések és gondolkodás"
       >
         <div
-          className={`compact-answer-status-rail detailed-answer-status-rail${
-            streaming
-              ? " is-running"
-              : answerInterrupted
-                ? " is-interrupted"
-                : " is-complete"
-          }`}
-          aria-label={
-            streaming
-              ? "Az AI dolgozik"
-              : answerInterrupted
-                ? "A válasz megszakítva"
-                : "A válasz kész"
-          }
+          className={`compact-answer-status-rail detailed-answer-status-rail is-${runCounterState}`}
+          aria-label={runCounterLabel}
         >
           {!runHeader && (
             <div className="compact-answer-provider-mark">
               <ProviderMark provider={provider} />
             </div>
           )}
-          <time>{overallElapsed || "0:00"}</time>
+          <time>
+            {runCounterGlyph && (
+              <span className="detailed-run-result-mark" aria-hidden="true">
+                {runCounterGlyph}
+              </span>
+            )}
+            <span>{overallElapsed || "0:00"}</span>
+          </time>
         </div>
 
         <div
@@ -7833,7 +7905,11 @@ function TurnProgressCard({
                         planDrafting ? undefined : selectedStep.id === step.id
                       }
                     >
-                      <span className="trace-step-marker is-numbered" aria-hidden="true">
+                      <span
+                        className="trace-step-marker is-numbered"
+                        data-step-number={stepIndex + 1}
+                        aria-hidden="true"
+                      >
                         <span className="detailed-step-index">{stepIndex + 1}</span>
                       </span>
                       <span className="trace-step-name">{step.step}</span>
@@ -7916,8 +7992,14 @@ function TurnProgressCard({
                           data-plan-step-index={segment.stepIndex}
                           key={`plan-step-${segment.stepIndex}`}
                         >
-                          <span className="detailed-plan-step-number" aria-hidden="true">
-                            {segment.number}.
+                          <span
+                            className="detailed-plan-step-number"
+                            aria-hidden="true"
+                          >
+                            <span className="detailed-plan-step-index">
+                              {segment.number}
+                            </span>
+                            <span className="detailed-plan-step-period">.</span>
                           </span>
                           <div className="detailed-plan-step-body">
                             {answerParagraphs(
@@ -11200,6 +11282,7 @@ function App() {
                     stageCount: progress.stageCount,
                     stageRole: progress.role,
                     stageAgent: progress.agentLabel,
+                    stageStatus: progress.status,
                   },
                 }
               : message,
@@ -11229,7 +11312,8 @@ function App() {
         // miközben a terv tíz lépést vett fel — a lista sosem látszott.
         const carriedPlanText =
           progress.role === "code"
-            ? chainRun.planText ??
+            ? progress.planText ??
+              chainRun.planText ??
               messagesRef.current.find(
                 (message) => message.id === chainRun.liveMessageId,
               )?.text ??
@@ -11246,7 +11330,7 @@ function App() {
         // A TERV kártya lépéslistája is most születik meg: ugyanezek a
         // pontok, kész státusszal — a terv-fázis alatt a lista üres volt,
         // mert a dump közben még nem léteztek a pontok.
-        if (progress.role === "code" && carriedSteps.length >= 2) {
+        if (progress.role === "code" && carriedSteps.length >= 1) {
           const outerRequestId = progress.requestId.replace(/-stage-\d+$/, "");
           const planStageTurnId = `request:${outerRequestId}-stage-${progress.stageIndex - 1}`;
           setPlanHistory((current) => ({
@@ -11262,7 +11346,7 @@ function App() {
           }));
         }
         const stageSteps =
-          carriedSteps.length >= 2
+          carriedSteps.length >= 1
             ? carriedSteps
             : progress.role === "plan"
               ? []
@@ -11278,7 +11362,7 @@ function App() {
           explanation: "",
           steps: stageSteps,
           activeStepId: null,
-          source: carriedSteps.length >= 2 ? "carried-plan" : "fallback",
+          source: carriedSteps.length >= 1 ? "carried-plan" : "fallback",
           startedAt: stageStartedAt,
           stepTimes: stageSteps.length && carriedSteps.length < 2
             ? { [stageSteps[0].id]: { startedAt: stageStartedAt } }
@@ -13748,7 +13832,7 @@ function App() {
           run.provider === "codex" &&
           codexEvent.requestId &&
           run.chainRequestIds.has(codexEvent.requestId) &&
-          run.plan.steps.length >= 2
+          run.plan.steps.length >= 1
         ) {
           const inferencePath =
             extractFilePath(codexEvent.payload) ?? activity.detail;
@@ -13824,6 +13908,35 @@ function App() {
           (activityWithStep.kind === "file"
             ? activityWithStep.detail
             : undefined);
+        if (
+          activityWithStep.kind === "file" &&
+          activityWithStep.status === "error" &&
+          filePath
+        ) {
+          const cwd =
+            runProjectPathRef.current || activeProjectPathRef.current;
+          const livePath = relativeChangePath(filePath, cwd);
+          void invoke<string | null>("read_code_file", {
+            cwd,
+            path: filePath,
+          })
+            .then((disk) => {
+              if (disk === null) {
+                discardLiveFile(ownerConversationId, livePath);
+                return;
+              }
+              queueLiveFile(ownerConversationId, {
+                path: livePath,
+                content: disk,
+                streaming: false,
+                mode: activityWithStep.beforeCode ? "edit" : "write",
+                highlight: wholeFileHighlight(disk),
+                sequence: activityWithStep.id,
+              });
+            })
+            .catch(() => discardLiveFile(ownerConversationId, livePath));
+          return;
+        }
         if (
           activityWithStep.kind === "file" &&
           (activityWithStep.afterCode?.trim() || activityWithStep.code?.trim())
@@ -14043,7 +14156,7 @@ function App() {
           // ezek váltják le a tárban is. (Ez volt a „3 pont a 6 helyett".)
           run.planText = checkpointAnswerText;
           const bornSteps = numberedPlanSteps(checkpointAnswerText);
-          if (bornSteps.length >= 2) {
+          if (bornSteps.length >= 1) {
             updateOwnedPlanState(ownerConversationId, {
               turnId: uiTurnId,
               explanation: "",
@@ -15698,6 +15811,26 @@ function App() {
       liveFileFrameRef.current = window.requestAnimationFrame(flushLiveFiles);
   };
 
+  const discardLiveFile = (
+    conversationId: string | null | undefined,
+    value: string,
+  ) => {
+    if (!conversationId || !value) return;
+    const projectRoot =
+      runProjectPathRef.current || activeProjectPathRef.current;
+    const path = canonicalLiveFilePath(value, projectRoot);
+    liveFilePendingRef.current.delete(
+      `${conversationId}\u0000${liveFilePathKey(path)}`,
+    );
+    setLiveFilesByConversation((current) => ({
+      ...current,
+      [conversationId]: removeLiveFile(
+        current[conversationId] ?? EMPTY_LIVE_FILES,
+        path,
+      ),
+    }));
+  };
+
   /**
    * Egy fájlművelet vetülete az élő nézetre.
    *
@@ -15985,6 +16118,12 @@ function App() {
         )
       : undefined;
     if (settings.pipelineEnabled && !recipe) return false;
+    const queuedRecipeSnapshot = recipe
+      ? recipeWithStageOverrides(
+          recipe,
+          (settings.pipelineStageOverrides ?? []) as PipelineStageOverride[],
+        )
+      : undefined;
 
     followUpDispatchingRef.current.add(followUp.id);
     const requestId = createRequestId();
@@ -16006,6 +16145,13 @@ function App() {
           },
         );
       }
+      // A follow-upot még azelőtt fogyasszuk el tartósan, hogy a beszélgetés
+      // mentése új SQLite-írást indítana. A fordított sorrendben a snapshot és
+      // a queue törlése egymásra tudott zárni, ezért egy már lefutott üzenet a
+      // következő appindításkor ismét megjelent a sorban.
+      if (!(await deleteFollowUp(followUp.id))) return false;
+      sessionQueuedFollowUpsRef.current.delete(followUp.id);
+
       const previousMessages = conversation.messages ?? [];
       const liveMessageId = agentAnswerMessageId(
         followUp.conversationId,
@@ -16047,7 +16193,7 @@ function App() {
             : [
                 {
                   id: "client-pre-plan",
-                  step: prePlanStepLabel(recipe?.stages[0]?.role),
+                  step: prePlanStepLabel(queuedRecipeSnapshot?.stages[0]?.role),
                   status: "inProgress",
                 },
               ],
@@ -16077,14 +16223,14 @@ function App() {
         completedTerminalTurns: new Set(),
         chainRequestIds: new Set(),
         planTaskToCarriedStep: {},
-        chain: recipe ? { recipe } : undefined,
+        chain: queuedRecipeSnapshot
+          ? { recipe: queuedRecipeSnapshot }
+          : undefined,
         answerStream: { meta: null, pending: "", frame: null },
         status: "streaming",
         turnCompleted: false,
       });
       updateOwnedPlanState(followUp.conversationId, initialPlan);
-      sessionQueuedFollowUpsRef.current.delete(followUp.id);
-      await deleteFollowUp(followUp.id);
 
       let sessionId: string | null = null;
       if (settings.provider !== "codex") {
@@ -16120,7 +16266,10 @@ function App() {
               placeholderRequestId: requestId,
               images: storedImages,
               cwd: projectPath,
-              sessionId,
+              // A pipeline új szerepkörrel és új checklisttel indul. A régi
+              // provider-session Task állapota különben átfolyik az új TERV-be;
+              // a beszélgetési előzményt a külön conversationContext viszi.
+              sessionId: null,
               conversationContext: conversationContext || null,
               maxBudgetUsd: settings.maxBudgetUsd ?? null,
               stageOverrides: settings.pipelineStageOverrides ?? [],
@@ -16156,6 +16305,11 @@ function App() {
               stageCount: run.recipe.stages.length,
               stageRole: stage.role,
               stageAgent: stage.agentLabel,
+              stageStatus: stage.succeeded
+                ? "completed"
+                : run.status === "cancelled"
+                  ? "cancelled"
+                  : "failed",
               verdict: stage.review?.verdict,
               verdictSummary: stage.review?.summary,
             },
@@ -16264,13 +16418,24 @@ function App() {
     }
   };
 
-  const deleteFollowUp = async (id: string) => {
-    try {
-      await invoke("pending_followup_delete", { id });
-      dispatchRunInput({ type: "delete_follow_up", id });
-    } catch (error) {
-      notify(`A következő üzenet nem törölhető: ${String(error)}`, "notify");
+  const deleteFollowUp = async (id: string): Promise<boolean> => {
+    const retryDelaysMs = [0, 100, 250, 500, 1_000, 2_000];
+    let lastError: unknown = null;
+    for (const delayMs of retryDelaysMs) {
+      if (delayMs > 0) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, delayMs));
+      }
+      try {
+        await invoke("pending_followup_delete", { id });
+        dispatchRunInput({ type: "delete_follow_up", id });
+        return true;
+      } catch (error) {
+        lastError = error;
+        if (!/database is (?:locked|busy)/i.test(String(error))) break;
+      }
     }
+    notify(`A következő üzenet nem törölhető: ${String(lastError)}`, "notify");
+    return false;
   };
 
   const moveFollowUp = async (id: string, direction: -1 | 1) => {
@@ -16321,7 +16486,7 @@ function App() {
     );
     setComposerQuotes(followUp.quoteRefs);
     setPendingImages(followUp.attachments);
-    await deleteFollowUp(followUp.id);
+    if (!(await deleteFollowUp(followUp.id))) return;
     if (send) window.setTimeout(() => composerFormRef.current?.requestSubmit(), 0);
     else window.setTimeout(() => inputRef.current?.focus(), 0);
   };
@@ -16623,6 +16788,22 @@ function App() {
     // path; re-running a chain is a whole-run action.
     const runPipeline =
       detailedRequest && Boolean(activePipelineRecipe) && !regeneration;
+    const pipelineStageOverridesSnapshot: PipelineStageOverride[] =
+      runPipeline && activePipelineRecipe
+        ? activePipelineRecipe.stages.map((_, index) => ({
+            model: stageValue(index, "model") || undefined,
+            effort: stageValue(index, "effort") || undefined,
+            provider: stageProvider(index),
+            accessProfile: stageAccessProfile(index),
+          }))
+        : [];
+    const pipelineRecipeSnapshot =
+      runPipeline && activePipelineRecipe
+        ? recipeWithStageOverrides(
+            activePipelineRecipe,
+            pipelineStageOverridesSnapshot,
+          )
+        : undefined;
     const userSequence = regeneration?.source.sequence ?? nextTimelineSequence();
     const liveSequence =
       regeneration?.originalAnswer.sequence ?? nextTimelineSequence();
@@ -16869,9 +17050,7 @@ function App() {
       chainRequestIds: new Set(),
       planTaskToCarriedStep: {},
       chain:
-        runPipeline && activePipelineRecipe
-          ? { recipe: activePipelineRecipe }
-          : undefined,
+        pipelineRecipeSnapshot ? { recipe: pipelineRecipeSnapshot } : undefined,
       answerStream: { meta: null, pending: "", frame: null },
       status: "preparing",
       turnCompleted: false,
@@ -17003,15 +17182,12 @@ function App() {
               placeholderRequestId: requestId,
               images: storedImages,
               cwd: isGeneralMode ? null : activeProjectData.path,
-              sessionId: resumeBridgeSessionId,
+              // A TERV minden új láncnál tiszta sessiont nyit. A KÓD ugyanazt
+              // a friss sessiont folytatja, a REVIEW pedig eleve külön indul.
+              sessionId: null,
               conversationContext: rehydrationContext || null,
               maxBudgetUsd: Number(claudeBudgetUsd),
-              stageOverrides: activePipelineRecipe.stages.map((_, index) => ({
-                model: stageValue(index, "model") || undefined,
-                effort: stageValue(index, "effort") || undefined,
-                provider: stageProvider(index),
-                accessProfile: stageAccessProfile(index),
-              })),
+              stageOverrides: pipelineStageOverridesSnapshot,
             },
           });
           // Stopping a chain used to throw away everything it had already
@@ -17073,6 +17249,11 @@ function App() {
               stageCount: run.recipe.stages.length,
               stageRole: stage.role,
               stageAgent: stage.agentLabel,
+              stageStatus: stage.succeeded
+                ? "completed"
+                : run.status === "cancelled"
+                  ? "cancelled"
+                  : "failed",
               verdict: stage.review?.verdict,
               verdictSummary: stage.review?.summary,
             },
@@ -17634,6 +17815,31 @@ function App() {
     const stageRequestIds = chainRecipe.stages.map(
       (_, index) => `${requestId}-stage-${index}`,
     );
+    const rerunStageOverrides: PipelineStageOverride[] = chainRecipe.stages.map(
+      (_, index) => ({
+        model:
+          pipelineStageOverrides[`${chainRecipe.id}:${index}`]?.model ??
+          undefined,
+        effort:
+          pipelineStageOverrides[`${chainRecipe.id}:${index}`]?.effort ??
+          undefined,
+        provider:
+          pipelineStageOverrides[`${chainRecipe.id}:${index}`]?.provider ??
+          undefined,
+        accessProfile:
+          pipelineStageOverrides[`${chainRecipe.id}:${index}`]
+            ?.accessProfile ??
+          accessProfileOfModel(
+            pipelineStageOverrides[`${chainRecipe.id}:${index}`]?.model ??
+              chainRecipe.stages[index]?.model ??
+              null,
+          ),
+      }),
+    );
+    const rerunRecipeSnapshot = recipeWithStageOverrides(
+      chainRecipe,
+      rerunStageOverrides,
+    );
     // Az újrafuttatás is egy futás: a gazdája az a beszélgetés, amelyikből
     // indult — nem az, amelyik közben a képernyőre kerül. Azonosító nélkül
     // nincs kinek címezni, tehát el sem indul.
@@ -17664,7 +17870,7 @@ function App() {
         activeMode === "general"
           ? null
           : normalizeConversationKey(activeProjectData.path),
-      provider: "anthropic",
+      provider: rerunRecipeSnapshot.stages[startStage]?.provider ?? "anthropic",
       clientTurnId: `request:${requestId}`,
       stageEpoch: 1,
       // Az újrafuttatásnak nincs saját élő buborékja: a szakaszok a maguk
@@ -17682,7 +17888,7 @@ function App() {
       // A `startStage` előtti szakaszok ebben a körben nem futnak: enélkül a
       // sáv úgy rajzolná őket, mintha még sorra kerülnének.
       chain: {
-        recipe: chainRecipe,
+        recipe: rerunRecipeSnapshot,
         resume: { chainKey, startStage, iteration, carried },
       },
       answerStream: { meta: null, pending: "", frame: null },
@@ -17729,39 +17935,12 @@ function App() {
           placeholderRequestId: null,
           images: [],
           cwd: activeMode === "general" ? null : activeProjectData.path,
-          sessionId:
-            claudeSessionIds[
-              bridgeSessionCacheKey(
-                threadKey,
-                (pipelineStageOverrides[
-                  `${chainRecipe.id}:${startStage}`
-                ]?.provider ??
-                  chainRecipe.stages[startStage]?.provider ??
-                  "anthropic") as AgentProviderId,
-              )
-            ] ??
-            null,
+          // A seedelt terv és a reviewer kifogása teljes kontextus; egy régi
+          // provider-session todo-listája csak összekeverné a javítási kört.
+          sessionId: null,
           conversationContext: null,
           maxBudgetUsd: Number(claudeBudgetUsd),
-          stageOverrides: chainRecipe.stages.map((_, index) => ({
-            model:
-              pipelineStageOverrides[`${chainRecipe.id}:${index}`]?.model ??
-              undefined,
-            effort:
-              pipelineStageOverrides[`${chainRecipe.id}:${index}`]?.effort ??
-              undefined,
-            provider:
-              pipelineStageOverrides[`${chainRecipe.id}:${index}`]?.provider ??
-              undefined,
-            accessProfile:
-              pipelineStageOverrides[`${chainRecipe.id}:${index}`]
-                ?.accessProfile ??
-              accessProfileOfModel(
-                pipelineStageOverrides[`${chainRecipe.id}:${index}`]?.model ??
-                  chainRecipe.stages[index]?.model ??
-                  null,
-              ),
-          })),
+          stageOverrides: rerunStageOverrides,
           startStage,
           seedArtifacts,
           retryFeedback: objection,
@@ -17821,6 +18000,11 @@ function App() {
           stageCount: run.recipe.stages.length,
           stageRole: stageResult.role,
           stageAgent: stageResult.agentLabel,
+          stageStatus: stageResult.succeeded
+            ? "completed"
+            : run.status === "cancelled"
+              ? "cancelled"
+              : "failed",
           verdict: stageResult.review?.verdict,
           verdictSummary: stageResult.review?.summary,
         },
@@ -18149,6 +18333,7 @@ function App() {
     agent: string;
     iteration: number;
     runId: string;
+    status?: MessagePipeline["stageStatus"];
     verdict?: string;
     verdictSummary?: string;
   };
@@ -18177,6 +18362,7 @@ function App() {
       agent: stage.stageAgent,
       iteration: iterationOf(stage),
       runId: stage.runId,
+      status: stage.stageStatus,
       verdict: stage.verdict,
       verdictSummary: stage.verdictSummary,
     });
@@ -18470,6 +18656,7 @@ function App() {
                 key: item.stageIndex,
                 label: STAGE_ROLE_LABELS[item.role] ?? item.role,
                 agent: item.agent,
+                status: item.status,
               })).map((item) => (
               <button
                 key={item.key}
@@ -18478,7 +18665,7 @@ function App() {
                 aria-selected={item.key === selectedStage}
                 // The phase that carries the verdict says so in the strip as
                 // well, so a run's outcome is readable without opening it.
-                className={`pipeline-run-tab is-complete${item.key === selectedStage ? " is-active" : ""}${
+                className={`pipeline-run-tab${item.status === "failed" ? " is-failed" : item.status === "cancelled" ? " is-stopped" : " is-complete"}${item.key === selectedStage ? " is-active" : ""}${
                   item.key === lastStageIndex && runVerdict?.verdict
                     ? runVerdict.verdict === "accepted"
                       ? " is-verdict-accepted"
@@ -18486,7 +18673,7 @@ function App() {
                     : ""
                 }`}
                 aria-label={`${item.label}: ${item.agent}`}
-                title={`${item.label} · ${item.agent}`}
+                title={`${item.label} · ${item.agent}${item.status === "cancelled" ? " · leállítva" : item.status === "failed" ? " · hibára futott" : ""}`}
                 onClick={() => {
                   setSelectedStages((current) => ({
                     ...current,
@@ -18695,6 +18882,28 @@ function App() {
       stage && chainStarts.length > 0 ? Math.min(...chainStarts) : undefined;
     const chainCompletedAt =
       stage && chainEnds.length > 0 ? Math.max(...chainEnds) : undefined;
+    const chainInterrupted = stage
+      ? messages.some(
+          (message) =>
+            message.role === "assistant" &&
+            message.pipeline &&
+            chainKeyOf(message.pipeline) === chainKey &&
+            iterationOf(message.pipeline) === selectedVersion &&
+            (message.interrupted || hasInterruptedAnswerMarker(message.text)),
+        )
+      : Boolean(
+          groupAnswer.interrupted ||
+            hasInterruptedAnswerMarker(groupAnswer.text),
+        );
+    const chainOutcome: TurnProgressCardProps["runOutcome"] = chainInterrupted
+      ? "stopped"
+      : (stage ? runVerdict?.verdict : groupAnswer.pipeline?.verdict) ===
+          "accepted"
+        ? "accepted"
+        : (stage ? runVerdict?.verdict : groupAnswer.pipeline?.verdict) ===
+            "changes"
+          ? "changes"
+          : undefined;
     return (
       <TurnProgressCard
         key={entry.key}
@@ -18714,6 +18923,7 @@ function App() {
               : "changes"
             : undefined
         }
+        runOutcome={chainOutcome}
         runHeader={runHeader}
         runStageCount={runStages.length}
         runFooter={runFooter}
@@ -18893,6 +19103,7 @@ function App() {
     const cwd = runProjectPathRef.current || activeProjectPath;
     for (const activity of activities) {
       if (activity.kind !== "file") continue;
+      if (activity.status === "error") continue;
       const rawPath = activity.detail?.trim();
       if (!rawPath || !/\.[a-z0-9]{1,8}$/i.test(rawPath)) continue;
       const readOnly =
@@ -19099,6 +19310,16 @@ function App() {
       <TurnProgressCard
         runPosition="end"
         runHeader={liveRunHeader}
+        runOutcome={
+          liveAnswer?.interrupted ||
+          hasInterruptedAnswerMarker(liveAnswer?.text ?? "")
+            ? "stopped"
+            : liveAnswer?.pipeline?.verdict === "accepted"
+            ? "accepted"
+            : liveAnswer?.pipeline?.verdict === "changes"
+              ? "changes"
+              : undefined
+        }
         runStageCount={liveRunStages.length}
         runStepSlotCount={Math.max(
           activePlan.steps.length,
@@ -19208,6 +19429,16 @@ function App() {
         <TurnProgressCard
           runPosition={pipelineProgress ? "end" : undefined}
           runHeader={liveRunHeader}
+          runOutcome={
+            liveAnswer?.interrupted ||
+            hasInterruptedAnswerMarker(liveAnswer?.text ?? "")
+              ? "stopped"
+              : liveAnswer?.pipeline?.verdict === "accepted"
+              ? "accepted"
+              : liveAnswer?.pipeline?.verdict === "changes"
+                ? "changes"
+                : undefined
+          }
           runStageCount={liveRunStages.length}
           runStepSlotCount={Math.max(
             activePlan.steps.length,

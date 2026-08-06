@@ -29,6 +29,12 @@ test("a lista a pontok címét mutatja, nem a teljes bekezdést", () => {
   );
 });
 
+test("a generikus lepés előtag helyett a konkrét cím látszik", () => {
+  assert.deepEqual(numberedPlanSteps("### 1. lépés: Csomagváz és SCPI-réteg"), [
+    { id: "carried-plan-0", step: "Csomagváz és SCPI-réteg" },
+  ]);
+});
+
 test("a cím határa a vastag fej, a gondolatjel vagy a kettőspont", () => {
   assert.equal(
     planStepTitle("1. **Tesztfájl vagy kézi ellenőrzési lista** – Ellenőrizni kell:"),
@@ -106,6 +112,35 @@ test("a beszámozott kockázatok nem lépések", () => {
       "README.md — rövid használati leírás",
     ],
   );
+});
+
+const PLAN_WITH_NUMBERED_HEADINGS = [
+  "## Implementációs terv",
+  "",
+  "### 1. Projektváz és adatmodell",
+  "A csomag és az alap típusok létrehozása.",
+  "",
+  "### 2. Determinisztikus zajmotor",
+  "Seedelt véletlenszám-generátor.",
+  "",
+  "### 3. Jelgenerátor modul",
+  "A virtuális RF-forrás megvalósítása.",
+  "",
+  "## Kockázatok",
+  "",
+  "1. Adatmodell-túlspecifikáció",
+  "2. Determinizmus megtörése",
+].join("\n");
+
+test("a markdown címsorba írt számozott lépések megelőzik a későbbi kockázatlistát", () => {
+  assert.deepEqual(
+    numberedPlanSteps(PLAN_WITH_NUMBERED_HEADINGS).map((step) => step.step),
+    ["Projektváz és adatmodell", "Determinisztikus zajmotor", "Jelgenerátor modul"],
+  );
+  const second = planStepSlice(PLAN_WITH_NUMBERED_HEADINGS, 1);
+  assert.ok(second.startsWith("### 2. Determinisztikus zajmotor"));
+  assert.ok(second.includes("Seedelt véletlenszám-generátor"));
+  assert.ok(!second.includes("Jelgenerátor modul"));
 });
 
 test("az utolsó lépés szelete a következő fejlécig tart, nem a kockázatokig", () => {

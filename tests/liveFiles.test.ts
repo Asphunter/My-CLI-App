@@ -10,6 +10,7 @@ import {
   followLiveFiles,
   openLiveFiles,
   reopenLiveFiles,
+  removeLiveFile,
   selectLiveFile,
   touchLiveFile,
   liveFilePathKey,
@@ -172,4 +173,12 @@ test("azonos fájlnév különböző könyvtárban külön tab marad", () => {
     "src/app.js",
     "tests/app.js",
   ]);
+});
+
+test("failed provider writes are removed from the live preview", () => {
+  let state = touchLiveFile(EMPTY_LIVE_FILES, touch("a.py", "disk", 1));
+  state = touchLiveFile(state, touch("b.py", "preview only", 2));
+  state = removeLiveFile(state, "B.PY");
+  assert.deepEqual(state.files.map((file) => file.path), ["a.py"]);
+  assert.equal(state.activePath, "a.py");
 });

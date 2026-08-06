@@ -33,3 +33,41 @@ export function stripExtendedLengthPrefix(value) {
 export function normalizeGuardPath(value) {
   return path.resolve(stripExtendedLengthPrefix(value));
 }
+
+/** True only for the workspace root itself or one of its descendants. */
+export function isInsideWorkspace(root, candidate) {
+  const resolvedRoot = normalizeGuardPath(root);
+  const resolvedCandidate = normalizeGuardPath(candidate);
+  return resolvedCandidate === resolvedRoot
+    || resolvedCandidate.startsWith(`${resolvedRoot}${path.sep}`);
+}
+
+/** Blocks both escapes from the workspace and this client's private state. */
+export function containsForbiddenPath(candidate, cwd) {
+  if (!isInsideWorkspace(cwd, candidate)) return true;
+  const relative = path.relative(cwd, candidate).replaceAll("\\", "/").toLowerCase();
+  return relative.split("/").some((segment) =>
+    [".git", ".min", "conversation audits", "artifacts"].includes(segment),
+  );
+}
+
+/**
+ * Finds absolute paths embedded in a shell command without truncating quoted
+ * Windows paths at their first space. That truncation used to turn
+ * `cd "C:/Users/.../My Project"` into `C:/Users/.../My`, so a command that
+ * explicitly entered its own workspace was denied as an escape.
+ */
+export function commandAppearsOutsideWorkspace(command, cwd) {
+  if (typeof command !== "string" || !command.trim()) return false;
+  if (/\.git(?:[\\/]|$)|\.min(?:[\\/]|$)|conversation audits/i.test(command)) return true;
+
+  const quotedPaths = [];
+  for (const pattern of [/"([A-Za-z]:[\\/][^"]*)"/g, /'([A-Za-z]:[\\/][^']*)'/g]) {
+    for (const match of command.matchAll(pattern)) quotedPaths.push(match[1]);
+  }
+  const unquoted = command.replace(/"[^"]*"|'[^']*'/g, " ");
+  const windowsPaths = unquoted.match(/[A-Za-z]:[\\/][^\s"';&|<>]*/g) ?? [];
+  const unixPaths = unquoted.match(/(?:^|\s)(\/(?:[^\s"';&|<>]+))/g) ?? [];
+  return [...quotedPaths, ...windowsPaths, ...unixPaths.map((value) => value.trim())]
+    .some((value) => containsForbiddenPath(path.resolve(cwd, value), cwd));
+}

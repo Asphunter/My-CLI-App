@@ -66,10 +66,25 @@ test("a részletes pipeline nem tart külön VÁLASZ fület", () => {
   assert.doesNotMatch(app, /className="pipeline-run-slider"/);
 });
 
+test("az egylépéses tervet a KÓD nem cseréli előkészítő placeholderre", () => {
+  assert.match(app, /derivedPlanSteps\.length >= 1/);
+  assert.match(app, /progress\.role === "code" && carriedSteps\.length >= 1/);
+  assert.match(app, /source: carriedSteps\.length >= 1 \? "carried-plan" : "fallback"/);
+  assert.match(app, /if \(bornSteps\.length >= 1\)/);
+  assert.doesNotMatch(app, /carriedSteps\.length >= 2/);
+  assert.doesNotMatch(app, /derivedPlanSteps\.length >= 2/);
+});
+
 test("a terv mindig teljes marad, és a kiválasztott lépés bekezdését emeli ki", () => {
   assert.match(app, /planTextSegments\(answer\?\.text \?\? ""\)/);
   assert.match(app, /data-plan-step-index=\{segment\.stepIndex\}/);
   assert.match(app, /segment\.stepIndex === selectedStepIndex \? " is-highlighted"/);
+  assert.match(app, /className="detailed-plan-step-index">[\s\S]*\{segment\.number\}/);
+  assert.match(app, /className="detailed-plan-step-period">\.<\/span>/);
+  assert.match(styles, /\.detailed-plan-step\.is-highlighted\s*\{[^}]*border:\s*0;[^}]*background:\s*transparent/s);
+  assert.match(styles, /\.detailed-plan-step-number\s*\{[^}]*width:\s*21px;[^}]*height:\s*21px;[^}]*place-items:\s*center/s);
+  assert.match(styles, /\.detailed-plan-step-index\s*\{[^}]*position:\s*absolute;[^}]*inset:\s*0;[^}]*place-items:\s*center/s);
+  assert.match(styles, /\.detailed-plan-step\.is-highlighted \.detailed-plan-step-number\s*\{[^}]*place-items:\s*center;[^}]*border-radius:\s*50%;[^}]*background:\s*#a59b7c;[^}]*color:\s*#050607/s);
   assert.doesNotMatch(app, /detailed-plan-view-toggle/);
   assert.doesNotMatch(app, />RAW</);
   assert.doesNotMatch(app, />RÉSZLET</);
@@ -91,7 +106,31 @@ test("a fázisválasztó felirat nélküli, vertikális provider rail", () => {
   assert.match(styles, /\.detailed-run-shell \.pipeline-run-tabs\s*\{[^}]*flex-direction:\s*column/s);
   assert.match(styles, /\.detailed-run-shell \.pipeline-run-tabs::after\s*\{[^}]*width:\s*1px[^}]*background:\s*rgba\(165, 155, 124, \.58\)/s);
   assert.match(styles, /\.detailed-run-shell \.pipeline-run-tab\.is-running::after/);
-  assert.match(styles, /\.detailed-run-shell \.pipeline-run-tab\.is-verdict-accepted\s*\{[^}]*#2ee174/s);
+  assert.match(styles, /\.detailed-run-shell \.pipeline-run-tab\s*\{[^}]*border-radius:\s*50%/s);
+  assert.match(styles, /\.detailed-run-shell \.pipeline-run-tab\.is-verdict-accepted,[\s\S]*border:\s*1px solid #39434b !important/);
+  assert.doesNotMatch(styles, /\.detailed-run-shell \.pipeline-run-tab\.is-verdict-accepted\s*\{[^}]*#2ee174/s);
+});
+
+test("az élő fázissáv a futáskor ténylegesen kiválasztott providereket mutatja", () => {
+  assert.match(app, /const recipeWithStageOverrides = \(/);
+  assert.match(app, /const provider = override\?\.provider \?\? stage\.provider/);
+  assert.match(app, /const pipelineRecipeSnapshot =/);
+  assert.match(app, /pipelineRecipeSnapshot \? \{ recipe: pipelineRecipeSnapshot \} : undefined/);
+  assert.match(app, /const livePipelineRecipe = viewedRun\?\.chain\?\.recipe \?\? activePipelineRecipe/);
+  assert.match(app, /provider: stage\.provider/);
+});
+
+test("a futáseredményt a számláló jelzi, nem a REVIEW fázis kerete", () => {
+  assert.match(app, /runOutcome\?: "accepted" \| "changes" \| "stopped"/);
+  assert.match(app, /const chainInterrupted = stage/);
+  assert.match(app, /iterationOf\(message\.pipeline\) === selectedVersion/);
+  assert.match(app, /runCounterState === "passed"[\s\S]*\? "✓"/);
+  assert.match(app, /runCounterState === "failed"[\s\S]*\? "×"/);
+  assert.match(app, /runCounterState === "stopped"[\s\S]*\? "■"/);
+  assert.match(app, /className="detailed-run-result-mark"/);
+  assert.match(styles, /\.detailed-answer-status-rail\.is-passed time\s*\{ color: #72d493; \}/);
+  assert.match(styles, /\.detailed-answer-status-rail\.is-failed time\s*\{ color: #ee737d; \}/);
+  assert.match(styles, /\.detailed-answer-status-rail\.is-stopped time\s*\{ color: #d7b56d; \}/);
 });
 
 test("a lezárt futás kiválasztott fázisát bal oldali, jobbra mutató nyíl jelöli", () => {
@@ -217,14 +256,20 @@ test("a részletes lépések kompakt számozott timeline-on és fade szeparátor
   assert.match(styles, /\.detailed-step-list\s*\{[^}]*gap:\s*1px/s);
   assert.match(styles, /\.trace-step-target \+ \.trace-step-target::before\s*\{[^}]*height:\s*1px;[^}]*linear-gradient/s);
   assert.match(app, /className="detailed-step-index">\{stepIndex \+ 1\}<\/span>/);
-  assert.match(styles, /\.detailed-step-list \.trace-step-marker,[\s\S]*width:\s*21px;[\s\S]*align-items:\s*center;[\s\S]*justify-content:\s*center;[\s\S]*border-radius:\s*6px/);
+  assert.match(app, /data-step-number=\{stepIndex \+ 1\}/);
+  assert.match(styles, /\.detailed-step-list \.trace-step-marker\s*\{[^}]*width:\s*21px;[^}]*align-items:\s*center;[^}]*justify-content:\s*center;[^}]*border-radius:\s*50%/s);
   assert.match(styles, /\.detailed-step-list \.detailed-step-index\s*\{[^}]*color:\s*#a59b7c;[^}]*font-size:\s*9px;[^}]*text-align:\s*center/s);
+  assert.match(styles, /\.detailed-step-list \.trace-step-row\.is-selected \.trace-step-marker,[\s\S]*background:\s*#a59b7c;[\s\S]*color:\s*#050607/);
   assert.match(styles, /\.detailed-step-list \.trace-step-row,[\s\S]*background:\s*transparent !important/);
   assert.match(app, /className="detailed-step-changes"/);
   assert.match(app, /className="trace-total-elapsed detailed-steps-total"/);
   assert.doesNotMatch(app, /completedStepCount/);
   assert.doesNotMatch(app, /detailed-steps-summary/);
   assert.doesNotMatch(app, /className="detailed-inline-changes"/);
+});
+
+test("a user D ikon is kör alakú", () => {
+  assert.match(styles, /\.user-avatar\s*\{[^}]*border:\s*1px solid #77745f;[^}]*border-radius:\s*50%/s);
 });
 
 test("a technikai részleteket csak a felirat nyitja és nincs mellette nyíl", () => {
@@ -247,6 +292,11 @@ test("a verdikt konklúziója a REVIEW utolsó lépése alatt marad", () => {
   assert.match(app, /\{isReviewStage && runFooter\}/);
   assert.doesNotMatch(app, /A bíráló elfogadta/);
   assert.match(styles, /\.detailed-step-list > \.pipeline-answer-next\s*\{[^}]*border:\s*0/s);
+});
+
+test("a KÓD a pipeline eseményben kapott tervet használja a tárolási verseny előtt", () => {
+  assert.match(app, /progress\.planText \?\?[\s\S]*chainRun\.planText \?\?/);
+  assert.match(app, /planText\?: string \| null/);
 });
 
 test("a user bubble normál betűsúlyt használ", () => {

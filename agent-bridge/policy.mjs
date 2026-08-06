@@ -118,7 +118,7 @@ export function planFromTodos(input) {
  */
 export function planFromTasks(tasks) {
   return [...tasks.values()]
-    .filter((task) => task && task.status !== "deleted")
+    .filter((task) => task && !task.hidden && task.status !== "deleted")
     .map((task, index) => {
       const step = (task.subject || task.activeForm || "").trim();
       if (!step) return null;
@@ -133,6 +133,95 @@ export function planFromTasks(tasks) {
       };
     })
     .filter(Boolean);
+}
+
+const cleanPlanTitle = (value) => String(value ?? "")
+  .trim()
+  .replace(/^#{1,6}\s*/, "")
+  .replace(/^\d+[.)]\s*/, "")
+  .replaceAll("**", "")
+  .split(/\s+[—–]\s+/, 1)[0]
+  .trim();
+
+const comparablePlanTitle = (value) => cleanPlanTitle(value)
+  .toLocaleLowerCase("hu-HU")
+  .replace(/[^\p{L}\p{N}]+/gu, " ")
+  .trim();
+
+/** Model workflow scaffolding is never a user plan step. */
+export function isChecklistMetaTask(value) {
+  const normalized = comparablePlanTitle(value);
+  if (!normalized) return false;
+  const hadZeroPrefix = /^\s*0[.)]\s*/.test(String(value ?? ""));
+  return hadZeroPrefix && (
+    /\b(előkészítés|előkészítése|értelmezés|értelmezése|checklist|todo)\b/u.test(normalized)
+    || /\b(kódolás|terv|feladat)\b/u.test(normalized)
+  );
+}
+
+/**
+ * Extracts the planner's numbered titles from a coding-stage prompt. Review
+ * stages intentionally return no titles: their checklist has a different,
+ * review-specific contract.
+ */
+export function expectedPlanTitlesFromPrompt(prompt) {
+  if (typeof prompt !== "string" || !prompt.includes("[SZEREP]\nTe vagy a kódoló.")) return [];
+  const marker = "A tervező terve:\n";
+  const start = prompt.indexOf(marker);
+  if (start < 0) return [];
+  const remainder = prompt.slice(start + marker.length);
+  const endCandidates = [
+    remainder.indexOf("\nVáltozott fájlok:"),
+    remainder.indexOf("\nA terv bírálata:"),
+    remainder.indexOf("\nA kódoló összefoglalója:"),
+    remainder.indexOf("\nA korábbi review:"),
+    remainder.indexOf("\n[SZEREP]"),
+  ].filter((index) => index >= 0);
+  const section = remainder.slice(0, endCandidates.length ? Math.min(...endCandidates) : undefined);
+  return section
+    .split(/\r?\n/)
+    .map((line) => line.match(/^\s*(?:#{1,6}\s*)?\d+[.)]\s+(.+)$/)?.[1] ?? "")
+    .map(cleanPlanTitle)
+    .filter(Boolean);
+}
+
+/** The exact planner title corresponding to a model-authored checklist row. */
+export function expectedPlanTitleFor(subject, expectedTitles) {
+  const candidate = comparablePlanTitle(subject);
+  if (!candidate) return null;
+  return expectedTitles.find((title) => {
+    const expected = comparablePlanTitle(title);
+    return candidate === expected || candidate.startsWith(`${expected} `) || expected.startsWith(`${candidate} `);
+  }) ?? null;
+}
+
+/**
+ * A full TodoWrite list is visible only through rows that correspond to the
+ * accepted plan. Model-invented "0. preparation" phases must not replace it.
+ */
+export function alignChecklistToExpectedPlan(steps, expectedTitles) {
+  if (!Array.isArray(expectedTitles) || expectedTitles.length === 0) return steps;
+  return steps.flatMap((step) => {
+    const expected = expectedPlanTitleFor(step?.step, expectedTitles);
+    return expected ? [{ ...step, step: expected }] : [];
+  });
+}
+
+/**
+ * Applies a TaskUpdate without losing bridge-only metadata. In particular,
+ * an invented preparation task remains hidden when the model changes it from
+ * pending to in_progress/completed.
+ */
+export function updatedChecklistTask(existing, input, fallbackPlanId) {
+  const text = (value) =>
+    typeof value === "string" && value.trim() ? value.trim() : "";
+  return {
+    ...existing,
+    planId: existing?.planId ?? fallbackPlanId,
+    subject: text(input?.subject) || existing?.subject || "",
+    activeForm: text(input?.activeForm) || existing?.activeForm || "",
+    status: text(input?.status) || existing?.status || "pending",
+  };
 }
 
 /**

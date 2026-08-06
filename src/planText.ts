@@ -6,7 +6,7 @@
  * kiemelhető blokkokként tartja meg. Egy szöveg, egy lista.
  */
 
-const NUMBERED_LINE = /^(\d+)[.)]\s+\S/;
+const NUMBERED_LINE = /^(?:#{1,6}\s+)?(\d+)[.)]\s+\S/;
 const HEADING_LINE = /^#{1,6}\s/;
 
 /**
@@ -25,12 +25,11 @@ const mainStepRun = (lines: string[]): number[] => {
   let headingSinceLast = false;
   for (const [index, line] of lines.entries()) {
     const trimmed = line.trim();
-    if (HEADING_LINE.test(trimmed)) {
-      headingSinceLast = true;
+    const match = trimmed.match(NUMBERED_LINE);
+    if (!match) {
+      if (HEADING_LINE.test(trimmed)) headingSinceLast = true;
       continue;
     }
-    const match = trimmed.match(NUMBERED_LINE);
-    if (!match) continue;
     const number = Number(match[1]);
     const current = runs[runs.length - 1];
     const previous = current?.[current.length - 1];
@@ -128,8 +127,11 @@ export const numberedPlanLines = (text: string) => {
  */
 export const planStepTitle = (line: string) => {
   const body = line
-    .replace(/^\d+[.)]\s+/, "")
     .replace(/^#+\s*/, "")
+    .replace(/^\d+[.)]\s+/, "")
+    // A model gyakran `1. lepés: Konkrét cim` alakot ir. A generikus
+    // "lepés" nem cim; a kettoespont utani resz az, amit a listan latni kell.
+    .replace(/^(?:lépés|lepes|step)\s*(?::|[–—-])\s*/i, "")
     .trim();
   const bold = body.match(/^\*\*(.+?)\*\*/) ?? body.match(/^__(.+?)__/);
   // Vastag fej nélkül az első gondolatjel vagy kettőspont a cím határa. A

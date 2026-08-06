@@ -1263,6 +1263,16 @@ fn append_agent_text_delta(buffer: &mut String, delta: &str) {
     }
 }
 
+fn replace_with_clean_final_text(buffer: &mut String, candidate: &str) {
+    // The bridge's terminal text is already reconstructed from the last
+    // complete assistant message. It is intentionally shorter than the raw
+    // provider result when that result glued tool narration to the answer, so
+    // length must never decide which one wins.
+    if !candidate.trim().is_empty() {
+        *buffer = candidate.to_string();
+    }
+}
+
 pub fn send(
     app: tauri::AppHandle,
     request: crate::agent::AgentTurnRequest,
@@ -1567,9 +1577,7 @@ pub fn send(
                             // between-tools narration glued on. "Longer wins"
                             // kept exactly that junk, so the clean text wins
                             // whenever the bridge produced one.
-                            if !payload_text.trim().is_empty() {
-                                final_text = payload_text.to_string();
-                            }
+                            replace_with_clean_final_text(&mut final_text, payload_text);
                         }
                         // The bridge emits this normalized event and then a
                         // terminal turn_completed frame. The latter is the
@@ -1625,9 +1633,7 @@ pub fn send(
                         .and_then(Value::as_str)
                         .or_else(|| message.payload.get("finalText").and_then(Value::as_str))
                         .unwrap_or_default();
-                    if payload_text.len() > final_text.len() {
-                        final_text = payload_text.to_string();
-                    }
+                    replace_with_clean_final_text(&mut final_text, payload_text);
                     total_cost_usd = message.payload.get("totalCostUsd").and_then(Value::as_f64);
                     events.push(emit_compat_event(
                         &app,
@@ -2062,6 +2068,25 @@ fn kill_process_tree(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_terminal_answer_replaces_longer_glued_narration() {
+        let mut accumulated =
+            "FINAL-PASS\n\nEllenőrzök.Első vizsgálat.Második vizsgálat.Végső összegzés".to_string();
+
+        replace_with_clean_final_text(&mut accumulated, "FINAL-PASS\n\nMinden ellenőrzés sikeres.");
+
+        assert_eq!(accumulated, "FINAL-PASS\n\nMinden ellenőrzés sikeres.");
+    }
+
+    #[test]
+    fn empty_terminal_answer_does_not_erase_streamed_text() {
+        let mut accumulated = "részleges, de hasznos válasz".to_string();
+
+        replace_with_clean_final_text(&mut accumulated, "  \n");
+
+        assert_eq!(accumulated, "részleges, de hasznos válasz");
+    }
 
     /// Subscription detection must read a login without ever surfacing tokens.
     #[test]

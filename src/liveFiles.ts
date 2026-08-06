@@ -207,6 +207,30 @@ export const closeLiveFile = (
   return { files, activePath: next?.path ?? null, following: false };
 };
 
+/**
+ * Sikertelen provider-iraskor az elo nezeti fajl nem valtozas: a modell csak
+ * elkezdte kisugarozni a tervezett tartalmat, de az nem kerult lemezre.
+ */
+export const removeLiveFile = (
+  state: LiveFileState,
+  path: string,
+): LiveFileState => {
+  const key = liveFilePathKey(path);
+  const files = state.files.filter(
+    (file) => liveFilePathKey(file.path) !== key,
+  );
+  if (files.length === state.files.length) return state;
+  const removedWasActive =
+    liveFilePathKey(state.activePath ?? "") === key;
+  return {
+    ...state,
+    files,
+    activePath: removedWasActive
+      ? files.filter((file) => !file.closed).at(-1)?.path ?? null
+      : state.activePath,
+  };
+};
+
 /** Minden elrejtett fül vissza a sávra. */
 export const reopenLiveFiles = (state: LiveFileState): LiveFileState => {
   const files = state.files.map((file) => ({ ...file, closed: false }));

@@ -431,24 +431,44 @@ fn claim_project_root(
     Ok(ProjectClaim { root })
 }
 
+/// A terv-fájl útvonalának feloldása a projekt alá, vagy elutasítás.
+///
+/// Az `is_absolute()` Windowson nem tartalmazási ellenőrzés: a `\terv.md` és a
+/// `C:terv.md` *nem* absolute, a `Path::join` viszont eldobja mellettük a
+/// bázist, így a kiírás a projekten kívülre kerül. Ezért a gyökér- és
+/// prefix-komponenst külön ki kell zárni (ezt teszi a `guard_relative_path`),
+/// és a végleges szülőnek is a projekt alatt kell maradnia — a mappát csak az
+/// ellenőrzés *után* hozzuk létre, hogy egy elutasított út ne hagyjon nyomot.
+fn resolve_plan_file(cwd: &str, plan_file: &str) -> Result<std::path::PathBuf, String> {
+    let relative = codex::guard_relative_path(plan_file)
+        .map_err(|_| format!("A terv-fájl útvonala nem megengedett: {plan_file}"))?;
+    let root = std::fs::canonicalize(cwd)
+        .map_err(|error| format!("A projekt mappája nem oldható fel: {error}"))?;
+    let target = root.join(&relative);
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| format!("A terv-fájl útvonala nem megengedett: {plan_file}"))?
+        .to_os_string();
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("A terv-fájl útvonala nem megengedett: {plan_file}"))?
+        .to_path_buf();
+    std::fs::create_dir_all(&parent)
+        .map_err(|error| format!("A tervek mappája nem hozható létre: {error}"))?;
+    let canonical_parent = std::fs::canonicalize(&parent)
+        .map_err(|error| format!("A tervek mappája nem oldható fel: {error}"))?;
+    if !canonical_parent.starts_with(&root) {
+        return Err(format!("A terv-fájl útvonala nem megengedett: {plan_file}"));
+    }
+    Ok(canonical_parent.join(file_name))
+}
+
 /// A terv-szakasz kimenetének kiírása a projekt alá.
 ///
 /// Csak relatív, `..`-mentes utat fogad: a fájl a munkaterületen belül marad,
 /// bárhonnan is jött a kérés.
 fn write_plan_file(cwd: &str, plan_file: &str, text: &str) -> Result<(), String> {
-    let relative = std::path::Path::new(plan_file);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|part| matches!(part, std::path::Component::ParentDir))
-    {
-        return Err(format!("A terv-fájl útvonala nem megengedett: {plan_file}"));
-    }
-    let target = std::path::Path::new(cwd).join(relative);
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("A tervek mappája nem hozható létre: {error}"))?;
-    }
+    let target = resolve_plan_file(cwd, plan_file)?;
     std::fs::write(&target, text)
         .map_err(|error| format!("A terv-fájl nem írható: {error}"))
 }
@@ -460,19 +480,7 @@ fn write_plan_file(cwd: &str, plan_file: &str, text: &str) -> Result<(), String>
 /// továbbra is a promptból dolgoznak —, a haszna a gitben olvasható előzmény.
 fn append_plan_file(cwd: &str, plan_file: &str, text: &str) -> Result<(), String> {
     use std::io::Write;
-    let relative = std::path::Path::new(plan_file);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|part| matches!(part, std::path::Component::ParentDir))
-    {
-        return Err(format!("A terv-fájl útvonala nem megengedett: {plan_file}"));
-    }
-    let target = std::path::Path::new(cwd).join(relative);
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("A tervek mappája nem hozható létre: {error}"))?;
-    }
+    let target = resolve_plan_file(cwd, plan_file)?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -2258,6 +2266,16 @@ mod tests {
 
         assert!(write_plan_file(&cwd, "../kifele.md", "x").is_err());
         assert!(write_plan_file(&cwd, "C:/abszolut.md", "x").is_err());
+        // Windowson a gyökér- és a meghajtó-relatív alak nem `is_absolute()`,
+        // a `join` mellettük mégis eldobja a bázist: e két eset korábban
+        // átment, és a lemez gyökerére, illetve az Indítópultba írt.
+        assert!(write_plan_file(&cwd, "\\kifele.md", "x").is_err());
+        assert!(write_plan_file(&cwd, "C:kifele.md", "x").is_err());
+        assert!(write_plan_file(&cwd, "\\Windows\\Temp\\kifele.md", "x").is_err());
+        assert!(append_plan_file(&cwd, "\\kifele.md", "x").is_err());
+        assert!(append_plan_file(&cwd, "C:kifele.md", "x").is_err());
+        // Az elutasított út nyomot sem hagy: a mappa csak ellenőrzés után jön létre.
+        assert!(!root.join("Windows").exists());
 
         // A kör naplója ugyanannak a fájlnak a végére kerül, nem egy másolatba.
         append_plan_file(&cwd, "tervek/2026-07-29-smith-v1.md", "\n\n## v1 bírálat\n")

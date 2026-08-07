@@ -1551,7 +1551,7 @@ fn is_guard_cloud_placeholder(_metadata: &fs::Metadata) -> bool {
     false
 }
 
-fn guard_relative_path(path: &str) -> Result<PathBuf, String> {
+pub(crate) fn guard_relative_path(path: &str) -> Result<PathBuf, String> {
     let relative = PathBuf::from(path);
     if relative.is_absolute()
         || relative.components().any(|component| {
@@ -3334,6 +3334,67 @@ fn kill_process_tree(pid: u32) {
 #[cfg(not(windows))]
 fn kill_process_tree(_pid: u32) {}
 
+/// A Codex gyerekfolyamat utolsó stderr-sorai.
+///
+/// Az app-server a saját hibáit (kvóta kimerült, hitelesítés, hálózat) a
+/// stderr-re írja, a protokollon viszont csak egy üres turn jön vissza. Amíg ez
+/// a csatorna `Stdio::null()` volt, egy „elérted a használati limitet" hibából a
+/// felhasználó annyit látott, hogy „a szakasz üres választ adott — ellenőrizd a
+/// modellt", és a rossz helyen keresett. A puffer szándékosan kicsi: ez
+/// diagnosztika, nem napló.
+const CODEX_STDERR_KEPT_LINES: usize = 12;
+const CODEX_STDERR_LINE_LIMIT: usize = 400;
+
+#[derive(Clone, Default)]
+struct CodexStderrTail(Arc<Mutex<VecDeque<String>>>);
+
+impl CodexStderrTail {
+    fn watch(&self, stderr: std::process::ChildStderr) {
+        let lines = Arc::clone(&self.0);
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let mut kept: String = trimmed.chars().take(CODEX_STDERR_LINE_LIMIT).collect();
+                if trimmed.chars().count() > CODEX_STDERR_LINE_LIMIT {
+                    kept.push('…');
+                }
+                let Ok(mut lines) = lines.lock() else { break };
+                if lines.len() == CODEX_STDERR_KEPT_LINES {
+                    lines.pop_front();
+                }
+                lines.push_back(kept);
+            }
+        });
+    }
+
+    /// A hibaüzenethez fűzhető, emberi olvasásra szánt kivonat.
+    fn summary(&self) -> Option<String> {
+        let lines = self.0.lock().ok()?;
+        // A provider hibái „ERROR:" előtaggal jönnek, és ezekből az utolsó a
+        // beszédes; ha nincs ilyen, a teljes farok is jobb, mint a semmi.
+        let chosen: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.to_ascii_lowercase().contains("error"))
+            .collect();
+        let text = if chosen.is_empty() {
+            lines.iter().cloned().collect::<Vec<_>>().join(" | ")
+        } else {
+            chosen
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        let trimmed = text.trim().to_string();
+        (!trimmed.is_empty()).then_some(trimmed)
+    }
+}
+
 fn spawn_app_server(app: &tauri::AppHandle) -> Result<Child, String> {
     let cwd = workspace_cwd();
     let binary = codex_binary(app)?;
@@ -3419,7 +3480,7 @@ pub fn send(
         .current_dir(&cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
     {
         Ok(child) => child,
@@ -3430,6 +3491,10 @@ pub fn send(
             ))
         }
     };
+    let stderr_tail = CodexStderrTail::default();
+    if let Some(stderr) = child.stderr.take() {
+        stderr_tail.watch(stderr);
+    }
 
     emit_main_window(
         &app,
@@ -3618,6 +3683,8 @@ pub fn send(
         )?;
 
         let mut final_text = String::new();
+        // A provider által megnevezett hiba, ha volt ilyen esemény.
+        let mut provider_error: Option<String> = None;
         // Which final-answer item the last delta belonged to. Two items are
         // two paragraphs; gluing their deltas straight after one another is
         // where "módosítok.Az implementáció" came from.
@@ -3650,13 +3717,34 @@ pub fn send(
                     }
                 }
             }
-            if method == "turn/completed" && final_text.trim().is_empty() {
-                final_text = unknown_agent_message_order
-                    .iter()
-                    .rev()
-                    .find_map(|key| unknown_agent_messages.get(key))
-                    .cloned()
-                    .unwrap_or_default();
+            // A provider a saját hibáit a protokollon mondja el: külön `error`
+            // eseményben, majd a `turn/completed`-ben `status: "failed"` és a
+            // szöveges ok. Eddig egyiket sem olvastuk, ezért egy kimerült keret
+            // („You've hit your usage limit… try again at …") a láncban
+            // „a szakasz üres választ adott, ellenőrizd a modellt" néven jelent
+            // meg — a felhasználó a modellt kezdte keresni a hiba helyett.
+            // A `willRetry: true` átmeneti: azt a futtató maga újrapróbálja.
+            if method == "error" && value["params"]["willRetry"] != Value::Bool(true) {
+                if let Some(message) = value["params"]["error"]["message"].as_str() {
+                    if provider_error.is_none() {
+                        provider_error = Some(message.to_string());
+                    }
+                }
+            }
+            if method == "turn/completed" {
+                if value["params"]["turn"]["status"].as_str() == Some("failed") {
+                    if let Some(message) = value["params"]["turn"]["error"]["message"].as_str() {
+                        provider_error = Some(message.to_string());
+                    }
+                }
+                if final_text.trim().is_empty() {
+                    final_text = unknown_agent_message_order
+                        .iter()
+                        .rev()
+                        .find_map(|key| unknown_agent_messages.get(key))
+                        .cloned()
+                        .unwrap_or_default();
+                }
             }
             if !method.is_empty() {
                 event_sequence = event_sequence.saturating_add(1);
@@ -3800,6 +3888,15 @@ pub fn send(
                     },
                 )?;
                 break;
+            }
+        }
+
+        // Üres válasz + a provider megnevezte a hibát: azt adjuk vissza, ne a
+        // lánc találgatását a modellről. Ha a protokoll hallgatott, a stderr
+        // farka a tartalék — folyamatszintű elhalálozásnál csak az beszél.
+        if final_text.trim().is_empty() {
+            if let Some(detail) = provider_error.or_else(|| stderr_tail.summary()) {
+                return Err(format!("A Codex nem adott választ: {detail}"));
             }
         }
 
@@ -4239,6 +4336,19 @@ pub fn open_project_folder(cwd: &str, path: &str) -> Result<(), String> {
     }
 }
 
+/// Amit sosem adunk át a rendszer alapértelmezett kezelőjének.
+///
+/// A `_ =>` ág `explorer.exe`-vel nyit, ami hasznos `.md`-re vagy `.png`-re, de
+/// ezeknél a típusoknál egyetlen kattintásból szkriptet futtat. A `.lnk` külön
+/// eset: adatfájl, nem symlink, ezért a canonicalize-alapú gyökérellenőrzésen
+/// átmegy, a célja viszont a lemez bármely pontjára mutathat — vagyis kijátssza
+/// a projektre szorítást. Megnyitni ezeket a „Megnyitás mappában" művelettel
+/// lehet, ott a felhasználó látja, mit indít.
+const SHELL_HANDLER_EXTENSIONS: &[&str] = &[
+    "lnk", "url", "pif", "scf", "hta", "vbs", "vbe", "js", "jse", "wsf", "wsh", "msc", "cpl",
+    "scr", "reg", "msi", "msp", "mst", "com", "jar", "appref-ms", "cmdline", "inf",
+];
+
 pub fn run_project_file(cwd: &str, path: &str) -> Result<(), String> {
     let (_root, target) = resolve_project_action_path(cwd, path)?;
     if !target.is_file() {
@@ -4252,6 +4362,11 @@ pub fn run_project_file(cwd: &str, path: &str) -> Result<(), String> {
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    if SHELL_HANDLER_EXTENSIONS.contains(&extension.as_str()) {
+        return Err(format!(
+            "Ez a fájltípus innen nem indítható (.{extension}) — használd a „Megnyitás mappában” műveletet."
+        ));
+    }
 
     #[cfg(windows)]
     {

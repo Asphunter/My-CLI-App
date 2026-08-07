@@ -1108,9 +1108,12 @@ where
         // reasons about an artifact that is not there, and leave the user an
         // empty bubble where the answer belongs.
         let outcome = match execute(execution).await {
+            // Az üzenet megnevezi a szakasz modelljét: „ellenőrizd a modellt"
+            // önmagában nem mondja meg, melyiket — a láncban három is van.
             Ok(outcome) if outcome.text.trim().is_empty() => Err(format!(
-                "A(z) {} szakasz üres választ adott. Ellenőrizd a szakaszhoz választott modellt.",
-                stage.role.label()
+                "A(z) {} szakasz ({}) üres választ adott. Ellenőrizd a szakaszhoz választott modellt és a provider keretét.",
+                stage.role.label(),
+                stage.model.as_deref().unwrap_or("nincs megadva modell")
             )),
             Ok(outcome)
                 if stage.role == StageRole::Plan

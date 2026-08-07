@@ -1792,6 +1792,39 @@ textarea::placeholder { color: var(--faint); }
   color: var(--tick4-khaki-light) !important;
 }
 
+/* Az ügynök saját szövege — a döntés nem ezen alapul, ezért halkabb és
+   láthatóan elkülönül a tényleges eszközhívástól. */
+.agent-interaction-claim {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border-left: 2px solid #3b4549;
+  background: rgba(255, 255, 255, .02);
+}
+
+.agent-interaction-claim p {
+  margin: 0 0 6px;
+  color: #9aa1a6;
+}
+
+.agent-interaction-claim p:last-child { margin-bottom: 0; }
+
+.agent-interaction-claim-label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .09em;
+  color: #6f777c;
+  text-transform: uppercase;
+}
+
+/* A modell által írt link célja nem látszik a címkéből, ezért a gazdagép
+   mindig ott van mellette — halkan, de olvashatóan. */
+.inline-link-origin {
+  color: #8b9296;
+  font-size: .92em;
+}
+
 .agent-interaction-preview {
   max-height: 240px;
   margin: 14px 0;

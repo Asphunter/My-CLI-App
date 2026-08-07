@@ -6895,6 +6895,7 @@ mod tests {
             stage_count: 3,
             stage_role: "review".to_string(),
             stage_agent: "Codex".to_string(),
+            stage_roster: Vec::new(),
             verdict: Some("changes_requested".to_string()),
             verdict_summary: Some("a teszt nem futott le.".to_string()),
         });
@@ -6960,6 +6961,7 @@ mod tests {
             stage_count: 3,
             stage_role: "code".to_string(),
             stage_agent: "Claude · Opus 5".to_string(),
+            stage_roster: Vec::new(),
             verdict: None,
             verdict_summary: None,
         });

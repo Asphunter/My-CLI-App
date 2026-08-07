@@ -1033,7 +1033,14 @@ async function runConnectionTest(request) {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const safeMessage = safeErrorMessage(error);
-    diagnostic("connection test failed", { requestId: request.requestId, error: message });
+    // A napló mindig aktív és nem rotál, a `redactForDiagnostic` pedig kulcs
+    // *nevekre* szűr, az `error` mezőre nem — ezen az úton pedig épp
+    // hitelesítési hibák jönnek, amelyek beágyazhatják a kulcsot. Ezért a
+    // redaktált változat kerül a naplóba, nem a nyers.
+    diagnostic("connection test failed", {
+      requestId: request.requestId,
+      error: safeMessage,
+    });
     writeMessage({
       type: "connection_result",
       request,

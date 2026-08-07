@@ -80,6 +80,11 @@ import {
   type ConversationScope,
 } from "./conversationScope";
 import {
+  conversationHasContent,
+  isUntitledConversation,
+  preferredThreadForProject,
+} from "./conversationSelection";
+import {
   mergePipelineStageTiming,
   pipelineChainTimingBounds,
 } from "./pipelineTiming";
@@ -2087,48 +2092,7 @@ const projectFromPath = (
   };
 };
 
-const isUntitledConversation = (title: string) =>
-  /^Új beszélgetés(?: \d+)?$/i.test(title.trim());
-
-const conversationHasContent = (conversation?: SyncConversation | null) =>
-  Boolean(
-    conversation &&
-      ((conversation.messages?.length ?? 0) > 0 ||
-        (conversation.workItems?.length ?? 0) > 0),
-  );
-
-const preferredThreadForProject = (
-  project: Project,
-  cache: Record<string, SyncConversation>,
-  preferredTitle: string,
-) => {
-  const preferred = project.threads.includes(preferredTitle)
-    ? preferredTitle
-    : "";
-  const preferredConversation = preferred
-    ? cache[`${project.path}/${preferred}`]
-    : undefined;
-  if (
-    preferred &&
-    (!isUntitledConversation(preferred) ||
-      conversationHasContent(preferredConversation))
-  ) {
-    return preferred;
-  }
-
-  const populatedThreads = project.threads
-    .map((title) => ({
-      title,
-      conversation: cache[`${project.path}/${title}`],
-    }))
-    .filter(({ conversation }) => conversationHasContent(conversation))
-    .sort((left, right) =>
-      (left.conversation?.updatedAt ?? "").localeCompare(
-        right.conversation?.updatedAt ?? "",
-      ),
-    );
-  return populatedThreads[populatedThreads.length - 1]?.title || preferred || project.threads[0] || "";
-};
+// A kiválasztás szabályai önálló modulban élnek, hogy tesztelhetők legyenek.
 
 const uniqueConversationTitle = (
   project: Project,
@@ -3049,20 +3013,45 @@ const loadStoredMessageMap = (): Record<string, Message[]> => {
   }
 };
 
+/**
+ * Ez a tároló az egész szálmapot újraírja minden commitnál, a localStorage
+ * kvótája pedig origónként néhány megabájt. Egy elég nagy válasz után a
+ * `setItem` tartósan elhasal — és mivel a hiba le volt nyelve, onnantól *minden*
+ * szál mentése csendben megszűnt. A kvótát ezért a legrégebbi szálak eldobásával
+ * szabadítjuk fel, a most mentett szálat pedig soha nem dobjuk el.
+ */
 const saveThreadMessages = (key: string, messages: Message[]) => {
+  const repaired = messages.map(repairHistoricalAssistantText);
+  let saved: Record<string, Message[]> = {};
   try {
-    const saved = JSON.parse(
+    saved = JSON.parse(
       localStorage.getItem(MESSAGE_HISTORY_STORAGE_KEY) ?? "{}",
     ) as Record<string, Message[]>;
-    localStorage.setItem(
-      MESSAGE_HISTORY_STORAGE_KEY,
-      JSON.stringify({
-        ...saved,
-        [key]: messages.map(repairHistoricalAssistantText),
-      }),
-    );
   } catch {
-    // A storage quota error must not break the conversation.
+    saved = {};
+  }
+  const store = { ...saved, [key]: repaired };
+  // A saját szálát mindig megtartjuk; a többit a mapban lévő sorrendben — ami a
+  // beszúrás sorrendje, tehát a legrégebben látott szál van elöl — dobjuk.
+  const evictable = Object.keys(store).filter((candidate) => candidate !== key);
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      localStorage.setItem(MESSAGE_HISTORY_STORAGE_KEY, JSON.stringify(store));
+      return;
+    } catch {
+      const victim = evictable.shift();
+      if (victim === undefined) {
+        // Már csak ez az egy szál van, és az sem fér el: a beszélgetés a
+        // SQLite-ban akkor is megvan, ez a tároló csak előnézet-gyorsítótár.
+        try {
+          localStorage.removeItem(MESSAGE_HISTORY_STORAGE_KEY);
+        } catch {
+          // Ha a törlés sem megy, nincs mit tenni — a futás ettől nem áll meg.
+        }
+        return;
+      }
+      delete store[victim];
+    }
   }
 };
 
@@ -4609,8 +4598,6 @@ const localFileExtensions = new Set([
   "csv",
   "doc",
   "docx",
-  "dll",
-  "exe",
   "gif",
   "go",
   "h",
@@ -4623,7 +4610,6 @@ const localFileExtensions = new Set([
   "js",
   "json",
   "jsx",
-  "lnk",
   "log",
   "md",
   "mid",
@@ -4672,7 +4658,16 @@ const mathHtmlCache = new Map<string, string | null>();
  * szöveget, ezért a KaTeX kimenete gyorsítótárba megy — enélkül minden képlet
  * újra-parse-olódna másodpercenként hatvanszor.
  */
+/**
+ * A `$$…$$` és `\[…\]` minta bármeddig nyúlhat, a KaTeX pedig szinkronban fut a
+ * fő szálon: egy megabájtos „képlet" befagyasztaná a felületet, és a
+ * gyorsítótárban is ott maradna. Ennél hosszabb bemenetnél a hívó a nyers TeX-et
+ * jeleníti meg, ami ilyen méretben amúgy is olvashatóbb.
+ */
+const MAX_MATH_LENGTH = 2000;
+
 const renderMathHtml = (tex: string, display: boolean) => {
+  if (tex.length > MAX_MATH_LENGTH) return null;
   const key = `${display ? "d" : "i"}|${tex}`;
   const cached = mathHtmlCache.get(key);
   if (cached !== undefined) return cached;
@@ -4718,6 +4713,34 @@ const isWindowsPathLike = (value: string) =>
   /^[A-Za-z]:[\\/]/.test(value) ||
   /^\\\\/.test(value) ||
   /^\.{1,2}[\\/]/.test(value);
+
+/**
+ * Egy válaszban a link *címkéje* és a *célja* is a modelltől jön, egymástól
+ * függetlenül, ez az ablak pedig címsor nélküli — a felhasználó kattintás előtt
+ * és után sem látja, hová megy. Ezért csak webes séma mehet át, és a gazdagép
+ * a címke mellett megjelenik: barátságos szöveg így nem takarhatja el a célt.
+ */
+const SAFE_LINK_SCHEMES = new Set(["http:", "https:", "mailto:"]);
+
+const safeExternalLink = (href: string) => {
+  let url: URL;
+  try {
+    url = new URL(href.trim());
+  } catch {
+    return null;
+  }
+  if (!SAFE_LINK_SCHEMES.has(url.protocol)) return null;
+  return {
+    href: url.href,
+    origin: url.protocol === "mailto:" ? url.pathname : url.host,
+  };
+};
+
+/** Kiterjesztések, amelyeknél a „Futtatás" előbb megkérdezi a felhasználót. */
+const EXECUTABLE_EXTENSIONS = new Set(["bat", "cmd", "ps1", "py", "exe"]);
+
+const executableExtensionOf = (path: string) =>
+  path.match(/\.([A-Za-z0-9]{1,12})$/)?.[1]?.toLowerCase() ?? "";
 
 const isLocalFileReference = (value: string) => {
   const candidate = normalizeFileReference(value);
@@ -4796,17 +4819,24 @@ const renderInlineMarkdown = (
     } else {
       const link = value.match(/^\[([^\]]+)\]\(([^\)]+)\)$/);
       if (link) {
+        const external = safeExternalLink(link[2]);
         parts.push(
-          fileButton(link[2], link[1], `file-link-${index}`) ?? (
-            <a
-              href={link[2]}
-              target="_blank"
-              rel="noreferrer"
-              key={`link-${index}`}
-            >
-              {link[1]}
-            </a>
-          ),
+          fileButton(link[2], link[1], `file-link-${index}`) ??
+            (external ? (
+              <a
+                href={external.href}
+                target="_blank"
+                rel="noreferrer"
+                key={`link-${index}`}
+              >
+                {link[1]}
+                <span className="inline-link-origin"> ({external.origin})</span>
+              </a>
+            ) : (
+              // Nem webes séma vagy értelmezhetetlen cél: a nyers szöveg
+              // olvasható marad, de kattinthatóvá nem válik.
+              <span key={`link-inert-${index}`}>{value}</span>
+            )),
         );
       } else {
         const previousCharacter = text[index - 1] ?? "";
@@ -12039,6 +12069,7 @@ function App() {
               selectedProject,
               localConversationCache,
               activeThreadRef.current,
+              { keepLiveSelection: true },
             );
             const selectedKey = `${selectedProject.path}/${selectedThread}`;
             messageKeyRef.current = selectedKey;
@@ -12518,6 +12549,10 @@ function App() {
                 selectedProject,
                 nextLocalConversationCache,
                 activeThreadRef.current,
+                // A poll-driven pull must not relocate the reader: an empty,
+                // freshly created conversation is a deliberate choice, and
+                // losing it also loses the composer settings set up in it.
+                { keepLiveSelection: true },
               );
         const selectedKey = `${selectedProject.path}/${selectedThread}`;
         const selectionStayedActive =
@@ -14587,6 +14622,24 @@ function App() {
     const target = fileActionMenu?.path;
     if (!target) return;
     closeFileActionMenu();
+    // A fájlhivatkozás a modell szövegéből is jöhet, ahol a látható címke és a
+    // tényleges útvonal független egymástól. Végrehajtható típusnál ezért a
+    // teljes utat megmutatjuk, és külön igent kérünk rá.
+    if (EXECUTABLE_EXTENSIONS.has(executableExtensionOf(target))) {
+      setAppDialog({
+        kind: "confirm",
+        title: "Végrehajtható fájl indítása",
+        message: `Elindítod ezt a fájlt? Kód fut le a gépeden.\n\n${target}`,
+        confirmLabel: "Indítás",
+        danger: true,
+        onConfirm: () => void launchProjectFile(target),
+      });
+      return;
+    }
+    await launchProjectFile(target);
+  };
+
+  const launchProjectFile = async (target: string) => {
     try {
       await invoke("run_project_file", {
         cwd: activeProjectPathRef.current || activeProjectPath,
@@ -15773,6 +15826,9 @@ function App() {
       project,
       localConversationCacheRef.current,
       activeThreadRef.current,
+      // Returning to Coding mode should land on the conversation left open,
+      // even when nothing has been typed into it yet.
+      { keepLiveSelection: true },
     );
     activeProjectRef.current = project.name;
     activeThreadRef.current = thread;
@@ -21273,14 +21329,37 @@ function App() {
         <div className="agent-interaction-overlay" role="presentation">
           <section className="agent-interaction-card" role="dialog" aria-modal="true" aria-labelledby="claude-approval-title">
             <span className="approval-eyebrow">CLAUDE JÓVÁHAGYÁS</span>
+            {/* A cím, a leírás és az indoklás az ügynöktől jön: egy elterelt
+                modell egy törlést is nevezhet „a README beolvasásának". Ezért
+                elsőként a tényleges eszköz és a paraméterei állnak — arról szól
+                a döntés —, a modell szövege pedig alattuk, jelölve, hogy az
+                nem ellenőrzött állítás. */}
             <h2 id="claude-approval-title">
-              {pendingClaudeApproval.title || `${pendingClaudeApproval.toolName} futtatása`}
+              {pendingClaudeApproval.toolName} futtatása
             </h2>
-            {pendingClaudeApproval.description && <p>{pendingClaudeApproval.description}</p>}
-            {pendingClaudeApproval.reason && <p className="agent-interaction-reason">{pendingClaudeApproval.reason}</p>}
             <pre className="agent-interaction-preview">
               {JSON.stringify(pendingClaudeApproval.input, null, 2)}
             </pre>
+            {(pendingClaudeApproval.title ||
+              pendingClaudeApproval.description ||
+              pendingClaudeApproval.reason) && (
+              <div className="agent-interaction-claim">
+                <span className="agent-interaction-claim-label">
+                  Az ügynök indoklása
+                </span>
+                {pendingClaudeApproval.title && (
+                  <p>{pendingClaudeApproval.title}</p>
+                )}
+                {pendingClaudeApproval.description && (
+                  <p>{pendingClaudeApproval.description}</p>
+                )}
+                {pendingClaudeApproval.reason && (
+                  <p className="agent-interaction-reason">
+                    {pendingClaudeApproval.reason}
+                  </p>
+                )}
+              </div>
+            )}
             <div className="agent-interaction-actions">
               <button type="button" onClick={() => void respondClaudeApproval("decline", "A felhasználó elutasította a műveletet.")}>Tiltás</button>
               {/* The grant outlives the turn now, so the label says what it

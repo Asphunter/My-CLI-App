@@ -1047,7 +1047,7 @@ textarea::placeholder { color: var(--faint); }
 .compact-answers-layout::before { display: none; }
 .compact-answers-layout.is-thinking-collapsed::before { right: -1px; width: auto; border-radius: 3px; }
 .compact-answers-panel { position: relative; display: flex; min-width: 0; height: 100%; box-sizing: border-box; flex-direction: column; overflow: hidden; padding: 0; border: 0; border-radius: 3px; }
-.compact-answers-panel::after { position: absolute; z-index: 0; top: var(--compact-answer-height, 100%); right: 0; bottom: 0; left: 0; pointer-events: none; background: repeating-linear-gradient(135deg, rgba(150, 146, 116, .04) 0, rgba(150, 146, 116, .04) 1px, transparent 1px, transparent 9px), var(--chat-bg); border-top: 1px solid var(--border-soft); content: ""; }
+.compact-answers-panel::after { position: absolute; z-index: 0; top: var(--compact-answer-height, 100%); right: 0; bottom: 0; left: 0; pointer-events: none; background: repeating-linear-gradient(135deg, rgba(165, 155, 124, .18) 0, rgba(165, 155, 124, .18) 1px, transparent 1px, transparent 9px), #000; border-top: 1px solid var(--detailed-fade-tail, rgba(165, 155, 124, .2)); content: ""; }
 .compact-answers-layout.is-current::after { display: none; }
 .compact-column-resizer { position: absolute; z-index: 5; top: 0; bottom: 0; left: min(var(--compact-answer-width, min(720px, 60%)), calc(100% - 240px)); width: 9px; padding: 0; background: transparent; cursor: col-resize; touch-action: none; user-select: none; transform: translateX(-5px); }
 .compact-column-resizer::after { position: absolute; top: 0; bottom: 0; left: 4px; width: 1px; background: transparent; content: ""; }
@@ -4101,28 +4101,7 @@ textarea::placeholder { color: var(--faint); }
   background-size: 100% 1px, 100% 1px !important;
 }
 
-/* ---------------------------------------------------------------------------
-   Ferde bézs vonalazás a fájlpanel körüli szabad helyen. Kizárólag ott: a
-   hasáb hátterére kötve minden rövid válasz mögé bekerült, és teleszórta az
-   üzenetfolyamot. A befoglaló sáv a panel alatti helyet is elfoglalja, a panel
-   pedig tömör háttérrel ül rajta, így a vonalak csak körülötte látszanak.
-   --------------------------------------------------------------------------- */
-.compact-answer-change-slot,
-.detailed-step-changes {
-  position: relative;
-  align-self: stretch;
-  background-image: repeating-linear-gradient(
-    -45deg,
-    rgba(165, 155, 124, .18) 0 1px,
-    transparent 1px 8px
-  );
-}
 
-.compact-answer-change-slot .trace-change-summary,
-.detailed-step-changes .trace-change-summary {
-  position: relative;
-  background-color: #000;
-}
 
 /* ---------------------------------------------------------------------------
    Bezárt lépés-oszlop: a válasz a teljes szélességet kapja, az elválasztó és a

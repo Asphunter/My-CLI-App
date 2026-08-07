@@ -7248,6 +7248,8 @@ function TurnProgressCard({
         [...steps].reverse().find((step) => step.status === "completed") ??
         steps[0]);
   const [selectedStepId, setSelectedStepId] = useState(activeStep.id);
+  /** Elrejtett lépés-oszlop: a válasz ilyenkor a teljes szélességet kapja. */
+  const [stepsCollapsed, setStepsCollapsed] = useState(false);
   // A terv-fázis GONDOLKODÁS MENETE panelje nem naplót mutat, hanem magát a
   // tervet: RAW = a teljes szöveg (élőben streamelve), DETAIL = a kiválasztott
   // lépés szelete.
@@ -7680,8 +7682,8 @@ function TurnProgressCard({
     260,
     Math.min(440, Math.ceil(86 + longestStepLabel * 5.2)),
   );
-  const answerActions = hasAnswer && !streaming && onRegenerate ? (
-    <div className="trace-answer-actions">
+  const regenerateAction =
+    hasAnswer && !streaming && onRegenerate ? (
       <button
         type="button"
         aria-label="Válasz újragenerálása"
@@ -7693,8 +7695,29 @@ function TurnProgressCard({
           <path d="M13 4.25A5.5 5.5 0 1 0 13.2 11" />
         </svg>
       </button>
+    ) : null;
+  // A lépések oszlopa ugyanúgy elrejthető, mint a Nem-Részletes nézet
+  // gondolkodás-hasábja, és a kapcsoló ugyanott, a reload mellett van.
+  const stepsToggleAction = (
+    <button
+      type="button"
+      className="compact-thinking-toolbar-toggle"
+      aria-expanded={!stepsCollapsed}
+      aria-label={
+        stepsCollapsed ? "Lépések megnyitása" : "Lépések bezárása"
+      }
+      title={stepsCollapsed ? "Lépések megnyitása" : "Lépések bezárása"}
+      onClick={() => setStepsCollapsed((collapsed) => !collapsed)}
+    >
+      <span aria-hidden="true">{stepsCollapsed ? "‹" : "›"}</span>
+    </button>
+  );
+  const answerActions = (
+    <div className="trace-answer-actions">
+      {regenerateAction}
+      {stepsToggleAction}
     </div>
-  ) : null;
+  );
   const selectStep = (stepId: string) => {
     followActiveStepRef.current = false;
     setSelectedStepId(stepId);
@@ -8061,7 +8084,7 @@ function TurnProgressCard({
 
         <div
           ref={detailedGridRef}
-          className={`detailed-trace-grid${isPlanStage ? " is-plan-stage" : " is-work-stage"}`}
+          className={`detailed-trace-grid${isPlanStage ? " is-plan-stage" : " is-work-stage"}${stepsCollapsed ? " is-steps-collapsed" : ""}`}
           style={
             {
               "--detailed-step-slots": reservedStepSlots,
@@ -19106,9 +19129,9 @@ function App() {
           {chainVersions.length > 1 && (
             // A re-run does not replace what it was answering: both attempts
             // stay readable, and this picks which one the panel is showing.
-            <label className="pipeline-run-version">
-              <span>VERZIÓ</span>
+            <label className="pipeline-run-version" title="Verzió választása">
               <select
+                aria-label="Verzió választása"
                 value={selectedVersion}
                 onChange={(event) =>
                   setSelectedVersions((current) => ({

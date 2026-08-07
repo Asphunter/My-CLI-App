@@ -3326,10 +3326,7 @@ textarea::placeholder { color: var(--faint); }
   /* A középső elválasztót a grid maga húzza végig: a válasz-sáv inset
      árnyéka csak a saját (max-height-tel sapkázott) magasságáig ér, és a
      hosszabb lépés-oszlop mellett szakadás látszott a FÁJLOK panel szintjén. */
-  background:
-    linear-gradient(#a59b7c, #a59b7c)
-      calc(100% - var(--detailed-steps-track)) 0 / 3px 100% no-repeat,
-    #000;
+  background: #000;
 }
 
 .detailed-trace-lane {
@@ -3404,7 +3401,7 @@ textarea::placeholder { color: var(--faint); }
     linear-gradient(#a59b7c, #a59b7c),
     linear-gradient(180deg, #000 0%, rgba(0, 0, 0, .9) 34%, transparent 100%);
   background-position: left top, right top, left top;
-  background-size: 100% 1px, 3px 100%, 100% 100%;
+  background-size: 100% 1px, 0 0, 100% 100%;
 }
 
 .detailed-trace-grid::after {
@@ -3415,12 +3412,26 @@ textarea::placeholder { color: var(--faint); }
     linear-gradient(#a59b7c, #a59b7c),
     linear-gradient(0deg, #000 0%, rgba(0, 0, 0, .9) 34%, transparent 100%);
   background-position: left bottom, right top, left top;
-  background-size: 100% 1px, 3px 100%, 100% 100%;
+  background-size: 100% 1px, 0 0, 100% 100%;
 }
 
 /* A lépések oszlopának felső és alsó élét a sáv háttere adja (fentebb). Az
    answer-oldali éleket a rács rajzolja, hogy ne mozduljanak a válasz
-   görgetősávjával. */
+   görgetősávjával. Az elválasztó vonal viszont saját elem a két hasáb határán:
+   háttérrétegként a szomszédos hasáb háttere és a görgetősáv is megvágta. */
+.detailed-steps-lane { position: relative; }
+
+.detailed-steps-lane::before {
+  position: absolute;
+  z-index: 4;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 1px;
+  background: #a59b7c;
+  content: "";
+  pointer-events: none;
+}
 
 /* The right column owns the only vertical scrollbar. Legacy detailed/compact
    containers must grow naturally inside it, otherwise the answer looks like a
@@ -4080,7 +4091,7 @@ textarea::placeholder { color: var(--faint); }
     linear-gradient(#a59b7c, #a59b7c) !important;
   background-repeat: no-repeat !important;
   background-position: left top, left bottom, var(--compact-divider-x) top !important;
-  background-size: 100% 1px, 100% 1px, 3px 100% !important;
+  background-size: 100% 1px, 100% 1px, 1px 100% !important;
 }
 
 /* Összecsukott gondolkodásnál nincs második hasáb, tehát elválasztó sem. */
@@ -4091,35 +4102,51 @@ textarea::placeholder { color: var(--faint); }
 }
 
 /* ---------------------------------------------------------------------------
-   A fájlpanel alatt maradó üres sáv nem üres fekete: ugyanaz a ferde vonalazás
-   fut benne, mint korábban, a jobb oldali hasáb szürkéjével — így látszik, hogy
-   ez szándékos hely, nem levágott tartalom.
+   A fájlpanel körüli fekete terület nem üres: bézs ferde vonalazás fut benne.
+   A vonalazás a fájlpanel *helyét* tölti ki, nem egy panel méretű képzeletbeli
+   keretet — ezért a befoglaló sáv kinyúlik a hasáb aljáig, és a vonalazás azon
+   fut, a panel pedig tömör háttérrel ül rajta.
    --------------------------------------------------------------------------- */
 .compact-answer-change-slot,
 .detailed-step-changes {
   position: relative;
-}
-
-.compact-answer-change-slot::after,
-.detailed-step-changes::after {
-  position: absolute;
-  z-index: -1;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  left: 0;
+  align-self: stretch;
+  min-height: 0;
   background-image: repeating-linear-gradient(
     -45deg,
-    var(--compact-lane-grey) 0 1px,
-    transparent 1px 7px
+    rgba(165, 155, 124, .18) 0 1px,
+    transparent 1px 8px
   );
-  content: "";
-  pointer-events: none;
 }
 
-/* A vonalazás a panel *alatti* helyre való, a sorok mögé nem. */
+/* A panel maga tömör, hogy a vonalazás csak körülötte látszódjon. */
 .compact-answer-change-slot .trace-change-summary,
 .detailed-step-changes .trace-change-summary {
   position: relative;
-  z-index: 1;
+  background-color: #000;
+}
+
+/* ---------------------------------------------------------------------------
+   Bezárt lépés-oszlop: a válasz a teljes szélességet kapja, az elválasztó és a
+   lépéssáv eltűnik — ugyanaz a viselkedés, mint a Nem-Részletes nézet
+   gondolkodás-hasábjánál.
+   --------------------------------------------------------------------------- */
+.detailed-trace-grid.is-steps-collapsed {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.detailed-trace-grid.is-steps-collapsed .detailed-steps-lane { display: none; }
+
+.detailed-trace-grid.is-steps-collapsed .detailed-thinking-lane,
+.detailed-trace-grid.is-steps-collapsed .detailed-plan-lane {
+  right: 0;
+}
+
+.detailed-trace-grid.is-steps-collapsed::before,
+.detailed-trace-grid.is-steps-collapsed::after {
+  width: 100%;
+}
+
+.detailed-trace-grid.is-steps-collapsed .detailed-answer-toolbar {
+  right: 9px;
 }

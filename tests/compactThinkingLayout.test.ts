@@ -203,11 +203,11 @@ test("a részletes nézet keretet zár: a vonalak nem halnak el, hanem végigfut
   );
   assert.match(
     styles,
-    /\.detailed-trace-grid::before\s*\{[^}]*top:\s*0;[^}]*height:\s*28px;[^}]*linear-gradient\(180deg, #000 0%, rgba\(0, 0, 0, \.9\) 34%, transparent 100%\);[^}]*background-size:\s*100% 1px, 3px 100%, 100% 100%/s,
+    /\.detailed-trace-grid::before\s*\{[^}]*top:\s*0;[^}]*height:\s*28px;[^}]*linear-gradient\(180deg, #000 0%, rgba\(0, 0, 0, \.9\) 34%, transparent 100%\);[^}]*background-size:\s*100% 1px, 0 0, 100% 100%/s,
   );
   assert.match(
     styles,
-    /\.detailed-trace-grid::after\s*\{[^}]*bottom:\s*0;[^}]*height:\s*28px;[^}]*linear-gradient\(0deg, #000 0%, rgba\(0, 0, 0, \.9\) 34%, transparent 100%\);[^}]*background-size:\s*100% 1px, 3px 100%, 100% 100%/s,
+    /\.detailed-trace-grid::after\s*\{[^}]*bottom:\s*0;[^}]*height:\s*28px;[^}]*linear-gradient\(0deg, #000 0%, rgba\(0, 0, 0, \.9\) 34%, transparent 100%\);[^}]*background-size:\s*100% 1px, 0 0, 100% 100%/s,
   );
   assert.match(
     styles,

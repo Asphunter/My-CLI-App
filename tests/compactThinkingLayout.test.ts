@@ -43,7 +43,7 @@ test("a részletes mód két oszlopban mutatja a lépéseket és az aktuális ta
   assert.match(app, /detailed-thinking-lane/);
   assert.match(
     styles,
-    /--detailed-steps-track: clamp\(260px, var\(--detailed-steps-width, 320px\), 40%\)[\s\S]*grid-template-columns:[\s\S]*minmax\(0, 1fr\)[\s\S]*var\(--detailed-steps-track\)/,
+    /--detailed-answer-track: max\(260px, min\(var\(--compact-answer-width[\s\S]*--detailed-steps-track: calc\(100% - var\(--detailed-answer-track\)\)[\s\S]*grid-template-columns:[\s\S]*minmax\(0, 1fr\)[\s\S]*var\(--detailed-steps-track\)/,
   );
   assert.match(
     styles,

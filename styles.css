@@ -3309,7 +3309,11 @@ textarea::placeholder { color: var(--faint); }
 
 .detailed-trace-grid {
   position: relative;
-  --detailed-steps-track: clamp(260px, var(--detailed-steps-width, 320px), 40%);
+  /* A válasz hasáb szélessége ugyanaz a képlet, mint a Nem-Részletes
+     nézetben, hogy a két mód egymásra illeszkedjen; a lépések a maradékot
+     kapják. */
+  --detailed-answer-track: max(260px, min(var(--compact-answer-width, min(720px, 60%)), calc(100% - 240px)));
+  --detailed-steps-track: calc(100% - var(--detailed-answer-track));
   --detailed-answer-rule-width: min(100%, max(0px, calc(var(--detailed-prompt-width, 720px) - var(--detailed-steps-track))));
   /* A VÁLASZ balra, a LÉPÉSEK jobbra — ugyanabban a sorrendben, ahogy a
      Nem-Részletes nézet mutatja őket, hogy a két mód között ne kelljen
@@ -3588,6 +3592,18 @@ textarea::placeholder { color: var(--faint); }
 
 .detailed-step-changes .trace-change-heading {
   border-bottom: 0;
+}
+
+/* A fájlpanelt ugyanaz a halk vonalpár zárja, mint a keretet — mindkét
+   módban, hogy a panel önálló egységként olvasható legyen. */
+.detailed-step-changes .trace-change-summary,
+.compact-answer-change-slot .trace-change-summary {
+  background-image:
+    linear-gradient(var(--detailed-fade-tail), var(--detailed-fade-tail)),
+    linear-gradient(var(--detailed-fade-tail), var(--detailed-fade-tail));
+  background-repeat: no-repeat;
+  background-position: left top, left bottom;
+  background-size: 100% 1px, 100% 1px;
 }
 
 /* Kinyitva sem nőhet a végtelenbe: onnantól görget. */
@@ -4072,4 +4088,38 @@ textarea::placeholder { color: var(--faint); }
   background-image: var(--detailed-fade-line), var(--detailed-fade-line) !important;
   background-position: left top, left bottom !important;
   background-size: 100% 1px, 100% 1px !important;
+}
+
+/* ---------------------------------------------------------------------------
+   A fájlpanel alatt maradó üres sáv nem üres fekete: ugyanaz a ferde vonalazás
+   fut benne, mint korábban, a jobb oldali hasáb szürkéjével — így látszik, hogy
+   ez szándékos hely, nem levágott tartalom.
+   --------------------------------------------------------------------------- */
+.compact-answer-change-slot,
+.detailed-step-changes {
+  position: relative;
+}
+
+.compact-answer-change-slot::after,
+.detailed-step-changes::after {
+  position: absolute;
+  z-index: -1;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  background-image: repeating-linear-gradient(
+    -45deg,
+    var(--compact-lane-grey) 0 1px,
+    transparent 1px 7px
+  );
+  content: "";
+  pointer-events: none;
+}
+
+/* A vonalazás a panel *alatti* helyre való, a sorok mögé nem. */
+.compact-answer-change-slot .trace-change-summary,
+.detailed-step-changes .trace-change-summary {
+  position: relative;
+  z-index: 1;
 }

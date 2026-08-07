@@ -6785,6 +6785,14 @@ function ImagePreviewOverlay({
 /** Fejléc + öt fájlsor: ennyi látszik, amíg a lista nincs kinyitva. */
 const CHANGE_SUMMARY_COLLAPSED_ROWS = 5;
 
+/**
+ * Csak a fájlnév. A hash-elt, mély útvonalak (`.gradle-check/native/1def…/…`)
+ * szélesebbre nyomták a panelt, mint a válasz maga; a teljes út a soron lévő
+ * tooltipben és a megnyitás műveletében továbbra is megvan.
+ */
+const fileNameOf = (path: string) =>
+  path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
+
 /** Files the preview overlay can render; everything else stays plain text. */
 const PREVIEWABLE_IMAGE_EXTENSIONS = ["svg", "png", "jpg", "jpeg", "webp"];
 const isPreviewableImagePath = (filePath: string) => {
@@ -6848,10 +6856,10 @@ function ChangeSummaryPanel({
                   onClick={() => onPreviewImage(file.sourcePath ?? file.path)}
                   title="Előnézet megnyitása"
                 >
-                  <code>{file.path}</code>
+                  <code>{fileNameOf(file.path)}</code>
                 </button>
               ) : (
-                <code>{file.path}</code>
+                <code>{fileNameOf(file.path)}</code>
               )}
               {label && <span className="trace-change-status">{label}</span>}
               <span className="trace-change-added">+{file.added}</span>
@@ -8165,16 +8173,6 @@ function TurnProgressCard({
                 </div>
               )}
             </div>
-            {displayedChangeSummary.length > 0 && (
-              <div className="detailed-step-changes">
-                <ChangeSummaryPanel
-                  files={displayedChangeSummary}
-                  onRollback={onRollbackChanges}
-                  rollbackBusy={rollbackBusy}
-                  onPreviewImage={onPreviewImage}
-                />
-              </div>
-            )}
           </section>
 
           <section
@@ -8400,6 +8398,19 @@ function TurnProgressCard({
                     </li>
                   )}
               </ul>
+            )}
+            {/* A fájlpanel a válasz alján van, ugyanott, ahol a Nem-Részletes
+                nézetben — a lépések oszlopában a válasz mellé került, és az
+                alatta maradt üres feketét sem töltötte ki semmi. */}
+            {displayedChangeSummary.length > 0 && (
+              <div className="detailed-step-changes">
+                <ChangeSummaryPanel
+                  files={displayedChangeSummary}
+                  onRollback={onRollbackChanges}
+                  rollbackBusy={rollbackBusy}
+                  onPreviewImage={onPreviewImage}
+                />
+              </div>
             )}
           </section>
         </div>

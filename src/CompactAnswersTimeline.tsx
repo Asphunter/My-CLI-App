@@ -129,13 +129,35 @@ export default function CompactAnswersTimeline({
         COMPACT_TIMELINE_MIN_HEIGHT,
         Math.min(thinkingViewportLimit, Math.ceil(thinkingHeight)),
       );
-      const changesHeight = changesSlot ? Math.ceil(changesSlot.offsetHeight) : 0;
-      const answerWithChangesHeight = Math.ceil(answerHeight) + changesHeight;
+      // A fájl-hasáb a rács teljes magasságára nyúlik, ezért az offsetHeight a
+      // kinyújtott érték lenne. A természetes magasság a tartalom + a listából
+      // már görgetésre szorult rész — a kártya eddig nő a fájlokért, felette
+      // (~20+ fájl) a lista görget.
+      let changesHeight = 0;
+      if (changesSlot) {
+        const changesContent = changesSlot.querySelector<HTMLElement>(
+          ".compact-answer-changes",
+        );
+        const changesList = changesSlot.querySelector<HTMLElement>(
+          ".trace-change-list",
+        );
+        const clippedRows = changesList
+          ? changesList.scrollHeight - changesList.clientHeight
+          : 0;
+        changesHeight = Math.min(
+          answerViewportLimit,
+          Math.ceil(
+            (changesContent?.offsetHeight ?? changesSlot.scrollHeight) +
+              clippedRows,
+          ),
+        );
+      }
+      const columnsFloorHeight = Math.max(Math.ceil(answerHeight), changesHeight);
       const next = {
         answer: Math.ceil(answerHeight),
         timeline: thinkingExpanded || thinkingPreparing || thinkingClosing
-          ? Math.max(answerWithChangesHeight, expandedThinkingHeight)
-          : answerWithChangesHeight,
+          ? Math.max(columnsFloorHeight, expandedThinkingHeight)
+          : columnsFloorHeight,
         changes: changesHeight,
       };
       setPanelHeights((current) =>
@@ -236,13 +258,21 @@ export default function CompactAnswersTimeline({
     const layoutSize = horizontal ? layout.offsetWidth : layout.offsetHeight;
     const visualSize = horizontal ? bounds.width : bounds.height;
     const scale = layoutSize > 0 && visualSize > 0 ? visualSize / layoutSize : 1;
-    const contentHeightFloor =
-      (panelHeights?.answer ?? 0) + (panelHeights?.changes ?? 0);
+    // A hasábok egymás mellett élnek: a magasság-padló a legmagasabbé, a
+    // szélesség-plafonból pedig a fix fájl-sáv is lejön.
+    const contentHeightFloor = Math.max(
+      panelHeights?.answer ?? 0,
+      panelHeights?.changes ?? 0,
+    );
+    const filesTrackWidth = changesSlotRef.current?.offsetWidth ?? 0;
     const min = horizontal
       ? COMPACT_ANSWER_MIN_WIDTH
       : Math.max(COMPACT_TIMELINE_MIN_HEIGHT, contentHeightFloor);
     const max = horizontal
-      ? Math.max(min, layout.offsetWidth - COMPACT_THINKING_MIN_WIDTH)
+      ? Math.max(
+          min,
+          layout.offsetWidth - COMPACT_THINKING_MIN_WIDTH - filesTrackWidth,
+        )
       : Math.max(min, window.innerHeight - 140);
     resizeDragRef.current = {
       kind,
@@ -287,7 +317,12 @@ export default function CompactAnswersTimeline({
       clampPanelSize(
         (answerColumnWidth ?? answersPanel.offsetWidth) + delta,
         COMPACT_ANSWER_MIN_WIDTH,
-        Math.max(COMPACT_ANSWER_MIN_WIDTH, layout.offsetWidth - COMPACT_THINKING_MIN_WIDTH),
+        Math.max(
+          COMPACT_ANSWER_MIN_WIDTH,
+          layout.offsetWidth -
+            COMPACT_THINKING_MIN_WIDTH -
+            (changesSlotRef.current?.offsetWidth ?? 0),
+        ),
       ),
     );
   };
@@ -303,11 +338,13 @@ export default function CompactAnswersTimeline({
         (manualPanelHeight ?? layout.offsetHeight) + delta,
         Math.max(
           COMPACT_TIMELINE_MIN_HEIGHT,
-          (panelHeights?.answer ?? 0) + (panelHeights?.changes ?? 0),
+          panelHeights?.answer ?? 0,
+          panelHeights?.changes ?? 0,
         ),
         Math.max(
           COMPACT_TIMELINE_MIN_HEIGHT,
-          (panelHeights?.answer ?? 0) + (panelHeights?.changes ?? 0),
+          panelHeights?.answer ?? 0,
+          panelHeights?.changes ?? 0,
           window.innerHeight - 140,
         ),
       ),
@@ -315,8 +352,9 @@ export default function CompactAnswersTimeline({
   };
 
   const displayedAnswerHeight = panelHeights?.answer;
+  // A fájl-hasáb a válasz mellett áll, nem alatta: a kártya a magasabbikig ér.
   const displayedContentFloor = panelHeights
-    ? panelHeights.answer + panelHeights.changes
+    ? Math.max(panelHeights.answer, panelHeights.changes)
     : undefined;
   const displayedLayoutHeight =
     manualPanelHeight && displayedContentFloor
@@ -340,7 +378,7 @@ export default function CompactAnswersTimeline({
 
   return (
     <article
-      className={`${className}${thinkingVisible ? " is-thinking-expanded" : " is-thinking-collapsed"}${thinkingClosing ? " is-thinking-closing" : ""}`}
+      className={`${className}${thinkingVisible ? " is-thinking-expanded" : " is-thinking-collapsed"}${thinkingClosing ? " is-thinking-closing" : ""}${changes ? " has-file-lane" : ""}`}
       data-quote-selectable="true"
       data-quote-anchor={quoteAnchor}
       aria-label="Válasz és gondolkodás"
@@ -356,7 +394,7 @@ export default function CompactAnswersTimeline({
         {elapsed && <time>{elapsed}</time>}
       </div>
       <div
-        className={`compact-answers-layout${thinkingVisible ? "" : " is-thinking-collapsed"}${thinkingClosing ? " is-thinking-closing" : ""}${footer ? " has-compact-tail" : ""}${resizing === "columns" ? " is-resizing-columns" : ""}${resizing === "height" ? " is-resizing-height" : ""}${selected?.live ? " is-current" : ""}`}
+        className={`compact-answers-layout${thinkingVisible ? "" : " is-thinking-collapsed"}${thinkingClosing ? " is-thinking-closing" : ""}${footer ? " has-compact-tail" : ""}${resizing === "columns" ? " is-resizing-columns" : ""}${resizing === "height" ? " is-resizing-height" : ""}${selected?.live ? " is-current" : ""}${changes ? " has-file-lane" : ""}`}
         style={layoutStyle}
         ref={layoutRef}
       >
@@ -402,11 +440,6 @@ export default function CompactAnswersTimeline({
               </article>
             )}
           </div>
-          {changes && (
-            <div className="compact-answer-change-slot" ref={changesSlotRef}>
-              {changes}
-            </div>
-          )}
         </section>
         {thinkingVisible && (
           <div
@@ -570,6 +603,15 @@ export default function CompactAnswersTimeline({
             </div>
           )}
         </section>
+        {changes && (
+          // A fájlok saját, harmadik hasábja — korábban a válasz aljához kötött
+          // abszolút réteg volt (top: var(--compact-answer-height)), lásd a
+          // c797e2d-nél eltört változatot; most rács-hasábként a teljes kártya-
+          // magasságot kapja.
+          <div className="compact-files-panel" ref={changesSlotRef}>
+            {changes}
+          </div>
+        )}
         <div
           className="compact-height-resizer"
           role="separator"

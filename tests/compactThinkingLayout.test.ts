@@ -36,14 +36,15 @@ test("futás közben csak a provider ikon kap orbit animációt", () => {
   );
 });
 
-test("a részletes mód két oszlopban mutatja a lépéseket és az aktuális tartalmat", () => {
+test("a részletes mód három hasábban mutatja a lépéseket, a tartalmat és a fájlokat", () => {
   assert.match(app, /detailed-trace-grid/);
   assert.doesNotMatch(app, /className="detailed-trace-lane detailed-answer-lane"/);
   assert.match(app, /detailed-steps-lane/);
   assert.match(app, /detailed-thinking-lane/);
+  assert.match(app, /detailed-files-lane/);
   assert.match(
     styles,
-    /--detailed-answer-track: max\(260px, min\(var\(--compact-answer-width[\s\S]*--detailed-steps-track: calc\(100% - var\(--detailed-answer-track\)\)[\s\S]*grid-template-columns:[\s\S]*minmax\(0, 1fr\)[\s\S]*var\(--detailed-steps-track\)/,
+    /--detailed-answer-track: max\(260px, min\(var\(--compact-answer-width[\s\S]*--detailed-steps-track: calc\(100% - var\(--detailed-answer-track\)\)[\s\S]*grid-template-columns:[\s\S]*minmax\(0, 1fr\)[\s\S]*calc\(var\(--detailed-steps-track\) - var\(--files-lane-track\)\)[\s\S]*var\(--files-lane-track\)/,
   );
   assert.match(
     styles,
@@ -176,15 +177,15 @@ test("a részletes nézet keretet zár: a vonalak nem halnak el, hanem végigfut
     styles,
     /--detailed-fade-line:\s*linear-gradient\(90deg, #a59b7c 0%[^;]*rgba\(165, 155, 124, \.2\) 100%\);/,
   );
-  // A panelen belüli, rövid elválasztóknak viszont maradt az elhaló változat:
-  // 20%-on megállva a végük levágott vonalnak látszana.
+  // A fájl-hasáb a keret halk oldalán él: a felső-alsó élét és a lépések
+  // felőli határvonalát is a fade-tail rajzolja, nem egy második khaki vonal.
   assert.match(
     styles,
-    /--detailed-inner-fade-line:\s*linear-gradient\(90deg, #a59b7c 0%[^;]*transparent 100%\);/,
+    /\.detailed-files-lane\s*\{[^}]*grid-column:\s*3;[^}]*background-color:\s*#000;[^}]*background-size:\s*100% 1px, 100% 1px/s,
   );
   assert.match(
     styles,
-    /\.detailed-step-changes::before\s*\{[^}]*background:\s*var\(--detailed-inner-fade-line\)/s,
+    /\.detailed-files-lane::before\s*\{[^}]*width:\s*1px;[^}]*background:\s*var\(--detailed-fade-tail\)/s,
   );
   assert.match(
     styles,
@@ -216,10 +217,6 @@ test("a részletes nézet keretet zár: a vonalak nem halnak el, hanem végigfut
   assert.match(
     styles,
     /\.detailed-step-list\s*\{[^}]*margin-bottom:\s*10px/s,
-  );
-  assert.match(
-    styles,
-    /\.detailed-step-changes::before\s*\{[^}]*background:\s*var\(--detailed-inner-fade-line\)/s,
   );
   assert.match(
     styles,
@@ -357,6 +354,57 @@ test("a kevés lépéses VÁLASZ tartalom szerint nő, majd 320 px-nél görget"
   assert.match(
     styles,
     /\.detailed-thinking-lane,[\s\S]*height:\s*100%;[\s\S]*overflow-y:\s*auto;[\s\S]*max-height:\s*var\(--detailed-answer-max-height, 320px\)/,
+  );
+});
+
+test("a fájlok mindkét módban saját, teljes magasságú harmadik hasábot kapnak", () => {
+  // Jóváhagyott arányok a kártya teljes szélességén: VÁLASZ 50%, a lépés/
+  // gondolkodás hasáb a maradék 3/4-e, a fájl-sáv a maradék — 240px padlóval.
+  // Fájlok nélkül a sáv 0px, és minden képlet a kéthasábos alakra esik vissza.
+  assert.match(
+    styles,
+    /\.compact-answer-card,\s*\.detailed-trace-grid\s*\{\s*--files-lane-track:\s*0px;\s*\}/,
+  );
+  assert.match(
+    styles,
+    /\.compact-answer-card\.has-file-lane,\s*\.detailed-trace-grid\.has-file-lane\s*\{\s*--files-lane-track:\s*max\(240px, 12\.5%\);\s*\}/,
+  );
+  assert.match(styles, /--compact-answer-width, 50%/);
+  assert.match(app, /displayedChangeSummary\.length > 0 \? " has-file-lane" : ""/);
+  assert.match(component, /\$\{changes \? " has-file-lane" : ""\}/);
+  // A fejléc+5 soros korlát és a lenyitó gomb kikerült: minden fájl kifér,
+  // görgetés csak a hasáb plafonja felett (~20+ fájl) jön elő.
+  assert.doesNotMatch(app, /CHANGE_SUMMARY_COLLAPSED_ROWS/);
+  assert.doesNotMatch(app, /trace-change-expand/);
+  assert.doesNotMatch(styles, /\.trace-change-expand/);
+  assert.match(
+    styles,
+    /\.detailed-step-changes \.trace-change-list\s*\{[^}]*overflow-y:\s*auto/s,
+  );
+  assert.match(
+    styles,
+    /\.compact-files-panel \.trace-change-list\s*\{[^}]*overflow-y:\s*auto/s,
+  );
+  // Nem-Részletes: a fájlpanel már nem a válasz aljához kötött abszolút réteg,
+  // hanem rács-hasáb (a c797e2d-nél eltört top-kötés végleg megszűnt).
+  assert.match(component, /className="compact-files-panel"/);
+  assert.doesNotMatch(styles, /\.compact-answer-change-slot/);
+  assert.doesNotMatch(
+    styles,
+    /\.compact-files-panel\s*\{[^}]*top:\s*var\(--compact-answer-height/s,
+  );
+  // Összecsukott középső hasáb mellett a fájl-hasáb megmarad.
+  assert.match(
+    styles,
+    /\.compact-answers-layout\.is-thinking-collapsed\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) var\(--files-lane-track\)/s,
+  );
+  assert.match(
+    styles,
+    /\.detailed-trace-grid\.is-steps-collapsed\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) var\(--files-lane-track\)/s,
+  );
+  assert.match(
+    styles,
+    /\.detailed-trace-grid\.is-steps-collapsed \.detailed-files-lane\s*\{\s*grid-column:\s*2;\s*\}/,
   );
 });
 

@@ -6782,9 +6782,6 @@ function ImagePreviewOverlay({
   );
 }
 
-/** Fejléc + öt fájlsor: ennyi látszik, amíg a lista nincs kinyitva. */
-const CHANGE_SUMMARY_COLLAPSED_ROWS = 5;
-
 /**
  * Csak a fájlnév. A hash-elt, mély útvonalak (`.gradle-check/native/1def…/…`)
  * szélesebbre nyomták a panelt, mint a válasz maga; a teljes út a soron lévő
@@ -6811,24 +6808,16 @@ function ChangeSummaryPanel({
   rollbackBusy?: boolean;
   onPreviewImage?: (path: string) => void;
 }) {
-  // Egy nagy futás negyven-ötven fájlt is érint, és a teljes lista mélyebb lett,
-  // mint maga a válasz. A panel ezért a fejléccel együtt hat sor magas, a többi
-  // egy kattintással nyílik — a fájlok száma a fejlécben addig is ott van.
-  const [changesExpanded, setChangesExpanded] = useState(false);
+  // A panel a saját, teljes magasságú hasábjában él, ezért nincs sorkorlát és
+  // lenyitó gomb: a lista lefelé kifér, és csak akkor görget, ha a hasáb
+  // plafonjánál is több (~20+) fájl van.
   if (files.length === 0) return null;
   const added = files.reduce((total, file) => total + file.added, 0);
   const removed = files.reduce((total, file) => total + file.removed, 0);
   const statusLabel = (status: ChangeSummaryFile["status"]) =>
     status === "added" ? "ÚJ" : status === "removed" ? "TÖRÖLT" : null;
-  const hidden = Math.max(0, files.length - CHANGE_SUMMARY_COLLAPSED_ROWS);
-  const shownFiles = changesExpanded
-    ? files
-    : files.slice(0, CHANGE_SUMMARY_COLLAPSED_ROWS);
   return (
-    <aside
-      className={`trace-change-summary${changesExpanded ? " is-expanded" : ""}`}
-      aria-label="Fájlok és változások"
-    >
+    <aside className="trace-change-summary" aria-label="Fájlok és változások">
       <div className="trace-change-heading">
         <strong>FÁJLOK / VÁLTOZÁSOK</strong>
         <span
@@ -6841,7 +6830,7 @@ function ChangeSummaryPanel({
         </span>
       </div>
       <ul className="trace-change-list">
-        {shownFiles.map((file) => {
+        {files.map((file) => {
           const label = statusLabel(file.status);
           return (
             <li
@@ -6868,22 +6857,6 @@ function ChangeSummaryPanel({
           );
         })}
       </ul>
-      {hidden > 0 && (
-        <button
-          type="button"
-          className="trace-change-expand"
-          aria-expanded={changesExpanded}
-          onClick={() => setChangesExpanded((open) => !open)}
-          title={
-            changesExpanded
-              ? "Lista összecsukása"
-              : `További ${hidden} fájl megjelenítése`
-          }
-        >
-          <span aria-hidden="true">{changesExpanded ? "⌃" : "⌄"}</span>
-          {changesExpanded ? "kevesebb" : `+${hidden}`}
-        </button>
-      )}
       {onRollback && (
         <div className="trace-change-footer">
           <button
@@ -8091,7 +8064,7 @@ function TurnProgressCard({
 
         <div
           ref={detailedGridRef}
-          className={`detailed-trace-grid${isPlanStage ? " is-plan-stage" : " is-work-stage"}${stepsCollapsed ? " is-steps-collapsed" : ""}`}
+          className={`detailed-trace-grid${isPlanStage ? " is-plan-stage" : " is-work-stage"}${stepsCollapsed ? " is-steps-collapsed" : ""}${displayedChangeSummary.length > 0 ? " has-file-lane" : ""}`}
           style={
             {
               "--detailed-step-slots": reservedStepSlots,
@@ -8427,10 +8400,12 @@ function TurnProgressCard({
                   )}
               </ul>
             )}
-            {/* A fájlpanel a válasz alján van, ugyanott, ahol a Nem-Részletes
-                nézetben — a lépések oszlopában a válasz mellé került, és az
-                alatta maradt üres feketét sem töltötte ki semmi. */}
-            {displayedChangeSummary.length > 0 && (
+          </section>
+
+          {/* A fájlok a rács harmadik hasábja a lépések mellett, a másik két
+              sávval azonos magasságban — nem a válasz aljára fűzött panel. */}
+          {displayedChangeSummary.length > 0 && (
+            <div className="detailed-trace-lane detailed-files-lane">
               <div className="detailed-step-changes">
                 <ChangeSummaryPanel
                   files={displayedChangeSummary}
@@ -8439,8 +8414,8 @@ function TurnProgressCard({
                   onPreviewImage={onPreviewImage}
                 />
               </div>
-            )}
-          </section>
+            </div>
+          )}
         </div>
 
 

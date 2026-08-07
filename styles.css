@@ -998,8 +998,14 @@ textarea::placeholder { color: var(--faint); }
 
 /* Final trace layout: the answer slot is visible during a live turn as well. */
 .trace-card { position: relative; width: calc(100% - 29px); max-width: none; margin: 0 0 10px 29px; overflow: visible; border: 1px solid #45515a; border-radius: 3px; background: #20262b; box-shadow: 0 8px 24px rgba(0, 0, 0, .2); }
+/* Jóváhagyott hasábarányok a kártya teljes szélességén: VÁLASZ 50%, LÉPÉSEK /
+   GONDOLKODÁS a maradék 3/4-e (37,5%), FÁJLOK a maradék (12,5%) — 240px
+   padlóval, keskeny ablakon a középső hasáb enged. Fájlok nélkül a sáv 0px,
+   és minden képlet a kéthasábos alakra esik vissza. */
+.compact-answer-card, .detailed-trace-grid { --files-lane-track: 0px; }
+.compact-answer-card.has-file-lane, .detailed-trace-grid.has-file-lane { --files-lane-track: max(240px, 12.5%); }
 .compact-answer-card { position: relative; width: calc(100% - 29px); max-width: none; margin: 0 0 10px 29px; overflow: visible; border: 0; border-radius: 0; background: #20262b; box-shadow: none; }
-.compact-answer-card.is-thinking-collapsed { width: min(720px, 60%); max-width: calc(100% - 29px); }
+.compact-answer-card.is-thinking-collapsed { width: calc(50% + var(--files-lane-track)); max-width: calc(100% - 29px); }
 .compact-answer-body { padding: 9px 12px; color: #c9d2dc; line-height: var(--line-height); }
 .compact-answer-line { display: flex; min-height: 18px; align-items: flex-start; gap: 8px; }
 .compact-answer-line p { min-width: 0; flex: 1 1 auto; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -1040,16 +1046,16 @@ textarea::placeholder { color: var(--faint); }
 .trace-answer-actions button > svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 .turn-progress-answer-tools { display: flex; justify-content: flex-end; margin: -3px -4px 4px 0; }
 
-.compact-answers-layout { position: relative; isolation: isolate; display: grid; grid-template-columns: minmax(260px, min(var(--compact-answer-width, min(720px, 60%)), calc(100% - 240px))) minmax(240px, 1fr); align-items: start; height: var(--compact-timeline-height, auto); min-height: 34px; background: var(--compact-lane-grey); }
-.compact-answers-layout.is-thinking-collapsed { grid-template-columns: minmax(0, 1fr); height: var(--compact-timeline-height, var(--compact-answer-height, auto)); }
+.compact-answers-layout { position: relative; isolation: isolate; display: grid; grid-template-columns: minmax(260px, min(var(--compact-answer-width, 50%), calc(100% - 240px - var(--files-lane-track)))) minmax(0, 1fr) var(--files-lane-track); align-items: start; height: var(--compact-timeline-height, auto); min-height: 34px; background: var(--compact-lane-grey); }
+.compact-answers-layout.is-thinking-collapsed { grid-template-columns: minmax(0, 1fr) var(--files-lane-track); height: var(--compact-timeline-height, var(--compact-answer-height, auto)); }
 .compact-answers-layout.has-compact-tail { border-bottom: 0; }
 /* A hasábot körülrajzoló kemény keret helyett a fade-keret zár (lásd fentebb). */
 .compact-answers-layout::before { display: none; }
 .compact-answers-layout.is-thinking-collapsed::before { right: -1px; width: auto; border-radius: 3px; }
 .compact-answers-panel { position: relative; display: flex; min-width: 0; height: 100%; box-sizing: border-box; flex-direction: column; overflow: hidden; padding: 0; border: 0; border-radius: 3px; }
-.compact-answers-panel::after { position: absolute; z-index: 0; top: var(--compact-answer-height, 100%); right: 0; bottom: 0; left: 0; pointer-events: none; background: repeating-linear-gradient(135deg, rgba(165, 155, 124, .18) 0, rgba(165, 155, 124, .18) 1px, transparent 1px, transparent 9px), #000; border-top: 1px solid var(--detailed-fade-tail, rgba(165, 155, 124, .2)); content: ""; }
+.compact-answers-panel::after { position: absolute; z-index: 0; top: var(--compact-answer-height, 100%); right: 0; bottom: 0; left: 0; pointer-events: none; background: repeating-linear-gradient(135deg, rgba(165, 155, 124, .07) 0, rgba(165, 155, 124, .07) 1px, transparent 1px, transparent 9px), #000; border-top: 1px solid var(--detailed-fade-tail, rgba(165, 155, 124, .2)); content: ""; }
 .compact-answers-layout.is-current::after { display: none; }
-.compact-column-resizer { position: absolute; z-index: 5; top: 0; bottom: 0; left: min(var(--compact-answer-width, min(720px, 60%)), calc(100% - 240px)); width: 9px; padding: 0; background: transparent; cursor: col-resize; touch-action: none; user-select: none; transform: translateX(-5px); }
+.compact-column-resizer { position: absolute; z-index: 5; top: 0; bottom: 0; left: max(260px, min(var(--compact-answer-width, 50%), calc(100% - 240px - var(--files-lane-track)))); width: 9px; padding: 0; background: transparent; cursor: col-resize; touch-action: none; user-select: none; transform: translateX(-5px); }
 .compact-column-resizer::after { position: absolute; top: 0; bottom: 0; left: 4px; width: 1px; background: transparent; content: ""; }
 .compact-column-resizer:hover::after, .compact-column-resizer:focus-visible::after, .compact-answers-layout.is-resizing-columns .compact-column-resizer::after { background: var(--tick4-khaki-accent); }
 .compact-column-resizer:focus-visible, .compact-height-resizer:focus-visible { outline: 0; }
@@ -1113,28 +1119,50 @@ textarea::placeholder { color: var(--faint); }
 .compact-technical-kind { color: var(--accent); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 7px; font-weight: 700; }
 .compact-technical-detail { max-height: 180px; overflow: auto; margin: 2px 3px 4px 18px; padding: 5px 7px; border-left: 1px solid #40534a; background: rgba(10, 14, 16, .28); color: #8e9b95; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 8px; line-height: 1.35; white-space: pre-wrap; overflow-wrap: anywhere; }
 .compact-primary-trace > .compact-technical-detail { grid-column: 1 / -1; width: 100%; box-sizing: border-box; margin-left: 0; }
-.compact-answer-change-slot { position: absolute; z-index: 1; top: var(--compact-answer-height, 100%); right: 0; left: 0; pointer-events: none; }
-.compact-answer-changes { padding: 12px 12px 10px; pointer-events: auto; }
+/* A fájl-hasáb a Nem-Részletes rács harmadik oszlopa. Korábban a válasz aljához
+   kötött abszolút réteg volt (top: var(--compact-answer-height)) — most a rács
+   teljes magasságát kapja, ugyanolyan magas, mint a másik két hasáb. */
+.compact-files-panel {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  min-width: 0;
+  height: 100%;
+  box-sizing: border-box;
+  flex-direction: column;
+  overflow: hidden;
+  background: #000;
+}
+.compact-answer-changes { display: flex; min-height: 0; flex: 0 1 auto; flex-direction: column; padding: 12px 12px 10px; }
 /* A Nem-Részletes fájlpanel ugyanaz, mint a Részletesben: keret és lekerekítés
    nélkül, fekete alapon, fejléc-vonal nélkül — a két mód között ne váltson
    megjelenést ugyanaz a panel. */
-.compact-answer-change-slot .trace-change-summary {
-  width: max-content;
-  min-width: min(240px, 100%);
-  max-width: 100%;
+.compact-files-panel .trace-change-summary {
+  display: flex;
+  width: auto;
+  min-width: 0;
+  max-width: none;
+  min-height: 0;
+  box-sizing: border-box;
+  flex: 0 1 auto;
+  flex-direction: column;
   margin: 0;
   padding: 7px 9px;
-  box-sizing: border-box;
   border: 0;
   border-radius: 0;
   background: #000;
   box-shadow: none;
 }
-.compact-answer-change-slot .trace-change-heading { border-bottom: 0; }
-.compact-answer-change-slot .trace-change-summary.is-expanded .trace-change-list {
-  max-height: 190px;
+.compact-files-panel .trace-change-heading { flex: 0 0 auto; border-bottom: 0; }
+/* Sorkorlát nincs: a lista a hasáb plafonjáig nő, és csak felette görget. */
+.compact-files-panel .trace-change-list {
+  min-height: 0;
+  flex: 0 1 auto;
   overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #2b3946 transparent;
 }
+.compact-files-panel .trace-change-footer { flex: 0 0 auto; }
 .trace-panel-heading { display: flex; min-height: 29px; align-items: center; gap: 8px; padding: 0 10px; border-bottom: 1px solid var(--border-soft); color: var(--text); }
 .trace-panel-heading strong { color: var(--accent); font-size: 10px; letter-spacing: .08em; }
 .trace-panel-heading span { color: var(--faint); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 8px; font-weight: 500; letter-spacing: 0; }
@@ -1150,10 +1178,6 @@ textarea::placeholder { color: var(--faint); }
 .trace-change-heading .trace-change-total-added { color: #8fe0aa; }
 .trace-change-heading .trace-change-total-removed { color: #e28a94; }
 .trace-change-list { display: grid; gap: 3px; margin: 7px 0 0; padding: 0; list-style: none; }
-/* A lista fejléccel együtt hat sor; a többi a lenyitó gombbal jön elő. */
-.trace-change-expand { display: flex; align-items: center; gap: 4px; width: 100%; margin: 5px 0 0; padding: 2px 0 0; border: 0; border-top: 1px solid rgba(165, 155, 124, .2); background: transparent; color: var(--faint); font-size: 8px; letter-spacing: .04em; }
-.trace-change-expand:hover, .trace-change-expand:focus-visible { color: var(--tick4-khaki-light); outline: 0; }
-.trace-change-expand span { font-size: 11px; line-height: 1; }
 .trace-change-list li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 7px; min-width: 0; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 8px; line-height: 1.25; }
 .trace-change-list li.has-status { grid-template-columns: minmax(0, 1fr) auto auto auto; }
 .trace-change-list code { min-width: 0; overflow: hidden; color: #cbd5de; text-overflow: ellipsis; white-space: nowrap; }
@@ -2729,11 +2753,11 @@ textarea::placeholder { color: var(--faint); }
 }
 
 .compact-answers-layout::before {
-  width: calc(min(var(--compact-answer-width, min(720px, 60%)), calc(100% - 240px)) + 2px);
+  width: calc(max(260px, min(var(--compact-answer-width, 50%), calc(100% - 240px - var(--files-lane-track)))) + 2px);
 }
 
 .compact-column-resizer {
-  left: calc(min(var(--compact-answer-width, min(720px, 60%)), calc(100% - 240px)) + 1px);
+  left: calc(max(260px, min(var(--compact-answer-width, 50%), calc(100% - 240px - var(--files-lane-track)))) + 1px);
 }
 
 .compact-thinking-panel:not(.is-collapsed) {
@@ -2745,6 +2769,13 @@ textarea::placeholder { color: var(--faint); }
   border: 1px solid var(--tick4-answer-deep);
   border-radius: 0 3px 3px 0;
   background: #20252a;
+}
+
+/* Fájl-hasáb mellett a gondolkodás középső sáv: a kártya jobb élét — és vele a
+   lekerekítést — a fájl-hasáb viseli. */
+.compact-answer-card.has-file-lane .compact-thinking-panel:not(.is-collapsed) {
+  margin-right: 0;
+  border-radius: 0;
 }
 
 .compact-thinking-panel.is-preparing {
@@ -3260,9 +3291,6 @@ textarea::placeholder { color: var(--faint); }
      még éppen látszanak, és azzal futnak végig — így a keret körbezár, de a
      hangsúly továbbra is a bal oldalon, a lépések mellett van. */
   --detailed-fade-line: linear-gradient(90deg, #a59b7c 0%, rgba(165, 155, 124, .72) 24%, rgba(165, 155, 124, .2) 52%, rgba(165, 155, 124, .2) 100%);
-  /* A panelen *belüli* elválasztók viszont rövidek, ezért ezek elhalnak: 20%-on
-     megállva a végük levágott vonalnak látszana, nem lezárásnak. */
-  --detailed-inner-fade-line: linear-gradient(90deg, #a59b7c 0%, rgba(165, 155, 124, .72) 46%, transparent 100%);
   /* A keret halk szakasza önmagában, hogy a jobb oldali oszlop egyenletesen
      folytassa azt, amivé a bal oldali vonal lecsengett. */
   --detailed-fade-tail: rgba(165, 155, 124, .2);
@@ -3310,17 +3338,20 @@ textarea::placeholder { color: var(--faint); }
 .detailed-trace-grid {
   position: relative;
   /* A válasz hasáb szélessége ugyanaz a képlet, mint a Nem-Részletes
-     nézetben, hogy a két mód egymásra illeszkedjen; a lépések a maradékot
-     kapják. */
-  --detailed-answer-track: max(260px, min(var(--compact-answer-width, min(720px, 60%)), calc(100% - 240px)));
+     nézetben, hogy a két mód egymásra illeszkedjen; a steps-track továbbra is
+     a válasz jobb szélétől a kártya jobb széléig tartó teljes sáv (ezt
+     használja a toolbar, a keret és a válasz-sáv is), a fájlok a belőle
+     kihasított harmadik oszlopot kapják. */
+  --detailed-answer-track: max(260px, min(var(--compact-answer-width, 50%), calc(100% - 240px - var(--files-lane-track))));
   --detailed-steps-track: calc(100% - var(--detailed-answer-track));
   --detailed-answer-rule-width: min(100%, max(0px, calc(var(--detailed-prompt-width, 720px) - var(--detailed-steps-track))));
-  /* A VÁLASZ balra, a LÉPÉSEK jobbra — ugyanabban a sorrendben, ahogy a
-     Nem-Részletes nézet mutatja őket, hogy a két mód között ne kelljen
-     átszokni. */
+  /* A VÁLASZ balra, a LÉPÉSEK középen, a FÁJLOK jobbra — ugyanabban a
+     sorrendben, ahogy a Nem-Részletes nézet mutatja őket, hogy a két mód
+     között ne kelljen átszokni. */
   grid-template-columns:
     minmax(0, 1fr)
-    var(--detailed-steps-track);
+    calc(var(--detailed-steps-track) - var(--files-lane-track))
+    var(--files-lane-track);
   min-height: var(--detailed-answer-height, 140px);
   align-items: stretch;
   /* A középső elválasztót a grid maga húzza végig: a válasz-sáv inset
@@ -3569,32 +3600,62 @@ textarea::placeholder { color: var(--faint); }
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 
-.detailed-step-changes {
+/* A fájlok hasábja: a rács harmadik oszlopa, Y-ban ugyanolyan magas, mint a
+   másik két sáv. A felső és alsó keretél a keret halk szakaszával fut végig,
+   ahogy a lépés-sávon. */
+.detailed-files-lane {
   position: relative;
-  flex: 0 0 auto;
+  display: flex;
+  /* A lépés-sáv order: 1-gyel, a gondolkodás order: 2-vel él; e nélkül a
+     fájl-sáv (order: 0) kerülne előre az auto-elhelyezésben, és a lépések a
+     rács második sorába csúsznának. */
+  order: 3;
+  grid-column: 3;
   min-width: 0;
-  margin-top: 8px;
-  padding-top: 12px;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 7px 8px 12px;
+  background-color: #000;
+  background-image:
+    linear-gradient(var(--detailed-fade-tail), var(--detailed-fade-tail)),
+    linear-gradient(var(--detailed-fade-tail), var(--detailed-fade-tail));
+  background-repeat: no-repeat, no-repeat;
+  background-position: left top, left bottom;
+  background-size: 100% 1px, 100% 1px;
 }
 
-.detailed-step-changes::before {
+/* A lépések és a fájlok határa: halk vonal — ez már a keret csendes oldala,
+   nem a válasz melletti khaki elválasztó. */
+.detailed-files-lane::before {
   position: absolute;
+  z-index: 4;
   top: 0;
-  left: -8px;
-  width: 52%;
-  height: 1px;
-  /* Panelen belüli elválasztó, nem keretél: rövid, tehát elhal a végén. */
-  background: var(--detailed-inner-fade-line);
+  bottom: 0;
+  left: 0;
+  width: 1px;
+  background: var(--detailed-fade-tail);
   content: "";
   pointer-events: none;
 }
 
+.detailed-step-changes {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+}
+
 .detailed-step-changes .trace-change-summary {
-  width: max-content;
-  min-width: min(240px, 100%);
-  max-width: 100%;
-  margin: 0;
+  display: flex;
+  width: auto;
+  min-width: 0;
+  max-width: none;
+  min-height: 0;
   box-sizing: border-box;
+  flex: 0 1 auto;
+  flex-direction: column;
+  margin: 0;
   border: 0;
   border-radius: 0;
   background: #000;
@@ -3602,26 +3663,21 @@ textarea::placeholder { color: var(--faint); }
 }
 
 .detailed-step-changes .trace-change-heading {
+  flex: 0 0 auto;
   border-bottom: 0;
 }
 
-/* A fájlpanelt ugyanaz a halk vonalpár zárja, mint a keretet — mindkét
-   módban, hogy a panel önálló egységként olvasható legyen. */
-.detailed-step-changes .trace-change-summary,
-.compact-answer-change-slot .trace-change-summary {
-  background-image:
-    linear-gradient(var(--detailed-fade-tail), var(--detailed-fade-tail)),
-    linear-gradient(var(--detailed-fade-tail), var(--detailed-fade-tail));
-  background-repeat: no-repeat;
-  background-position: left top, left bottom;
-  background-size: 100% 1px, 100% 1px;
+/* Sorkorlát és lenyitó gomb nincs: a lista a hasáb plafonjáig nő, és csak
+   tényleg sok (~20+) fájlnál görget. */
+.detailed-step-changes .trace-change-list {
+  min-height: 0;
+  flex: 0 1 auto;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #333b41 transparent;
 }
 
-/* Kinyitva sem nőhet a végtelenbe: onnantól görget. */
-.detailed-step-changes .trace-change-summary.is-expanded .trace-change-list {
-  max-height: 190px;
-  overflow-y: auto;
-}
+.detailed-step-changes .trace-change-footer { flex: 0 0 auto; }
 
 .detailed-step-changes .trace-change-path {
   overflow: hidden;
@@ -3916,13 +3972,6 @@ textarea::placeholder { color: var(--faint); }
   line-height: 1;
 }
 
-@media (max-width: 900px) {
-  .detailed-trace-grid {
-    --detailed-steps-track: max(220px, 38%);
-    grid-template-columns: minmax(220px, 38%) minmax(0, 1fr);
-  }
-}
-
 /* Compact instrument-style timeline for the detailed LÉPÉSEK lane. */
 .detailed-step-list {
   min-height: calc(var(--detailed-step-slots, 1) * 27px + 8px);
@@ -4080,7 +4129,7 @@ textarea::placeholder { color: var(--faint); }
    `background: transparent` különben visszaütné.
    --------------------------------------------------------------------------- */
 .compact-answers-layout {
-  --compact-divider-x: max(260px, min(var(--compact-answer-width, min(720px, 60%)), calc(100% - 240px)));
+  --compact-divider-x: max(260px, min(var(--compact-answer-width, 50%), calc(100% - 240px - var(--files-lane-track))));
   --detailed-fade-line: linear-gradient(90deg, #a59b7c 0%, rgba(165, 155, 124, .72) 24%, rgba(165, 155, 124, .2) 52%, rgba(165, 155, 124, .2) 100%);
   /* `!important`, mert több korábbi szabály is `background` rövidítéssel nyúl
      ehhez az elemhez, és azok visszaütnék a keretet. */
@@ -4094,11 +4143,35 @@ textarea::placeholder { color: var(--faint); }
   background-size: 100% 1px, 100% 1px, 1px 100% !important;
 }
 
+/* A gondolkodás és a fájlok határán halk vonal — a keret csendes oldala, nem
+   még egy khaki elválasztó. */
+.compact-answers-layout.has-file-lane {
+  background-image:
+    var(--detailed-fade-line),
+    var(--detailed-fade-line),
+    linear-gradient(#a59b7c, #a59b7c),
+    linear-gradient(var(--detailed-fade-tail, rgba(165, 155, 124, .2)), var(--detailed-fade-tail, rgba(165, 155, 124, .2))) !important;
+  background-repeat: no-repeat !important;
+  background-position: left top, left bottom, var(--compact-divider-x) top, calc(100% - var(--files-lane-track)) top !important;
+  background-size: 100% 1px, 100% 1px, 1px 100%, 1px 100% !important;
+}
+
 /* Összecsukott gondolkodásnál nincs második hasáb, tehát elválasztó sem. */
 .compact-answers-layout.is-thinking-collapsed {
   background-image: var(--detailed-fade-line), var(--detailed-fade-line) !important;
   background-position: left top, left bottom !important;
   background-size: 100% 1px, 100% 1px !important;
+}
+
+/* Összecsukott középső hasáb mellett a fájl-hasáb megmarad, a határvonalával
+   együtt. */
+.compact-answers-layout.is-thinking-collapsed.has-file-lane {
+  background-image:
+    var(--detailed-fade-line),
+    var(--detailed-fade-line),
+    linear-gradient(var(--detailed-fade-tail, rgba(165, 155, 124, .2)), var(--detailed-fade-tail, rgba(165, 155, 124, .2))) !important;
+  background-position: left top, left bottom, calc(100% - var(--files-lane-track)) top !important;
+  background-size: 100% 1px, 100% 1px, 1px 100% !important;
 }
 
 
@@ -4110,37 +4183,39 @@ textarea::placeholder { color: var(--faint); }
    --------------------------------------------------------------------------- */
 .detailed-trace-grid.is-steps-collapsed {
   /* Becsukva a válasz nem terjed ki a képernyő széléig: pont annyi marad,
-     amennyi a Nem-Részletes nézetben is — a válasz saját szélessége. */
-  width: var(--detailed-answer-track);
-  grid-template-columns: minmax(0, 1fr);
+     amennyi a Nem-Részletes nézetben is — a válasz saját szélessége, plusz a
+     megmaradó fájl-hasáb. Csak a középső (lépés) sáv tűnik el. */
+  width: calc(var(--detailed-answer-track) + var(--files-lane-track));
+  grid-template-columns: minmax(0, 1fr) var(--files-lane-track);
 }
 
 .detailed-trace-grid.is-steps-collapsed .detailed-steps-lane { display: none; }
 
+.detailed-trace-grid.is-steps-collapsed .detailed-files-lane { grid-column: 2; }
+
 .detailed-trace-grid.is-steps-collapsed .detailed-thinking-lane,
 .detailed-trace-grid.is-steps-collapsed .detailed-plan-lane {
-  right: 0;
+  right: var(--files-lane-track);
 }
 
 .detailed-trace-grid.is-steps-collapsed::before,
 .detailed-trace-grid.is-steps-collapsed::after {
-  width: 100%;
+  width: calc(100% - var(--files-lane-track));
 }
 
 .detailed-trace-grid.is-steps-collapsed .detailed-answer-toolbar {
-  right: 9px;
+  right: calc(var(--files-lane-track) + 9px);
 }
 
 /* ---------------------------------------------------------------------------
-   A fájlpanelt fent és lent a keret halk bézs vonala zárja — ugyanaz mindkét
-   módban —, és a Nem-Részletes fő paneleket is ugyanaz a vonalpár keretezi,
-   ahogy a Részletes rácsot.
+   A Nem-Részletes fő paneleket ugyanaz a vonalpár keretezi, ahogy a Részletes
+   rácsot. A fájl-hasáb kerete a hasábé (compact-files-panel / files-lane), nem
+   a benne ülő panelé.
    --------------------------------------------------------------------------- */
-.compact-answer-change-slot .trace-change-summary,
-.detailed-step-changes .trace-change-summary {
+.compact-files-panel {
   background-image:
-    linear-gradient(var(--detailed-fade-tail), var(--detailed-fade-tail)),
-    linear-gradient(var(--detailed-fade-tail), var(--detailed-fade-tail)) !important;
+    linear-gradient(var(--detailed-fade-tail, rgba(165, 155, 124, .2)), var(--detailed-fade-tail, rgba(165, 155, 124, .2))),
+    linear-gradient(var(--detailed-fade-tail, rgba(165, 155, 124, .2)), var(--detailed-fade-tail, rgba(165, 155, 124, .2))) !important;
   background-repeat: no-repeat !important;
   background-position: left top, left bottom !important;
   background-size: 100% 1px, 100% 1px !important;
@@ -4174,32 +4249,9 @@ textarea::placeholder { color: var(--faint); }
   margin: 0 0 2px;
 }
 
-/* ---------------------------------------------------------------------------
-   A reload és a lépés-kapcsoló felfelé nyíló fülként a panel tetején ül, nem a
-   szöveg jobb felső sarkában — így a válasz a teljes hasábszélességet
-   használhatja. Mindkét módban ugyanez.
-   --------------------------------------------------------------------------- */
-.detailed-answer-toolbar,
-.compact-answer-action-row {
-  top: -19px !important;
-  bottom: auto !important;
-  padding: 0 !important;
-  background: transparent !important;
-}
+/* A reload és a lépés-kapcsoló a panel jobb felső sarkában marad. A „felfelé
+   fülek" változat háromszor is elhasalt: a negatív pozíciót a sávok overflow-ja
+   levágta, engedékennyé tett ősökkel pedig a gombok egy féláttetsző réteg alá
+   kerültek. Ez saját, külön kör: a rétegsorrendet kell rendbe tenni, nem a
+   pozíciót tolni. */
 
-.detailed-answer-toolbar .trace-answer-actions button,
-.compact-answer-action-row .trace-answer-actions button {
-  height: 19px;
-  border-bottom: 0;
-  border-radius: 3px 3px 0 0;
-  background: #12171a;
-}
-
-/* A fülek elkerültek a szöveg útjából, tehát a jobb oldali hely felszabadul. */
-.compact-answers-list:has(.compact-answer-action-row) .compact-answer-block,
-.compact-answers-list:has(.compact-answer-action-row .trace-answer-actions) .compact-answer-block {
-  padding-right: 0;
-}
-
-.detailed-thinking-lane,
-.detailed-plan-lane { padding-right: 8px; }

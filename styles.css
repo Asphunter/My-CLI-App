@@ -1119,9 +1119,9 @@ textarea::placeholder { color: var(--faint); }
    nélkül, fekete alapon, fejléc-vonal nélkül — a két mód között ne váltson
    megjelenést ugyanaz a panel. */
 .compact-answer-change-slot .trace-change-summary {
-  width: auto;
-  min-width: 0;
-  max-width: none;
+  width: max-content;
+  min-width: min(240px, 100%);
+  max-width: 100%;
   margin: 0;
   padding: 7px 9px;
   box-sizing: border-box;
@@ -4127,3 +4127,31 @@ textarea::placeholder { color: var(--faint); }
 .detailed-trace-grid.is-steps-collapsed .detailed-answer-toolbar {
   right: 9px;
 }
+
+/* ---------------------------------------------------------------------------
+   A fájlpanelt fent és lent a keret halk bézs vonala zárja — ugyanaz mindkét
+   módban —, és a Nem-Részletes fő paneleket is ugyanaz a vonalpár keretezi,
+   ahogy a Részletes rácsot.
+   --------------------------------------------------------------------------- */
+.compact-answer-change-slot .trace-change-summary,
+.detailed-step-changes .trace-change-summary {
+  background-image:
+    linear-gradient(var(--detailed-fade-tail), var(--detailed-fade-tail)),
+    linear-gradient(var(--detailed-fade-tail), var(--detailed-fade-tail)) !important;
+  background-repeat: no-repeat !important;
+  background-position: left top, left bottom !important;
+  background-size: 100% 1px, 100% 1px !important;
+}
+
+.compact-answers-panel,
+.compact-thinking-panel {
+  background-image:
+    var(--detailed-fade-line),
+    var(--detailed-fade-line) !important;
+  background-repeat: no-repeat !important;
+  background-position: left top, left bottom !important;
+  background-size: 100% 1px, 100% 1px !important;
+}
+
+/* A gondolkodás-hasáb kemény bal szegélye helyett a rács elválasztója marad. */
+.compact-thinking-panel { border-left: 0; }

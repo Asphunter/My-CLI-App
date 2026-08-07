@@ -43,11 +43,11 @@ test("a részletes mód két oszlopban mutatja a lépéseket és az aktuális ta
   assert.match(app, /detailed-thinking-lane/);
   assert.match(
     styles,
-    /--detailed-steps-track: clamp\(260px, var\(--detailed-steps-width, 320px\), 40%\)[\s\S]*grid-template-columns:[\s\S]*var\(--detailed-steps-track\)[\s\S]*minmax\(0, 1fr\)/,
+    /--detailed-steps-track: clamp\(260px, var\(--detailed-steps-width, 320px\), 40%\)[\s\S]*grid-template-columns:[\s\S]*minmax\(0, 1fr\)[\s\S]*var\(--detailed-steps-track\)/,
   );
   assert.match(
     styles,
-    /\.detailed-thinking-lane,[\s\S]*\.detailed-plan-lane \{[\s\S]*position: absolute;[\s\S]*bottom: auto;[\s\S]*left: var\(--detailed-steps-track\);[\s\S]*height: 100%;[\s\S]*overflow-y: auto/,
+    /\.detailed-thinking-lane,[\s\S]*\.detailed-plan-lane \{[\s\S]*position: absolute;[\s\S]*right: var\(--detailed-steps-track\);[\s\S]*bottom: auto;[\s\S]*left: 0;[\s\S]*height: 100%;[\s\S]*overflow-y: auto/,
   );
   assert.match(
     styles,
@@ -199,7 +199,7 @@ test("a részletes nézet keretet zár: a vonalak nem halnak el, hanem végigfut
   );
   assert.match(
     styles,
-    /\.detailed-steps-lane\s*\{[^}]*background-position:\s*left top, left bottom;[^}]*background-size:\s*100% 1px, 100% 1px/s,
+    /\.detailed-steps-lane\s*\{[^}]*grid-column:\s*2;[^}]*background-color:\s*var\(--compact-lane-grey\)[^}]*background-size:\s*100% 1px, 100% 1px/s,
   );
   assert.match(
     styles,
@@ -211,7 +211,7 @@ test("a részletes nézet keretet zár: a vonalak nem halnak el, hanem végigfut
   );
   assert.match(
     styles,
-    /\.detailed-thinking-lane,[\s\S]*padding:\s*28px 7px 28px 8px/,
+    /\.detailed-thinking-lane,[\s\S]*padding:\s*28px 8px 28px 7px/,
   );
   assert.match(
     styles,
@@ -251,7 +251,11 @@ test("a részletes nézet keretet zár: a vonalak nem halnak el, hanem végigfut
   );
   assert.match(
     styles,
-    /\.detailed-answer-toolbar\s*\{[^}]*top:\s*7px;[^}]*right:\s*7px;[^}]*left:\s*auto;[^}]*transform:\s*none/s,
+    /\.detailed-answer-toolbar\s*\{[^}]*top:\s*7px;[^}]*left:\s*auto;[^}]*transform:\s*none/s,
+  );
+  assert.match(
+    styles,
+    /\.detailed-answer-toolbar\s*\{[^}]*z-index:\s*6;[^}]*right:\s*calc\(var\(--detailed-steps-track\) \+ 9px\)/s,
   );
   assert.doesNotMatch(
     app,

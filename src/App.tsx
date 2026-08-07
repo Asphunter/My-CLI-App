@@ -6782,6 +6782,9 @@ function ImagePreviewOverlay({
   );
 }
 
+/** Fejléc + öt fájlsor: ennyi látszik, amíg a lista nincs kinyitva. */
+const CHANGE_SUMMARY_COLLAPSED_ROWS = 5;
+
 /** Files the preview overlay can render; everything else stays plain text. */
 const PREVIEWABLE_IMAGE_EXTENSIONS = ["svg", "png", "jpg", "jpeg", "webp"];
 const isPreviewableImagePath = (filePath: string) => {
@@ -6800,13 +6803,24 @@ function ChangeSummaryPanel({
   rollbackBusy?: boolean;
   onPreviewImage?: (path: string) => void;
 }) {
+  // Egy nagy futás negyven-ötven fájlt is érint, és a teljes lista mélyebb lett,
+  // mint maga a válasz. A panel ezért a fejléccel együtt hat sor magas, a többi
+  // egy kattintással nyílik — a fájlok száma a fejlécben addig is ott van.
+  const [changesExpanded, setChangesExpanded] = useState(false);
   if (files.length === 0) return null;
   const added = files.reduce((total, file) => total + file.added, 0);
   const removed = files.reduce((total, file) => total + file.removed, 0);
   const statusLabel = (status: ChangeSummaryFile["status"]) =>
     status === "added" ? "ÚJ" : status === "removed" ? "TÖRÖLT" : null;
+  const hidden = Math.max(0, files.length - CHANGE_SUMMARY_COLLAPSED_ROWS);
+  const shownFiles = changesExpanded
+    ? files
+    : files.slice(0, CHANGE_SUMMARY_COLLAPSED_ROWS);
   return (
-    <aside className="trace-change-summary" aria-label="Fájlok és változások">
+    <aside
+      className={`trace-change-summary${changesExpanded ? " is-expanded" : ""}`}
+      aria-label="Fájlok és változások"
+    >
       <div className="trace-change-heading">
         <strong>FÁJLOK / VÁLTOZÁSOK</strong>
         <span
@@ -6819,7 +6833,7 @@ function ChangeSummaryPanel({
         </span>
       </div>
       <ul className="trace-change-list">
-        {files.map((file) => {
+        {shownFiles.map((file) => {
           const label = statusLabel(file.status);
           return (
             <li
@@ -6846,6 +6860,22 @@ function ChangeSummaryPanel({
           );
         })}
       </ul>
+      {hidden > 0 && (
+        <button
+          type="button"
+          className="trace-change-expand"
+          aria-expanded={changesExpanded}
+          onClick={() => setChangesExpanded((open) => !open)}
+          title={
+            changesExpanded
+              ? "Lista összecsukása"
+              : `További ${hidden} fájl megjelenítése`
+          }
+        >
+          <span aria-hidden="true">{changesExpanded ? "⌃" : "⌄"}</span>
+          {changesExpanded ? "kevesebb" : `+${hidden}`}
+        </button>
+      )}
       {onRollback && (
         <div className="trace-change-footer">
           <button
@@ -8032,6 +8062,11 @@ function TurnProgressCard({
             } as CSSProperties
           }
         >
+          {/* A rácson ül, nem a görgethető válaszsávon: onnan a gomb elgörgött
+              a tartalommal, itt viszont végig a válasz felett marad. */}
+          {answerActions && (
+            <div className="detailed-answer-toolbar">{answerActions}</div>
+          )}
           <section
             className="detailed-trace-lane detailed-steps-lane"
             aria-label="Lépések listája"
@@ -8148,9 +8183,6 @@ function TurnProgressCard({
             data-quote-anchor={quoteAnchor(`thinking:${selectedStep.id}`)}
             aria-label="Gondolkodás menete"
           >
-            {answerActions && (
-              <div className="detailed-answer-toolbar">{answerActions}</div>
-            )}
             {isPlanStage ? (
               <>
                 <div

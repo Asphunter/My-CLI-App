@@ -998,7 +998,7 @@ textarea::placeholder { color: var(--faint); }
 
 /* Final trace layout: the answer slot is visible during a live turn as well. */
 .trace-card { position: relative; width: calc(100% - 29px); max-width: none; margin: 0 0 10px 29px; overflow: visible; border: 1px solid #45515a; border-radius: 3px; background: #20262b; box-shadow: 0 8px 24px rgba(0, 0, 0, .2); }
-.compact-answer-card { position: relative; width: calc(100% - 29px); max-width: none; margin: 0 0 10px 29px; overflow: visible; border: 1px solid #45515a; border-radius: 3px; background: #20262b; box-shadow: none; }
+.compact-answer-card { position: relative; width: calc(100% - 29px); max-width: none; margin: 0 0 10px 29px; overflow: visible; border: 0; border-radius: 0; background: #20262b; box-shadow: none; }
 .compact-answer-card.is-thinking-collapsed { width: min(720px, 60%); max-width: calc(100% - 29px); }
 .compact-answer-body { padding: 9px 12px; color: #c9d2dc; line-height: var(--line-height); }
 .compact-answer-line { display: flex; min-height: 18px; align-items: flex-start; gap: 8px; }
@@ -1039,11 +1039,12 @@ textarea::placeholder { color: var(--faint); }
 .trace-answer-actions button:hover, .trace-answer-actions button:focus-visible { border-color: #5e9877; background: #1d3528; color: var(--text); outline: 0; }
 .trace-answer-actions button > svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 .turn-progress-answer-tools { display: flex; justify-content: flex-end; margin: -3px -4px 4px 0; }
-.compact-answer-card { border-color: #101519; }
-.compact-answers-layout { position: relative; isolation: isolate; display: grid; grid-template-columns: minmax(260px, min(var(--compact-answer-width, min(720px, 60%)), calc(100% - 240px))) minmax(240px, 1fr); align-items: start; height: var(--compact-timeline-height, auto); min-height: 34px; background: #151a1e; }
+
+.compact-answers-layout { position: relative; isolation: isolate; display: grid; grid-template-columns: minmax(260px, min(var(--compact-answer-width, min(720px, 60%)), calc(100% - 240px))) minmax(240px, 1fr); align-items: start; height: var(--compact-timeline-height, auto); min-height: 34px; background: var(--compact-lane-grey); }
 .compact-answers-layout.is-thinking-collapsed { grid-template-columns: minmax(0, 1fr); height: var(--compact-timeline-height, var(--compact-answer-height, auto)); }
-.compact-answers-layout.has-compact-tail { border-bottom: 1px solid #45515a; }
-.compact-answers-layout::before { position: absolute; z-index: 1; top: -1px; bottom: -1px; left: -1px; width: calc(min(var(--compact-answer-width, min(720px, 60%)), calc(100% - 240px)) + 1px); box-sizing: border-box; border: 1px solid #101519; border-radius: 3px 0 0 3px; content: ""; pointer-events: none; }
+.compact-answers-layout.has-compact-tail { border-bottom: 0; }
+/* A hasábot körülrajzoló kemény keret helyett a fade-keret zár (lásd fentebb). */
+.compact-answers-layout::before { display: none; }
 .compact-answers-layout.is-thinking-collapsed::before { right: -1px; width: auto; border-radius: 3px; }
 .compact-answers-panel { position: relative; display: flex; min-width: 0; height: 100%; box-sizing: border-box; flex-direction: column; overflow: hidden; padding: 0; border: 0; border-radius: 3px; }
 .compact-answers-panel::after { position: absolute; z-index: 0; top: var(--compact-answer-height, 100%); right: 0; bottom: 0; left: 0; pointer-events: none; background: repeating-linear-gradient(135deg, rgba(150, 146, 116, .04) 0, rgba(150, 146, 116, .04) 1px, transparent 1px, transparent 9px), var(--chat-bg); border-top: 1px solid var(--border-soft); content: ""; }
@@ -1114,7 +1115,26 @@ textarea::placeholder { color: var(--faint); }
 .compact-primary-trace > .compact-technical-detail { grid-column: 1 / -1; width: 100%; box-sizing: border-box; margin-left: 0; }
 .compact-answer-change-slot { position: absolute; z-index: 1; top: var(--compact-answer-height, 100%); right: 0; left: 0; pointer-events: none; }
 .compact-answer-changes { padding: 12px 12px 10px; pointer-events: auto; }
-.compact-answer-change-slot .trace-change-summary { margin: 0; }
+/* A Nem-Részletes fájlpanel ugyanaz, mint a Részletesben: keret és lekerekítés
+   nélkül, fekete alapon, fejléc-vonal nélkül — a két mód között ne váltson
+   megjelenést ugyanaz a panel. */
+.compact-answer-change-slot .trace-change-summary {
+  width: auto;
+  min-width: 0;
+  max-width: none;
+  margin: 0;
+  padding: 7px 9px;
+  box-sizing: border-box;
+  border: 0;
+  border-radius: 0;
+  background: #000;
+  box-shadow: none;
+}
+.compact-answer-change-slot .trace-change-heading { border-bottom: 0; }
+.compact-answer-change-slot .trace-change-summary.is-expanded .trace-change-list {
+  max-height: 190px;
+  overflow-y: auto;
+}
 .trace-panel-heading { display: flex; min-height: 29px; align-items: center; gap: 8px; padding: 0 10px; border-bottom: 1px solid var(--border-soft); color: var(--text); }
 .trace-panel-heading strong { color: var(--accent); font-size: 10px; letter-spacing: .08em; }
 .trace-panel-heading span { color: var(--faint); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 8px; font-weight: 500; letter-spacing: 0; }
@@ -1130,6 +1150,10 @@ textarea::placeholder { color: var(--faint); }
 .trace-change-heading .trace-change-total-added { color: #8fe0aa; }
 .trace-change-heading .trace-change-total-removed { color: #e28a94; }
 .trace-change-list { display: grid; gap: 3px; margin: 7px 0 0; padding: 0; list-style: none; }
+/* A lista fejléccel együtt hat sor; a többi a lenyitó gombbal jön elő. */
+.trace-change-expand { display: flex; align-items: center; gap: 4px; width: 100%; margin: 5px 0 0; padding: 2px 0 0; border: 0; border-top: 1px solid rgba(165, 155, 124, .2); background: transparent; color: var(--faint); font-size: 8px; letter-spacing: .04em; }
+.trace-change-expand:hover, .trace-change-expand:focus-visible { color: var(--tick4-khaki-light); outline: 0; }
+.trace-change-expand span { font-size: 11px; line-height: 1; }
 .trace-change-list li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 7px; min-width: 0; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 8px; line-height: 1.25; }
 .trace-change-list li.has-status { grid-template-columns: minmax(0, 1fr) auto auto auto; }
 .trace-change-list code { min-width: 0; overflow: hidden; color: #cbd5de; text-overflow: ellipsis; white-space: nowrap; }
@@ -1405,6 +1429,9 @@ textarea::placeholder { color: var(--faint); }
   --tick4-user-border: #969274;
   --tick4-answer-bg: #151a1e;
   --tick4-answer-deep: #101519;
+  /* A lépés/gondolkodás hasáb szürkéje. Egy helyen definiálva, hogy a
+     Részletes és a Nem-Részletes nézet ugyanazt használja. */
+  --compact-lane-grey: #151a1e;
 }
 
 /* The project tree uses the exact same dark surface as the VÁLASZ body. */
@@ -2305,9 +2332,10 @@ textarea::placeholder { color: var(--faint); }
 .detailed-answer-lane { padding: 0; }
 .detailed-answer-toolbar {
   position: absolute;
-  z-index: 3;
+  /* A rács felső fekete sávja z-index 2-n van, ezért ez fölé kell kerülnie. */
+  z-index: 6;
   top: 7px;
-  right: 8px;
+  right: calc(var(--detailed-steps-track) + 9px);
   display: flex;
   align-items: center;
   gap: 5px;
@@ -3084,7 +3112,6 @@ textarea::placeholder { color: var(--faint); }
 
 .detailed-answer-toolbar {
   top: 5px;
-  right: 7px;
   background: linear-gradient(90deg, transparent, #000 24%);
 }
 
@@ -3236,6 +3263,9 @@ textarea::placeholder { color: var(--faint); }
   /* A panelen *belüli* elválasztók viszont rövidek, ezért ezek elhalnak: 20%-on
      megállva a végük levágott vonalnak látszana, nem lezárásnak. */
   --detailed-inner-fade-line: linear-gradient(90deg, #a59b7c 0%, rgba(165, 155, 124, .72) 46%, transparent 100%);
+  /* A keret halk szakasza önmagában, hogy a jobb oldali oszlop egyenletesen
+     folytassa azt, amivé a bal oldali vonal lecsengett. */
+  --detailed-fade-tail: rgba(165, 155, 124, .2);
   --detailed-code-fade-line: linear-gradient(90deg, rgba(165, 155, 124, .52) 0%, rgba(165, 155, 124, .3) 46%, transparent 100%);
   --run-stage-count: 1;
 }
@@ -3281,17 +3311,20 @@ textarea::placeholder { color: var(--faint); }
   position: relative;
   --detailed-steps-track: clamp(260px, var(--detailed-steps-width, 320px), 40%);
   --detailed-answer-rule-width: min(100%, max(0px, calc(var(--detailed-prompt-width, 720px) - var(--detailed-steps-track))));
+  /* A VÁLASZ balra, a LÉPÉSEK jobbra — ugyanabban a sorrendben, ahogy a
+     Nem-Részletes nézet mutatja őket, hogy a két mód között ne kelljen
+     átszokni. */
   grid-template-columns:
-    var(--detailed-steps-track)
-    minmax(0, 1fr);
+    minmax(0, 1fr)
+    var(--detailed-steps-track);
   min-height: var(--detailed-answer-height, 140px);
   align-items: stretch;
   /* A középső elválasztót a grid maga húzza végig: a válasz-sáv inset
      árnyéka csak a saját (max-height-tel sapkázott) magasságáig ér, és a
-     hosszabb bal oszlop mellett szakadás látszott a FÁJLOK panel szintjén. */
+     hosszabb lépés-oszlop mellett szakadás látszott a FÁJLOK panel szintjén. */
   background:
-    linear-gradient(#a59b7c, #a59b7c) var(--detailed-steps-track) 0 / 3px 100%
-      no-repeat,
+    linear-gradient(#a59b7c, #a59b7c)
+      calc(100% - var(--detailed-steps-track)) 0 / 3px 100% no-repeat,
     #000;
 }
 
@@ -3306,16 +3339,20 @@ textarea::placeholder { color: var(--faint); }
   min-width: 0;
   width: auto;
   max-width: none;
-  order: 1;
+  grid-column: 2;
   overflow-x: hidden;
   overflow-y: visible;
   padding: 7px 7px 12px 8px;
   border: 0;
-  background-color: #000;
-  /* A keret felső és alsó éle ugyanígy, háttérrétegként: a pszeudoelemes
-     változat a padding miatt 15px-cel a középső elválasztó előtt megállt, és a
-     keret ott nyitva maradt. */
-  background-image: var(--detailed-fade-line), var(--detailed-fade-line);
+  /* Ugyanaz a szürke, mint a Nem-Részletes nézet lépés-hasábjában. */
+  background-color: var(--compact-lane-grey);
+  /* A keret felső és alsó éle háttérrétegként: a pszeudoelemes változat a
+     padding miatt 15px-cel az elválasztó előtt megállt, és a keret ott nyitva
+     maradt. Ez a jobb oldali oszlop, tehát a keret itt már a halk szakaszában
+     van — végig egyenletesen folytatja a bal oldalon indult vonalat. */
+  background-image:
+    linear-gradient(var(--detailed-fade-tail), var(--detailed-fade-tail)),
+    linear-gradient(var(--detailed-fade-tail), var(--detailed-fade-tail));
   background-repeat: no-repeat, no-repeat;
   background-position: left top, left bottom;
   background-size: 100% 1px, 100% 1px;
@@ -3326,16 +3363,16 @@ textarea::placeholder { color: var(--faint); }
 .detailed-plan-lane {
   position: absolute;
   top: 0;
-  right: 0;
+  right: var(--detailed-steps-track);
   bottom: auto;
-  left: var(--detailed-steps-track);
+  left: 0;
   height: 100%;
-  order: 2;
+  order: 1;
   overflow-x: hidden;
   overflow-y: auto;
   min-height: 0;
   max-height: var(--detailed-answer-max-height, 320px);
-  padding: 28px 7px 28px 8px;
+  padding: 28px 8px 28px 7px;
   border: 0;
   background-color: #000;
   box-shadow: inset 3px 0 0 #a59b7c !important;
@@ -3348,7 +3385,7 @@ textarea::placeholder { color: var(--faint); }
 .detailed-trace-grid::after {
   position: absolute;
   z-index: 2;
-  left: var(--detailed-steps-track);
+  left: 0;
   width: calc(100% - var(--detailed-steps-track));
   background-repeat: no-repeat;
   content: "";
@@ -3362,7 +3399,7 @@ textarea::placeholder { color: var(--faint); }
     var(--detailed-fade-line),
     linear-gradient(#a59b7c, #a59b7c),
     linear-gradient(180deg, #000 0%, rgba(0, 0, 0, .9) 34%, transparent 100%);
-  background-position: left top, left top, left top;
+  background-position: left top, right top, left top;
   background-size: 100% 1px, 3px 100%, 100% 100%;
 }
 
@@ -3373,7 +3410,7 @@ textarea::placeholder { color: var(--faint); }
     var(--detailed-fade-line),
     linear-gradient(#a59b7c, #a59b7c),
     linear-gradient(0deg, #000 0%, rgba(0, 0, 0, .9) 34%, transparent 100%);
-  background-position: left bottom, left top, left top;
+  background-position: left bottom, right top, left top;
   background-size: 100% 1px, 3px 100%, 100% 100%;
 }
 
@@ -3553,8 +3590,10 @@ textarea::placeholder { color: var(--faint); }
   border-bottom: 0;
 }
 
-.detailed-step-changes .trace-change-list {
-  max-height: 150px;
+/* Kinyitva sem nőhet a végtelenbe: onnantól görget. */
+.detailed-step-changes .trace-change-summary.is-expanded .trace-change-list {
+  max-height: 190px;
+  overflow-y: auto;
 }
 
 .detailed-step-changes .trace-change-path {
@@ -3662,7 +3701,6 @@ textarea::placeholder { color: var(--faint); }
 /* Keep the single regenerate action pinned to the answer panel corner. */
 .detailed-answer-toolbar {
   top: 7px;
-  right: 7px;
   left: auto;
   transform: none;
 }
@@ -4005,4 +4043,33 @@ textarea::placeholder { color: var(--faint); }
   .detailed-run-shell:not(.has-phase-rail) .detailed-answer-status-rail {
     left: -29px;
   }
+}
+
+/* ---------------------------------------------------------------------------
+   A Nem-Részletes nézet ugyanazt a keretet viseli, mint a Részletes: a felső és
+   alsó él a válasz bal szélén teljes erővel indul, a felénél lecseng arra a
+   halk szintre, ahol még éppen látszik, és azzal fut végig; a két hasáb között
+   ugyanaz a 3px-es khaki elválasztó. A blokk a fájl végén áll, mert egy korábbi
+   `background: transparent` különben visszaütné.
+   --------------------------------------------------------------------------- */
+.compact-answers-layout {
+  --compact-divider-x: max(260px, min(var(--compact-answer-width, min(720px, 60%)), calc(100% - 240px)));
+  --detailed-fade-line: linear-gradient(90deg, #a59b7c 0%, rgba(165, 155, 124, .72) 24%, rgba(165, 155, 124, .2) 52%, rgba(165, 155, 124, .2) 100%);
+  /* `!important`, mert több korábbi szabály is `background` rövidítéssel nyúl
+     ehhez az elemhez, és azok visszaütnék a keretet. */
+  background-color: var(--compact-lane-grey) !important;
+  background-image:
+    var(--detailed-fade-line),
+    var(--detailed-fade-line),
+    linear-gradient(#a59b7c, #a59b7c) !important;
+  background-repeat: no-repeat !important;
+  background-position: left top, left bottom, var(--compact-divider-x) top !important;
+  background-size: 100% 1px, 100% 1px, 3px 100% !important;
+}
+
+/* Összecsukott gondolkodásnál nincs második hasáb, tehát elválasztó sem. */
+.compact-answers-layout.is-thinking-collapsed {
+  background-image: var(--detailed-fade-line), var(--detailed-fade-line) !important;
+  background-position: left top, left bottom !important;
+  background-size: 100% 1px, 100% 1px !important;
 }

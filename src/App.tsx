@@ -7712,7 +7712,12 @@ function TurnProgressCard({
       <span aria-hidden="true">{stepsCollapsed ? "‹" : "›"}</span>
     </button>
   );
-  const answerActions = (
+  // A Nem-Részletes nézetnek megvan a saját gondolkodás-csukó gombja; a lépés-
+  // kapcsoló csak a Részletes rácsban jelent bármit, ezért csak oda kerül.
+  const answerActions = regenerateAction ? (
+    <div className="trace-answer-actions">{regenerateAction}</div>
+  ) : null;
+  const detailedAnswerActions = (
     <div className="trace-answer-actions">
       {regenerateAction}
       {stepsToggleAction}
@@ -8095,9 +8100,7 @@ function TurnProgressCard({
         >
           {/* A rácson ül, nem a görgethető válaszsávon: onnan a gomb elgörgött
               a tartalommal, itt viszont végig a válasz felett marad. */}
-          {answerActions && (
-            <div className="detailed-answer-toolbar">{answerActions}</div>
-          )}
+          <div className="detailed-answer-toolbar">{detailedAnswerActions}</div>
           <section
             className="detailed-trace-lane detailed-steps-lane"
             aria-label="Lépések listája"

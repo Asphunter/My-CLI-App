@@ -19071,6 +19071,43 @@ function App() {
     const runVerdict = stageForVersion(chain, selectedVersion, lastStageIndex);
     const runHeader = stage ? (
         <div className="pipeline-run-header is-history" data-run-id={chainKey}>
+          {chainVersions.length > 1 && (
+            // A re-run does not replace what it was answering: both attempts
+            // stay readable, and this picks which one the panel is showing.
+            // A sín fölött ül, és görgetésre is vált: a nyíllal pötyögés
+            // helyett egy mozdulat elég két verzió között.
+            <label
+              className="pipeline-run-version"
+              title="Verzió választása — görgetéssel is váltható"
+              onWheel={(event) => {
+                const index = chainVersions.indexOf(selectedVersion);
+                const next =
+                  chainVersions[index + (event.deltaY > 0 ? 1 : -1)];
+                if (next === undefined) return;
+                setSelectedVersions((current) => ({
+                  ...current,
+                  [chainKey]: next,
+                }));
+              }}
+            >
+              <select
+                aria-label="Verzió választása"
+                value={selectedVersion}
+                onChange={(event) =>
+                  setSelectedVersions((current) => ({
+                    ...current,
+                    [chainKey]: Number(event.target.value),
+                  }))
+                }
+              >
+                {chainVersions.map((version) => (
+                  <option key={version} value={version}>
+                    {`v${version}`}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           <span
             className="pipeline-run-tabs"
             role="tablist"
@@ -19131,28 +19168,6 @@ function App() {
               </button>
             ))}
           </span>
-          {chainVersions.length > 1 && (
-            // A re-run does not replace what it was answering: both attempts
-            // stay readable, and this picks which one the panel is showing.
-            <label className="pipeline-run-version" title="Verzió választása">
-              <select
-                aria-label="Verzió választása"
-                value={selectedVersion}
-                onChange={(event) =>
-                  setSelectedVersions((current) => ({
-                    ...current,
-                    [chainKey]: Number(event.target.value),
-                  }))
-                }
-              >
-                {chainVersions.map((version) => (
-                  <option key={version} value={version}>
-                    {`v${version}`}
-                  </option>
-                ))}
-              </select>
-            </label>
-          )}
         </div>
       ) : undefined;
     const historicalRecipe = stage

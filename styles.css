@@ -4158,3 +4158,48 @@ textarea::placeholder { color: var(--faint); }
 
 /* A gondolkodás-hasáb kemény bal szegélye helyett a rács elválasztója marad. */
 .compact-thinking-panel { border-left: 0; }
+
+/* ---------------------------------------------------------------------------
+   A verzióválasztó a fázissín *fölött* ül, a sín pedig lejjebb kezd — így a
+   választó nem lóg bele a válaszba, és görgetéssel is váltható.
+   --------------------------------------------------------------------------- */
+.detailed-run-shell .pipeline-run-header.is-history {
+  flex-direction: column;
+  justify-content: flex-start;
+  gap: 6px;
+}
+
+.detailed-run-shell .pipeline-run-header.is-history .pipeline-run-version {
+  order: -1;
+  margin: 0 0 2px;
+}
+
+/* ---------------------------------------------------------------------------
+   A reload és a lépés-kapcsoló felfelé nyíló fülként a panel tetején ül, nem a
+   szöveg jobb felső sarkában — így a válasz a teljes hasábszélességet
+   használhatja. Mindkét módban ugyanez.
+   --------------------------------------------------------------------------- */
+.detailed-answer-toolbar,
+.compact-answer-action-row {
+  top: -19px !important;
+  bottom: auto !important;
+  padding: 0 !important;
+  background: transparent !important;
+}
+
+.detailed-answer-toolbar .trace-answer-actions button,
+.compact-answer-action-row .trace-answer-actions button {
+  height: 19px;
+  border-bottom: 0;
+  border-radius: 3px 3px 0 0;
+  background: #12171a;
+}
+
+/* A fülek elkerültek a szöveg útjából, tehát a jobb oldali hely felszabadul. */
+.compact-answers-list:has(.compact-answer-action-row) .compact-answer-block,
+.compact-answers-list:has(.compact-answer-action-row .trace-answer-actions) .compact-answer-block {
+  padding-right: 0;
+}
+
+.detailed-thinking-lane,
+.detailed-plan-lane { padding-right: 8px; }

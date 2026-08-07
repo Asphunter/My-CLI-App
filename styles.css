@@ -4102,37 +4102,26 @@ textarea::placeholder { color: var(--faint); }
 }
 
 /* ---------------------------------------------------------------------------
-   A válasz alatt maradó üres terület nem üres fekete: bézs ferde vonalazás fut
-   *az egész* szabad sávban, a fájlpanel körül is. Ezért a vonalazás a hasáb
-   hátterén van (az fedi a teljes szabad helyet), a szöveg és a fájlpanel pedig
-   tömör háttérrel ül rajta, így csak körülöttük látszik.
+   Ferde bézs vonalazás a fájlpanel körüli szabad helyen. Kizárólag ott: a
+   hasáb hátterére kötve minden rövid válasz mögé bekerült, és teleszórta az
+   üzenetfolyamot. A befoglaló sáv a panel alatti helyet is elfoglalja, a panel
+   pedig tömör háttérrel ül rajta, így a vonalak csak körülötte látszanak.
    --------------------------------------------------------------------------- */
-.compact-answer-panel,
-.detailed-thinking-lane,
-.detailed-plan-lane {
+.compact-answer-change-slot,
+.detailed-step-changes {
+  position: relative;
+  align-self: stretch;
   background-image: repeating-linear-gradient(
     -45deg,
     rgba(165, 155, 124, .18) 0 1px,
     transparent 1px 8px
-  ) !important;
+  );
 }
 
-.compact-answer-block,
-.compact-answer-block-content,
-.detailed-thinking-list,
-.detailed-plan-content,
-.detailed-final-answer,
 .compact-answer-change-slot .trace-change-summary,
 .detailed-step-changes .trace-change-summary {
   position: relative;
   background-color: #000;
-}
-
-/* A fájlpanel körüli sáv átlátszó, hogy a hasáb vonalazása látszódjon rajta. */
-.compact-answer-change-slot,
-.detailed-step-changes {
-  align-self: stretch;
-  background: transparent;
 }
 
 /* ---------------------------------------------------------------------------

@@ -5835,15 +5835,27 @@ function EffortSlider({
     };
   }, [modelMenuOpen]);
 
-  const handleWheel = (event: WheelEvent<HTMLDivElement>) => {
-    if (Math.abs(event.deltaY) < 2) return;
-    event.preventDefault();
-    const now = Date.now();
-    if (now - wheelAtRef.current < 240) return;
-    wheelAtRef.current = now;
-    setModelMenuOpen(false);
-    onCycleProvider(event.deltaY > 0 ? 1 : -1);
-  };
+  // React a wheel-t passzívként köti be, ezért a JSX `onWheel`-ből a
+  // `preventDefault()` csak egy konzolhibát ír ("Unable to preventDefault inside
+  // passive event listener invocation") — a beszélgetés eközben elgörgült a
+  // provider-váltás alatt. Ezért kézzel, `passive: false`-szal kötjük be.
+  const cycleProviderRef = useRef(onCycleProvider);
+  cycleProviderRef.current = onCycleProvider;
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+    const onWheel = (event: globalThis.WheelEvent) => {
+      if (Math.abs(event.deltaY) < 2) return;
+      event.preventDefault();
+      const now = Date.now();
+      if (now - wheelAtRef.current < 240) return;
+      wheelAtRef.current = now;
+      setModelMenuOpen(false);
+      cycleProviderRef.current(event.deltaY > 0 ? 1 : -1);
+    };
+    root.addEventListener("wheel", onWheel, { passive: false });
+    return () => root.removeEventListener("wheel", onWheel);
+  }, []);
 
   return (
     <div
@@ -5856,7 +5868,6 @@ function EffortSlider({
       }
       data-provider={provider}
       data-model={modelId}
-      onWheel={handleWheel}
       ref={rootRef}
     >
       <div className="composer-effort-track" aria-hidden="true">

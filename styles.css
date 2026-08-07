@@ -3229,7 +3229,13 @@ textarea::placeholder { color: var(--faint); }
   width: calc(100% - 29px);
   max-width: none;
   margin: 7px 0 8px 29px;
-  --detailed-fade-line: linear-gradient(90deg, #a59b7c 0%, rgba(165, 155, 124, .72) 46%, transparent 100%);
+  /* A keret vonalai nem halnak el: a felénél leesnek arra az erősségre, ahol
+     még éppen látszanak, és azzal futnak végig — így a keret körbezár, de a
+     hangsúly továbbra is a bal oldalon, a lépések mellett van. */
+  --detailed-fade-line: linear-gradient(90deg, #a59b7c 0%, rgba(165, 155, 124, .72) 24%, rgba(165, 155, 124, .2) 52%, rgba(165, 155, 124, .2) 100%);
+  /* A panelen *belüli* elválasztók viszont rövidek, ezért ezek elhalnak: 20%-on
+     megállva a végük levágott vonalnak látszana, nem lezárásnak. */
+  --detailed-inner-fade-line: linear-gradient(90deg, #a59b7c 0%, rgba(165, 155, 124, .72) 46%, transparent 100%);
   --detailed-code-fade-line: linear-gradient(90deg, rgba(165, 155, 124, .52) 0%, rgba(165, 155, 124, .3) 46%, transparent 100%);
   --run-stage-count: 1;
 }
@@ -3306,10 +3312,13 @@ textarea::placeholder { color: var(--faint); }
   padding: 7px 7px 12px 8px;
   border: 0;
   background-color: #000;
-  background-image: var(--detailed-fade-line);
-  background-repeat: no-repeat;
-  background-position: left bottom;
-  background-size: 52% 1px;
+  /* A keret felső és alsó éle ugyanígy, háttérrétegként: a pszeudoelemes
+     változat a padding miatt 15px-cel a középső elválasztó előtt megállt, és a
+     keret ott nyitva maradt. */
+  background-image: var(--detailed-fade-line), var(--detailed-fade-line);
+  background-repeat: no-repeat, no-repeat;
+  background-position: left top, left bottom;
+  background-size: 100% 1px, 100% 1px;
   flex-direction: column;
 }
 
@@ -3354,7 +3363,7 @@ textarea::placeholder { color: var(--faint); }
     linear-gradient(#a59b7c, #a59b7c),
     linear-gradient(180deg, #000 0%, rgba(0, 0, 0, .9) 34%, transparent 100%);
   background-position: left top, left top, left top;
-  background-size: var(--detailed-answer-rule-width) 1px, 3px 100%, 100% 100%;
+  background-size: 100% 1px, 3px 100%, 100% 100%;
 }
 
 .detailed-trace-grid::after {
@@ -3365,22 +3374,12 @@ textarea::placeholder { color: var(--faint); }
     linear-gradient(#a59b7c, #a59b7c),
     linear-gradient(0deg, #000 0%, rgba(0, 0, 0, .9) 34%, transparent 100%);
   background-position: left bottom, left top, left top;
-  background-size: var(--detailed-answer-rule-width) 1px, 3px 100%, 100% 100%;
+  background-size: 100% 1px, 3px 100%, 100% 100%;
 }
 
-/* The steps column has its own fixed top rule. The answer rules above are
-   anchored to the grid so they do not move with the answer scrollbar. */
-.detailed-steps-lane::before {
-  position: absolute;
-  z-index: 5;
-  top: 0;
-  left: 0;
-  width: 52%;
-  height: 1px;
-  background: var(--detailed-fade-line);
-  content: "";
-  pointer-events: none;
-}
+/* A lépések oszlopának felső és alsó élét a sáv háttere adja (fentebb). Az
+   answer-oldali éleket a rács rajzolja, hogy ne mozduljanak a válasz
+   görgetősávjával. */
 
 /* The right column owns the only vertical scrollbar. Legacy detailed/compact
    containers must grow naturally inside it, otherwise the answer looks like a
@@ -3532,7 +3531,8 @@ textarea::placeholder { color: var(--faint); }
   left: -8px;
   width: 52%;
   height: 1px;
-  background: var(--detailed-fade-line);
+  /* Panelen belüli elválasztó, nem keretél: rövid, tehát elhal a végén. */
+  background: var(--detailed-inner-fade-line);
   content: "";
   pointer-events: none;
 }

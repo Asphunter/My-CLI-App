@@ -165,18 +165,26 @@ test("a kért fekete Tree és válaszfelület a pontos szürke chat-háttéren m
   assert.match(styles, /\.detailed-final-answer\s*\{[^}]*border:\s*0/s);
 });
 
-test("a részletes nézet fade vonalakkal zár, a fájlpanel pedig keret nélküli", () => {
+test("a részletes nézet keretet zár: a vonalak nem halnak el, hanem végigfutnak", () => {
   assert.match(
     styles,
     /\.detailed-run-shell \.detailed-trace-card\s*\{[^}]*border:\s*0\s*!important/s,
   );
+  // A keret vonala a felénél leesik arra az erősségre, ahol még éppen látszik,
+  // és azzal fut a végéig — nem `transparent`-be, különben a keret nyitva marad.
   assert.match(
     styles,
-    /\.detailed-run-shell\s*\{[^}]*--detailed-fade-line:\s*linear-gradient\(90deg, #a59b7c/,
+    /--detailed-fade-line:\s*linear-gradient\(90deg, #a59b7c 0%[^;]*rgba\(165, 155, 124, \.2\) 100%\);/,
+  );
+  // A panelen belüli, rövid elválasztóknak viszont maradt az elhaló változat:
+  // 20%-on megállva a végük levágott vonalnak látszana.
+  assert.match(
+    styles,
+    /--detailed-inner-fade-line:\s*linear-gradient\(90deg, #a59b7c 0%[^;]*transparent 100%\);/,
   );
   assert.match(
     styles,
-    /\.detailed-steps-lane::before\s*\{[^}]*width:\s*52%;[^}]*background:\s*var\(--detailed-fade-line\)/s,
+    /\.detailed-step-changes::before\s*\{[^}]*background:\s*var\(--detailed-inner-fade-line\)/s,
   );
   assert.match(
     styles,
@@ -191,15 +199,15 @@ test("a részletes nézet fade vonalakkal zár, a fájlpanel pedig keret nélkü
   );
   assert.match(
     styles,
-    /\.detailed-steps-lane\s*\{[^}]*background-image:\s*var\(--detailed-fade-line\)[^}]*background-position:\s*left bottom[^}]*background-size:\s*52% 1px/s,
+    /\.detailed-steps-lane\s*\{[^}]*background-position:\s*left top, left bottom;[^}]*background-size:\s*100% 1px, 100% 1px/s,
   );
   assert.match(
     styles,
-    /\.detailed-trace-grid::before\s*\{[^}]*top:\s*0;[^}]*height:\s*28px;[^}]*linear-gradient\(180deg, #000 0%, rgba\(0, 0, 0, \.9\) 34%, transparent 100%\);[^}]*background-size:\s*var\(--detailed-answer-rule-width\) 1px, 3px 100%, 100% 100%/s,
+    /\.detailed-trace-grid::before\s*\{[^}]*top:\s*0;[^}]*height:\s*28px;[^}]*linear-gradient\(180deg, #000 0%, rgba\(0, 0, 0, \.9\) 34%, transparent 100%\);[^}]*background-size:\s*100% 1px, 3px 100%, 100% 100%/s,
   );
   assert.match(
     styles,
-    /\.detailed-trace-grid::after\s*\{[^}]*bottom:\s*0;[^}]*height:\s*28px;[^}]*linear-gradient\(0deg, #000 0%, rgba\(0, 0, 0, \.9\) 34%, transparent 100%\);[^}]*background-size:\s*var\(--detailed-answer-rule-width\) 1px, 3px 100%, 100% 100%/s,
+    /\.detailed-trace-grid::after\s*\{[^}]*bottom:\s*0;[^}]*height:\s*28px;[^}]*linear-gradient\(0deg, #000 0%, rgba\(0, 0, 0, \.9\) 34%, transparent 100%\);[^}]*background-size:\s*100% 1px, 3px 100%, 100% 100%/s,
   );
   assert.match(
     styles,
@@ -211,7 +219,7 @@ test("a részletes nézet fade vonalakkal zár, a fájlpanel pedig keret nélkü
   );
   assert.match(
     styles,
-    /\.detailed-step-changes::before\s*\{[^}]*background:\s*var\(--detailed-fade-line\)/s,
+    /\.detailed-step-changes::before\s*\{[^}]*background:\s*var\(--detailed-inner-fade-line\)/s,
   );
   assert.match(
     styles,

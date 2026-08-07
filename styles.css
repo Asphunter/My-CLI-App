@@ -4109,6 +4109,9 @@ textarea::placeholder { color: var(--faint); }
    gondolkodás-hasábjánál.
    --------------------------------------------------------------------------- */
 .detailed-trace-grid.is-steps-collapsed {
+  /* Becsukva a válasz nem terjed ki a képernyő széléig: pont annyi marad,
+     amennyi a Nem-Részletes nézetben is — a válasz saját szélessége. */
+  width: var(--detailed-answer-track);
   grid-template-columns: minmax(0, 1fr);
 }
 

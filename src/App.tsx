@@ -7709,7 +7709,9 @@ function TurnProgressCard({
       title={stepsCollapsed ? "Lépések megnyitása" : "Lépések bezárása"}
       onClick={() => setStepsCollapsed((collapsed) => !collapsed)}
     >
-      <span aria-hidden="true">{stepsCollapsed ? "‹" : "›"}</span>
+      {/* Ugyanaz az irány, mint a Nem-Részletes gondolkodás-kapcsolóján:
+          nyitva a becsukás iránya (‹), csukva a kinyitás iránya (›). */}
+      <span aria-hidden="true">{stepsCollapsed ? "›" : "‹"}</span>
     </button>
   );
   // A Nem-Részletes nézetnek megvan a saját gondolkodás-csukó gombja; a lépés-

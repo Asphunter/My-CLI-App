@@ -82,10 +82,11 @@ test("a terv mindig teljes marad, és a kiválasztott lépés bekezdését emeli
   assert.match(app, /segment\.stepIndex === selectedStepIndex \? " is-highlighted"/);
   assert.match(app, /className="detailed-plan-step-index">[\s\S]*\{segment\.number\}/);
   assert.match(app, /className="detailed-plan-step-period">\.<\/span>/);
-  assert.match(styles, /\.detailed-plan-step\.is-highlighted\s*\{[^}]*border:\s*0;[^}]*background:\s*transparent/s);
+  // Bézs panelen a bézs karika és az áttetsző kiemelés eltűnt: a jelölés tinta.
+  assert.match(styles, /\.detailed-plan-step\.is-highlighted\s*\{[^}]*border:\s*0;[^}]*background:\s*rgba\(0, 0, 0, \.14\)/s);
   assert.match(styles, /\.detailed-plan-step-number\s*\{[^}]*width:\s*21px;[^}]*height:\s*21px;[^}]*place-items:\s*center/s);
   assert.match(styles, /\.detailed-plan-step-index\s*\{[^}]*position:\s*absolute;[^}]*inset:\s*0;[^}]*place-items:\s*center/s);
-  assert.match(styles, /\.detailed-plan-step\.is-highlighted \.detailed-plan-step-number\s*\{[^}]*place-items:\s*center;[^}]*border-radius:\s*50%;[^}]*background:\s*#a59b7c;[^}]*color:\s*#050607/s);
+  assert.match(styles, /\.detailed-plan-step\.is-highlighted \.detailed-plan-step-number\s*\{[^}]*place-items:\s*center;[^}]*border-radius:\s*50%;[^}]*background:\s*#12120e;[^}]*color:\s*#e8e2cd/s);
   assert.doesNotMatch(app, /detailed-plan-view-toggle/);
   assert.doesNotMatch(app, />RAW</);
   assert.doesNotMatch(app, />RÉSZLET</);
@@ -186,9 +187,10 @@ test("a kért fekete Tree és válaszfelület a pontos szürke chat-háttéren m
   assert.match(styles, /Detailed mode v2:[\s\S]*--tick4-on-answer:\s*#fff/);
   assert.match(styles, /\.workspace\s*\{\s*background:\s*#000/);
   assert.match(styles, /\.composer-multi-ai-toggle[^}]*background:\s*#000/s);
-  assert.match(styles, /\.compact-answer-card::before,[\s\S]*width:\s*3px;[\s\S]*background:\s*#a59b7c\s*!important;/);
-  assert.match(styles, /\.detailed-run-shell \.detailed-trace-card::before,[\s\S]*background:\s*#a59b7c\s*!important;/);
-  assert.match(styles, /\.detailed-thinking-lane,[\s\S]*box-shadow:\s*inset 3px 0 0 #a59b7c\s*!important/s);
+  // A válasz bal éle fekete: a panel maga lett bézs, bézs élt nem lehetne látni.
+  assert.match(styles, /\.compact-answer-card::before,[\s\S]*width:\s*3px;[\s\S]*background:\s*#000\s*!important;/);
+  assert.match(styles, /\.detailed-run-shell \.detailed-trace-card::before,[\s\S]*background:\s*#000\s*!important;/);
+  assert.match(styles, /\.detailed-thinking-lane,[\s\S]*box-shadow:\s*inset 3px 0 0 #000\s*!important/s);
   assert.match(styles, /\.detailed-final-answer\s*\{[^}]*border:\s*0/s);
 });
 
@@ -222,7 +224,7 @@ test("a részletes nézet keretet zár: a vonalak nem halnak el, hanem végigfut
   assert.match(app, /"--detailed-prompt-width": detailedPromptWidth/);
   assert.match(
     styles,
-    /\.detailed-thinking-lane,[\s\S]*box-shadow:\s*inset 3px 0 0 #a59b7c !important/,
+    /\.detailed-thinking-lane,[\s\S]*box-shadow:\s*inset 3px 0 0 #000 !important/,
   );
   assert.match(
     styles,
@@ -376,16 +378,22 @@ test("a VÁLASZ tartalom szerint nő 320-ig, de a magasabb szomszédokat kitölt
   assert.match(app, /observer\.observe\(content\)/);
   assert.match(app, /ref=\{detailedGridRef\}/);
   // A 320 a rács min-height-jét vezérli: ennyit kérhet a válasz *egyedül*.
+  // Kézi magasságnál viszont a húzott érték a padló is, különben a rács a
+  // tartalomnál nem lett alacsonyabb, a sáv meg igen — és a kettő különbsége
+  // fekete résként nyílt ki a válasz alja és a rács alsó őrsávja között.
   assert.match(
     styles,
-    /min-height:\s*var\(--detailed-answer-height, 140px\)/,
+    /min-height:\s*var\(--detailed-card-height, var\(--detailed-answer-height, 140px\)\)/,
   );
   assert.match(
     styles,
     /\.detailed-thinking-lane,[\s\S]*height:\s*100%;[\s\S]*overflow-y:\s*auto/,
   );
-  // A sávnak viszont nincs saját plafonja, különben egy 420-as sorban 320-nál
-  // görgetne, és alatta 100 px üresen maradna.
+  // A sávnak nincs saját plafonja: a sor magasságát viszi, és abban görget.
+  assert.match(
+    styles,
+    /\.detailed-thinking-lane,[\s\S]*max-height:\s*none;/,
+  );
   assert.doesNotMatch(styles, /--detailed-answer-max-height/);
   assert.doesNotMatch(app, /--detailed-answer-max-height/);
 });
@@ -402,7 +410,10 @@ test("a fájlok mindkét módban saját, teljes magasságú harmadik hasábot ka
     styles,
     /\.compact-answer-card\.has-file-lane,\s*\.detailed-trace-grid\.has-file-lane\s*\{\s*--files-lane-track:\s*max\(240px, 12\.5%\);\s*\}/,
   );
-  assert.match(styles, /--compact-answer-width, 50%/);
+  // A válasz alapszélessége a húzóka maximuma: a `100%` fallback mellett a
+  // `min()` mindig a plafont (`100% - 240px - fájlsáv`) választja, amíg a
+  // felhasználó nem húz saját értéket.
+  assert.match(styles, /--compact-answer-width, 100%/);
   assert.match(app, /displayedChangeSummary\.length > 0 \? " has-file-lane" : ""/);
   assert.match(component, /\$\{changes \? " has-file-lane" : ""\}/);
   // A fejléc+5 soros korlát és a lenyitó gomb kikerült: minden fájl kifér,
@@ -558,11 +569,10 @@ test("a Részletes kártyán ugyanaz a két húzóka van, mint a Nem-Részletese
   assert.match(app, /\{!stepsCollapsed && \(\s*<div\s+className="detailed-column-resizer"/);
 });
 
-test("a VÁLASZ kapja a szürke felületet, a többi hasáb fekete", () => {
-  // Csere: a válasz a korábbi sáv-szürkét kapta (így önálló lapként olvasható,
-  // és a fehér szöveg ~17:1-en ül 21:1 helyett — ennyivel kevesebb a haláció),
-  // a LÉPÉSEK / GONDOLKODÁS MENETE és a FÁJLOK pedig fekete, mint a chat.
-  assert.match(styles, /--answer-surface:\s*#151a1e/);
+test("a VÁLASZ kapja a saját felületet, a többi hasáb fekete", () => {
+  // A válasz önálló lapként olvasható a körülötte fekete LÉPÉSEK /
+  // GONDOLKODÁS MENETE és FÁJLOK hasábok között.
+  assert.match(styles, /--answer-surface:\s*#a59b7c/);
   assert.match(
     styles,
     /\.detailed-thinking-lane,[\s\S]*?background-color:\s*var\(--answer-surface\)/,
@@ -640,13 +650,28 @@ test("futás közben a technikai csoport nyílik, narratív elemre csukódik", (
   for (const source of [app, component]) {
     assert.match(
       source,
-      /if \(!streaming\) return;[\s\S]{0,200}?last\.kind === "technical" \? last\.id : null/,
+      /if \(!streaming \|\| technicalAutoPaused\) return;[\s\S]{0,200}?last\.kind === "technical" \? last\.id : null/,
     );
   }
 });
 
-test("a menet közbeni sorok külön bulletet kapnak, a lezárt válasz prózája nem", () => {
-  assert.match(app, /streaming \? \(\s*<ul className="compact-answer-stream">/);
+test("a kézzel becsukott technikai csoport nem nyílik vissza futás közben", () => {
+  // Minden új technikai sor újrafuttatta az automatikát, így a becsukás
+  // azonnal visszaugrott. Az első kézi kattintás után az automatika hallgat,
+  // és csak a következő válasznál indul újra.
+  for (const source of [app, component]) {
+    assert.match(source, /setTechnicalAutoPaused\(true\);/);
+    assert.match(source, /technicalAutoPaused\]/);
+  }
+  assert.match(component, /setTechnicalAutoPaused\(false\);/);
+});
+
+test("csak a DeepSeek menet közbeni sorai kapnak külön bulletet, a lezárt válasz prózája nem", () => {
+  // A többi szolgáltató maga ír listát; ott a sor-bullet dupla felsorolás lenne.
+  assert.match(
+    app,
+    /streaming && provider === "deepseek" \? \(\s*<ul className="compact-answer-stream">/,
+  );
   assert.match(app, /liveNarrationLines\(block\.text\)/);
   assert.match(styles, /\.compact-answer-stream \{[^}]*list-style: none/s);
   // A lezárt válasz továbbra is a rendes bekezdés-renderelőt kapja.

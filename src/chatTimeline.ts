@@ -214,7 +214,14 @@ export const buildWorkLogGroups = <
     evidence: GroupEvidence,
   ) => {
     const key = `session:${bucket}`;
-    const floor = userSequenceByKey.get(bucket);
+    // A fázis-bucket `userKey::run:<id>#<n>` alakú, a padló viszont user-kulcsra
+    // van indexelve: a nyers `bucket`-tel a lekérdezés mindig elvétett, így a
+    // csoport padló nélkül maradt. Egyetlen régebbi bizonyíték (a 244. sori
+    // minimum-szabály miatt) ilyenkor lerántotta a csoportot a saját kérdése
+    // elé — innen ugrott fel a legutolsó válasz kártyája fázisváltáskor.
+    const floor = userSequenceByKey.get(
+      stageUserKeyByBucket.get(bucket) ?? bucket,
+    );
     const sequence = finiteNumber(floor)
       // A trace card owns the answer for this user turn, so it must never
       // sort before the user row. Older plan/activity metadata can have the

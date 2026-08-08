@@ -1,14 +1,15 @@
 /**
- * A futás közbeni válasz-szöveg bontása bulletpontokra.
+ * A DeepSeek futás közbeni válasz-szövegének bontása bulletpontokra.
  *
- * Egy kódoló futás alatt a modell a szerszámhívások közé rövid mondatokat ír
- * („Telepítés sikeres — az APK a telefonon van. Folytatom a füstteszttel:"),
- * és ezek egyetlen, egyre hosszabb szövegtömbbé fűződnek össze a VÁLASZ
- * panelben. Így nem látszik, hol ér véget az egyik gondolat és hol kezdődik a
- * következő. Ez a bontás soronként külön bulletet ad nekik.
+ * A DeepSeek a szerszámhívások közé írt rövid mondatait („Telepítés sikeres —
+ * az APK a telefonon van. Folytatom a füstteszttel:") tagolás nélkül fűzi
+ * egymás után, így egyetlen, egyre hosszabb szövegtömb lesz belőlük a VÁLASZ
+ * panelben, és nem látszik, hol ér véget az egyik gondolat. Ez a bontás
+ * soronként külön bulletet ad nekik.
  *
- * A lezárt válasz **nem** megy át ezen: annak saját szerkezete van (címsorok,
- * listák, kódblokkok), és azt a rendes markdown-renderelő rajzolja.
+ * Csak a DeepSeek megy át ezen. A többi szolgáltató saját markdown-szerkezetet
+ * ír (címsorok, listák, kódblokkok), és a sor-bullet arra ráültetve dupla
+ * felsorolást adna; ugyanezért a lezárt válasz sem megy át rajta sehol.
  */
 
 /** Egy sor önálló gondolat — kivéve a kódblokkokat, azok egyben maradnak. */

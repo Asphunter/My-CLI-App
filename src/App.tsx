@@ -97,6 +97,7 @@ import {
   DETAILED_STEPS_MIN_WIDTH,
 } from "./detailedLayout";
 import { changeRowLabels, changeSummaryView } from "./changeSummaryView";
+import { listBreak, listIndent, type ComposerEdit } from "./composerList";
 import { liveNarrationLines } from "./liveNarration";
 import {
   resolveRegenerationRequestSettings,
@@ -1041,11 +1042,19 @@ const DEFAULT_MODEL = "gpt-5.6-luna";
 const DEFAULT_EFFORT = "low";
 const DEFAULT_CLAUDE_EFFORT = "low";
 const DEFAULT_CLAUDE_BUDGET_USD = "0.05";
-// A tool-using coding turn needs several agent turns: read, edit, run the test,
-// then answer. The old default of 1 came from the API-key era where every turn
-// cost money; with subscription auth the turn limit is the only guard, so it has
-// to be high enough for the work to actually finish.
-const DEFAULT_CLAUDE_MAX_TURNS = "40";
+// Alapból nincs körlimit. A Claude Code interaktív módban sem korlátozza a
+// köröket — a `maxTurns` az SDK opcionális kapcsolója —, és a korábbi 40-es
+// plafon egy húsz percen át dolgozó kódoló kört ölt meg félúton: a fájlok már
+// a lemezen voltak, a turn mégis hibára futott. Egy elszabadult kört nem ez fog
+// megállítani, hanem a STOP és a mért módban a költségkeret. Aki mégis akar
+// plafont, a beállításban megadhatja — az üres mező jelenti a „nincs limit"-et.
+const DEFAULT_CLAUDE_MAX_TURNS = "";
+
+/** Üres/érvénytelen mező = nincs plafon; a bridge ilyenkor el sem küldi. */
+const claudeTurnLimit = (value: string): number | null => {
+  const parsed = Number.parseInt(value.trim(), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+};
 const MODEL_PREFERENCE_VERSION = "4";
 const EFFORT_PREFERENCE_VERSION = "1";
 const READING_SETTINGS_VERSION = "3";
@@ -7640,6 +7649,11 @@ function TurnProgressCard({
   }, [orderedActivities, stepActivities, stepCommentary]);
   const [expandedTechnicalSectionId, setExpandedTechnicalSectionId] =
     useState<string | null>(null);
+  // Lásd a Nem-Részletes párját: az első kézi csukás után az automatika
+  // elhallgat, különben minden új technikai sor visszanyitná a csoportot.
+  const [technicalAutoPaused, setTechnicalAutoPaused] = useState(false);
+  // A LÉPÉSEK hasáb nyitó animációja — a gondolkodás-hasáb mozdulatának párja.
+  const [stepsOpening, setStepsOpening] = useState(false);
   const [expandedTraceDetailId, setExpandedTraceDetailId] =
     useState<string | null>(null);
   const thinkingListRef = useRef<HTMLUListElement>(null);
@@ -7802,7 +7816,12 @@ function TurnProgressCard({
         stepsCollapsed ? "Lépések megnyitása" : "Lépések bezárása"
       }
       title={stepsCollapsed ? "Lépések megnyitása" : "Lépések bezárása"}
-      onClick={() => setStepsCollapsed((collapsed) => !collapsed)}
+      onClick={() =>
+        setStepsCollapsed((collapsed) => {
+          if (collapsed) setStepsOpening(true);
+          return !collapsed;
+        })
+      }
     >
       {/* Ugyanaz az irány, mint a Nem-Részletes gondolkodás-kapcsolóján:
           nyitva a becsukás iránya (‹), csukva a kinyitás iránya (›). */}
@@ -8131,11 +8150,21 @@ function TurnProgressCard({
   // telnek a sorai — és becsukódik, amint valódi mondat (narratív elem)
   // érkezik. Lezárt futásnál a kézi állítás marad érvényben.
   useEffect(() => {
-    if (!streaming) return;
+    if (!streaming || technicalAutoPaused) return;
     const last = detailedTraceSections.at(-1);
     if (!last) return;
     setExpandedTechnicalSectionId(last.kind === "technical" ? last.id : null);
-  }, [streaming, detailedTraceSections]);
+  }, [streaming, detailedTraceSections, technicalAutoPaused]);
+  // A nyitó animáció egy körre él: utána a sáv a saját helyén marad.
+  useEffect(() => {
+    if (!stepsOpening) return;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      setStepsOpening(false);
+      return;
+    }
+    const timeout = window.setTimeout(() => setStepsOpening(false), 230);
+    return () => window.clearTimeout(timeout);
+  }, [stepsOpening]);
   useLayoutEffect(() => {
     const grid = detailedGridRef.current;
     const content = isPlanStage
@@ -8226,12 +8255,13 @@ function TurnProgressCard({
         statusIcon={<ProviderMark provider={provider} />}
         actions={answerActions}
         renderAnswer={(block: CompactAnswerBlock) =>
-          // Futás közben a modell menet közbeni sorai folynak ide, egyetlen
-          // összemosódott szövegtömbként. Ezek soronként külön bulletet
-          // kapnak, hogy látszódjon, hol ér véget az egyik gondolat és hol
-          // kezdődik a következő. A lezárt válasz prózája érintetlen marad:
-          // annak saját szerkezete van (címsorok, listák, kódblokkok).
-          streaming ? (
+          // A DeepSeek futás közben tagolás nélkül fűzi egymás után a
+          // szerszámhívások közti mondatait: egyetlen, egyre hosszabb
+          // szövegtömb lesz belőle, amiben nem látszik, hol ér véget az egyik
+          // gondolat. Ott — és csak ott — kap minden sor külön bulletet.
+          // A többi szolgáltató saját markdown-szerkezetet ír (címsorok,
+          // listák), arra ráültetve a sor-bullet dupla felsorolást adna.
+          streaming && provider === "deepseek" ? (
             <ul className="compact-answer-stream">
               {liveNarrationLines(block.text).map((line, index) => (
                 <li key={`${index}:${line.slice(0, 24)}`}>
@@ -8333,7 +8363,7 @@ function TurnProgressCard({
               a tartalommal, itt viszont végig a válasz felett marad. */}
           <div className="detailed-answer-toolbar">{detailedAnswerActions}</div>
           <section
-            className="detailed-trace-lane detailed-steps-lane"
+            className={`detailed-trace-lane detailed-steps-lane${stepsOpening ? " is-opening" : ""}`}
             aria-label="Lépések listája"
           >
             <div
@@ -8554,11 +8584,12 @@ function TurnProgressCard({
                         <button
                           type="button"
                           className="compact-technical-toggle"
-                          onClick={() =>
+                          onClick={() => {
+                            setTechnicalAutoPaused(true);
                             setExpandedTechnicalSectionId((current) =>
                               current === section.id ? null : section.id,
-                            )
-                          }
+                            );
+                          }}
                           aria-expanded={expandedTechnicalSectionId === section.id}
                         >
                           <span className="compact-technical-label">{section.label}</span>
@@ -9557,8 +9588,11 @@ function App() {
     useState<ClaudeApprovalRequest | null>(null);
   const [pendingClaudeQuestion, setPendingClaudeQuestion] =
     useState<ClaudeQuestionRequest | null>(null);
-  const [claudeQuestionDraft, setClaudeQuestionDraft] = useState("");
-  const [claudeQuestionSelections, setClaudeQuestionSelections] = useState<string[]>([]);
+  // Kérdésenként külön tárolva a listából választott címkék és a saját szöveg.
+  // Egyetlen közös mezőben a kattintás beleírta a címkét a szövegdobozba, több
+  // választásnál pedig egyetlen leütés némán eldobta az összes bepipált opciót.
+  const [claudeQuestionChoices, setClaudeQuestionChoices] = useState<string[][]>([]);
+  const [claudeQuestionTexts, setClaudeQuestionTexts] = useState<string[]>([]);
   const [commandsOpen, setCommandsOpen] = useState(false);
   const [openMenu, setOpenMenu] = useState<OpenMenu>(null);
   const [newProjectMenuOpen, setNewProjectMenuOpen] = useState(false);
@@ -10399,8 +10433,19 @@ function App() {
     meta: Omit<CodexDelta, "delta">,
   ) => {
     const stream = run.answerStream;
+    // A híd az `itemId`-ben jelzi, hányadik assistant-üzenetről van szó, épp
+    // azért, hogy két külön üzenet szövege ne ragadjon egybe. A határt viszont
+    // eddig senki nem fordította le bekezdésre: a delták vakon fűződtek
+    // egymáshoz, és a mentett válaszban „…a repo állapotát ellenőrzöm:A forrás
+    // fájlok rendben." lett belőle — a sorok összeolvadtak, a felsorolás
+    // eltűnt. Az üzenethatár innentől bekezdéshatár.
+    const previousItemId = stream.meta?.itemId;
+    const boundary =
+      meta.itemId && previousItemId && meta.itemId !== previousItemId
+        ? "\n\n"
+        : "";
     stream.meta = meta;
-    stream.pending += delta;
+    stream.pending += `${boundary}${delta}`;
     // Gördülékenységre csak akkor van szükség, ha látszik: háttérben futó
     // beszélgetésnél vagy elrejtett ablaknál az adagolás csak fölösleges
     // rendereket csinálna, ott a teljes darab megy egyben.
@@ -12089,8 +12134,8 @@ function App() {
       listen<ClaudeQuestionRequest>("agent-question", (event) => {
         setPendingClaudeQuestion(event.payload);
         setPendingClaudeApproval(null);
-        setClaudeQuestionDraft("");
-        setClaudeQuestionSelections([]);
+        setClaudeQuestionChoices([]);
+        setClaudeQuestionTexts([]);
       }),
     ])
       .then((unlisteners) => {
@@ -14921,8 +14966,8 @@ function App() {
     // See the approval flow above: never leave a stale question blocking the
     // composer when the underlying bridge turn has already terminated.
     setPendingClaudeQuestion(null);
-    setClaudeQuestionDraft("");
-    setClaudeQuestionSelections([]);
+    setClaudeQuestionChoices([]);
+    setClaudeQuestionTexts([]);
     try {
       await invoke("claude_question_response", {
         questionId: pending.questionId,
@@ -16614,7 +16659,7 @@ function App() {
         pipelineEnabled:
           activeModeRef.current !== "general" && showDetailedTrace,
         maxBudgetUsd: Number(claudeBudgetUsd),
-        maxTurns: Number(claudeMaxTurns),
+        maxTurns: claudeTurnLimit(claudeMaxTurns),
         pipelineStageOverrides: activePipelineRecipe?.stages.map((_, index) => ({
           model: stageValue(index, "model") || undefined,
           effort: stageValue(index, "effort") || undefined,
@@ -17961,7 +18006,7 @@ function App() {
               replaceMessageId: regeneration?.originalAnswer.id,
               replaceTurnId: regeneration?.turnId,
               maxBudgetUsd: Number(claudeBudgetUsd),
-              maxTurns: Number(claudeMaxTurns),
+              maxTurns: claudeTurnLimit(claudeMaxTurns),
             },
           })
         : // Through the same door as every other turn. `codex_send` is the
@@ -18191,8 +18236,13 @@ function App() {
                         regeneration?.originalAnswer.text ||
                         "",
                     )
-                  : stripStaleInterruptionMarker(message).text.trim() ||
-                    regeneration?.originalAnswer.text ||
+                  : // Bukott futásnál a hiba a válasz — nem az előző verzió.
+                    // A régi szöveg visszaállítása itt azt a látszatot keltette,
+                    // hogy az új futás ezt az eredményt adta: egy 20 perces
+                    // DeepSeek-kör után a *megelőző* Claude-hiba jelent meg a
+                    // kártyán, holott az új kör bukott el. Az eredeti szöveg a
+                    // regenerálás verziótárában marad meg, nem itt.
+                    stripStaleInterruptionMarker(message).text.trim() ||
                     `Nem sikerült a ${providerName}-kérés: ${errorDescription.userMessage}`,
                 turnId: message.turnId ?? activeTurnIdRef.current,
                 live: false,
@@ -18692,30 +18742,45 @@ function App() {
     }
   };
 
+  const applyComposerEdit = (
+    textarea: HTMLTextAreaElement,
+    edit: ComposerEdit,
+  ) => {
+    textarea.setRangeText(edit.text, edit.from, edit.to, "end");
+    const quoteId = textarea.dataset.quoteId;
+    if (quoteId) {
+      quoteInstructionDraftsRef.current[quoteId] = textarea.value;
+    } else inputDraftRef.current = textarea.value;
+    requestAnimationFrame(() => {
+      const position = edit.from + edit.text.length;
+      textarea.focus();
+      textarea.setSelectionRange(position, position);
+      resizeComposerTextarea(textarea);
+    });
+  };
+
   const handleInputKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    // Tab a listában szintet vált; listán kívül marad a fókuszléptetés.
+    if (event.key === "Tab") {
+      const textarea = event.currentTarget;
+      if (textarea.selectionStart !== textarea.selectionEnd) return;
+      const edit = listIndent(
+        textarea.value,
+        textarea.selectionStart,
+        event.shiftKey ? "out" : "in",
+      );
+      if (!edit) return;
+      event.preventDefault();
+      applyComposerEdit(textarea, edit);
+      return;
+    }
     if (event.key !== "Enter") return;
     if (event.shiftKey) {
       const textarea = event.currentTarget;
-      const cursor = textarea.selectionStart;
-      const beforeCursor = textarea.value.slice(0, cursor);
-      const currentLine = beforeCursor.slice(
-        beforeCursor.lastIndexOf("\n") + 1,
-      );
-      const numberedLine = currentLine.match(/^(\s*)(\d+)\)/);
-      if (!numberedLine) return;
+      const edit = listBreak(textarea.value, textarea.selectionStart);
+      if (!edit) return;
       event.preventDefault();
-      const insertion = `\n${numberedLine[1]}${Number(numberedLine[2]) + 1}) `;
-      textarea.setRangeText(insertion, cursor, textarea.selectionEnd, "end");
-      const quoteId = textarea.dataset.quoteId;
-      if (quoteId) {
-        quoteInstructionDraftsRef.current[quoteId] = textarea.value;
-      } else inputDraftRef.current = textarea.value;
-      requestAnimationFrame(() => {
-        const position = cursor + insertion.length;
-        textarea.focus();
-        textarea.setSelectionRange(position, position);
-        resizeComposerTextarea(textarea);
-      });
+      applyComposerEdit(textarea, edit);
       return;
     }
     if (!event.shiftKey) {
@@ -19305,9 +19370,24 @@ function App() {
       runStages.find((item) => item.role === "code") ??
       runStages.find((item) => item.role === "plan") ??
       runStages.at(-1);
-    const selectedStage = stage
+    const requestedStage = stage
       ? (selectedStages[chainKey] ?? outputStage?.stageIndex ?? lastStageIndex)
       : 0;
+    // Olyan fázisra mutató kiválasztás, aminek ebben a verzióban nincs üzenete,
+    // MINDEN szakasz-kártyát elnémít: a `stageForVersion` semmit nem ad vissza,
+    // a lenti azonosság-feltétel pedig így mindegyikre igaz lesz, és eltűnik az
+    // egész VÁLASZ panel. Mivel a rossz index a state-ben marad, csak a GUI
+    // újraindítása hozta vissza. A kiválasztás ezért mindig létező fázisra esik.
+    const resolvableStages = stage
+      ? slotsOfChain(chain).filter((slot) =>
+          stageForVersion(chain, selectedVersion, slot),
+        )
+      : [];
+    const selectedStage = !stage
+      ? 0
+      : resolvableStages.includes(requestedStage)
+        ? requestedStage
+        : (resolvableStages.at(-1) ?? requestedStage);
     // Only the chosen phase draws itself; the others are one click away.
     // Matched on the run as well as the slot: two versions own the same slot,
     // and without the run id both of them would draw the panel.
@@ -19325,12 +19405,20 @@ function App() {
     // bottom of the conversation; the live card is assembled further down the
     // file, so this leaves a marker and the card is dropped in afterwards —
     // cheaper than hoisting half the render above the timeline.
-    // Deliberately not waiting for `pipelineProgress`: that arrives with the
-    // first stage, and until then the card would render at the bottom and then
-    // jump into place — which is exactly the "it started a new conversation"
-    // moment this is meant to remove. `liveRunResume` is set before the run is
-    // even asked for.
-    if (stage && liveRunResume?.chainKey === chainKey) {
+    // A jelölőt csak akkor szabad kiírni, ha be is fogják váltani. A beváltás
+    // feltétele `rerunInPlace` = `liveRunResume && pipelineProgress &&
+    // hasLiveRerunSlot`; ha a jelölő ennél lazább feltétellel megy ki, a
+    // maradék ágon a szűrő **kidobja** — és a lánc kártyája nyom nélkül eltűnik
+    // a beszélgetésből. Pont ez történt: a re-run lefutott, a `pipelineProgress`
+    // elszállt, a `chain.resume` viszont a futáskezelőben maradt, így a
+    // legutolsó válasz kártyája kiesett a timeline-ból, és csak a GUI
+    // újraindítása hozta vissza.
+    //
+    // A korábbi megjegyzés a `pipelineProgress` bevárását azért kerülte, mert
+    // addig az élő kártya alul rajzol, majd a helyére ugrik. Ez a csere egy
+    // pillanatnyi ugrást vált ki egy tartósan elveszett kártya helyett — a
+    // kettő közül ez a rosszabbik eset megszűnik.
+    if (stage && liveRunResume?.chainKey === chainKey && pipelineProgress) {
       return LIVE_RERUN_SLOT;
     }
     // The verdict of the version being read, not of the newest one: a reader
@@ -21779,68 +21867,158 @@ function App() {
         </div>
       )}
       {pendingClaudeQuestion && (() => {
-        const question = pendingClaudeQuestion.questions[0];
-        if (!question) return null;
-        // The Agent SDK keys the answers record by the question's full text.
-        // Using the short header instead makes the SDK drop the answer and tell
-        // the model "no answer provided", losing the selection silently.
-        const answerKey = question.question || question.header || "answer";
-        const options = question.options ?? [];
-        const multiSelect = question.multiSelect === true;
-        const selected = multiSelect
-          ? claudeQuestionSelections
-          : claudeQuestionDraft
-            ? [claudeQuestionDraft]
-            : [];
+        // Az eszköz egyszerre négy kérdést is feladhat. Korábban csak az első
+        // jelent meg, a többiről a modell „no answer provided"-ot kapott.
+        const questions = pendingClaudeQuestion.questions.filter(
+          (item) => item.question || item.header,
+        );
+        if (questions.length === 0) return null;
+
+        const answerFor = (
+          question: ClaudeQuestionRequest["questions"][number],
+          index: number,
+        ): string | string[] | null => {
+          const picked = claudeQuestionChoices[index] ?? [];
+          const typed = (claudeQuestionTexts[index] ?? "").trim();
+          if (question.multiSelect === true) {
+            const all = typed ? [...picked, typed] : picked;
+            return all.length > 0 ? all : null;
+          }
+          return picked[0] ?? (typed || null);
+        };
+
+        const answered = questions.filter(
+          (question, index) => answerFor(question, index) !== null,
+        ).length;
+
+        const submit = () => {
+          const answer: Record<string, unknown> = {};
+          questions.forEach((question, index) => {
+            const value = answerFor(question, index);
+            if (value === null) return;
+            // The Agent SDK keys the answers record by the question's full text.
+            // Using the short header instead makes the SDK drop the answer and
+            // tell the model "no answer provided", losing the selection silently.
+            answer[question.question || question.header || `answer-${index}`] = value;
+          });
+          void respondClaudeQuestion(answer);
+        };
+
+        const setChoice = (index: number, next: string[]) =>
+          setClaudeQuestionChoices((current) => {
+            const copy = [...current];
+            copy[index] = next;
+            return copy;
+          });
+        const setText = (index: number, next: string) =>
+          setClaudeQuestionTexts((current) => {
+            const copy = [...current];
+            copy[index] = next;
+            return copy;
+          });
+
         return (
           <div className="agent-interaction-overlay" role="presentation">
-            <section className="agent-interaction-card" role="dialog" aria-modal="true" aria-labelledby="claude-question-title">
-              <span className="approval-eyebrow">CLAUDE KÉRDÉS</span>
-              <h2 id="claude-question-title">{question.question || question.header || "Válassz egy lehetőséget"}</h2>
-              <div className="agent-question-options">
-                {options.map((option) => {
-                  const label = option.label || "Választás";
-                  const active = selected.includes(label);
-                  return (
-                    <button
-                      type="button"
-                      className={active ? "is-selected" : ""}
-                      key={label}
-                      onClick={() => {
-                        if (multiSelect) {
-                          setClaudeQuestionSelections((current) =>
-                            current.includes(label)
-                              ? current.filter((item) => item !== label)
-                              : [...current, label],
-                          );
-                        } else {
-                          setClaudeQuestionDraft(label);
-                        }
-                      }}
+            <section
+              className="agent-interaction-card agent-question-card"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="claude-question-title"
+            >
+              <span className="agent-question-eyebrow">Claude kérdez</span>
+              {questions.map((question, index) => {
+                const title =
+                  question.question || question.header || "Válassz egy lehetőséget";
+                const options = question.options ?? [];
+                const multiSelect = question.multiSelect === true;
+                const picked = claudeQuestionChoices[index] ?? [];
+                return (
+                  <div className="agent-question-block" key={`${index}:${title}`}>
+                    <h2
+                      className="agent-question-title"
+                      id={index === 0 ? "claude-question-title" : undefined}
                     >
-                      <strong>{label}</strong>
-                      {option.description && <small>{option.description}</small>}
-                    </button>
-                  );
-                })}
-              </div>
-              <input
-                className="agent-question-free-text"
-                value={multiSelect ? claudeQuestionDraft : claudeQuestionDraft}
-                onChange={(event) => setClaudeQuestionDraft(event.target.value)}
-                placeholder="Saját válasz…"
-                aria-label="Saját válasz"
-              />
+                      {title}
+                    </h2>
+                    <div
+                      className="agent-question-options"
+                      role={multiSelect ? "group" : "radiogroup"}
+                      aria-label={title}
+                    >
+                      {options.map((option) => {
+                        const label = option.label || "Választás";
+                        const active = picked.includes(label);
+                        return (
+                          <button
+                            type="button"
+                            key={label}
+                            role={multiSelect ? "checkbox" : "radio"}
+                            aria-checked={active}
+                            className={`agent-question-option${active ? " is-selected" : ""}`}
+                            onClick={() => {
+                              setChoice(
+                                index,
+                                multiSelect
+                                  ? active
+                                    ? picked.filter((item) => item !== label)
+                                    : [...picked, label]
+                                  : active
+                                    ? []
+                                    : [label],
+                              );
+                              // Egyválasztósnál a lista és a saját szöveg
+                              // kizárja egymást, így mindig látszik, mi megy el.
+                              if (!multiSelect) setText(index, "");
+                            }}
+                          >
+                            <span className="agent-question-mark" aria-hidden="true" />
+                            <span className="agent-question-label">{label}</span>
+                            {option.description && (
+                              <span className="agent-question-note">
+                                {option.description}
+                              </span>
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <label className="agent-question-free">
+                      <span className="agent-question-free-label">
+                        {multiSelect ? "És a magad szavaival" : "Vagy a magad szavaival"}
+                      </span>
+                      <input
+                        className="agent-question-free-text"
+                        value={claudeQuestionTexts[index] ?? ""}
+                        onChange={(event) => {
+                          const value = event.target.value;
+                          setText(index, value);
+                          if (!multiSelect && value.trim()) setChoice(index, []);
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key !== "Enter" || answered === 0) return;
+                          event.preventDefault();
+                          submit();
+                        }}
+                        placeholder="Írd ide…"
+                      />
+                    </label>
+                  </div>
+                );
+              })}
               <div className="agent-interaction-actions">
-                <button type="button" onClick={() => void respondClaudeQuestion({ [answerKey]: "" })}>Mégse</button>
+                {questions.length > 1 && (
+                  <span className="agent-question-progress">
+                    {answered} / {questions.length} megválaszolva
+                  </span>
+                )}
+                <button type="button" onClick={() => void respondClaudeQuestion({})}>
+                  Mégse
+                </button>
                 <button
                   type="button"
                   className="agent-interaction-primary"
-                  disabled={selected.length === 0 && !claudeQuestionDraft.trim()}
-                  onClick={() => {
-                    const answer = claudeQuestionDraft.trim() || (multiSelect ? selected : selected[0]);
-                    void respondClaudeQuestion({ [answerKey]: answer });
-                  }}
+                  disabled={answered === 0}
+                  onClick={submit}
                 >
                   Válasz küldése
                 </button>

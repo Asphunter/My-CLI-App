@@ -1077,7 +1077,13 @@ async function runLiveTurn(request) {
   const model = typeof payload.model === "string" && payload.model.trim() ? payload.model.trim() : "claude-sonnet-5";
   const effort = typeof payload.effort === "string" && payload.effort.trim() ? payload.effort.trim() : "low";
   const maxBudgetUsd = typeof payload.maxBudgetUsd === "number" ? payload.maxBudgetUsd : 0.05;
-  const maxTurns = typeof payload.maxTurns === "number" ? payload.maxTurns : 1;
+  // Hiányzó vagy nem pozitív érték = nincs körlimit: ilyenkor a `maxTurns` ki
+  // sem kerül az SDK opciói közé. A korábbi `: 1` fallback ennél is rosszabb
+  // volt — egyetlen kör után elvágta volna a munkát.
+  const maxTurns =
+    typeof payload.maxTurns === "number" && payload.maxTurns > 0
+      ? payload.maxTurns
+      : null;
   const cwd = normalizeCwd(payload.cwd);
   const initialResume = typeof payload.sessionId === "string" && payload.sessionId.trim() ? payload.sessionId.trim() : null;
   const abortController = new AbortController();
@@ -1189,7 +1195,7 @@ async function runLiveTurn(request) {
             model,
             ...providerReasoningOptions(effort),
             ...budgetOption(maxBudgetUsd),
-            maxTurns,
+            ...(maxTurns ? { maxTurns } : {}),
             cwd,
             ...(resumeForQuery ? { resume: resumeForQuery } : {}),
             systemPrompt: {

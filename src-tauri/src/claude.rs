@@ -1325,10 +1325,12 @@ pub fn send(
     if !max_budget_usd.is_finite() || !(0.01..=5.0).contains(&max_budget_usd) {
         return Err("Az agent coding budgetje 0.01 és 5.00 USD közé essen.".to_string());
     }
+    // Nincs alapértelmezett plafon: a hiányzó érték „nincs limit"-et jelent, és
+    // a bridge ilyenkor ki sem írja a `maxTurns`-t az SDK-nak. A korábbi 40-es
+    // alapérték egy dolgozó, húsz perces kódoló kört ölt meg félúton.
     let max_turns = request
         .max_turns
-        .unwrap_or(DEFAULT_MAX_TURNS)
-        .clamp(1, MAX_TURNS_CEILING);
+        .map(|value| value.clamp(1, MAX_TURNS_CEILING));
     let guard_snapshot = crate::codex::begin_agent_workspace_snapshot(&cwd)?;
     let keep_workspace = request.keep_workspace;
     let mut child: Option<Child> = None;

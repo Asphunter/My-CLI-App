@@ -80,6 +80,9 @@ export default function CompactAnswersTimeline({
     null,
   );
   const [expandedDetailId, setExpandedDetailId] = useState<string | null>(null);
+  // Az első kézi csukás után az automatika elhallgat: futás közben minden új
+  // technikai sor újranyitotta a csoportot, így a becsukás azonnal visszaugrott.
+  const [technicalAutoPaused, setTechnicalAutoPaused] = useState(false);
   const [thinkingExpanded, setThinkingExpanded] = useState(false);
   const [thinkingPreparing, setThinkingPreparing] = useState(false);
   const [thinkingOpening, setThinkingOpening] = useState(false);
@@ -175,6 +178,7 @@ export default function CompactAnswersTimeline({
   useEffect(() => {
     setExpandedTechnicalId(null);
     setExpandedDetailId(null);
+    setTechnicalAutoPaused(false);
     setThinkingExpanded(false);
     setThinkingPreparing(false);
     setThinkingOpening(false);
@@ -188,11 +192,11 @@ export default function CompactAnswersTimeline({
   // érkezik, mert onnantól az a lényeg. Lezárt futásnál a kézi állítás marad
   // érvényben: itt már nem nyúlunk hozzá.
   useEffect(() => {
-    if (!streaming) return;
+    if (!streaming || technicalAutoPaused) return;
     const last = visibleTrace.at(-1);
     if (!last) return;
     setExpandedTechnicalId(last.kind === "technical" ? last.id : null);
-  }, [streaming, visibleTrace]);
+  }, [streaming, visibleTrace, technicalAutoPaused]);
 
   useEffect(() => {
     if (!thinkingOpening) return;
@@ -497,11 +501,12 @@ export default function CompactAnswersTimeline({
                     <button
                       type="button"
                       className="compact-technical-toggle"
-                      onClick={() =>
+                      onClick={() => {
+                        setTechnicalAutoPaused(true);
                         setExpandedTechnicalId((current) =>
                           current === section.id ? null : section.id,
-                        )
-                      }
+                        );
+                      }}
                       aria-expanded={expandedTechnicalId === section.id}
                     >
                       <span className="trace-thinking-bullet">•</span>

@@ -148,7 +148,11 @@ export const buildCompactTraceSections = (
     technical = [];
     sections.push({
       kind: "technical",
-      id: `technical:${items[0].id}:${items.at(-1)!.id}`,
+      // Csak az első elem azonosítja a csoportot. Korábban az utolsó elem
+      // id-ja is benne volt, így streamelés közben minden új technikai sorral
+      // megváltozott az id — a kinyitott csoport ilyenkor „becsukódott", mert
+      // a megjegyzett id már nem egyezett semmivel.
+      id: `technical:${items[0].id}`,
       items,
       label: technicalGroupLabel(items),
     });

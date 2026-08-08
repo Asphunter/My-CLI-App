@@ -14,6 +14,8 @@ import {
   type ClipboardEvent as ReactClipboardEvent,
   type FormEvent,
   type KeyboardEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
   type ReactNode,
   type WheelEvent,
 } from "react";
@@ -90,8 +92,12 @@ import {
 } from "./pipelineTiming";
 import {
   detailedAnswerPanelHeight,
-  DETAILED_ANSWER_MAX_HEIGHT,
+  DETAILED_ANSWER_MIN_HEIGHT,
+  DETAILED_ANSWER_MIN_WIDTH,
+  DETAILED_STEPS_MIN_WIDTH,
 } from "./detailedLayout";
+import { changeRowLabels, changeSummaryView } from "./changeSummaryView";
+import { liveNarrationLines } from "./liveNarration";
 import {
   resolveRegenerationRequestSettings,
   type RegenerationRequestSettings,
@@ -6782,14 +6788,6 @@ function ImagePreviewOverlay({
   );
 }
 
-/**
- * Csak a fájlnév. A hash-elt, mély útvonalak (`.gradle-check/native/1def…/…`)
- * szélesebbre nyomták a panelt, mint a válasz maga; a teljes út a soron lévő
- * tooltipben és a megnyitás műveletében továbbra is megvan.
- */
-const fileNameOf = (path: string) =>
-  path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
-
 /** Files the preview overlay can render; everything else stays plain text. */
 const PREVIEWABLE_IMAGE_EXTENSIONS = ["svg", "png", "jpg", "jpeg", "webp"];
 const isPreviewableImagePath = (filePath: string) => {
@@ -6811,11 +6809,51 @@ function ChangeSummaryPanel({
   // A panel a saját, teljes magasságú hasábjában él, ezért nincs sorkorlát és
   // lenyitó gomb: a lista lefelé kifér, és csak akkor görget, ha a hasáb
   // plafonjánál is több (~20+) fájl van.
+  //
+  // A nulla-változású fájlok (generált melléktermék) egyetlen csoportba
+  // csuklanak — churn szerint, nem darabszám szerint, tehát amit a futás
+  // ténylegesen írt, az mindig látszik.
+  const [untouchedOpen, setUntouchedOpen] = useState(false);
+  const view = useMemo(() => changeSummaryView(files), [files]);
+  const labels = useMemo(() => {
+    const ordered = [...view.changed, ...view.untouched];
+    const text = changeRowLabels(ordered);
+    return new Map(ordered.map((file, index) => [file, text[index]]));
+  }, [view]);
   if (files.length === 0) return null;
   const added = files.reduce((total, file) => total + file.added, 0);
   const removed = files.reduce((total, file) => total + file.removed, 0);
   const statusLabel = (status: ChangeSummaryFile["status"]) =>
     status === "added" ? "ÚJ" : status === "removed" ? "TÖRÖLT" : null;
+  const renderRow = (file: ChangeSummaryFile) => {
+    const label = view.showStatus ? statusLabel(file.status) : null;
+    const name = labels.get(file) ?? file.path;
+    return (
+      <li
+        className={`${label ? "has-status" : ""}${view.showRemoved ? " has-removed" : ""}`.trim() || undefined}
+        key={`${file.status}:${file.path}`}
+        title={file.sourcePath ?? file.path}
+      >
+        {onPreviewImage && isPreviewableImagePath(file.path) ? (
+          <button
+            type="button"
+            className="trace-change-preview"
+            onClick={() => onPreviewImage(file.sourcePath ?? file.path)}
+            title="Előnézet megnyitása"
+          >
+            <code>{name}</code>
+          </button>
+        ) : (
+          <code>{name}</code>
+        )}
+        {label && <span className="trace-change-status">{label}</span>}
+        <span className="trace-change-added">+{file.added}</span>
+        {view.showRemoved && (
+          <span className="trace-change-removed">−{file.removed}</span>
+        )}
+      </li>
+    );
+  };
   return (
     <aside className="trace-change-summary" aria-label="Fájlok és változások">
       <div className="trace-change-heading">
@@ -6826,36 +6864,32 @@ function ChangeSummaryPanel({
         >
           <span>{files.length} fájl</span>
           <span className="trace-change-total-added">+{added}</span>
-          <span className="trace-change-total-removed">−{removed}</span>
+          {removed > 0 && (
+            <span className="trace-change-total-removed">−{removed}</span>
+          )}
         </span>
       </div>
       <ul className="trace-change-list">
-        {files.map((file) => {
-          const label = statusLabel(file.status);
-          return (
-            <li
-              className={label ? "has-status" : undefined}
-              key={`${file.status}:${file.path}`}
-              title={file.sourcePath ?? file.path}
+        {view.changed.map(renderRow)}
+        {view.untouched.length > 0 && (
+          <li className="trace-change-untouched">
+            <button
+              type="button"
+              className="trace-change-untouched-toggle"
+              aria-expanded={untouchedOpen}
+              onClick={() => setUntouchedOpen((open) => !open)}
+              title={
+                untouchedOpen
+                  ? "Változás nélküli fájlok elrejtése"
+                  : "Változás nélküli fájlok megjelenítése"
+              }
             >
-              {onPreviewImage && isPreviewableImagePath(file.path) ? (
-                <button
-                  type="button"
-                  className="trace-change-preview"
-                  onClick={() => onPreviewImage(file.sourcePath ?? file.path)}
-                  title="Előnézet megnyitása"
-                >
-                  <code>{fileNameOf(file.path)}</code>
-                </button>
-              ) : (
-                <code>{fileNameOf(file.path)}</code>
-              )}
-              {label && <span className="trace-change-status">{label}</span>}
-              <span className="trace-change-added">+{file.added}</span>
-              <span className="trace-change-removed">−{file.removed}</span>
-            </li>
-          );
-        })}
+              <span aria-hidden="true">{untouchedOpen ? "⌃" : "⌄"}</span>
+              {`${view.untouched.length} fájl változás nélkül`}
+            </button>
+          </li>
+        )}
+        {untouchedOpen && view.untouched.map(renderRow)}
       </ul>
       {onRollback && (
         <div className="trace-change-footer">
@@ -6871,6 +6905,78 @@ function ChangeSummaryPanel({
         </div>
       )}
     </aside>
+  );
+}
+
+/**
+ * A fájl-hasáb keskeny ablakon csíkká csuklik, és a panel overlayben nyílik.
+ *
+ * 1100 px-es ablaknál mérve a válasz 295 px-re szorult, és a szakszöveg ott
+ * már csúnyán tördel. Az engedményt keskenyen a fájloknak kell megtenniük, nem
+ * a válasznak: a sáv 240 px helyett 28 px, a lista pedig egy kattintásra, a
+ * kártya jobb széléről nyílik.
+ */
+function FilesLane({
+  files,
+  className,
+  onRollback,
+  rollbackBusy,
+  onPreviewImage,
+}: {
+  files: ChangeSummaryFile[];
+  className: string;
+  onRollback?: () => void;
+  rollbackBusy?: boolean;
+  onPreviewImage?: (path: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const laneRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    // Capture fázisban: a kártya saját kattintáskezelői (lépésválasztás,
+    // előnézet) különben előbb futnának le, mint a záródás.
+    const closeOnOutside = (event: globalThis.PointerEvent) => {
+      if (!laneRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    document.addEventListener("pointerdown", closeOnOutside, true);
+    return () => {
+      window.removeEventListener("keydown", closeOnEscape);
+      document.removeEventListener("pointerdown", closeOnOutside, true);
+    };
+  }, [open]);
+  if (files.length === 0) return null;
+  const added = files.reduce((total, file) => total + file.added, 0);
+  return (
+    <div className="files-lane" ref={laneRef}>
+      {/* A csík mindig renderel; hogy melyik látszik — csík vagy panel —, azt
+          a szélességi breakpoint dönti el, nem JS. */}
+      <button
+        type="button"
+        className="files-lane-strip"
+        aria-expanded={open}
+        aria-label={`Fájlok és változások — ${files.length} fájl`}
+        title={`${files.length} fájl · +${added}`}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span className="files-lane-strip-glyph" aria-hidden="true">
+          ▤
+        </span>
+        <span className="files-lane-strip-count">{files.length}</span>
+        <span className="files-lane-strip-added">+{added}</span>
+      </button>
+      <div className={`${className} files-lane-body${open ? " is-open" : ""}`}>
+        <ChangeSummaryPanel
+          files={files}
+          onRollback={onRollback}
+          rollbackBusy={rollbackBusy}
+          onPreviewImage={onPreviewImage}
+        />
+      </div>
+    </div>
   );
 }
 
@@ -7223,6 +7329,22 @@ function TurnProgressCard({
   const [selectedStepId, setSelectedStepId] = useState(activeStep.id);
   /** Elrejtett lépés-oszlop: a válasz ilyenkor a teljes szélességet kapja. */
   const [stepsCollapsed, setStepsCollapsed] = useState(false);
+  // Ugyanaz a két húzóka, mint a Nem-Részletes kártyán: a VÁLASZ és a LÉPÉSEK
+  // határa, illetve az alsó keretvonal. A szélesség a közös
+  // `--compact-answer-width`-en át megy, tehát a két mód egymásra illeszkedik.
+  const [detailedAnswerWidth, setDetailedAnswerWidth] = useState<number>();
+  const [detailedCardHeight, setDetailedCardHeight] = useState<number>();
+  const [detailedResizing, setDetailedResizing] = useState<
+    "columns" | "height" | null
+  >(null);
+  const detailedResizeRef = useRef<{
+    kind: "columns" | "height";
+    pointerId: number;
+    startClient: number;
+    startValue: number;
+    min: number;
+    max: number;
+  } | null>(null);
   // A terv-fázis GONDOLKODÁS MENETE panelje nem naplót mutat, hanem magát a
   // tervet: RAW = a teljes szöveg (élőben streamelve), DETAIL = a kiválasztott
   // lépés szelete.
@@ -7698,6 +7820,104 @@ function TurnProgressCard({
       {stepsToggleAction}
     </div>
   );
+  // A Nem-Részletes kártya két húzókájának párja. A szélesség a közös
+  // `--compact-answer-width`-et állítja (ezt olvassa a `--detailed-answer-track`
+  // képlete), a magasság pedig a rács fix magasságát és vele a sávok plafonját.
+  const clampSize = (value: number, min: number, max: number) =>
+    Math.min(max, Math.max(min, Math.round(value)));
+  const startDetailedResize = (
+    kind: "columns" | "height",
+    event: ReactPointerEvent<HTMLDivElement>,
+  ) => {
+    if (event.button !== 0) return;
+    const grid = detailedGridRef.current;
+    if (!grid) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const horizontal = kind === "columns";
+    const answerLane = grid.querySelector<HTMLElement>(
+      ".detailed-thinking-lane, .detailed-plan-lane",
+    );
+    const filesLane = grid.querySelector<HTMLElement>(".detailed-files-lane");
+    detailedResizeRef.current = {
+      kind,
+      pointerId: event.pointerId,
+      startClient: horizontal ? event.clientX : event.clientY,
+      startValue: horizontal
+        ? (answerLane?.offsetWidth ?? Math.round(grid.offsetWidth / 2))
+        : grid.offsetHeight,
+      min: horizontal ? DETAILED_ANSWER_MIN_WIDTH : DETAILED_ANSWER_MIN_HEIGHT,
+      max: horizontal
+        ? Math.max(
+            DETAILED_ANSWER_MIN_WIDTH,
+            grid.offsetWidth -
+              DETAILED_STEPS_MIN_WIDTH -
+              (filesLane?.offsetWidth ?? 0),
+          )
+        : Math.max(DETAILED_ANSWER_MIN_HEIGHT, window.innerHeight - 140),
+    };
+    setDetailedResizing(kind);
+  };
+  const moveDetailedResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = detailedResizeRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    const client = drag.kind === "columns" ? event.clientX : event.clientY;
+    const next = clampSize(
+      drag.startValue + (client - drag.startClient),
+      drag.min,
+      drag.max,
+    );
+    if (drag.kind === "columns") setDetailedAnswerWidth(next);
+    else setDetailedCardHeight(next);
+  };
+  const finishDetailedResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (detailedResizeRef.current?.pointerId !== event.pointerId) return;
+    detailedResizeRef.current = null;
+    setDetailedResizing(null);
+  };
+  const resizeDetailedColumnsByKeyboard = (
+    event: ReactKeyboardEvent<HTMLDivElement>,
+  ) => {
+    const delta =
+      event.key === "ArrowLeft" ? -16 : event.key === "ArrowRight" ? 16 : 0;
+    const grid = detailedGridRef.current;
+    if (!delta || !grid) return;
+    event.preventDefault();
+    const answerLane = grid.querySelector<HTMLElement>(
+      ".detailed-thinking-lane, .detailed-plan-lane",
+    );
+    const filesLane = grid.querySelector<HTMLElement>(".detailed-files-lane");
+    setDetailedAnswerWidth(
+      clampSize(
+        (detailedAnswerWidth ?? answerLane?.offsetWidth ?? 0) + delta,
+        DETAILED_ANSWER_MIN_WIDTH,
+        Math.max(
+          DETAILED_ANSWER_MIN_WIDTH,
+          grid.offsetWidth -
+            DETAILED_STEPS_MIN_WIDTH -
+            (filesLane?.offsetWidth ?? 0),
+        ),
+      ),
+    );
+  };
+  const resizeDetailedHeightByKeyboard = (
+    event: ReactKeyboardEvent<HTMLDivElement>,
+  ) => {
+    const delta =
+      event.key === "ArrowUp" ? -16 : event.key === "ArrowDown" ? 16 : 0;
+    const grid = detailedGridRef.current;
+    if (!delta || !grid) return;
+    event.preventDefault();
+    setDetailedCardHeight(
+      clampSize(
+        (detailedCardHeight ?? grid.offsetHeight) + delta,
+        DETAILED_ANSWER_MIN_HEIGHT,
+        Math.max(DETAILED_ANSWER_MIN_HEIGHT, window.innerHeight - 140),
+      ),
+    );
+  };
   const selectStep = (stepId: string) => {
     followActiveStepRef.current = false;
     setSelectedStepId(stepId);
@@ -7907,6 +8127,15 @@ function TurnProgressCard({
       return true;
     }),
   );
+  // Futás közben a technikai csoport magától nyílik, hogy látszódjon, ahogy
+  // telnek a sorai — és becsukódik, amint valódi mondat (narratív elem)
+  // érkezik. Lezárt futásnál a kézi állítás marad érvényben.
+  useEffect(() => {
+    if (!streaming) return;
+    const last = detailedTraceSections.at(-1);
+    if (!last) return;
+    setExpandedTechnicalSectionId(last.kind === "technical" ? last.id : null);
+  }, [streaming, detailedTraceSections]);
   useLayoutEffect(() => {
     const grid = detailedGridRef.current;
     const content = isPlanStage
@@ -7996,27 +8225,46 @@ function TurnProgressCard({
         elapsed={overallElapsed}
         statusIcon={<ProviderMark provider={provider} />}
         actions={answerActions}
-        renderAnswer={(block: CompactAnswerBlock) => (
-          <div className="compact-answer-text">
-            {answerParagraphs(
-              block.text,
-              block.final ? answerQuoteRefs : [],
-              onQuoteJump,
-            )}
-          </div>
-        )}
+        renderAnswer={(block: CompactAnswerBlock) =>
+          // Futás közben a modell menet közbeni sorai folynak ide, egyetlen
+          // összemosódott szövegtömbként. Ezek soronként külön bulletet
+          // kapnak, hogy látszódjon, hol ér véget az egyik gondolat és hol
+          // kezdődik a következő. A lezárt válasz prózája érintetlen marad:
+          // annak saját szerkezete van (címsorok, listák, kódblokkok).
+          streaming ? (
+            <ul className="compact-answer-stream">
+              {liveNarrationLines(block.text).map((line, index) => (
+                <li key={`${index}:${line.slice(0, 24)}`}>
+                  <span className="trace-thinking-bullet" aria-hidden="true">
+                    •
+                  </span>
+                  <div className="compact-answer-text">
+                    {answerParagraphs(line, [], onQuoteJump)}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div className="compact-answer-text">
+              {answerParagraphs(
+                block.text,
+                block.final ? answerQuoteRefs : [],
+                onQuoteJump,
+              )}
+            </div>
+          )
+        }
         renderTraceText={(text) => <InlineMarkdown text={text} />}
         renderTraceAction={renderCompactTraceAction}
         changes={
           changeSummary.length > 0 ? (
-            <div className="compact-answer-changes">
-              <ChangeSummaryPanel
-                files={changeSummary}
-                onRollback={onRollbackChanges}
-                rollbackBusy={rollbackBusy}
-                onPreviewImage={onPreviewImage}
-              />
-            </div>
+            <FilesLane
+              className="compact-answer-changes"
+              files={changeSummary}
+              onRollback={onRollbackChanges}
+              rollbackBusy={rollbackBusy}
+              onPreviewImage={onPreviewImage}
+            />
           ) : null
         }
         footer={runFooter}
@@ -8064,12 +8312,20 @@ function TurnProgressCard({
 
         <div
           ref={detailedGridRef}
-          className={`detailed-trace-grid${isPlanStage ? " is-plan-stage" : " is-work-stage"}${stepsCollapsed ? " is-steps-collapsed" : ""}${displayedChangeSummary.length > 0 ? " has-file-lane" : ""}`}
+          className={`detailed-trace-grid${isPlanStage ? " is-plan-stage" : " is-work-stage"}${stepsCollapsed ? " is-steps-collapsed" : ""}${displayedChangeSummary.length > 0 ? " has-file-lane" : ""}${detailedResizing === "columns" ? " is-resizing-columns" : ""}${detailedResizing === "height" ? " is-resizing-height" : ""}`}
           style={
             {
               "--detailed-step-slots": reservedStepSlots,
               "--detailed-steps-width": `${preferredStepLaneWidth}px`,
-              "--detailed-answer-max-height": `${DETAILED_ANSWER_MAX_HEIGHT}px`,
+              ...(detailedAnswerWidth
+                ? { "--compact-answer-width": `${detailedAnswerWidth}px` }
+                : {}),
+              ...(detailedCardHeight
+                ? {
+                    "--detailed-card-height": `${detailedCardHeight}px`,
+                    "--detailed-lane-cap": `${detailedCardHeight}px`,
+                  }
+                : {}),
             } as CSSProperties
           }
         >
@@ -8406,16 +8662,52 @@ function TurnProgressCard({
               sávval azonos magasságban — nem a válasz aljára fűzött panel. */}
           {displayedChangeSummary.length > 0 && (
             <div className="detailed-trace-lane detailed-files-lane">
-              <div className="detailed-step-changes">
-                <ChangeSummaryPanel
-                  files={displayedChangeSummary}
-                  onRollback={onRollbackChanges}
-                  rollbackBusy={rollbackBusy}
-                  onPreviewImage={onPreviewImage}
-                />
-              </div>
+              <FilesLane
+                className="detailed-step-changes"
+                files={displayedChangeSummary}
+                onRollback={onRollbackChanges}
+                rollbackBusy={rollbackBusy}
+                onPreviewImage={onPreviewImage}
+              />
             </div>
           )}
+
+          {/* Ugyanaz a két húzóka, mint a Nem-Részletes kártyán: a VÁLASZ és a
+              LÉPÉSEK határa, illetve az alsó keretvonal. */}
+          {!stepsCollapsed && (
+            <div
+              className="detailed-column-resizer"
+              role="separator"
+              aria-label="Válasz és lépések szélességének állítása"
+              aria-orientation="vertical"
+              aria-valuemin={DETAILED_ANSWER_MIN_WIDTH}
+              aria-valuenow={detailedAnswerWidth}
+              tabIndex={0}
+              title="Panelek szélességének állítása"
+              onKeyDown={resizeDetailedColumnsByKeyboard}
+              onPointerDown={(event) => startDetailedResize("columns", event)}
+              onPointerMove={moveDetailedResize}
+              onPointerUp={finishDetailedResize}
+              onPointerCancel={finishDetailedResize}
+              onLostPointerCapture={finishDetailedResize}
+            />
+          )}
+          <div
+            className="detailed-height-resizer"
+            role="separator"
+            aria-label="Panel magasságának állítása"
+            aria-orientation="horizontal"
+            aria-valuemin={DETAILED_ANSWER_MIN_HEIGHT}
+            aria-valuenow={detailedCardHeight}
+            tabIndex={0}
+            title="Panelmagasság állítása"
+            onKeyDown={resizeDetailedHeightByKeyboard}
+            onPointerDown={(event) => startDetailedResize("height", event)}
+            onPointerMove={moveDetailedResize}
+            onPointerUp={finishDetailedResize}
+            onPointerCancel={finishDetailedResize}
+            onLostPointerCapture={finishDetailedResize}
+          />
         </div>
 
 
@@ -19044,44 +19336,48 @@ function App() {
     // The verdict of the version being read, not of the newest one: a reader
     // who went back to v1 is looking at what v1 concluded.
     const runVerdict = stageForVersion(chain, selectedVersion, lastStageIndex);
+    const versionIndex = chainVersions.indexOf(selectedVersion);
+    const stepVersion = (delta: number) => {
+      const next = chainVersions[versionIndex + delta];
+      if (next === undefined) return;
+      setSelectedVersions((current) => ({ ...current, [chainKey]: next }));
+    };
+    // A verziócímke a kiválasztott fázis nyilához tapad, tehát vele együtt
+    // mozog a sínen. A sorköz a sín geometriája: 21 px ikon + 9 px rés.
+    const activeTabIndex = Math.max(
+      0,
+      runStageTabs.findIndex((item) => item.stageIndex === selectedStage),
+    );
     const runHeader = stage ? (
-        <div className="pipeline-run-header is-history" data-run-id={chainKey}>
+        <div
+          className="pipeline-run-header is-history"
+          data-run-id={chainKey}
+          style={{ "--active-tab-index": activeTabIndex } as CSSProperties}
+        >
           {chainVersions.length > 1 && (
             // A re-run does not replace what it was answering: both attempts
             // stay readable, and this picks which one the panel is showing.
-            // A sín fölött ül, és görgetésre is vált: a nyíllal pötyögés
-            // helyett egy mozdulat elég két verzió között.
-            <label
+            // Csak a szám, nyíl-indikáció nélkül, kattintásra körbejár. A
+            // kiválasztott fázis nyilához tapad (lásd `--active-tab-index`),
+            // tehát vele együtt mozog a sínen, és nem tolja lejjebb az
+            // ikonokat.
+            <button
+              type="button"
               className="pipeline-run-version"
-              title="Verzió választása — görgetéssel is váltható"
-              onWheel={(event) => {
-                const index = chainVersions.indexOf(selectedVersion);
-                const next =
-                  chainVersions[index + (event.deltaY > 0 ? 1 : -1)];
-                if (next === undefined) return;
-                setSelectedVersions((current) => ({
-                  ...current,
-                  [chainKey]: next,
-                }));
-              }}
+              aria-label={`Verzió: v${selectedVersion} — kattintásra vált`}
+              title="Kattintás: verzióváltás"
+              onClick={() =>
+                stepVersion(
+                  versionIndex >= chainVersions.length - 1
+                    ? -versionIndex
+                    : 1,
+                )
+              }
             >
-              <select
-                aria-label="Verzió választása"
-                value={selectedVersion}
-                onChange={(event) =>
-                  setSelectedVersions((current) => ({
-                    ...current,
-                    [chainKey]: Number(event.target.value),
-                  }))
-                }
-              >
-                {chainVersions.map((version) => (
-                  <option key={version} value={version}>
-                    {`v${version}`}
-                  </option>
-                ))}
-              </select>
-            </label>
+              <span className="pipeline-run-version-value" aria-live="polite">
+                {`v${selectedVersion}`}
+              </span>
+            </button>
           )}
           <span
             className="pipeline-run-tabs"
@@ -19629,8 +19925,54 @@ function App() {
             : selectedProvider,
       })))
     : [];
+  // A futó szakasz adatai — ugyanaz, amit a kártya is kap. Külön néven, mert a
+  // „van-e már mit mutatni" döntés is ebből él.
+  const liveStageActivities =
+    pipelineProgress && liveTurnId
+      ? codeActivity.filter((activity) => activity.turnId === liveTurnId)
+      : (liveWorkGroup?.activities ?? []);
+  const liveStageCommentary = liveWorkGroup
+    ? commentaryForWorkGroup(
+        liveWorkGroup,
+        pipelineProgress && liveTurnId ? liveTurnId : undefined,
+      )
+    : commentaryEntries.filter((commentary) =>
+        Boolean(liveTurnId && commentary.turnId === liveTurnId),
+      );
+  /**
+   * Van-e már bármi, amit a panelek megmutathatnak. Amíg nincs, a kártya meg
+   * sem jelenik: induláskor eddig két üres panel állt egymás mellett pörgő
+   * ikonokkal, szöveg nélkül. Ilyenkor csak a fázissín látszik.
+   */
+  // Csak *szöveg* számít tartalomnak. Az aktivitások (szerszámhívások) nem:
+  // élőben mérve már 300 ms-nál befutott az első, és a kártya ott állt üresen,
+  // pörgő ikonokkal — pontosan az az állapot, amit el akartunk tüntetni. A
+  // válasz szövege vagy egy narrációs sor viszont valódi látnivaló.
+  const liveTurnHasContent =
+    Boolean(liveAnswer?.text?.trim()) ||
+    liveStageCommentary.some((entry) => entry.body?.trim());
+  /**
+   * A *mutatott* szakasz csak akkor lép a következőre, ha annak már van
+   * tartalma — addig az előző szakasz paneljei maradnak a képernyőn. Enélkül a
+   * váltás pillanatában a nézet átugrott egy üres kártyára.
+   */
+  const [liveRevealedStage, setLiveRevealedStage] = useState<number | null>(
+    null,
+  );
+  useEffect(() => {
+    if (!pipelineProgress) {
+      setLiveRevealedStage(null);
+      return;
+    }
+    if (!liveTurnHasContent) return;
+    setLiveRevealedStage((current) =>
+      current === pipelineProgress.stageIndex
+        ? current
+        : pipelineProgress.stageIndex,
+    );
+  }, [pipelineProgress?.stageIndex, pipelineProgress?.runId, liveTurnHasContent]);
   const liveShownStage = pipelineProgress
-    ? (liveStageChoice ?? pipelineProgress.stageIndex)
+    ? (liveStageChoice ?? liveRevealedStage ?? pipelineProgress.stageIndex)
     : 0;
   const liveFinishedStageText = (index: number) => {
     // A re-run carries its earlier phases rather than producing them, so their
@@ -19833,7 +20175,16 @@ function App() {
     viewingActiveRun &&
     (!activeTurnHasCompleted || Boolean(pipelineProgress)) && (
       <div className="live-turn-anchor">
-        {liveFinishedStagePanel ? (
+        {/* Amíg nincs mit mutatni, csak a fázissín áll itt — nem két üres
+            panel pörgő ikonokkal. Ugyanez fázisváltáskor: a `liveShownStage`
+            addig az előző szakaszon marad, amíg az újnak nincs tartalma, tehát
+            ide csak a legelső fázis kezdete előtt jutunk el.
+            Csak láncnál rejtünk: egyágenses futásnál nincs fázissín, ott a
+            kártya elrejtése azt jelentené, hogy az Enter után semmi nem
+            jelezné, hogy elindult a munka. */}
+        {pipelineProgress && !liveTurnHasContent && !liveFinishedStagePanel ? (
+          liveRunHeader
+        ) : liveFinishedStagePanel ? (
           liveFinishedStagePanel
         ) : (
         <TurnProgressCard
@@ -19861,23 +20212,8 @@ function App() {
             selectedProvider
           }
           plan={activePlan}
-          activities={
-            pipelineProgress && liveTurnId
-              ? codeActivity.filter(
-                  (activity) => activity.turnId === liveTurnId,
-                )
-              : liveWorkGroup?.activities ?? []
-          }
-          commentary={
-            liveWorkGroup
-              ? commentaryForWorkGroup(
-                  liveWorkGroup,
-                  pipelineProgress && liveTurnId ? liveTurnId : undefined,
-                )
-              : commentaryEntries.filter((commentary) =>
-                  Boolean(liveTurnId && commentary.turnId === liveTurnId),
-                )
-          }
+          activities={liveStageActivities}
+          commentary={liveStageCommentary}
           status={codeStatus}
           // A lezárt szakasz nem „ír" — a következő indulására vár. Amíg
           // streamelőnek mondtuk, a lépései félkésznek látszottak a váltás
@@ -20855,12 +21191,11 @@ function App() {
               : rerunInPlace
                 ? null
                 : liveTurnContent}
-            {/* A futás véget ért, de amit írt, az olvasható marad — a panel
-                ilyenkor a saját helyén áll, a lezárt kártya alatt. */}
-            {activeMode === "coding" &&
-              !liveTurnContent &&
-              viewedLiveFiles.files.length > 0 &&
-              liveCodePanel}
+            {/* A KÓD panel csak írás közben él. Korábban a futás után is itt
+                maradt, a stream legalján — így egy ezer üzenettel korábbi
+                válaszhoz tartozó panel a beszélgetés legaljára ült. A megírt
+                fájlok a FÁJLOK / VÁLTOZÁSOK hasábban a saját kártyájukon
+                maradnak, tehát semmi nem vész el. */}
             {viewingActiveRun && !isAtBottom && (
               <button
                 type="button"

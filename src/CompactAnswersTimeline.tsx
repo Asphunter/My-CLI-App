@@ -96,7 +96,6 @@ export default function CompactAnswersTimeline({
   const [panelHeights, setPanelHeights] = useState<{
     answer: number;
     timeline: number;
-    changes: number;
   }>();
   useLayoutEffect(() => {
     const answersList = answersListRef.current;
@@ -129,41 +128,19 @@ export default function CompactAnswersTimeline({
         COMPACT_TIMELINE_MIN_HEIGHT,
         Math.min(thinkingViewportLimit, Math.ceil(thinkingHeight)),
       );
-      // A fájl-hasáb a rács teljes magasságára nyúlik, ezért az offsetHeight a
-      // kinyújtott érték lenne. A természetes magasság a tartalom + a listából
-      // már görgetésre szorult rész — a kártya eddig nő a fájlokért, felette
-      // (~20+ fájl) a lista görget.
-      let changesHeight = 0;
-      if (changesSlot) {
-        const changesContent = changesSlot.querySelector<HTMLElement>(
-          ".compact-answer-changes",
-        );
-        const changesList = changesSlot.querySelector<HTMLElement>(
-          ".trace-change-list",
-        );
-        const clippedRows = changesList
-          ? changesList.scrollHeight - changesList.clientHeight
-          : 0;
-        changesHeight = Math.min(
-          answerViewportLimit,
-          Math.ceil(
-            (changesContent?.offsetHeight ?? changesSlot.scrollHeight) +
-              clippedRows,
-          ),
-        );
-      }
-      const columnsFloorHeight = Math.max(Math.ceil(answerHeight), changesHeight);
+      // A kártya magasságát a VÁLASZ vagy a GONDOLKODÁS szabja meg — a fájlok
+      // nem. Egy hosszú fájllista különben magasra húzta a kártyát, és a rövid
+      // válasz alatt üres feketét hagyott; a lista most a kész magasságba
+      // illeszkedik, és ha nem fér, görget.
+      const columnsFloorHeight = Math.ceil(answerHeight);
       const next = {
         answer: Math.ceil(answerHeight),
         timeline: thinkingExpanded || thinkingPreparing || thinkingClosing
           ? Math.max(columnsFloorHeight, expandedThinkingHeight)
           : columnsFloorHeight,
-        changes: changesHeight,
       };
       setPanelHeights((current) =>
-        current?.answer === next.answer &&
-        current.timeline === next.timeline &&
-        current.changes === next.changes
+        current?.answer === next.answer && current.timeline === next.timeline
           ? current
           : next,
       );
@@ -205,6 +182,17 @@ export default function CompactAnswersTimeline({
     setAnswerColumnWidth(undefined);
     setManualPanelHeight(undefined);
   }, [selected?.id]);
+
+  // Futás közben a technikai csoport magától nyílik, hogy látszódjon, ahogy
+  // telnek a sorai — és becsukódik, amint valódi mondat (narratív elem)
+  // érkezik, mert onnantól az a lényeg. Lezárt futásnál a kézi állítás marad
+  // érvényben: itt már nem nyúlunk hozzá.
+  useEffect(() => {
+    if (!streaming) return;
+    const last = visibleTrace.at(-1);
+    if (!last) return;
+    setExpandedTechnicalId(last.kind === "technical" ? last.id : null);
+  }, [streaming, visibleTrace]);
 
   useEffect(() => {
     if (!thinkingOpening) return;
@@ -258,12 +246,9 @@ export default function CompactAnswersTimeline({
     const layoutSize = horizontal ? layout.offsetWidth : layout.offsetHeight;
     const visualSize = horizontal ? bounds.width : bounds.height;
     const scale = layoutSize > 0 && visualSize > 0 ? visualSize / layoutSize : 1;
-    // A hasábok egymás mellett élnek: a magasság-padló a legmagasabbé, a
-    // szélesség-plafonból pedig a fix fájl-sáv is lejön.
-    const contentHeightFloor = Math.max(
-      panelHeights?.answer ?? 0,
-      panelHeights?.changes ?? 0,
-    );
+    // A magasság-padlót a válasz adja (a fájlok nem húzzák a kártyát), a
+    // szélesség-plafonból viszont a fix fájl-sáv lejön.
+    const contentHeightFloor = panelHeights?.answer ?? 0;
     const filesTrackWidth = changesSlotRef.current?.offsetWidth ?? 0;
     const min = horizontal
       ? COMPACT_ANSWER_MIN_WIDTH
@@ -336,15 +321,10 @@ export default function CompactAnswersTimeline({
     setManualPanelHeight(
       clampPanelSize(
         (manualPanelHeight ?? layout.offsetHeight) + delta,
+        Math.max(COMPACT_TIMELINE_MIN_HEIGHT, panelHeights?.answer ?? 0),
         Math.max(
           COMPACT_TIMELINE_MIN_HEIGHT,
           panelHeights?.answer ?? 0,
-          panelHeights?.changes ?? 0,
-        ),
-        Math.max(
-          COMPACT_TIMELINE_MIN_HEIGHT,
-          panelHeights?.answer ?? 0,
-          panelHeights?.changes ?? 0,
           window.innerHeight - 140,
         ),
       ),
@@ -352,10 +332,8 @@ export default function CompactAnswersTimeline({
   };
 
   const displayedAnswerHeight = panelHeights?.answer;
-  // A fájl-hasáb a válasz mellett áll, nem alatta: a kártya a magasabbikig ér.
-  const displayedContentFloor = panelHeights
-    ? Math.max(panelHeights.answer, panelHeights.changes)
-    : undefined;
+  // A kártya a válaszig ér — a fájl-hasáb ebbe illeszkedik, nem ez nyúlik utána.
+  const displayedContentFloor = panelHeights?.answer;
   const displayedLayoutHeight =
     manualPanelHeight && displayedContentFloor
       ? Math.max(manualPanelHeight, displayedContentFloor)

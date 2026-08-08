@@ -1053,7 +1053,12 @@ textarea::placeholder { color: var(--faint); }
 .compact-answers-layout::before { display: none; }
 .compact-answers-layout.is-thinking-collapsed::before { right: -1px; width: auto; border-radius: 3px; }
 .compact-answers-panel { position: relative; display: flex; min-width: 0; height: 100%; box-sizing: border-box; flex-direction: column; overflow: hidden; padding: 0; border: 0; border-radius: 3px; }
-.compact-answers-panel::after { position: absolute; z-index: 0; top: var(--compact-answer-height, 100%); right: 0; bottom: 0; left: 0; pointer-events: none; background: repeating-linear-gradient(135deg, rgba(165, 155, 124, .07) 0, rgba(165, 155, 124, .07) 1px, transparent 1px, transparent 9px), #000; border-top: 1px solid var(--detailed-fade-tail, rgba(165, 155, 124, .2)); content: ""; }
+/* A válasz alatti maradék: sima fekete, felül egyetlen vonallal. A korábbi
+   átlós sraffozás kitöltött felület volt, és renderelési hibának olvasódott,
+   nem annak, hogy a válasz itt véget ért. A jelentést most a vonal színe
+   hordozza — halk bézs: rendben lezárult; borostyán: elvágva. */
+.compact-answers-panel::after { position: absolute; z-index: 0; top: var(--compact-answer-height, 100%); right: 0; bottom: 0; left: 0; pointer-events: none; background: var(--answer-surface); border-top: 1px solid var(--detailed-fade-tail, rgba(165, 155, 124, .2)); content: ""; }
+.compact-answer-card.is-interrupted .compact-answers-panel::after { border-top-color: rgba(215, 163, 109, .55); }
 .compact-answers-layout.is-current::after { display: none; }
 .compact-column-resizer { position: absolute; z-index: 5; top: 0; bottom: 0; left: max(260px, min(var(--compact-answer-width, 50%), calc(100% - 240px - var(--files-lane-track)))); width: 9px; padding: 0; background: transparent; cursor: col-resize; touch-action: none; user-select: none; transform: translateX(-5px); }
 .compact-column-resizer::after { position: absolute; top: 0; bottom: 0; left: 4px; width: 1px; background: transparent; content: ""; }
@@ -1079,14 +1084,23 @@ textarea::placeholder { color: var(--faint); }
 .compact-answer-status-rail.is-complete time { color: #72d493; }
 .compact-answer-status-rail.is-interrupted time { color: #ee737d; }
 .compact-answers-list { position: relative; z-index: 1; display: grid; min-height: 0; max-height: var(--compact-answer-height, 100%); box-sizing: border-box; gap: 5px; overflow-x: hidden; overflow-y: auto; padding: 10px 12px; scrollbar-width: thin; scrollbar-color: #2b3946 transparent; overflow-anchor: none; }
-.compact-answer-action-row { position: absolute; z-index: 2; top: 6px; right: 8px; display: flex; min-height: 22px; align-items: center; justify-content: flex-end; }
+/* A gombok a szöveg *felett* lebegnek, nem mellette: a sorok a panel jobb
+   széléig futhatnak, nincs fenntartott üres sáv. Nyugalmi állapotban viszont
+   láthatatlanok — különben tartósan elnyelnék az első sorok végét —, és a
+   kártyára mozdulva jelennek meg. */
+.compact-answer-action-row { position: absolute; z-index: 7; top: 6px; right: 8px; display: flex; min-height: 22px; align-items: center; justify-content: flex-end; padding-left: 12px; background: linear-gradient(90deg, transparent, var(--tick4-answer-deep) 24%); opacity: 0; transition: opacity .14s ease; }
+.compact-answer-card:hover .compact-answer-action-row,
+.compact-answer-card:focus-within .compact-answer-action-row { opacity: 1; }
 .compact-answer-action-row .trace-answer-actions { margin-left: 0; }
 .compact-thinking-toolbar-toggle { display: inline-grid; width: 22px; height: 22px; place-items: center; margin-left: 4px; padding: 0; border: 1px solid #40515a; border-radius: 4px; background: rgba(25, 32, 36, .72); color: var(--muted); }
 .compact-thinking-toolbar-toggle:hover, .compact-thinking-toolbar-toggle:focus-visible { border-color: var(--tick4-khaki-accent); background: rgba(150, 146, 116, .16); color: var(--tick4-khaki-light); outline: 0; }
 .compact-thinking-toolbar-toggle span { font-family: "Segoe UI Symbol", "Segoe UI", sans-serif; font-size: 16px; font-weight: 700; line-height: 1; transform: translateY(-1px); }
-.compact-answers-list:has(.compact-answer-action-row) .compact-answer-block { padding-right: 34px; }
-.compact-answers-list:has(.compact-answer-action-row .trace-answer-actions) .compact-answer-block { padding-right: 84px; }
+/* Nincs jobb oldali fenntartás: a gombok fölötte lebegnek (lásd fentebb). */
 .compact-answer-block { display: block; min-width: 0; padding: 0; color: #c9d2dc; }
+/* Futás közbeni sorok: mindegyik önálló bullet, hogy ne folyjanak egybe. */
+.compact-answer-stream { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.compact-answer-stream > li { display: grid; grid-template-columns: 10px minmax(0, 1fr); align-items: start; gap: 5px; min-width: 0; }
+.compact-answer-stream .trace-thinking-bullet { line-height: 1.5; }
 .compact-answer-block-content { min-width: 0; font-size: 10px; line-height: var(--line-height); overflow-wrap: anywhere; }
 .compact-answer-block-content p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .compact-answer-block-content p + p { margin-top: 6px; }
@@ -1178,8 +1192,18 @@ textarea::placeholder { color: var(--faint); }
 .trace-change-heading .trace-change-total-added { color: #8fe0aa; }
 .trace-change-heading .trace-change-total-removed { color: #e28a94; }
 .trace-change-list { display: grid; gap: 3px; margin: 7px 0 0; padding: 0; list-style: none; }
-.trace-change-list li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 7px; min-width: 0; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 8px; line-height: 1.25; }
-.trace-change-list li.has-status { grid-template-columns: minmax(0, 1fr) auto auto auto; }
+/* Az oszlopok csak akkor épülnek fel, ha van mit mutatniuk: ha semmit nem
+   töröltek, a `−0` oszlop 45 soron át ugyanazt a nullát ismételné, és a
+   státusz-badge is csak akkor különböztet meg, ha többféle státusz van. */
+.trace-change-list li { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 7px; min-width: 0; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 8px; line-height: 1.25; }
+.trace-change-list li.has-removed { grid-template-columns: minmax(0, 1fr) auto auto; }
+.trace-change-list li.has-status { grid-template-columns: minmax(0, 1fr) auto auto; }
+.trace-change-list li.has-status.has-removed { grid-template-columns: minmax(0, 1fr) auto auto auto; }
+/* A nulla-változású (generált) fájlok egyetlen, alapból csukott sorban. */
+.trace-change-untouched { display: block; margin-top: 3px; }
+.trace-change-untouched-toggle { display: flex; align-items: center; gap: 4px; width: 100%; padding: 2px 0 0; border: 0; border-top: 1px solid rgba(165, 155, 124, .2); background: transparent; color: var(--faint); font-family: inherit; font-size: 8px; letter-spacing: .04em; cursor: pointer; }
+.trace-change-untouched-toggle:hover, .trace-change-untouched-toggle:focus-visible { color: var(--tick4-khaki-light); outline: 0; }
+.trace-change-untouched-toggle span { font-size: 11px; line-height: 1; }
 .trace-change-list code { min-width: 0; overflow: hidden; color: #cbd5de; text-overflow: ellipsis; white-space: nowrap; }
 .trace-change-status { color: var(--faint); font-family: "Segoe UI", Inter, system-ui, sans-serif; font-size: 7px; letter-spacing: .03em; }
 .trace-change-added { color: #8fe0aa; }
@@ -2258,14 +2282,23 @@ textarea::placeholder { color: var(--faint); }
    It sits right after the phase strip rather than pushed to the far edge: the
    version belongs to the phases it switches, and across the width of the panel
    the two read as unrelated controls. */
+/* Csak a szám, kattintásra vált. */
 .pipeline-run-version {
-  display: flex; align-items: center; gap: 5px;
+  display: flex; align-items: center; justify-content: center;
+  padding: 0; border: 0; background: transparent;
   color: var(--faint); font-size: 8px; font-weight: 700; letter-spacing: .1em;
+  cursor: pointer;
 }
-.pipeline-run-version select {
-  padding: 2px 4px; border: 1px solid #3c4650; border-radius: 3px;
-  background: #171c21; color: var(--accent-strong);
-  font: inherit; font-size: 9px; letter-spacing: .04em; cursor: pointer;
+.pipeline-run-version:hover .pipeline-run-version-value,
+.pipeline-run-version:focus-visible .pipeline-run-version-value {
+  color: var(--tick4-khaki-light);
+}
+.pipeline-run-version:focus-visible { outline: 0; }
+.pipeline-run-version-value {
+  color: #a59b7c; font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 9px; font-weight: 700; font-variant-numeric: tabular-nums;
+  letter-spacing: 0; line-height: 1.15;
+  transition: color .14s ease;
 }
 .pipeline-run-version.is-live {
   padding: 2px 7px; border: 1px solid var(--accent); border-radius: 3px;
@@ -2364,7 +2397,7 @@ textarea::placeholder { color: var(--faint); }
   align-items: center;
   gap: 5px;
   padding-left: 10px;
-  background: linear-gradient(90deg, transparent, #000 22%);
+  background: linear-gradient(90deg, transparent, var(--answer-surface) 22%);
 }
 .detailed-answer-toolbar .trace-answer-actions { margin-left: 0; }
 .detailed-answer-body {
@@ -2768,7 +2801,8 @@ textarea::placeholder { color: var(--faint); }
   margin: -1px -1px -1px 1px;
   border: 1px solid var(--tick4-answer-deep);
   border-radius: 0 3px 3px 0;
-  background: #20252a;
+  /* Fekete, mint a chat háttér — a szürkét a VÁLASZ kapta meg. */
+  background: #000;
 }
 
 /* Fájl-hasáb mellett a gondolkodás középső sáv: a kártya jobb élét — és vele a
@@ -2863,6 +2897,11 @@ textarea::placeholder { color: var(--faint); }
   --tick4-answer-bg: #000;
   --tick4-answer-deep: #000;
   --tick4-on-answer: #fbe7c5;
+  /* A VÁLASZ panel felülete. A fekete és a sáv-szürke helyet cserélt: a válasz
+     kapta a szürkét (így önálló lapként olvasható, és a fehér szöveg alatta
+     nem 21:1-en ül, hanem ~17:1-en — ennyivel kevesebb a haláció), a LÉPÉSEK /
+     GONDOLKODÁS MENETE és a FÁJLOK pedig feketék, mint a chat háttér. */
+  --answer-surface: #151a1e;
 }
 .chat { background: #000; }
 .user-message .message-body {
@@ -2878,12 +2917,18 @@ textarea::placeholder { color: var(--faint); }
 .compact-answer-card,
 .pipeline-answer-card { background: #000 !important; }
 .compact-answers-layout,
-.compact-answers-panel { background: #000 !important; }
+.compact-answers-panel { background: var(--answer-surface) !important; }
 .detailed-answer-lane,
-.detailed-answer-body { background: #000 !important; }
+.detailed-answer-body { background: var(--answer-surface) !important; }
 .detailed-answer-toolbar {
-  background: linear-gradient(90deg, transparent, #000 22%);
+  background: linear-gradient(90deg, transparent, var(--answer-surface) 22%);
+  /* Lásd a kompakt sort: lebeg a szöveg felett, de csak hoverre látszik, hogy
+     ne nyelje el tartósan a sorok végét. */
+  opacity: 0;
+  transition: opacity .14s ease;
 }
+.detailed-run-shell:hover .detailed-answer-toolbar,
+.detailed-run-shell:focus-within .detailed-answer-toolbar { opacity: 1; }
 .compact-answer-card::before,
 .detailed-answer-lane::before {
   position: absolute;
@@ -2949,7 +2994,9 @@ textarea::placeholder { color: var(--faint); }
 
 .detailed-trace-lane {
   min-height: 112px;
-  max-height: min(420px, calc(100vh - 210px));
+  /* Húzott magasságnál a sávok plafonja a húzott érték, különben a 420-as
+     alapkorlát — enélkül a rács kinyílna, de a sávok 420-nál megállnának. */
+  max-height: var(--detailed-lane-cap, min(420px, calc(100vh - 210px)));
   background: #000;
 }
 
@@ -3050,7 +3097,7 @@ textarea::placeholder { color: var(--faint); }
 .detailed-plan-content {
   position: relative;
   display: block;
-  padding: 2px 58px 10px 10px;
+  padding: 2px 0 10px 10px;
   scroll-behavior: smooth;
 }
 
@@ -3143,7 +3190,7 @@ textarea::placeholder { color: var(--faint); }
 
 .detailed-answer-toolbar {
   top: 5px;
-  background: linear-gradient(90deg, transparent, #000 24%);
+  background: linear-gradient(90deg, transparent, var(--answer-surface) 24%);
 }
 
 .detailed-thinking-list {
@@ -3176,11 +3223,11 @@ textarea::placeholder { color: var(--faint); }
   top: 7px;
   right: 5px;
   padding-left: 10px;
-  background: linear-gradient(90deg, transparent, #000 24%);
+  background: linear-gradient(90deg, transparent, var(--answer-surface) 24%);
 }
 
 .detailed-final-answer-toolbar .trace-answer-actions { margin: 0; }
-.detailed-final-answer-body { padding: 0; background: #000; }
+.detailed-final-answer-body { padding: 0; background: var(--answer-surface); }
 .detailed-final-answer-body .trace-answer-text { min-width: 0; }
 
 .detailed-inline-changes { padding: 2px 0 0; }
@@ -3353,6 +3400,8 @@ textarea::placeholder { color: var(--faint); }
     calc(var(--detailed-steps-track) - var(--files-lane-track))
     var(--files-lane-track);
   min-height: var(--detailed-answer-height, 140px);
+  /* Kézi magasság a húzókáról; enélkül a tartalom szabja meg. */
+  height: var(--detailed-card-height, auto);
   align-items: stretch;
   /* A középső elválasztót a grid maga húzza végig: a válasz-sáv inset
      árnyéka csak a saját (max-height-tel sapkázott) magasságáig ér, és a
@@ -3376,8 +3425,8 @@ textarea::placeholder { color: var(--faint); }
   overflow-y: visible;
   padding: 7px 7px 12px 8px;
   border: 0;
-  /* Ugyanaz a szürke, mint a Nem-Részletes nézet lépés-hasábjában. */
-  background-color: var(--compact-lane-grey);
+  /* Fekete, mint a chat háttér — a szürkét a VÁLASZ kapta meg. */
+  background-color: #000;
   /* A keret felső és alsó éle háttérrétegként: a pszeudoelemes változat a
      padding miatt 15px-cel az elválasztó előtt megállt, és a keret ott nyitva
      maradt. Ez a jobb oldali oszlop, tehát a keret itt már a halk szakaszában
@@ -3398,15 +3447,23 @@ textarea::placeholder { color: var(--faint); }
   right: var(--detailed-steps-track);
   bottom: auto;
   left: 0;
+  /* Nincs saját plafon: a sáv a rács sorának magasságát veszi fel. A 320 a
+     rács `min-height`-jén él tovább (`--detailed-answer-height`), vagyis azt
+     mondja meg, mennyit kényszeríthet ki a válasz *egyedül* — nem azt, hogy
+     mennyit használhat, ha a szomszéd sávok amúgy is magasabbra húzzák a
+     sort. Korábban a válasz 320-nál görgött, miközben alatta 100 px üresen
+     állt egy 420-as rácsban. */
   height: 100%;
   order: 1;
   overflow-x: hidden;
   overflow-y: auto;
   min-height: 0;
-  max-height: var(--detailed-answer-max-height, 320px);
-  padding: 28px 8px 28px 7px;
+  /* A fenti-lenti guard 28 px volt: két-három üres sornyi rés a válasz elején
+     és végén. A lecsengő sávnak ennyi nem kell — 10 px elég ahhoz, hogy a
+     görgetett szöveg ne vágódjon el élesen. */
+  padding: 10px 8px 10px 7px;
   border: 0;
-  background-color: #000;
+  background-color: var(--answer-surface);
   box-shadow: inset 3px 0 0 #a59b7c !important;
 }
 
@@ -3426,22 +3483,22 @@ textarea::placeholder { color: var(--faint); }
 
 .detailed-trace-grid::before {
   top: 0;
-  height: 28px;
+  height: 10px;
   background-image:
     var(--detailed-fade-line),
     linear-gradient(#a59b7c, #a59b7c),
-    linear-gradient(180deg, #000 0%, rgba(0, 0, 0, .9) 34%, transparent 100%);
+    linear-gradient(180deg, var(--answer-surface) 0%, var(--answer-surface) 34%, transparent 100%);
   background-position: left top, right top, left top;
   background-size: 100% 1px, 0 0, 100% 100%;
 }
 
 .detailed-trace-grid::after {
   bottom: 0;
-  height: 28px;
+  height: 10px;
   background-image:
     var(--detailed-fade-line),
     linear-gradient(#a59b7c, #a59b7c),
-    linear-gradient(0deg, #000 0%, rgba(0, 0, 0, .9) 34%, transparent 100%);
+    linear-gradient(0deg, var(--answer-surface) 0%, var(--answer-surface) 34%, transparent 100%);
   background-position: left bottom, right top, left top;
   background-size: 100% 1px, 0 0, 100% 100%;
 }
@@ -3612,6 +3669,11 @@ textarea::placeholder { color: var(--faint); }
   order: 3;
   grid-column: 3;
   min-width: 0;
+  /* A sor magasságát a VÁLASZ vagy a LÉPÉSEK szabja meg — a fájlok nem. Egy
+     45 fájlos lista különben magasra húzta a kártyát, és a rövid válasz alatt
+     üres feketét hagyott. A tartalom ezért abszolút (lásd lentebb), a sáv maga
+     nem visz saját belmagasságot. */
+  min-height: 0;
   flex-direction: column;
   overflow: hidden;
   padding: 7px 8px 12px;
@@ -3704,12 +3766,15 @@ textarea::placeholder { color: var(--faint); }
   color: #828b91;
 }
 
+/* A jobb oldali 48 px-es fenntartás megszűnt: a reload és a lépés-kapcsoló
+   saját, magasabb rétegen lebeg a szöveg felett (lásd a toolbar z-indexét),
+   nem tolja el a sorokat. A válasz így a hasáb teljes szélességét használja. */
 .detailed-final-answer {
   margin: 10px 0 0;
-  padding: 10px 48px 4px 0;
+  padding: 10px 0 4px 0;
   border: 0;
   border-radius: 0;
-  background: #000;
+  background: var(--answer-surface);
 }
 
 .detailed-final-answer:first-child {
@@ -3777,8 +3842,11 @@ textarea::placeholder { color: var(--faint); }
   background: transparent;
 }
 
+/* Nincs 58 px-es fenntartás a gomboknak: azok saját, magasabb rétegen
+   lebegnek a szöveg felett (és csak hoverre látszanak), tehát a terv sorai a
+   hasáb teljes szélességét használhatják. */
 .detailed-plan-content {
-  padding: 2px 58px 10px 3px;
+  padding: 2px 0 10px 3px;
 }
 
 /* Keep the single regenerate action pinned to the answer panel corner. */
@@ -3873,15 +3941,18 @@ textarea::placeholder { color: var(--faint); }
 
 /* Historical phase browsing only. The live selector keeps its running orbit;
    after completion this right-pointing marker shows the phase being read. */
+/* Kisebb nyíl, közelebb az ikonhoz: a nyíl és a verziócímke együtt jobbra
+   csúszik, így a Tree elválasztó vonala és a verziószám közé rés kerül (a
+   címke bal széle korábban pontosan a vonalon ült). */
 .detailed-run-shell .pipeline-run-header.is-history .pipeline-run-tab.is-active::before {
   position: absolute;
   top: 50%;
-  right: calc(100% + 4px);
+  right: calc(100% + 1px);
   width: 0;
   height: 0;
-  border-top: 5px solid transparent;
-  border-bottom: 5px solid transparent;
-  border-left: 7px solid #d7ceaf;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 5px solid #d7ceaf;
   content: "";
   filter: drop-shadow(0 0 3px rgba(215, 206, 175, .38));
   pointer-events: none;
@@ -3928,12 +3999,27 @@ textarea::placeholder { color: var(--faint); }
   border-color: #a59b7c !important;
 }
 
+/* A sín *fölött* lebeg, nem a sorában: a folyamban lejjebb tolta a
+   fázisikonokat, és azok már nem a válasz első sorával egy vonalban ültek —
+   ellentétben a user-üzenetek D avatarjával. Kivéve a folyamból, az ikonok
+   visszakerülnek a kártya tetejére. A korábbi `left: 26px` ráadásul ki is
+   vitte a chipet a 21 px-es sávból, rá a válasz szövegére. */
+/* A kiválasztott fázis ▶ nyilához tapad, és vele együtt mozog: a sorköz a sín
+   geometriája (21 px ikon + 9 px rés), a vízszintes pozíció pedig közvetlenül
+   a nyíl mellé esik (a nyíl a tabtól `100% + 4px`-re indul, 7 px széles). Így
+   a címke nem a folyamban ül, tehát a fázisikonok a kártya első sorával egy
+   vonalban maradnak. */
 .detailed-run-shell .pipeline-run-version {
   position: absolute;
-  top: 4px;
-  left: 26px;
   z-index: 3;
+  top: calc(var(--active-tab-index, 0) * 30px);
+  right: calc(100% + 7px);
+  left: auto;
+  height: 21px;
+  width: auto;
+  max-width: none;
   white-space: nowrap;
+  transition: top .16s ease;
 }
 
 .detailed-run-shell.has-phase-rail .detailed-answer-status-rail {
@@ -4132,8 +4218,9 @@ textarea::placeholder { color: var(--faint); }
   --compact-divider-x: max(260px, min(var(--compact-answer-width, 50%), calc(100% - 240px - var(--files-lane-track))));
   --detailed-fade-line: linear-gradient(90deg, #a59b7c 0%, rgba(165, 155, 124, .72) 24%, rgba(165, 155, 124, .2) 52%, rgba(165, 155, 124, .2) 100%);
   /* `!important`, mert több korábbi szabály is `background` rövidítéssel nyúl
-     ehhez az elemhez, és azok visszaütnék a keretet. */
-  background-color: var(--compact-lane-grey) !important;
+     ehhez az elemhez, és azok visszaütnék a keretet. Fekete: a szürke a
+     VÁLASZ paneljére került át. */
+  background-color: #000 !important;
   background-image:
     var(--detailed-fade-line),
     var(--detailed-fade-line),
@@ -4254,4 +4341,185 @@ textarea::placeholder { color: var(--faint); }
    levágta, engedékennyé tett ősökkel pedig a gombok egy féláttetsző réteg alá
    kerültek. Ez saját, külön kör: a rétegsorrendet kell rendbe tenni, nem a
    pozíciót tolni. */
+
+/* ---------------------------------------------------------------------------
+   Húzókák a Részletes kártyán — ugyanaz a kettő, mint a Nem-Részletesen: a
+   VÁLASZ és a LÉPÉSEK határa, illetve az alsó keretvonal. A vonalat nem a
+   húzóka rajzolja (azt a rács háttere adja), csak hoverre gyullad ki, ahogy a
+   kompakt párjánál.
+   --------------------------------------------------------------------------- */
+.detailed-column-resizer {
+  position: absolute;
+  z-index: 8;
+  top: 0;
+  bottom: 0;
+  left: var(--detailed-answer-track);
+  width: 9px;
+  padding: 0;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+  user-select: none;
+  transform: translateX(-5px);
+}
+
+.detailed-column-resizer::after {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 4px;
+  width: 1px;
+  background: transparent;
+  content: "";
+}
+
+.detailed-column-resizer:hover::after,
+.detailed-column-resizer:focus-visible::after,
+.detailed-trace-grid.is-resizing-columns .detailed-column-resizer::after {
+  background: var(--tick4-khaki-accent);
+}
+
+.detailed-height-resizer {
+  position: absolute;
+  z-index: 8;
+  right: 0;
+  bottom: -5px;
+  left: 0;
+  height: 10px;
+  padding: 0;
+  background: transparent;
+  cursor: row-resize;
+  touch-action: none;
+  user-select: none;
+}
+
+.detailed-height-resizer::after {
+  position: absolute;
+  top: 4px;
+  right: 0;
+  left: 0;
+  height: 1px;
+  background: transparent;
+  content: "";
+}
+
+.detailed-height-resizer:hover::after,
+.detailed-height-resizer:focus-visible::after,
+.detailed-trace-grid.is-resizing-height .detailed-height-resizer::after {
+  background: var(--tick4-khaki-accent);
+}
+
+.detailed-column-resizer:focus-visible,
+.detailed-height-resizer:focus-visible { outline: 0; }
+
+/* ---------------------------------------------------------------------------
+   Keskeny ablak: a fájl-hasáb csíkká csuklik, a lista overlayben nyílik.
+
+   1100 px-en mérve a válasz 295 px-re szorult (295/240/240), és a szakszöveg
+   ott már csúnyán tördel. A küszöb levezethető: a válasz addig tartja az
+   50%-át, amíg a kártya ≥ 2×(240+240) — a ~290 px-es oldalsávval ez ~1250 px
+   ablak. A `--files-lane-track` cseréjével minden szélesség-képlet (rács,
+   csukott kártyaszélesség, elválasztók, átméretező-plafonok) magától követi.
+   --------------------------------------------------------------------------- */
+/* A hasáb tartalma abszolút, hogy a rács sorát ne a fájllista magassága
+   szabja meg: a kártya a VÁLASZ vagy a LÉPÉSEK szerint áll be, a lista pedig
+   ebbe a magasságba illeszkedik, és ha nem fér, görget. */
+.files-lane {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.files-lane-body {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+}
+
+/* Széles ablakon a hasáb maga a panel — csík nincs. */
+.files-lane-strip { display: none; }
+
+@media (max-width: 1250px) {
+  .compact-answer-card.has-file-lane,
+  .detailed-trace-grid.has-file-lane { --files-lane-track: 28px; }
+
+  /* A csík a teljes sávot kitölti, az overlay pedig kilóg belőle — ezért itt
+     a hasáb nem vághat. (A „felfelé fülek" pont ezen buktak el: a sávok
+     overflow-ja levágta őket.) */
+  .detailed-files-lane,
+  .compact-files-panel {
+    overflow: visible;
+    padding: 0;
+  }
+
+  .files-lane-strip {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 7px;
+    width: 28px;
+    height: 100%;
+    padding: 10px 0;
+    border: 0;
+    background: transparent;
+    color: var(--faint);
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 8px;
+    font-weight: 650;
+    letter-spacing: .04em;
+    line-height: 1;
+    cursor: pointer;
+    writing-mode: vertical-rl;
+  }
+
+  .files-lane-strip:hover,
+  .files-lane-strip:focus-visible {
+    color: var(--tick4-khaki-light);
+    outline: 0;
+  }
+
+  .files-lane-strip[aria-expanded="true"] { color: var(--tick4-khaki-light); }
+  .files-lane-strip-glyph { font-size: 10px; }
+  .files-lane-strip-added { color: #8fe0aa; }
+
+  /* A kártya jobb széléről nyílik, a toolbar (z-index 6) fölött. Fekete
+     alapon a vetett árnyék önmagában láthatatlan, ezért a réteget bal oldalt
+     a keret halk vonala határolja — ugyanaz, ami a hasábot is zárta. */
+  .files-lane-body {
+    position: absolute;
+    z-index: 9;
+    top: 0;
+    right: 0;
+    display: none;
+    width: min(300px, 70vw);
+    height: 100%;
+    padding: 7px 8px 12px;
+    box-sizing: border-box;
+    border-left: 1px solid var(--detailed-fade-tail, rgba(165, 155, 124, .2));
+    background: #000;
+    box-shadow: -14px 0 30px rgba(0, 0, 0, .58);
+  }
+
+  .files-lane-body.is-open { display: flex; }
+}
+
+/* 680 px alatt a rács amúgy is blokkokra esik szét: ott a panel a maga
+   teljes szélességében folyjon, csík és overlay nélkül. */
+@media (max-width: 680px) {
+  .compact-answer-card.has-file-lane,
+  .detailed-trace-grid.has-file-lane { --files-lane-track: 0px; }
+  .files-lane-strip { display: none; }
+  .files-lane-body {
+    position: static;
+    display: flex;
+    width: auto;
+    height: auto;
+    box-shadow: none;
+  }
+}
 
